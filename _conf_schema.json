@@ -1,0 +1,98 @@
+{
+  "enabled": {
+    "description": "启用插件",
+    "hint": "插件总开关。关掉后不监听消息、不注入、不推进世界时钟。",
+    "obvious_hint": true,
+    "type": "bool",
+    "default": true
+  },
+  "web_enabled": {
+    "description": "启用网页编辑器",
+    "hint": "在 WebUI 插件详情页显示「虚拟世界编辑器」。地图、动作、日程、记忆都在里面配。",
+    "obvious_hint": true,
+    "type": "bool",
+    "default": true
+  },
+  "llm_provider_id": {
+    "description": "插件用模型（接管回复 + 自主行为）",
+    "hint": "插件自己发起的调用用它：接管回复、自主决策、主动发言、动作续说。留空用会话默认 Provider。\n选型：能稳定输出 JSON 的即可，别用推理型模型（更慢、还等于思考两次）。很在意聊天质量就别用太便宜的档位。",
+    "_special": "select_provider",
+    "obvious_hint": true,
+    "type": "string",
+    "default": ""
+  },
+  "helper_provider_id": {
+    "description": "辅助模型（补工具参数）",
+    "hint": "把「她想干什么」翻译成工具参数用。选便宜、快、能稳定输出 JSON 的。留空跟随上面那个。",
+    "_special": "select_provider",
+    "obvious_hint": false,
+    "type": "string",
+    "default": ""
+  },
+  "vision_provider_id": {
+    "description": "图片转述模型（多模态）",
+    "hint": "群友发图时先把图转成文字描述。必须选支持图片输入的。留空＝不转述，图片在提示词里只留一句「看不清内容」。",
+    "_special": "select_provider",
+    "obvious_hint": false,
+    "type": "string",
+    "default": ""
+  },
+  "context_provider_id": {
+    "description": "上下文压缩模型",
+    "hint": "群聊留档太长时压成摘要用，只在「全局设置 → 上下文 → 超出后怎么办」选「压成摘要」时才调用。留空跟随第一个。",
+    "_special": "select_provider",
+    "obvious_hint": false,
+    "type": "string",
+    "default": ""
+  },
+  "creator_provider_id": {
+    "description": "内容生成模型（生成动作 / 地点）",
+    "hint": "只在编辑器里点「生成动作 / 生成地点」时调用，平时完全不占 token。留空跟随第一个。",
+    "_special": "select_provider",
+    "obvious_hint": false,
+    "type": "string",
+    "default": ""
+  },
+  "tick_interval": {
+    "description": "tick 间隔（秒）",
+    "hint": "世界时钟走一格 = 1 tick，动作和走路的耗时都按 tick 算。默认 60 秒。",
+    "obvious_hint": true,
+    "type": "int",
+    "default": 60
+  },
+  "decider_interval": {
+    "description": "自主决策间隔（秒）",
+    "hint": "多久评估一次「接下来做什么」。默认 300 秒。",
+    "obvious_hint": true,
+    "type": "int",
+    "default": 300
+  },
+  "web_password": {
+    "description": "编辑器访问密码",
+    "hint": "留空直接用 WebUI 的登录鉴权；填了就要求额外输一次密码。",
+    "obvious_hint": false,
+    "type": "string",
+    "default": ""
+  },
+  "debug": {
+    "description": "调试日志",
+    "hint": "把提示词、模型返回、动作校验写进后台日志（含群聊内容，注意隐私）。",
+    "obvious_hint": false,
+    "type": "bool",
+    "default": false
+  },
+  "reply_hook_bridge": {
+    "description": "接管回复也过其他插件的钩子",
+    "hint": "接管回复会先过一遍 AstrBot 的「LLM 响应后」「发送前」钩子。好感度这类靠解析回复标记工作的插件需要它。",
+    "obvious_hint": true,
+    "type": "bool",
+    "default": true
+  },
+  "log_level": {
+    "description": "日志级别",
+    "hint": "DEBUG / INFO / WARNING / ERROR。",
+    "obvious_hint": false,
+    "type": "string",
+    "default": "INFO"
+  }
+}

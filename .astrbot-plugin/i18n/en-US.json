@@ -1,0 +1,8 @@
+{
+  "pages": {
+    "world_editor": {
+      "title": "Virtual World Editor",
+      "description": "Configure the map, actions, schedules, memories and session whitelist, and watch her state in real time."
+    }
+  }
+}

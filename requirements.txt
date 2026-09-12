@@ -1,0 +1,5 @@
+# 本插件只依赖 AstrBot 自带依赖，无需额外安装第三方包。
+# - pydantic（配置校验）：AstrBot 自带
+# - sqlite3（运行时状态与记忆）：Python 标准库
+# 故意不引入 apscheduler / sqlmodel / fastapi：
+# 日程由插件内置的 tick 调度器负责，持久层使用标准库 sqlite3，Web 走 AstrBot 官方 Page 机制。
