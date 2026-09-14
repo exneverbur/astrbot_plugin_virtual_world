@@ -1789,6 +1789,7 @@ function bindButtons() {
   $("state-wake").addEventListener("click", () => stateAction("wake"));
   $("state-clear-context").addEventListener("click", clearChatContext);
   $("status-nickname-save").addEventListener("click", saveNickname);
+  $("status-nickname-fetch").addEventListener("click", () => nicknameAction("refresh_nickname"));
   // 锁定 / 解锁合成一个按钮：按钮文字跟着当前状态走
   $("status-nickname-toggle").addEventListener("click", () => {
     const locked = Boolean((ui.status || {}).nickname_locked);
@@ -1980,7 +1981,11 @@ async function nicknameAction(action) {
   if (!sessionId) return;
   try {
     const result = await apiPost("state/action", { session: sessionId, action });
-    toast(result.note || "已执行");
+    if (action === "refresh_nickname") {
+      toast(result.ok ? `读到了她现在的群名片：「${result.card}」` : result.note || "没读到群名片");
+    } else {
+      toast(result.note || "已执行");
+    }
     refreshStatus();
   } catch (error) {
     toast(error.message || "执行失败");
@@ -3061,6 +3066,7 @@ async function commitGeneratedActions(drafts) {
       payload.id = id;
     }
     used.add(payload.id);
+    payload.created_at = payload.created_at || Date.now();
     actions().push(payload);
     added += 1;
   });
@@ -3534,6 +3540,7 @@ function createActionForNode(nodeId) {
     visible: true,
     description: "",
     enabled: true,
+    created_at: Date.now(),
   });
   markDirty();
   openActionDrawer(id);
@@ -4655,7 +4662,13 @@ function renderActionGrid() {
   refreshActionFilterOptions();
   const grid = $("action-grid");
   grid.innerHTML = "";
-  const list = visibleActions();
+  // 内置动作排最前（引擎专用，先让用户看到）；其余按加入时间倒序，没时间的保持原顺序。
+  const list = visibleActions().slice().sort((a, b) => {
+    const aBuiltin = a.builtin ? 1 : 0;
+    const bBuiltin = b.builtin ? 1 : 0;
+    if (aBuiltin !== bBuiltin) return bBuiltin - aBuiltin;
+    return num(b.created_at, 0) - num(a.created_at, 0);
+  });
   $("action-count").textContent = `共 ${actions().length} 个动作，当前显示 ${list.length} 个`;
   if (!list.length) {
     grid.appendChild(el("p", "muted", actions().length ? "没有匹配的动作。" : "还没有动作。"));
@@ -4798,6 +4811,7 @@ function copyAction(actionId) {
   const clone = JSON.parse(JSON.stringify(source));
   clone.id = id;
   clone.name = `${source.name || source.id}（副本）`;
+  clone.created_at = Date.now();
   actions().push(clone);
   markDirty();
   renderActionGrid();
@@ -4882,6 +4896,7 @@ function addAction() {
     visible: false,
     interruptible: true,
     enabled: true,
+    created_at: Date.now(),
     duration_mode: "fixed",
     duration: 600,
     duration_min: 600,

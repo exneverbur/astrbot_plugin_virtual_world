@@ -2314,6 +2314,8 @@ class VirtualWorldPlugin(Star):
             result = await self.messenger.set_group_card(session_id, base)
             note = "已改回原名" if result.ok else f"改回原名失败：{result.reason}"
             return json_response({"ok": result.ok, "note": note})
+        if action == "refresh_nickname":
+            return json_response(await self.engine.refresh_nickname(session_id))
         if action == "reset_state":
             # 清掉这个会话的全部状态（位置、数值、计划、留档）。名字里必须带 state：
             # 以前它就叫 "reset"，和编辑器的「恢复原名」按钮撞名，一点就把状态删了。

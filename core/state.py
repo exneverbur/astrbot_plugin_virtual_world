@@ -98,6 +98,11 @@ class WorldState:
     last_user_activity_at: float = 0.0
     last_nickname_update_at: float = 0.0
     sleep_reply_at: float = 0.0
+    sleep_skip_at: float = 0.0
+    """上一次记录「她在睡觉所以没回」的时间（用来给日志节流）。"""
+
+    sleep_skip_count: int = 0
+    """距离上次记录又挡下了几条消息。"""
     """上次用「她睡着了」的固定文案回话的时间（冷却用，0 表示没回过）。"""
     no_sleep_until: int = 0
     """刚被叫醒的保护期：世界时间在此之前，规则不再安排她回去睡。"""

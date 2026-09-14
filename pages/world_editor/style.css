@@ -1110,6 +1110,10 @@ details.raw-json summary {
   color: var(--muted);
   min-height: 32px;
   overflow: hidden;
+  /* 描述最多三行，卡片高度才整齐 */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
 }
 
 .action-card .card-actions {

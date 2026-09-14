@@ -166,6 +166,11 @@ def render_event(event: dict[str, Any], world: WorldConfig | None = None) -> str
         return f"日程「{detail.get('id', '')}」到点触发"
 
     if kind == "nickname":
+        if detail.get("manual"):
+            to = detail.get("to") or ""
+            if detail.get("ok") is False:
+                return f"重新读群名片失败：{_clip(detail.get('note'), 80)}"
+            return f"重新读了她的群名片：「{to}」"
         if detail.get("base"):
             return f"记下了她原来的群名片「{detail.get('base')}」"
         to = detail.get("to") or ""
@@ -232,6 +237,9 @@ def render_event(event: dict[str, Any], world: WorldConfig | None = None) -> str
         )
 
     if kind == "sleep_skip":
+        count = int(detail.get("count") or 0)
+        if count > 1:
+            return f"她在睡觉，又挡下了这期间的 {count} 条消息（其它插件也一起挡了）"
         return f"她在睡觉，没有回复（{_clip(detail.get('reason'), 60)}）"
 
     if kind == "send_failed":

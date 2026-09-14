@@ -500,12 +500,22 @@ class VirtualWorldEngine:
                 return False
             # 挡下来之前先记一笔：她醒来还得知道群里发生过什么
             self._note_presence(state, ctx)
+            # 睡着的时候群里刷屏，不能每来一条就写一条日志——日志页会被刷爆。
+            # 每 10 分钟最多记一条，并带上这段时间一共挡下了多少条。
+            now = self._now()
+            state.sleep_skip_count = int(state.sleep_skip_count) + 1
+            if state.sleep_skip_at and now - float(state.sleep_skip_at) < 600.0:
+                return True
+            suppressed = int(state.sleep_skip_count)
+            state.sleep_skip_count = 0
+            state.sleep_skip_at = now
             await self._log_event(
                 state,
                 "sleep_skip",
                 {
                     "user": ctx.user_name or ctx.user_id or "有人",
                     "reason": "她在睡觉，这条消息被整个挡下（其它插件也不会执行）",
+                    "count": suppressed,
                 },
             )
             return True
@@ -3765,6 +3775,32 @@ class VirtualWorldEngine:
                 state, "cancel", {"mode": "queue", "plan": True, "note": "放弃了还没做的安排"}
             )
             return True
+
+    async def refresh_nickname(self, session_id: str) -> dict[str, Any]:
+        """重新从平台读一次她现在的群名片（编辑器「重新获取」按钮用）。"""
+
+        if not self.is_enabled(session_id):
+            return {"ok": False, "card": "", "note": "这个会话没有启用虚拟世界"}
+        card = ""
+        try:
+            card = str(await self.messenger.fetch_group_card(session_id) or "").strip()
+        except Exception as exc:
+            self._log("warning", f"读取群名片失败：{exc}")
+        async with self.session_state(session_id) as state:
+            before = state.bot_current_nickname
+            if card:
+                state.bot_current_nickname = card
+                if not state.bot_base_nickname:
+                    # 之前没记过原名，就把这次读到的当成原名
+                    state.bot_base_nickname = card
+                state.last_nickname_update_at = self._now()
+            note = "" if card else "还没收到过这个群的消息，拿不到机器人句柄"
+            await self._log_event(
+                state,
+                "nickname",
+                {"manual": True, "to": card, "ok": bool(card), "note": note},
+            )
+        return {"ok": bool(card), "card": card, "before": before, "note": note}
 
     async def clear_all_states(self) -> int:
         """清掉所有会话的世界状态（切换预设时用）。记忆与日志不动。"""
