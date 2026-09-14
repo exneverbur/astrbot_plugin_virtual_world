@@ -179,6 +179,7 @@ class AstrBotLLM:
         contexts: list[dict] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        image_urls: list[str] | None = None,
     ) -> LLMReply:
         context = self.plugin.context
         provider_id = (self.provider_id or self.plugin.llm_provider_id or "").strip()
@@ -190,6 +191,7 @@ class AstrBotLLM:
         kwargs: dict[str, Any] = {}
         if temperature is not None:
             kwargs["temperature"] = temperature
+        images = [str(item) for item in (image_urls or []) if str(item).strip()]
         token = self.plugin.set_self_initiated()
         try:
             response = await context.llm_generate(
@@ -197,9 +199,27 @@ class AstrBotLLM:
                 prompt=prompt,
                 system_prompt=system_prompt,
                 contexts=list(contexts) if contexts else None,
+                image_urls=images or None,
                 **kwargs,
             )
         except Exception as exc:
+            # Provider 不支持图片（或图片取不回来）时，退回纯文字再来一次
+            if images:
+                try:
+                    response = await context.llm_generate(
+                        chat_provider_id=provider_id,
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        contexts=list(contexts) if contexts else None,
+                        **kwargs,
+                    )
+                    self.plugin.logger.warning(
+                        f"[virtual_world] 带图片调用失败（{exc}），已退回纯文字"
+                    )
+                    text = getattr(response, "completion_text", "") or ""
+                    return LLMReply(text=text, ok=True)
+                except Exception as retry_exc:
+                    return LLMReply(ok=False, error=str(retry_exc))
             # 历史上下文格式不被某些 Provider 接受时，退化成不带历史再试一次
             if contexts:
                 try:
@@ -236,6 +256,8 @@ class AstrBotVision:
         self.plugin = plugin
         self.provider_id = provider_id
         self._cache: dict[str, str] = {}
+        self.last_error: str = ""
+        """最近一次转述失败的原因（写进日志，方便排查"模型看不见图片"）。"""
 
     @property
     def enabled(self) -> bool:
@@ -295,9 +317,157 @@ class AstrBotVision:
             )
         except Exception as exc:
             self.plugin.logger.debug(f"[virtual_world] 图片转述失败：{exc}")
+            self.last_error = f"{type(exc).__name__}: {exc}"
             return ""
         text = str(getattr(response, "completion_text", "") or "").strip()
+        if not text:
+            self.last_error = "转述模型没有返回文字（可能不支持图片输入）"
         return " ".join(text.split())[:200]
+
+
+class AstrBotCommands:
+    """把「指令触发」型动作转成真正的指令，交给别的插件执行。
+
+    寻找方式与 AstrBot 的指令分发一致：从 handler 注册表里按指令名（含别名）匹配，
+    借用这个会话最近一条真实事件，把消息文本换成指令本身，再调用它的处理器。
+    处理器 yield 出来的文本会被收集起来交回给大模型。
+    """
+
+    def __init__(self, plugin: "VirtualWorldPlugin") -> None:
+        self.plugin = plugin
+
+    async def trigger(
+        self, session_id: str, command: str, *, event: Any = None
+    ) -> ToolCallResult:
+        text = " ".join(str(command or "").split())
+        if not text:
+            return ToolCallResult(ok=False, error="指令是空的")
+        if not text.startswith("/"):
+            text = "/" + text
+        word = text.split()[0].lstrip("/")
+        matched = self._find(text)
+        if matched is None:
+            return ToolCallResult(ok=False, error=f"没找到指令「{word}」")
+        record, command_filter = matched
+        real_event = event or self.plugin.last_event(session_id) or self.plugin.last_event_any()
+        if real_event is None:
+            return ToolCallResult(
+                ok=False, error="还没有收到过这个会话的消息，指令没有上下文可用"
+            )
+        try:
+            params = self._params(record, command_filter, text)
+        except Exception as exc:
+            return ToolCallResult(ok=False, error=str(exc))
+        restore = self._swap_text(real_event, text)
+        try:
+            result = record.handler(real_event, **params)
+            texts: list[str] = []
+            if inspect.isasyncgen(result):
+                async for item in result:
+                    texts.append(_tool_result_text(item))
+            elif inspect.isawaitable(result):
+                texts.append(_tool_result_text(await result))
+            else:
+                texts.append(_tool_result_text(result))
+        except Exception as exc:
+            return ToolCallResult(ok=False, error=f"{type(exc).__name__}: {exc}", tool=word)
+        finally:
+            restore()
+        body = "\n".join(part for part in texts if part).strip()
+        if not body:
+            body = f"（指令「{word}」执行了，但没有返回文字）"
+        return ToolCallResult(ok=True, text=body, tool=word)
+
+    def _find(self, text: str) -> tuple[Any, Any] | None:
+        """按指令名找处理器（含别名）；跳过本插件自己的指令，避免绕回自己。"""
+
+        try:
+            from astrbot.core.star.star_handler import (
+                EventType,
+                star_handlers_registry,
+            )
+        except Exception:
+            return None
+        try:
+            handlers = star_handlers_registry.get_handlers_by_event_type(
+                EventType.AdapterMessageEvent
+            )
+        except Exception:
+            return None
+        for record in handlers:
+            module = str(getattr(record, "handler_module_path", "") or "")
+            if PLUGIN_NAME in module:
+                continue
+            for event_filter in list(getattr(record, "event_filters", []) or []):
+                names = getattr(event_filter, "get_complete_command_names", None)
+                if not callable(names):
+                    continue
+                try:
+                    candidates = [str(name) for name in names()]
+                except Exception:
+                    continue
+                for name in candidates:
+                    if event_filter.equals(text) or text.split()[0].lstrip("/") == name.lstrip("/"):
+                        return record, event_filter
+        return None
+
+    @staticmethod
+    def _params(record: Any, command_filter: Any, text: str) -> dict[str, Any]:
+        """按处理器签名解析参数（和 AstrBot 指令分发同一套转换）。"""
+
+        signature = inspect.signature(record.handler)
+        param_type: dict[str, Any] = {}
+        for name, parameter in signature.parameters.items():
+            if name in ("self", "event"):
+                continue
+            param_type[name] = (
+                parameter.annotation
+                if parameter.annotation is not inspect.Parameter.empty
+                else parameter.default
+            )
+        if not param_type:
+            return {}
+        args = text.split()[1:]
+        return command_filter.validate_and_convert_params(args, param_type)
+
+    @staticmethod
+    def _swap_text(event: Any, text: str):
+        """临时把事件的消息文本换成指令本身，返回还原用的回调。"""
+
+        message_obj = getattr(event, "message_obj", None)
+        previous_str = getattr(event, "message_str", None)
+        previous_obj_str = getattr(message_obj, "message_str", None)
+        previous_chain = getattr(message_obj, "message", None)
+        try:
+            event.message_str = text
+        except Exception:
+            pass
+        if message_obj is not None:
+            try:
+                message_obj.message_str = text
+                message_obj.message = [Plain(text=text)]
+            except Exception:
+                pass
+
+        def restore() -> None:
+            if previous_str is not None:
+                try:
+                    event.message_str = previous_str
+                except Exception:
+                    pass
+            if message_obj is not None:
+                if previous_obj_str is not None:
+                    try:
+                        message_obj.message_str = previous_obj_str
+                    except Exception:
+                        pass
+                if previous_chain is not None:
+                    try:
+                        message_obj.message = previous_chain
+                    except Exception:
+                        pass
+
+        return restore
 
 
 class AstrBotMessenger:
@@ -816,7 +986,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "Codex",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v1.6.0",
+    "v1.2.0",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -861,6 +1031,7 @@ class VirtualWorldPlugin(Star):
             creator_llm=AstrBotLLM(self, self.creator_provider_id),
             messenger=self.messenger,
             tools=AstrBotTools(self),
+            commands=AstrBotCommands(self),
             persona=AstrBotPersona(self),
             clock=None,
             tick_seconds=float(self.tick_interval),
@@ -1027,6 +1198,23 @@ class VirtualWorldPlugin(Star):
                 for index, caption in enumerate(captions or [])
                 if caption
             ]
+            session_id = event.unified_msg_origin
+            if described:
+                # 转述结果同时进日志与调试输出：成功就显示描述
+                await self.engine.note_vision(
+                    session_id,
+                    ok=True,
+                    images=len(sources),
+                    detail="；".join(described),
+                )
+            else:
+                reason = "没配图片转述模型"
+                if getattr(self, "vision", None) is not None and self.vision.enabled:
+                    reason = str(getattr(self.vision, "last_error", "") or "转述没有返回内容")
+                # 失败也记一条：失败原因是排查"模型看不见图片"的唯一线索
+                await self.engine.note_vision(
+                    session_id, ok=False, images=len(sources), detail=reason
+                )
             notes.append(
                 "；".join(described) if described else "对方发了一张图片，看不清内容"
             )
@@ -1090,6 +1278,22 @@ class VirtualWorldPlugin(Star):
             event.get_message_str() or ""
         )
         user_text = await self._annotate_message(event, user_text)
+        image_urls: list[str] = []
+        if not (getattr(self, "vision", None) is not None and self.vision.enabled):
+            # 没配转述模型时，直接把图片交给多模态主模型：
+            # 「自上次回复以来收到的图片」+ 这条消息自己的图，按配置的上限截断。
+            pending = await self.engine.take_pending_images(session_id)
+            current = _image_sources(event)
+            limit = max(1, int(self.engine.world.context.image_max))
+            merged = list(dict.fromkeys([*pending, *current]))[-limit:]
+            if merged:
+                image_urls = merged
+                await self.engine.note_vision(
+                    session_id,
+                    ok=True,
+                    images=len(merged),
+                    detail=f"没配转述模型，直接把 {len(merged)} 张图交给多模态主模型",
+                )
         ctx = MessageContext(
             session_id=session_id,
             user_id=event.get_sender_id(),
@@ -1101,6 +1305,7 @@ class VirtualWorldPlugin(Star):
             persona_id=_event_persona_id(event),
             # 其他插件（上下文理解、图片转文字、记忆…）写进 system_prompt 的内容原样带过去
             other_context=(getattr(req, "system_prompt", "") or "").strip(),
+            image_urls=image_urls,
         )
 
         # 睡觉时的门禁：没被明确叫醒就只回固定文案（或保持安静），
@@ -1150,6 +1355,11 @@ class VirtualWorldPlugin(Star):
             req.system_prompt = (req.system_prompt or "") + injection
         except Exception as exc:
             self.logger.warning(f"[virtual_world] 注入提示词失败：{exc}")
+        # 注入模式下主人格会替她说话，同样算"已经回应过这批群聊"
+        try:
+            await self.engine.mark_chat_replied_by_session(session_id)
+        except Exception:
+            pass
         # 注入模式不会自己发消息，但门禁（被叫醒等）攒下的回显要补上
         echo = self.engine.take_pending_echo(session_id)
         if echo:
@@ -1317,6 +1527,8 @@ class VirtualWorldPlugin(Star):
             is_wake=bool(event.is_wake_up()),
             is_mentioned=_is_at_bot(event) or bool(event.is_private_chat()),
             is_private=bool(event.is_private_chat()),
+            # 记下这条消息带的图片，等下次回复时一起给多模态主模型
+            image_urls=_image_sources(event),
         )
         if not await self.engine.should_block_sleep(ctx):
             return
@@ -1506,6 +1718,76 @@ class VirtualWorldPlugin(Star):
             return
 
         yield event.plain_result(f"未知指令：{action}\n\n{_help_text(self._pronoun())}")
+
+    # ---------------- 给主人格 / 别的插件用的日程工具 ----------------
+
+    @filter.llm_tool(name="vw_schedule_list")
+    async def tool_schedule_list(self, event: AstrMessageEvent) -> str:
+        """查看虚拟世界里 Bot 自己的日程表（什么时候会自动做什么）。
+
+        没有参数，直接调用。
+        """
+
+        return self.engine.schedule_text()
+
+    @filter.llm_tool(name="vw_schedule_add")
+    async def tool_schedule_add(
+        self,
+        event: AstrMessageEvent,
+        time: str,
+        actions: str,
+        days: str = "",
+    ) -> str:
+        """给虚拟世界里的 Bot 加一条日程：到点她会自动做一串动作。
+
+        Args:
+            time(string): 触发时间，24 小时制，例如 07:30
+            actions(string): 动作链，用 > 表示先后顺序，例如 say>walk_to>search_web；需要先去某地时写成 walk_to@书房 id
+            days(string): 星期，用逗号分隔，可选 mon,tue,wed,thu,fri,sat,sun；留空表示每天
+        """
+
+        chain: list[dict[str, Any]] = []
+        for raw in str(actions or "").replace("，", ",").split(">"):
+            part = raw.strip()
+            if not part:
+                continue
+            node = ""
+            if "@" in part:
+                part, node = (piece.strip() for piece in part.split("@", 1))
+            step: dict[str, Any] = {"type": part}
+            if node:
+                step["target_node"] = node
+            chain.append(step)
+        ok, note = await self.engine.schedule_add(
+            {
+                "time": time,
+                "days": [day.strip() for day in str(days or "").replace("，", ",").split(",") if day.strip()],
+                "action_chain": chain,
+                "auto_travel": True,
+            }
+        )
+        return note
+
+    @filter.llm_tool(name="vw_schedule_remove")
+    async def tool_schedule_remove(
+        self,
+        event: AstrMessageEvent,
+        schedule_id: str = "",
+        time: str = "",
+        keyword: str = "",
+    ) -> str:
+        """删掉虚拟世界里 Bot 自己加的一条日程（用户手动配的日程删不掉）。
+
+        Args:
+            schedule_id(string): 日程 id，最准；不知道就留空
+            time(string): 按时间匹配，例如 07:30
+            keyword(string): 按里面出现的动作名匹配，例如 新闻
+        """
+
+        ok, note = await self.engine.schedule_remove(
+            {"id": schedule_id, "time": time, "keyword": keyword}
+        )
+        return note
 
     async def _handle_nickname_command(self, event: AstrMessageEvent, rest: list[str]) -> str:
         sub = rest[0].lower() if rest else ""
@@ -1733,6 +2015,12 @@ class VirtualWorldPlugin(Star):
         register(f"/{p}/memories/import", self.api_memory_import, ["POST"], "导入记忆")
         register(f"/{p}/prompt", self.api_prompt, ["GET"], "预览提示词")
         register(f"/{p}/backup", self.api_backup, ["POST"], "备份配置")
+        register(f"/{p}/presets", self.api_presets, ["GET"], "预设列表")
+        register(f"/{p}/presets/save", self.api_preset_save, ["POST"], "把当前配置存成预设")
+        register(f"/{p}/presets/apply", self.api_preset_apply, ["POST"], "应用预设")
+        register(f"/{p}/presets/delete", self.api_preset_delete, ["POST"], "删除预设")
+        register(f"/{p}/presets/rename", self.api_preset_rename, ["POST"], "重命名预设")
+        register(f"/{p}/presets/json", self.api_preset_json, ["GET", "POST"], "读写预设 JSON")
 
     def _guard(self, payload: dict[str, Any] | None = None) -> Any:
         """统一鉴权：返回错误响应或 None。"""
@@ -2282,6 +2570,122 @@ class VirtualWorldPlugin(Star):
                 "sections": prompt_section_index(text),
             }
         )
+
+    # ---------------- 预设：成套的世界配置 ----------------
+
+    async def api_presets(self):
+        guard = self._guard()
+        if guard is not None:
+            return guard
+        return json_response(
+            {
+                "presets": self.store.list_presets(),
+                "active": self.store.active_preset(),
+            }
+        )
+
+    async def api_preset_save(self):
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        preset_id = str(payload.get("id") or "").strip()
+        if not preset_id:
+            return error_response("预设 id 不能为空")
+        try:
+            path = self.store.save_preset(
+                preset_id,
+                name=str(payload.get("name") or "").strip(),
+                note=str(payload.get("note") or "").strip(),
+            )
+        except Exception as exc:
+            return error_response(f"保存预设失败：{exc}")
+        self.store.set_active_preset(path.stem)
+        return json_response({"ok": True, "id": path.stem})
+
+    async def api_preset_apply(self):
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        preset_id = str(payload.get("id") or "").strip()
+        if not preset_id:
+            return error_response("缺少预设 id")
+        clear_state = bool(payload.get("clear_state", True))
+        try:
+            result = self.store.apply_preset(preset_id)
+        except Exception as exc:
+            return error_response(f"应用预设失败：{exc}")
+        warnings = list(result.get("warnings") or [])
+        warnings.extend(self.engine.reload_config())
+        cleared = await self.engine.clear_all_states() if clear_state else 0
+        return json_response(
+            {
+                "ok": True,
+                "id": preset_id,
+                "cleared_sessions": cleared,
+                "warnings": warnings,
+            }
+        )
+
+    async def api_preset_delete(self):
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        preset_id = str(payload.get("id") or "").strip()
+        if not self.store.delete_preset(preset_id):
+            return error_response("找不到这个预设")
+        return json_response({"ok": True})
+
+    async def api_preset_rename(self):
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        preset_id = str(payload.get("id") or "").strip()
+        data = self.store.read_preset(preset_id)
+        if not data:
+            return error_response("找不到这个预设")
+        data["name"] = str(payload.get("name") or "").strip() or preset_id
+        if payload.get("note") is not None:
+            data["note"] = str(payload.get("note") or "")
+        warnings = self.store.write_preset(preset_id, data)
+        return json_response({"ok": True, "warnings": warnings})
+
+    async def api_preset_json(self):
+        """GET：读出预设原文；POST：整段写回（导入 / 直接编辑都走这里）。"""
+
+        if request.method == "POST":
+            payload = await request.json(default={}) or {}
+            guard = self._guard(payload)
+            if guard is not None:
+                return guard
+            preset_id = str(payload.get("id") or "").strip()
+            if not preset_id:
+                return error_response("缺少预设 id")
+            raw = payload.get("payload")
+            if isinstance(raw, dict):
+                data = raw
+            else:
+                text = str(payload.get("json") or "").strip()
+                try:
+                    data = json.loads(text) if text else {}
+                except json.JSONDecodeError as exc:
+                    return error_response(f"JSON 格式不对：{exc}")
+            try:
+                warnings = self.store.write_preset(preset_id, data)
+            except Exception as exc:
+                return error_response(f"写入预设失败：{exc}")
+            return json_response({"ok": True, "id": preset_id, "warnings": warnings})
+        guard = self._guard()
+        if guard is not None:
+            return guard
+        preset_id = request.query.get("id", "") or ""
+        data = self.store.read_preset(preset_id)
+        if not data:
+            return error_response("找不到这个预设")
+        return json_response({"preset": data})
 
     async def api_backup(self):
         payload = await request.json(default={}) or {}

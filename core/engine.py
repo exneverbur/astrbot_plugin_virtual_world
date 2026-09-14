@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone as dt_timezone
@@ -143,6 +144,8 @@ class MessageContext:
     other_context: str = ""
     is_group_lively: bool = False
     mood_signal: str = ""
+    image_urls: list[str] = field(default_factory=list)
+    """这次要直接交给多模态主模型的图片地址（没配转述模型时才用）。"""
 
 
 @dataclass
@@ -189,6 +192,7 @@ class VirtualWorldEngine:
         creator_llm=None,
         messenger=None,
         tools=None,
+        commands=None,
         persona=None,
         clock=None,
         tick_seconds: float = DEFAULT_TICK_SECONDS,
@@ -207,6 +211,8 @@ class VirtualWorldEngine:
         self.creator_llm = creator_llm or self.llm
         self.messenger = messenger
         self.tools = tools
+        # 指令通道：把别家插件的指令转发出去（「指令触发」型动作用）
+        self.commands = commands
         self.persona = persona
         self.clock = clock
         self.tick_seconds = max(1.0, float(tick_seconds))
@@ -554,6 +560,8 @@ class VirtualWorldEngine:
                 self._queue_echo(ctx.session_id, echo.debug_messages)
                 return SleepReply(mode="silent", reason="固定文案还在冷却")
             state.sleep_reply_at = self._now()
+            # 睡觉时回的这句也是"被搭话后的回复"，同样要压一压后面的主动搭话
+            self.engagement.note_passive_reply(state, tick_seconds=self.tick_seconds)
             await self._log_event(
                 state, "sleep_reply", {"user": who, "text": text}, outcome=echo
             )
@@ -579,6 +587,8 @@ class VirtualWorldEngine:
                 node = self.node(state.node_id)
 
             extra_notes, woke = self._record_user_message(state, ctx)
+            # 刚被搭话（她马上要回一句）：接下来一段时间别再因为孤独感主动开口
+            self.engagement.note_passive_reply(state, tick_seconds=self.tick_seconds)
             if woke:
                 echo = TickOutcome(session_id=ctx.session_id)
                 await self._log_event(
@@ -877,7 +887,11 @@ class VirtualWorldEngine:
 
         # --- 第二阶段：调用大模型（不持锁） ---
         raw = await self._ask_llm(
-            ctx.session_id, system_prompt, user_prompt, contexts=history
+            ctx.session_id,
+            system_prompt,
+            user_prompt,
+            contexts=history,
+            image_urls=list(ctx.image_urls) or None,
         )
         if raw is None:
             return ReplyOutcome(ok=False, error="大模型调用失败")
@@ -926,6 +940,10 @@ class VirtualWorldEngine:
                     is_self=True,
                 )
                 self.note_dialogue(state, text=message, is_self=True)
+            if outcome.messages:
+                # 她真的回了：把已回应水位线推上去，并记下"刚才在聊什么"
+                self.mark_chat_replied(state)
+            self.note_chat_note(state, parsed.chat_note)
             await self._echo_events_since(state, outcome, echo_marker)
             # 模型顺手给的总结只当"写记忆时的提示"，不单独落成一条记忆
             self.note_memory_hint(state, parsed.memory)
@@ -968,6 +986,7 @@ class VirtualWorldEngine:
         第二个返回值表示这次是不是把她叫醒了（调用方负责写一条事件日志）。
         """
 
+        self._note_images(state, ctx.image_urls)
         state.touch_user(
             ctx.user_id or "unknown",
             name=ctx.user_name,
@@ -1033,6 +1052,7 @@ class VirtualWorldEngine:
     def _note_presence(self, state: WorldState, ctx: MessageContext) -> None:
         """记下「谁在说话」（调用方负责持锁）。"""
 
+        self._note_images(state, ctx.image_urls)
         state.touch_user(
             ctx.user_id,
             name=ctx.user_name,
@@ -1051,6 +1071,56 @@ class VirtualWorldEngine:
         if ctx.is_wake:
             # 有人 @她，就算一次有效互动
             self.engagement.on_user_replied(state)
+
+    def _note_images(self, state: WorldState, urls: list[str] | None) -> None:
+        """记住自上次回复以来收到的图片（只在「没配转述模型」时用得上）。"""
+
+        if not urls:
+            return
+        limit = max(1, int(self.world.context.image_max))
+        seen = {str(item.get("url") or "") for item in state.pending_images}
+        for url in urls:
+            text = str(url or "").strip()
+            if not text or text in seen:
+                continue
+            state.pending_images.append({"url": text, "at": self._now()})
+            seen.add(text)
+        if len(state.pending_images) > limit:
+            state.pending_images = state.pending_images[-limit:]
+
+    async def take_pending_images(self, session_id: str) -> list[str]:
+        """取走并清空「自上次回复以来收到的图片」。"""
+
+        if not self.is_enabled(session_id):
+            return []
+        async with self.session_state(session_id) as state:
+            urls = [
+                str(item.get("url") or "")
+                for item in state.pending_images
+                if str(item.get("url") or "")
+            ]
+            state.pending_images = []
+            return urls
+
+    async def note_vision(
+        self, session_id: str, *, ok: bool, images: int, detail: str
+    ) -> None:
+        """记一条图片相关的事件：转述成功（写了什么）、失败（为什么）、或者直接交给主模型。"""
+
+        if not self.is_enabled(session_id):
+            return
+        try:
+            async with self.session_state(session_id) as state:
+                echo = TickOutcome(session_id=session_id)
+                await self._log_event(
+                    state,
+                    "vision",
+                    {"ok": bool(ok), "images": int(images or 0), "detail": _clip_text(detail, 200)},
+                    outcome=echo,
+                )
+                self._queue_echo(session_id, echo.debug_messages)
+        except Exception as exc:  # 记日志失败不该影响回复
+            self._log("debug", f"图片事件写入失败: {exc}")
 
     # ================= 工具 =================
 
@@ -1133,10 +1203,26 @@ class VirtualWorldEngine:
     def missing_params_for(self, chosen: str, params: dict[str, Any]) -> list[str]:
         """某个已确定的工具还缺哪些必填参数。"""
 
-        schema = self.tool_schemas().get(chosen) or {}
+        schema = normalize_param_schema(self.tool_schemas().get(chosen) or {})
         required = [str(name) for name in (schema.get("required") or [])]
         given = {str(key) for key, value in (params or {}).items() if value not in ("", None)}
         return [name for name in required if name not in given]
+
+    def declared_params(self, chosen: str) -> list[str]:
+        """工具自己声明了哪些参数（不分必填可选）。"""
+
+        schema = normalize_param_schema(self.tool_schemas().get(chosen) or {})
+        return [str(name) for name in (schema.get("properties") or {})]
+
+    def unfilled_params(self, chosen: str, params: dict[str, Any]) -> list[str]:
+        """声明了但这次还没给的参数。
+
+        工具作者经常把参数写成"可选"，实现里却必须要（例如天气工具的 city），
+        所以只要工具声明了参数、而这次一个都没给全，就值得让辅助模型试一次。
+        """
+
+        given = {str(key) for key, value in (params or {}).items() if value not in ("", None)}
+        return [name for name in self.declared_params(chosen) if name not in given]
 
     def allowed_tool_names(self, node_id: str) -> set[str]:
         return allowed_tools(self.world, self.node(node_id))
@@ -1378,6 +1464,13 @@ class VirtualWorldEngine:
             ):
                 for flag in flags:
                     plan = self.decider.forced_plan(state, flag)
+                    if (
+                        plan is not None
+                        and self.plan_speaks(plan)
+                        and self.engagement.proactive_blocked(state)
+                    ):
+                        # 刚回过话说明有人理她，别再触发"太久没人说话，强制找人"
+                        continue
                     if plan:
                         state.current_plan = plan
                         state.last_forced_plan_at = self._now()
@@ -1395,6 +1488,9 @@ class VirtualWorldEngine:
             outcome.notes.append(
                 f"t={state.world_time} node={state.node_id} state={state.state} mood={state.mood}"
             )
+            if outcome.messages:
+                # 她这一轮主动开口了，也算回应过了这些群聊内容
+                self.mark_chat_replied(state)
             await self._echo_events_since(state, outcome, echo_marker)
         return outcome
 
@@ -1583,6 +1679,7 @@ class VirtualWorldEngine:
             engagement_hint=self.engagement.hint(state),
             max_messages=self.world.limits.max_messages_per_say,
             recent_chat=self.chat_context(state),
+            reasoning=bool(self.world.reasoning_enabled),
         )
         prompt = self.prompts.build_reply_followup_prompt(hint, tool_result)
         reply = await self._ask_llm(state.session_id, system_prompt, prompt)
@@ -1664,6 +1761,16 @@ class VirtualWorldEngine:
                 if self.decider.should_ask_llm(state):
                     llm_plan = await self._ask_llm_for_plan(state, node, outcome)
                     plan = llm_plan or plan
+                if plan is not None and self.plan_speaks(plan):
+                    # 刚被搭话、她也回过了：这段时间别主动开口，免得跟被动回复挤在一起
+                    if self.engagement.proactive_blocked(state):
+                        outcome.notes.append("刚回过话，这轮不主动搭话")
+                        await self._log_event(
+                            state,
+                            "engagement",
+                            {"reason": "刚回过话，跳过主动发言"},
+                        )
+                        plan = None
                 if plan is not None:
                     await self._apply_plan(state, node, outcome, plan)
                     self._count_autonomous(state)
@@ -1741,6 +1848,9 @@ class VirtualWorldEngine:
             group_chatting=self.group_is_chatting(state),
             interject_allowed=self.interject_allowed(state),
         )
+        if plan is not None and self.plan_speaks(plan) and self.engagement.proactive_blocked(state):
+            outcome.notes.append("刚回过话，到了新地方也不主动搭话")
+            plan = None
         # 她特地走过来通常是有目的的：把刚才的打算和她现在能做什么摆在最前面，
         # 免得这次调用还在"重新规划整段时间"。
         where = (node.name if node else "") or state.node_id
@@ -1791,6 +1901,7 @@ class VirtualWorldEngine:
             max_messages=self.world.limits.max_messages_per_say,
             recent_chat=self.chat_context(state),
             mode="plan",
+            reasoning=bool(self.world.reasoning_enabled),
         )
         prompt = (
             (f"{hint}\n\n" if hint else "")
@@ -2156,6 +2267,7 @@ class VirtualWorldEngine:
         tool_name: str = "",
         params: dict[str, Any] | None = None,
         previous_results: str = "",
+        error_hint: str = "",
     ) -> tuple[dict[str, Any], str]:
         """把「她想干什么」翻译成工具需要的参数字典。
 
@@ -2164,6 +2276,8 @@ class VirtualWorldEngine:
 
         ``previous_results`` 用于一个动作挂了多个工具的场景：把它传给补全模型，
         后面的工具就能用上前一个工具查回来的内容（例如先搜到网址、再去抓正文）。
+        ``error_hint`` 是上一次调用报的错：带着它再补一次，能救回"schema 写可选、
+        实现却必须要"这类工具。
         """
 
         base = dict(params if params is not None else (action.params or {}))
@@ -2173,14 +2287,20 @@ class VirtualWorldEngine:
         if not chosen or self.helper_llm is None:
             return {}, ""
         missing = self.missing_params_for(chosen, base)
-        if not missing and not previous_results:
+        unfilled = self.unfilled_params(chosen, base)
+        if not missing and not unfilled and not previous_results and not error_hint:
             # 已经齐了就不用问模型；但带了"上一个工具的结果"时是有意重算，必须再问一次
             return {}, ""
         intent = (action.intent or action.content or "").strip()
         if not intent:
             return {}, "没有给出想做什么"
         cache_key = (chosen, intent)
-        cached = None if previous_results else self._filled_params.get(cache_key)
+        # 带了上一个工具的结果、或者带了报错时都是"有意重算"，不吃缓存
+        cached = (
+            None
+            if (previous_results or error_hint)
+            else self._filled_params.get(cache_key)
+        )
         if cached:
             return dict(cached), ""
         if not self._tool_param_allowed(state):
@@ -2195,6 +2315,7 @@ class VirtualWorldEngine:
             intent=intent,
             recent_chat=self.chat_context(state),
             previous_results=previous_results,
+            error_hint=error_hint,
         )
         reply = await self._ask_helper(
             state.session_id, system_prompt, prompt
@@ -2300,14 +2421,22 @@ class VirtualWorldEngine:
             )
             return False
 
-        base = dict(self._act_get(action, "params", {}) or {})
+        # 用户在动作里配好的固定参数（例如查天气固定 city=武汉）先铺底，
+        # 大模型这一轮写出来的参数覆盖在它上面。
+        fixed: dict[str, str] = {}
+        for key, spec in (definition.params or {}).items():
+            value = getattr(spec, "value", "")
+            if isinstance(value, str) and value.strip():
+                fixed[str(key)] = value.strip()
+        base = {**fixed, **dict(self._act_get(action, "params", {}) or {})}
         stored: dict[str, dict[str, Any]] = {}
         for index, name in enumerate(names):
             # 大模型写出来的参数只当第一个工具的，其余工具由辅助模型按各自定义补
             params = dict(base) if index == 0 else {}
             missing = self.missing_params_for(name, params)
+            unfilled = self.unfilled_params(name, params)
             note = ""
-            if missing:
+            if missing or unfilled:
                 filled, note = await self.fill_tool_params(
                     state, definition, action, tool_name=name, params=params
                 )
@@ -2336,6 +2465,441 @@ class VirtualWorldEngine:
         self._act_set(action, "tool_params", stored)
         self._act_set(action, "params", dict(stored.get(names[0]) or {}))
         return True
+
+    # ---------------- 日程：查看 / 添加 / 删除（内置动作与对外工具共用） ----------------
+
+    async def _run_command_action(
+        self,
+        state: WorldState,
+        node: NodeDef | None,
+        outcome: TickOutcome,
+        definition: ActionDef,
+        action: PlannedAction,
+        event: Any = None,
+    ) -> None:
+        """指令触发：把意图拼成一条指令，交给 AstrBot 去执行，再把结果交回给她。
+
+        有真实消息事件时直接用那条事件（图片、引用都跟着走）；
+        自主触发时借用这个会话最近一条事件——所以在这种情况下没有图片。
+        """
+
+        command = str(definition.trigger_command or "").strip()
+        if not command:
+            outcome.notes.append(f"动作 {definition.id} 没有配置要触发的指令，已跳过")
+            await self._log_event(
+                state,
+                "skip",
+                {"action": definition.id, "note": "指令型动作没有配置要触发的指令"},
+            )
+            return
+        intent = (action.intent or action.content or "").strip()
+        if not intent:
+            outcome.notes.append(f"动作 {definition.id} 没有说清想干什么，已跳过")
+            await self._log_event(
+                state,
+                "skip",
+                {"action": definition.id, "note": "指令型动作没有给出 intent"},
+            )
+            return
+
+        line = await self._compose_command(state, definition, command, intent)
+        if self.commands is None:
+            outcome.notes.append("没有可用的指令通道，已跳过")
+            return
+        call = await self.commands.trigger(state.session_id, line)
+        await self._log_event(
+            state,
+            "command",
+            {
+                "action": definition.id,
+                "command": line,
+                "ok": bool(call.ok),
+                "result": _clip_text(call.text, 400),
+                "error": call.error,
+            },
+            outcome=self._echo_into(outcome, state),
+        )
+        outcome.notes.append(
+            f"触发指令「{line}」：" + ("成功" if call.ok else f"失败（{call.error}）")
+        )
+        detail = call.text if call.ok else f"（这条指令没跑成：{call.error}）"
+        hint = (
+            "用你自己的话把这条指令返回的内容讲一句，别照抄格式、别编。"
+            if call.ok
+            else "这条指令没跑成，用一句自然的话说明一下，别编内容。"
+        )
+        await self._llm_followup(state, node, outcome, hint, detail or "（没有返回内容）")
+
+    async def _compose_command(
+        self,
+        state: WorldState,
+        definition: ActionDef,
+        command: str,
+        intent: str,
+    ) -> str:
+        """把意图拼成一条完整指令；补不出参数就退回指令名本身。"""
+
+        base = command if command.startswith("/") else f"/{command}"
+        if self.helper_llm is None or not self._tool_param_allowed(state):
+            return base
+        system_prompt, prompt = self.prompts.build_command_prompt(
+            command=base,
+            hint=str(definition.trigger_hint or ""),
+            intent=intent,
+        )
+        reply = await self._ask_helper(state.session_id, system_prompt, prompt)
+        self._count_tool_param(state)
+        text = " ".join(str(reply or "").split()).strip().strip("`")
+        if not text:
+            return base
+        return text if text.startswith("/") else f"/{text}"
+
+    SCHEDULE_ACTION_IDS = ("schedule_list", "schedule_add", "schedule_remove")
+
+    def schedule_text(self) -> str:
+        """把所有日程渲染成一行行给模型看的文本。"""
+
+        items = list(getattr(self.schedules, "schedules", None) or [])
+        if not items:
+            return "（现在没有任何日程）"
+        lines = []
+        for item in items:
+            chain = " → ".join(step.type for step in (item.action_chain or []) if step.type)
+            days = "/".join(item.days or [])
+            who = "她自己加的" if str(getattr(item, "created_by", "") or "") == "bot" else "用户配的"
+            state = "启用" if item.enabled else "停用"
+            lines.append(
+                f"- {item.id}｜{item.time}｜{days}｜{chain or '（空）'}｜{state}｜{who}"
+                + ("｜到点自动先走过去" if item.auto_travel else "")
+            )
+        return "\n".join(lines)
+
+    async def schedule_add(self, payload: dict[str, Any]) -> tuple[bool, str]:
+        """加一条她自己安排的日程（校验时间、星期、动作链）。"""
+
+        raw = self.store.raw_schedules()
+        items = list(raw.get("schedules") or [])
+        time_text = " ".join(str(payload.get("time") or "").split())
+        # 常见写法都收："7:05" / "07:5" / "7:5" 统一成 HH:MM
+        if not re.match(r"^\d{1,2}:\d{1,2}$", time_text):
+            return False, f"时间「{time_text or '（空）'}」看不懂，要写成 HH:MM"
+        hour, minute = (int(part) for part in time_text.split(":"))
+        if hour > 23 or minute > 59:
+            return False, f"时间「{time_text}」不对"
+        time_text = f"{hour:02d}:{minute:02d}"
+
+        days = [
+            str(day)
+            for day in (payload.get("days") or [])
+            if str(day) in ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+        ]
+        if not days:
+            days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+        chain: list[dict[str, Any]] = []
+        for step in payload.get("action_chain") or []:
+            if not isinstance(step, dict):
+                continue
+            action_id = str(step.get("type") or step.get("action") or "").strip()
+            definition = self.world.action_map().get(action_id)
+            if definition is None or not definition.enabled:
+                return False, f"动作「{action_id or '（空）'}」不存在或已停用，这条日程没加成"
+            item: dict[str, Any] = {"type": action_id}
+            for key in ("target_node", "target", "content", "duration", "messages", "params"):
+                if step.get(key):
+                    item[key] = step[key]
+            chain.append(item)
+        if not chain:
+            return False, "日程里至少要有一个动作"
+        if len(chain) > max(1, int(self.world.limits.max_action_chain_depth) + 2):
+            return False, "日程里的动作太多了，拆成两条吧"
+
+        schedule_id = str(payload.get("id") or "").strip()
+        if not schedule_id:
+            schedule_id = f"bot_{int(self._now())}"
+        if any(str(item.get("id")) == schedule_id for item in items):
+            return False, f"已经有一条叫「{schedule_id}」的日程了"
+
+        items.append(
+            {
+                "id": schedule_id,
+                "enabled": True,
+                "time": time_text,
+                "days": days,
+                "action_chain": chain,
+                "auto_travel": bool(payload.get("auto_travel", True)),
+                "conditions": dict(payload.get("conditions") or {}),
+                "sessions": list(payload.get("sessions") or []),
+                "priority": 5,
+                "created_by": "bot",
+            }
+        )
+        self.store.save_schedules({**raw, "schedules": items})
+        self.reload_config()
+        names = " → ".join(
+            (self.world.action_map().get(step["type"]).name or step["type"])
+            if self.world.action_map().get(step["type"])
+            else step["type"]
+            for step in chain
+        )
+        return True, f"{time_text} 的日程加好了：{names}"
+
+    async def schedule_remove(self, selector: dict[str, Any]) -> tuple[bool, str]:
+        """删掉她自己加的一条日程（用户配的动不了）。"""
+
+        raw = self.store.raw_schedules()
+        items = list(raw.get("schedules") or [])
+        target_id = str(selector.get("id") or "").strip()
+        time_text = str(selector.get("time") or "").strip()
+        keyword = str(selector.get("keyword") or "").strip()
+        matched = None
+        for item in items:
+            if target_id and str(item.get("id")) == target_id:
+                matched = item
+                break
+            if time_text and str(item.get("time")) == time_text:
+                matched = item
+                break
+            if keyword:
+                blob = " ".join(
+                    [str(item.get("id") or ""), str(item.get("time") or "")]
+                    + [str(step.get("type") or "") for step in item.get("action_chain") or []]
+                )
+                if keyword in blob:
+                    matched = item
+                    break
+        if matched is None:
+            return False, "没找到那条日程"
+        if str(matched.get("created_by") or "") != "bot":
+            return False, "那条是用户自己配的日程，我删不了"
+        items = [item for item in items if item is not matched]
+        self.store.save_schedules({**raw, "schedules": items})
+        self.reload_config()
+        return True, f"删掉了 {matched.get('time')} 那条日程"
+
+    async def _run_schedule_action(
+        self,
+        state: WorldState,
+        node: NodeDef | None,
+        outcome: TickOutcome,
+        definition: ActionDef,
+        action: PlannedAction,
+    ) -> None:
+        """日程三件套：把意图交给辅助模型解析成结构化操作，再落库。"""
+
+        op = {
+            "schedule_list": "list",
+            "schedule_add": "add",
+            "schedule_remove": "remove",
+        }.get(definition.id, "list")
+        intent = (action.intent or action.content or "").strip()
+        payload: dict[str, Any] = {}
+        if op in ("add", "remove"):
+            if not intent:
+                await self._log_event(
+                    state,
+                    "schedule_edit",
+                    {"op": op, "ok": False, "note": "没有说清要做什么"},
+                    outcome=self._echo_into(outcome, state),
+                )
+                outcome.notes.append("日程动作没有给出意图，已跳过")
+                return
+            payload = await self._parse_schedule_intent(state, op, intent)
+
+        if op == "list":
+            ok, note = True, self.schedule_text()
+        elif op == "add":
+            ok, note = await self.schedule_add(payload)
+        else:
+            ok, note = await self.schedule_remove(payload)
+
+        await self._log_event(
+            state,
+            "schedule_edit",
+            {"op": op, "ok": bool(ok), "note": note, "raw": payload},
+            outcome=self._echo_into(outcome, state),
+        )
+        outcome.notes.append(f"日程 {op}：{note}")
+        hint = (
+            "用一句自然的话说说你刚安排的这件事（或者刚刚看到的日程），别念清单。"
+            if ok
+            else "刚才那件事没办成，用一句自然的话说明一下，别编。"
+        )
+        await self._llm_followup(state, node, outcome, hint, note)
+
+    async def _parse_schedule_intent(
+        self, state: WorldState, op: str, intent: str
+    ) -> dict[str, Any]:
+        """让辅助模型把「每天七点查新闻」翻成结构化日程参数。"""
+
+        if self.helper_llm is None or not self._tool_param_allowed(state):
+            return {"raw": intent}
+        action_lines = [
+            f"- {item.id}：{item.name or item.id}"
+            for item in self.world.actions
+            if item.enabled
+        ]
+        system_prompt, prompt = self.prompts.build_schedule_action_prompt(
+            op=op,
+            intent=intent,
+            actions=action_lines,
+            current=self.schedule_text(),
+            now=self.local_now(),
+        )
+        reply = await self._ask_helper(state.session_id, system_prompt, prompt)
+        self._count_tool_param(state)
+        payload = extract_json_object(reply) if reply else None
+        return payload if isinstance(payload, dict) else {"raw": intent}
+
+    async def _run_recall(
+        self,
+        state: WorldState,
+        node: NodeDef | None,
+        outcome: TickOutcome,
+        action: PlannedAction,
+    ) -> None:
+        """主动回想：把「想回忆什么」翻成检索条件，翻记忆，再带着结果问她一次。"""
+
+        intent = (action.intent or action.content or "").strip()
+        if not intent and action.target_node:
+            intent = f"回忆一下{self._node_name(action.target_node)}里的事"
+        if not intent:
+            outcome.notes.append("回想没有说要回忆什么，已跳过")
+            await self._log_event(
+                state, "recall_start", {"intent": "", "note": "没有说要回忆什么"}
+            )
+            return
+
+        query = await self._parse_recall_query(state, intent, action.target_node)
+        await self._log_event(
+            state,
+            "recall_start",
+            {"intent": intent, "query": query},
+            outcome=self._echo_into(outcome, state),
+        )
+
+        limit = max(1, min(5, int(query.get("limit") or 3)))
+        memories = self.memory.recall(
+            session_id=state.session_id,
+            persona_id="",
+            nodes=list(query.get("nodes") or []),
+            keyword=str(query.get("keyword") or ""),
+            memory_type=str(query.get("type") or ""),
+            mode=(self.world.memory_scope_mode if self.world else None),
+            limit=limit,
+            now=self._now(),
+        )
+        try:
+            stamp_now = self.local_now()
+        except Exception:
+            stamp_now = None
+        detail = "\n".join(
+            item.render(stamp=self.prompts._memory_stamp(item.created_at, stamp_now))
+            for item in memories
+        )
+        keyword = str(query.get("keyword") or "")
+        where = "、".join(query.get("node_names") or []) or "任何地方"
+        await self._log_event(
+            state,
+            "recall_done",
+            {
+                "count": len(memories),
+                "keyword": keyword,
+                "where": where,
+                "detail": detail or "什么都没想起来",
+            },
+            outcome=self._echo_into(outcome, state),
+        )
+
+        hint = (
+            "把你想起来的这些用第一人称说一句（可以带一点当时的情绪），别逐条念、别编新的细节。"
+            if detail
+            else "这次什么都没想起来——照实说一句「想不起来」就好，不要编。也可以只输出 think 或空动作列表。"
+        )
+        await self._llm_followup(
+            state, node, outcome, hint, detail or "（翻了一遍记忆，什么都没想起来）"
+        )
+
+    @staticmethod
+    def _echo_into(outcome: TickOutcome, state: WorldState) -> TickOutcome:
+        """回想的两条事件也走调试回显（勾了「回想开始/回想完成」就会发出来）。"""
+
+        return TickOutcome(session_id=outcome.session_id)
+
+    async def _parse_recall_query(
+        self, state: WorldState, intent: str, target_node: str = ""
+    ) -> dict[str, Any]:
+        """解析检索条件：优先问辅助模型，拿不到就退化成"按名字猜"。"""
+
+        nodes = list(self.world.node_map().values())
+        node_names = [item.name or item.id for item in nodes]
+        zone_names = [zone.name or zone.id for zone in self.world.zones]
+        query: dict[str, Any] = {}
+        if self.helper_llm is not None and self._tool_param_allowed(state):
+            system_prompt, prompt = self.prompts.build_recall_query_prompt(
+                intent=intent,
+                node_names=node_names,
+                zone_names=zone_names,
+                memory_types=["scene", "interaction", "relation", "inner", "event"],
+            )
+            reply = await self._ask_helper(state.session_id, system_prompt, prompt)
+            self._count_tool_param(state)
+            payload = extract_json_object(reply) if reply else None
+            if isinstance(payload, dict):
+                query = payload
+
+        # 地点/区域：结构化字段优先，其次从意图里出现的名字里找
+        node_id = self._match_node(str(query.get("node") or "").strip() or target_node)
+        zone_id = self._match_zone(str(query.get("zone") or "").strip())
+        if not node_id and not zone_id:
+            node_id = self._match_node_in_text(intent)
+            zone_id = self._match_zone_in_text(intent)
+
+        wanted: list[str] = []
+        if node_id:
+            wanted = [node_id]  # 指定地点：只看那个地点
+        elif zone_id:
+            wanted = [item.id for item in self.world.nodes_in_zone(zone_id)]
+        return {
+            "keyword": str(query.get("keyword") or "").strip() or ("" if (node_id or zone_id) else intent),
+            "nodes": wanted,
+            "node_names": [self._node_name(item) for item in wanted],
+            "zone": zone_id,
+            "type": str(query.get("type") or "").strip(),
+            "limit": query.get("limit") or 3,
+        }
+
+    def _match_node(self, text: str) -> str:
+        if not text:
+            return ""
+        key = text.strip()
+        for node in self.world.node_map().values():
+            if key in (node.id, node.name):
+                return node.id
+        return ""
+
+    def _match_zone(self, text: str) -> str:
+        if not text:
+            return ""
+        key = text.strip()
+        for zone in self.world.zones:
+            if key in (zone.id, zone.name):
+                return zone.id
+        return ""
+
+    def _match_node_in_text(self, text: str) -> str:
+        for node in self.world.node_map().values():
+            name = node.name or node.id
+            if name and name in text:
+                return node.id
+        return ""
+
+    def _match_zone_in_text(self, text: str) -> str:
+        for zone in self.world.zones:
+            name = zone.name or zone.id
+            if name and name in text:
+                return zone.id
+        return ""
 
     async def _run_tool_calls(
         self,
@@ -2380,6 +2944,40 @@ class VirtualWorldEngine:
                     )
                     continue
             call = await self._call_tool(definition.id, params, state, tool_name=name)
+            if not call.ok and _looks_like_argument_error(call.error):
+                # 工具作者把参数写成"可选"、实现里却必须要：拿报错再补一次，只重试一次
+                retried, note = await self.fill_tool_params(
+                    state,
+                    definition,
+                    PlannedAction(
+                        type=definition.id,
+                        intent=str(action.get("intent") or action.get("content") or ""),
+                    ),
+                    tool_name=name,
+                    params=params,
+                    error_hint=str(call.error or ""),
+                )
+                if retried:
+                    retry_params = {**params, **retried}
+                    again = await self._call_tool(
+                        definition.id, retry_params, state, tool_name=name
+                    )
+                    await self._log_event(
+                        state,
+                        "tool",
+                        {
+                            "action": definition.id,
+                            "tool": again.tool or name,
+                            "params": dict(again.params or retry_params),
+                            "ok": bool(again.ok),
+                            "result": _clip_text(again.text, 400),
+                            "error": again.error,
+                            "note": "按报错补了一次参数" + (f"：{note}" if note else ""),
+                        },
+                    )
+                    if again.ok or again.text:
+                        call = again
+                        params = retry_params
             sent = dict(call.params or params)
             if not last_params:
                 last_params = sent
@@ -2524,6 +3122,27 @@ class VirtualWorldEngine:
             return
 
         # 瞬时动作
+        if definition.id == "recall":
+            # 主动回忆：翻记忆 → 带着结果再问她一次（她只需要在续说里讲话）
+            await self._run_recall(state, node, outcome, action)
+            if from_plan and state.current_plan is not None:
+                advance(state)
+                await self._tick_plan(state, node, outcome, depth=depth + 1)
+            return
+        if definition.id in self.SCHEDULE_ACTION_IDS:
+            # 日程三件套：同样"做完再问她一次"，她只负责说话
+            await self._run_schedule_action(state, node, outcome, definition, action)
+            if from_plan and state.current_plan is not None:
+                advance(state)
+                await self._tick_plan(state, node, outcome, depth=depth + 1)
+            return
+        if definition.llm_level == "command":
+            # 指令触发：拼一条指令交给 AstrBot 跑，再把结果交回给她
+            await self._run_command_action(state, node, outcome, definition, action)
+            if from_plan and state.current_plan is not None:
+                advance(state)
+                await self._tick_plan(state, node, outcome, depth=depth + 1)
+            return
         if definition.llm_level == "tool":
             # 瞬时工具动作也要真的调工具：当场调用 → 就着结果说一句。
             # from_plan 交回下面统一处理，避免计划被推进两次。
@@ -2784,6 +3403,7 @@ class VirtualWorldEngine:
             engagement_hint=self.engagement.hint(state),
             max_messages=self.world.limits.max_messages_per_say,
             recent_chat=self.chat_context(state),
+            reasoning=bool(self.world.reasoning_enabled),
         )
         prompt = instruction + '\n只输出 JSON：{"actions":[{"type":"say","messages":["..."]}]}'
         reply = await self._ask_llm(state.session_id, system_prompt, prompt)
@@ -2864,6 +3484,7 @@ class VirtualWorldEngine:
         system_prompt: str,
         prompt: str,
         contexts: list[dict[str, Any]] | None = None,
+        image_urls: list[str] | None = None,
     ) -> str | None:
         if self.llm is None:
             return None
@@ -2873,6 +3494,7 @@ class VirtualWorldEngine:
                 system_prompt=system_prompt,
                 prompt=prompt,
                 contexts=list(contexts) if contexts else None,
+                image_urls=list(image_urls) if image_urls else None,
             )
         except Exception as exc:
             self._log("warning", f"LLM 调用失败: {exc}")
@@ -3144,6 +3766,32 @@ class VirtualWorldEngine:
             )
             return True
 
+    async def clear_all_states(self) -> int:
+        """清掉所有会话的世界状态（切换预设时用）。记忆与日志不动。"""
+
+        cleared = 0
+        for session_id in list(self.state_session_ids()):
+            try:
+                await self.db.call("delete_state", session_id)
+                cleared += 1
+            except Exception as exc:
+                self._log("warning", f"清状态失败 {session_id}: {exc}")
+        self._event_ids.clear()
+        self._last_decider_at.clear()
+        return cleared
+
+    def state_session_ids(self) -> list[str]:
+        """有世界状态的会话 id。"""
+
+        try:
+            return [
+                str(item)
+                for item in self.db.raw.list_state_ids()
+                if str(item)
+            ]
+        except Exception:
+            return []
+
     async def wake_up(self, session_id: str) -> bool:
         if not self.is_enabled(session_id):
             return False
@@ -3258,13 +3906,48 @@ class VirtualWorldEngine:
             now=self._now(),
             seconds=max(60, int(config.chat_window_minutes) * 60),
             limit=max(1, int(config.chat_max_messages)),
+            # 已经回应过的消息不再回放：她对那些话已经答过了，再带进去只会重复回应
+            after=float(state.chat_replied_until or 0.0),
         )
+
+    def mark_chat_replied(self, state: WorldState) -> None:
+        """她真的回了一句：把"已回应水位线"推到当前，并清掉上一轮的背景句。"""
+
+        state.chat_replied_until = self._now()
+
+    async def mark_chat_replied_by_session(self, session_id: str) -> None:
+        """按会话推进"已回应水位线"（注入模式下主人格替她回复时用）。"""
+
+        if not self.is_enabled(session_id):
+            return
+        async with self.session_state(session_id) as state:
+            self.mark_chat_replied(state)
+
+    def note_chat_note(self, state: WorldState, text: str) -> None:
+        """记下「刚才在聊什么」（模型顺手写的），下一轮当背景用。"""
+
+        note = " ".join(str(text or "").split())
+        if note:
+            state.chat_note = _clip_text(note, 80)
 
     def group_is_chatting(self, state: WorldState) -> bool:
         """群里最近是否真的有人在聊。"""
 
         need = max(1, int(self.world.decider.min_messages_to_interject))
         return len(self.chat_context(state)) >= need
+
+    @staticmethod
+    def plan_speaks(plan: dict[str, Any] | None) -> bool:
+        """这份计划里有没有"她主动开口"的动作。"""
+
+        for step in (plan or {}).get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            if step.get("interject"):
+                return True
+            if str(step.get("action") or "") in ("say", "share"):
+                return True
+        return False
 
     def willingness(self, state: WorldState) -> float:
         """她对「现在开口」的整体意愿（0~1）：给决策器与外部联动共用。"""
@@ -3537,7 +4220,13 @@ class VirtualWorldEngine:
             "recent_events": state.recent_events[-10:],
             # 群聊上下文：留档条数 + 摘要（编辑器里能看到、也能一键清空）
             "chat_history_count": len(state.recent_chat),
+            "chat_unreplied_count": len(self.chat_context(state)),
+            "chat_replied_count": max(
+                0,
+                len(state.recent_chat) - len(self.chat_context(state)),
+            ),
             "chat_summary": str(state.chat_summary or ""),
+            "chat_note": str(state.chat_note or ""),
             "nickname": state.bot_current_nickname or state.bot_base_nickname,
             # 名片是否被锁住（编辑器里用一个按钮切换，所以要能读到当前状态）
             "nickname_locked": bool(state.bot_nickname_locked),
@@ -3619,6 +4308,7 @@ class VirtualWorldEngine:
             engagement_hint=self.engagement.hint(state),
             max_messages=self.world.limits.max_messages_per_say,
             recent_chat=self.chat_context(state),
+            reasoning=bool(self.world.reasoning_enabled),
         )
 
     def _event_marker(self, state: WorldState) -> int:
@@ -3755,11 +4445,112 @@ class VirtualWorldEngine:
                 pass
 
 
+_ARGUMENT_ERROR_MARKERS = (
+    "required positional argument",
+    "unexpected keyword argument",
+    "missing 1 required",
+    "required argument",
+    "got an unexpected keyword",
+    "positional argument",
+    "参数",
+)
+
+
+def _looks_like_argument_error(error: Any) -> bool:
+    """这次失败像不像"参数给少了 / 给错了"。
+
+    很多第三方工具的 schema 写着参数可选，实现却必须要；调用当场报
+    ``missing 1 required positional argument``。这种错值得带回去重新补一次参数。
+    """
+
+    text = str(error or "").lower()
+    if not text:
+        return False
+    return any(marker in text for marker in _ARGUMENT_ERROR_MARKERS)
+
+
+_SCHEMA_RESERVED_KEYS = {
+    "type",
+    "properties",
+    "required",
+    "title",
+    "description",
+    "additionalProperties",
+    "$schema",
+    "definitions",
+    "$defs",
+}
+
+
+def normalize_param_schema(schema: Any) -> dict[str, Any]:
+    """把各家工具写的参数描述统一成 ``{"properties": {...}, "required": [...]}``。
+
+    AstrBot 里工具的参数定义至少有四种写法，真实插件里全都遇到过：
+
+    - 标准 JSON Schema：``{"type": "object", "properties": {...}, "required": [...]}``；
+    - 省掉外层、直接给键值表：``{"city": {"description": "地点"}}``；
+    - 参数列表：``[{"name": "city", "description": "地点", "required": true}]``；
+    - 属性值是字符串：``{"city": "地点，例如杭州"}``。
+
+    统一之后，"哪些参数要填、哪些是必填"就有唯一答案了。
+    """
+
+    if isinstance(schema, list):
+        properties: dict[str, Any] = {}
+        required: list[str] = []
+        for item in schema:
+            if isinstance(item, str):
+                properties[item] = {}
+                continue
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("key") or "").strip()
+            if not name:
+                continue
+            properties[name] = {
+                "type": str(item.get("type") or "string"),
+                "description": str(item.get("description") or ""),
+            }
+            if item.get("required"):
+                required.append(name)
+        return {"properties": properties, "required": required}
+
+    if not isinstance(schema, dict):
+        return {"properties": {}, "required": []}
+
+    raw_properties = schema.get("properties")
+    if not isinstance(raw_properties, dict):
+        # 没有 properties 时，把顶层那些"不是 schema 关键字"的键当成参数表
+        guessed = {
+            str(key): value
+            for key, value in schema.items()
+            if key not in _SCHEMA_RESERVED_KEYS
+        }
+        raw_properties = guessed if guessed else {}
+
+    properties = {}
+    required = {str(name) for name in (schema.get("required") or []) if str(name)}
+    for name, spec in raw_properties.items():
+        key = str(name)
+        if isinstance(spec, str):
+            properties[key] = {"description": spec}
+            continue
+        if not isinstance(spec, dict):
+            properties[key] = {}
+            continue
+        properties[key] = dict(spec)
+        # 有的工具把"必填"写在属性自己身上
+        if spec.get("required") is True:
+            required.add(key)
+    return {"properties": properties, "required": sorted(required)}
+
+
 def render_param_text(schema: dict[str, Any]) -> str:
     """把工具自带的参数 schema 渲染成一行中文说明（提示词与编辑器共用）。"""
 
-    properties = (schema or {}).get("properties") or {}
-    required = set((schema or {}).get("required") or [])
+    normalized = normalize_param_schema(schema)
+    properties = normalized.get("properties") or {}
+    required = set(normalized.get("required") or [])
     if not properties:
         return "（这个工具不需要参数）"
     parts: list[str] = []

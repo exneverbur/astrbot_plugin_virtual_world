@@ -66,6 +66,9 @@ class ParseResult:
     cancel: str = ""
     """模型是否要求取消她手头的安排：``now`` = 立刻停手并放弃剩下的，``queue`` = 只清掉还没开始的。"""
 
+    chat_note: str = ""
+    """一句话交代「刚才这段在聊什么」，下一轮当背景用，避免重复回应老话题。"""
+
 
 REASONING_KEYS = ("env", "state", "mood", "who", "intent")
 
@@ -267,7 +270,17 @@ def parse_action_payload(
         raw_text=raw,
         memory=parse_memory(payload.get("memory")),
         cancel=parse_cancel(payload.get("cancel")),
+        chat_note=_clean_note(payload.get("chat_note")),
     )
+
+
+def _clean_note(payload: Any) -> str:
+    """群聊背景句：只取一句话，太长就截断。"""
+
+    if payload is None:
+        return ""
+    text = " ".join(str(payload).split())
+    return text[:80]
 
 
 def parse_memory(payload: Any) -> str:

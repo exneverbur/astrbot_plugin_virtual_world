@@ -25,7 +25,7 @@ def _rename_keys(data: Any, mapping: dict[str, str]) -> Any:
     return result
 
 Category = Literal["instant", "continuous"]
-LLMLevel = Literal["template", "single", "tool"]
+LLMLevel = Literal["template", "single", "tool", "command"]
 ActionScope = Literal["global", "node"]
 TargetType = Literal["none", "user", "group"]
 MemoryScopeMode = Literal["group", "persona", "group_persona", "global", "node"]
@@ -33,6 +33,20 @@ ColdStartMode = Literal["awakening", "silent", "custom"]
 Gender = Literal["female", "male", "other"]
 
 PRONOUNS: dict[str, str] = {"female": "她", "male": "他", "other": "ta"}
+
+# 这些动作在引擎里有专门逻辑（说话的出口、寻路、睡眠门禁、内心活动、分享上限），
+# 删掉会让整个世界跑不起来，所以只能停用、不能删除。
+REQUIRED_BUILTIN_ACTIONS: tuple[str, ...] = (
+    "say",
+    "walk_to",
+    "sleep",
+    "think",
+    "share",
+    "recall",
+    "schedule_list",
+    "schedule_add",
+    "schedule_remove",
+)
 
 
 def _clean_names(names: Any, fallback: Any = "") -> list[str]:
@@ -225,6 +239,8 @@ class ParamDef(Permissive):
     type: str = "string"
     required: bool = False
     description: str = ""
+    value: str = ""
+    """固定值：填了之后这个参数不再交给辅助模型猜（例如查天气固定 city=武汉）。"""
 
 
 class OnComplete(Permissive):
@@ -277,8 +293,17 @@ class ActionDef(Permissive):
     tool_names: list[str] = Field(default_factory=list)
     """工具型动作要用到的工具，可以配多个，执行时按顺序调用并汇总结果。"""
 
+    trigger_command: str = ""
+    """「指令触发」型动作要触发的 AstrBot 指令，例如 ``情感分析`` 或 ``/天气``。"""
+
+    trigger_hint: str = ""
+    """给辅助模型看的参数说明：这条指令需要哪些参数、怎么给（例如「城市名」）。"""
+
     group: str = ""
     """动作分组。留空时编辑器按用途自动归类；写了就用自己起的名字。"""
+
+    builtin: bool = False
+    """内置动作：引擎对它有专门逻辑，只能停用、不能删除（例如说话、移动、睡觉）。"""
 
     visible: bool = False
     priority: int = 5
@@ -378,6 +403,11 @@ class Engagement(Permissive):
     silence_window_minutes: int = 60
     cooldown_after_unanswered: int = 120
     halve_on_cooldown_end: bool = True
+    after_reply_cooldown_minutes: int = 10
+    """刚被搭话、她回完话之后的这段时间里，不要再因为孤独感主动开口。
+
+    被动回复和主动搭话挨得太近会显得像刷屏；被动回复本身不受这个限制。
+    """
 
 
 class NicknameSync(Permissive):
@@ -411,6 +441,11 @@ ECHO_EVENT_TYPES: dict[str, str] = {
     "memory": "📝",
     "nickname": "🏷️",
     "cancel": "🛑",
+    "vision": "🖼️",
+    "recall_start": "💭",
+    "recall_done": "📖",
+    "schedule_edit": "🗓️",
+    "command": "🧩",
     "engagement": "💤",
     "extreme": "🚨",
     "context": "🗜️",
@@ -451,6 +486,12 @@ class MemoryConfig(Permissive):
 
     summary_max_chars: int = 60
     """总结的长度上限（写进提示词约束模型）。"""
+
+    recall_penalty_minutes: int = 120
+    """「临时召回惩罚」的窗口：刚被想起过的记忆在这段时间内会轻一点被再次想起。"""
+
+    recall_penalty_strength: float = 0.5
+    """窗口内最多打几折（0.5 = 最多降一半权重），出了窗口自动恢复。"""
 
 
 class SleepConfig(Permissive):
@@ -549,6 +590,9 @@ class ContextConfig(Permissive):
 
     history_max_chars: int = 400
     """单条历史消息进入摘要前截断到多少字。"""
+
+    image_max: int = 3
+    """没配图片转述模型时，最多把几张图片直接交给多模态主模型（自上次回复以来）。"""
 
 
 class DefaultState(Permissive):
@@ -1059,6 +1103,26 @@ def parse_world(data: dict[str, Any]) -> tuple[WorldConfig, list[str]]:
                 warnings.append(f"动作 {action_id} 限定节点为空，已改为全局动作")
                 action.scope = "global"
         actions.append(action)
+    world.actions = actions
+
+    # 内置动作：引擎对它们有专门逻辑，缺失会让世界跑不起来，所以自动补回来。
+    # 用户删不掉它们（编辑器里删除按钮是禁用的），手改 JSON、导入预设也拦得住。
+    have = {action.id for action in actions}
+    missing_builtin = [
+        action_id for action_id in REQUIRED_BUILTIN_ACTIONS if action_id not in have
+    ]
+    if missing_builtin:
+        from .defaults import default_actions
+
+        defaults = {item["id"]: item for item in default_actions()}
+        for action_id in missing_builtin:
+            payload = defaults.get(action_id)
+            if payload:
+                actions.append(ActionDef.model_validate(payload))
+                warnings.append(f"缺少内置动作 {action_id}，已按默认值补回（它只能停用，不能删除）")
+    for action in actions:
+        if action.id in REQUIRED_BUILTIN_ACTIONS:
+            action.builtin = True
     world.actions = actions
 
     # 跨区连线（门户对）：两端的区域与房间都必须存在，且房间确实属于那一端区域

@@ -64,11 +64,23 @@ class WorldState:
     recent_chat: list[dict[str, Any]] = field(default_factory=list)
     """最近群聊内容（持久化，重启后仍在）。带上限，按配置决定丢弃还是压缩。"""
 
+    pending_images: list[dict[str, Any]] = field(default_factory=list)
+    """自上次回复以来收到的图片（没配转述模型时，会把它们直接交给多模态主模型）。
+
+    只存地址和时间，回复一次就清空；上限由「全局设置 → 上下文 → 图片上限」决定。
+    """
+
     chat_summary: str = ""
     """较早群聊的压缩摘要（`chat_overflow = compress` 时才会有内容）。"""
 
     chat_summary_at: float = 0.0
     """上次压缩摘要的时间戳。"""
+
+    chat_replied_until: float = 0.0
+    """「已回应水位线」：这个时间点之前的群聊不再进"最近在聊"（留档仍然保留）。"""
+
+    chat_note: str = ""
+    """上一次回复时顺手写下的一句「刚才在聊什么」，只作为下一轮的话题背景。"""
 
     user_presence: dict[str, dict[str, Any]] = field(default_factory=dict)
     bot_base_nickname: str = ""
@@ -80,6 +92,8 @@ class WorldState:
     last_engagement_time: int = 0
     awaiting_reply: bool = False
     cooldown_until: int = 0
+    proactive_block_until: int = 0
+    """在这个 tick 之前不要主动开口（刚回过话之后的冷却）。被动回复不受影响。"""
     mood_override_until: int = 0
     last_user_activity_at: float = 0.0
     last_nickname_update_at: float = 0.0
@@ -307,7 +321,7 @@ class WorldState:
             self.recent_chat = self.recent_chat[-keep:]
 
     def recent_chat_within(
-        self, *, now: float, seconds: float, limit: int = 0
+        self, *, now: float, seconds: float, limit: int = 0, after: float = 0.0
     ) -> list[dict[str, Any]]:
         """取时间窗内的聊天记录。
 
@@ -319,6 +333,9 @@ class WorldState:
             item
             for item in self.recent_chat
             if now - float(item.get("at", 0)) <= max(0.0, seconds)
+            # 水位线只挡「别人说过的、已经回应过的」；她自己说过的话要留着，
+            # 下一轮才能要求她「别重复刚才那句」。
+            and (float(item.get("at", 0)) > float(after or 0.0) or item.get("is_self"))
         ]
         if limit > 0:
             kept = kept[-limit:]

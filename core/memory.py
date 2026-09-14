@@ -223,37 +223,75 @@ class MemoryEngine:
         session_id: str,
         persona_id: str,
         node_id: str = "",
+        nodes: list[str] | None = None,
+        keyword: str = "",
+        memory_type: str = "",
         focus_user: str = "",
         mode: str | None = None,
         limit: int = 5,
         now: float | None = None,
         fallback: bool = True,
     ) -> list[RecalledMemory]:
-        """召回记忆。返回按分数降序的结果。"""
+        """召回记忆。返回按分数降序的结果。
+
+        ``node_id`` / ``nodes``：按地点过滤（``nodes`` 用于"回想某个区域里的所有地点"）。
+        ``keyword``：主题关键词，命中越多的排越前（是加成，不是硬过滤）。
+        """
 
         mode = mode or (self.world.memory_scope_mode if self.world else SCOPE_GROUP_PERSONA)
         now = now if now is not None else time.time()
-        candidates = self._query(session_id, persona_id, mode, node_id)
+        wanted_nodes = [str(item) for item in (nodes or []) if str(item)]
+        if node_id and node_id not in wanted_nodes:
+            wanted_nodes.append(node_id)
+        candidates = self._query(
+            session_id,
+            persona_id,
+            mode,
+            node_id,
+            nodes=wanted_nodes,
+            memory_type=memory_type,
+        )
         # 降级策略只用于「人格未知」（persona_id 为空）的旧数据兼容：
         # 此时把本会话的所有记忆拉进来，但绝不跨会话取 group 级记忆，避免隐私泄露。
         if not candidates and fallback and not persona_id:
-            candidates = self._query(session_id, persona_id, SCOPE_GROUP, node_id)
+            candidates = self._query(
+                session_id,
+                persona_id,
+                SCOPE_GROUP,
+                node_id,
+                nodes=wanted_nodes,
+                memory_type=memory_type,
+            )
 
         scored: list[tuple[float, dict[str, Any]]] = []
         for item in candidates:
             score = self._score(item, focus_user=focus_user, node_id=node_id, now=now)
+            if keyword:
+                score *= self._keyword_bonus(content=item.get("content", ""), keyword=keyword)
             if score <= 0:
                 continue
             scored.append((score, item))
         scored.sort(key=lambda pair: pair[0], reverse=True)
 
+        if keyword:
+            # 主题词一个都没命中的，只在没别的东西可 recall 时才拿出来垫底
+            hits = [pair for pair in scored if self._keyword_hits(pair[1].get("content", ""), keyword)]
+            if hits:
+                scored = hits
         results = [self._to_recalled(score, item) for score, item in scored[:limit]]
         if results:
             self.db.mark_recalled([item.id for item in results], when=now)
         return results
 
     def _query(
-        self, session_id: str, persona_id: str, mode: str, node_id: str = ""
+        self,
+        session_id: str,
+        persona_id: str,
+        mode: str,
+        node_id: str = "",
+        *,
+        nodes: list[str] | None = None,
+        memory_type: str = "",
     ) -> list[dict[str, Any]]:
         """按作用域模式取候选记忆。
 
@@ -266,14 +304,18 @@ class MemoryEngine:
         另外，「节点专属记忆」（scope=node）只要地点对得上就会被想起，与模式无关。
         """
 
+        wanted_nodes = [str(item) for item in (nodes or []) if str(item)]
+        if node_id and node_id not in wanted_nodes:
+            wanted_nodes.append(node_id)
         rows: list[dict[str, Any]] = []
-        if node_id:
+        for where in wanted_nodes:
             # 节点专属记忆只属于「这个会话的这个地点」，必须按会话过滤，
             # 否则 A 群的房间记忆会漏进 B 群（真实环境实测到的 bug）。
             node_rows = self.db.query_memories(
                 session_id=session_id if session_id else None,
-                node_id=node_id,
+                node_id=where,
                 scope=SCOPE_NODE,
+                memory_type=memory_type or None,
                 limit=200,
             )
             rows.extend(
@@ -281,7 +323,7 @@ class MemoryEngine:
                 for item in node_rows
                 if not persona_id
                 or not item.get("persona_id")
-                or item.get("persona_id") == persona_id
+                    or item.get("persona_id") == persona_id
             )
         if mode == SCOPE_GLOBAL:
             for scope in (SCOPE_GLOBAL, SCOPE_GROUP, SCOPE_PERSONA, SCOPE_GROUP_PERSONA):
@@ -291,16 +333,29 @@ class MemoryEngine:
         if mode in (SCOPE_GROUP, SCOPE_GROUP_PERSONA) and session_id:
             rows.extend(
                 item
-                for item in self.db.query_memories(session_id=session_id, limit=500)
+                for item in self.db.query_memories(
+                    session_id=session_id, memory_type=memory_type or None, limit=500
+                )
                 if item.get("scope") in (SCOPE_GROUP, SCOPE_GROUP_PERSONA)
             )
         if mode in (SCOPE_PERSONA, SCOPE_GROUP_PERSONA) and persona_id:
             rows.extend(
                 item
-                for item in self.db.query_memories(persona_id=persona_id, limit=500)
+                for item in self.db.query_memories(
+                    persona_id=persona_id, memory_type=memory_type or None, limit=500
+                )
                 if item.get("scope") in (SCOPE_PERSONA, SCOPE_GROUP_PERSONA)
             )
-        rows.extend(self.db.query_memories(scope=SCOPE_GLOBAL, limit=200))
+        rows.extend(
+            self.db.query_memories(
+                scope=SCOPE_GLOBAL, memory_type=memory_type or None, limit=200
+            )
+        )
+        if wanted_nodes:
+            # 指定了地点/区域就只看这些地方：所有作用域的记忆都带 node_id（写它时的所在地），
+            # 不按这个过滤的话，"回忆厨房"会把书房的事也捞进来。
+            allowed = set(wanted_nodes)
+            rows = [item for item in rows if str(item.get("node_id") or "") in allowed]
         return _dedupe(rows)
 
     def _score(
@@ -322,11 +377,34 @@ class MemoryEngine:
         age_days = max(0.0, (now - float(item.get("created_at", now))) / 86400.0)
         score *= 0.5 ** (age_days / 30.0)
 
-        # 反复召回会略微降权，避免来来回回提同一件事
-        recall_count = int(item.get("recall_count", 0))
-        score *= 1.0 / (1.0 + recall_count * 0.2)
+        # 临时召回惩罚：刚被想起过的记忆在窗口内轻一点，出了窗口自动恢复。
+        # （以前是按累计次数永久降权，想起来太多次的记忆就再也回不来了。）
+        config = self.world.memory if self.world is not None else None
+        window = max(60.0, float(getattr(config, "recall_penalty_minutes", 120) or 120) * 60)
+        strength = min(0.95, max(0.0, float(getattr(config, "recall_penalty_strength", 0.5) or 0.0)))
+        last = float(item.get("last_recalled") or 0.0)
+        if last and strength > 0 and now - last < window:
+            freshness = 1.0 - max(0.0, now - last) / window
+            score *= max(0.05, 1.0 - strength * freshness)
 
         return score
+
+    @staticmethod
+    def _keyword_hits(content: Any, keyword: str) -> int:
+        """主题词在内容里命中几个（中文按字/词直接包含即可）。"""
+
+        text = str(content or "")
+        words = [word for word in str(keyword or "").replace("，", " ").replace(",", " ").split() if word]
+        if not words:
+            words = [str(keyword or "").strip()]
+        return sum(1 for word in words if word and word in text)
+
+    def _keyword_bonus(self, *, content: Any, keyword: str) -> float:
+        hits = self._keyword_hits(content, keyword)
+        if not hits:
+            return 1.0
+        # 命中越多排越前，但不要把分数拉爆
+        return 1.0 + min(1.5, 0.5 * hits)
 
     @staticmethod
     def _to_recalled(score: float, item: dict[str, Any]) -> RecalledMemory:

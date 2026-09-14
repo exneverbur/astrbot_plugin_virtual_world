@@ -1140,6 +1140,12 @@ details.raw-json summary {
   color: #e06c6c;
 }
 
+.icon-btn.disabled,
+.icon-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
 .badge {
   font-size: 10px;
   border-radius: 999px;

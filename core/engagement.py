@@ -49,6 +49,24 @@ class EngagementTracker:
         if state.cooldown_until:
             state.cooldown_until = 0
 
+    def note_passive_reply(self, state: WorldState, *, tick_seconds: float) -> None:
+        """她刚回完一条消息：接下来一小段时间不要再主动开口。"""
+
+        minutes = max(0, int(self.world.engagement.after_reply_cooldown_minutes))
+        if minutes <= 0:
+            return
+        ticks = max(1, int(round(minutes * 60 / max(1.0, tick_seconds))))
+        state.proactive_block_until = max(
+            int(state.proactive_block_until), int(state.world_time) + ticks
+        )
+
+    def proactive_blocked(self, state: WorldState) -> bool:
+        """是不是处在"刚回过话"的主动发言冷却里。"""
+
+        return bool(state.proactive_block_until) and state.world_time < int(
+            state.proactive_block_until
+        )
+
     # ---------------- 评估 ----------------
 
     def evaluate(self, state: WorldState, *, tick_seconds: float) -> EngagementVerdict:

@@ -32,6 +32,7 @@
           <button data-tab="memories">记忆库</button>
           <button data-tab="logs">日志</button>
           <button data-tab="settings">全局设置</button>
+          <button data-tab="presets">预设</button>
           <button data-tab="debug">调试</button>
         </nav>
         <div class="topbar-right">
@@ -307,6 +308,21 @@
         </section>
 
         <!-- 调试 -->
+        <!-- 预设 -->
+        <section id="tab-presets" class="tab">
+          <div class="row">
+            <button id="preset-save" class="primary">把当前配置存成预设</button>
+            <button id="preset-import" class="ghost">粘贴 JSON 导入…</button>
+            <button id="preset-refresh" class="ghost">刷新</button>
+          </div>
+          <p class="muted">
+            一个预设 = 一整套地图 / 动作 / 日程 / 会话白名单，可以随便切换。
+            应用预设会清空所有会话的位置、数值、计划与群聊留档（**记忆和日志不动**），
+            应用前会自动把当前配置备份一份。
+          </p>
+          <div id="preset-list" class="list"></div>
+        </section>
+
         <section id="tab-debug" class="tab">
           <div class="row">
             <label class="field grow">

@@ -300,15 +300,27 @@ class PromptBuilder:
         zone = self.world.zone_map().get(self.world.zone_of(node.id))
         where = f"{zone.name} · {node.name or node.id}" if zone else (node.name or node.id)
         zone_note = f"\n{_one_line(zone.note, 40)}" if zone is not None and zone.note else ""
+        exclusive = [
+            a.name or a.id
+            for a in actions
+            if a.id != "walk_to" and getattr(a, "scope", "global") == "node"
+        ]
+        exclusive_line = (
+            "这里有几件别处做不了的事："
+            + "、".join(exclusive)
+            + "——人都到这儿了，可以顺手挑一件做（别每次都同一件）。\n\n"
+            if exclusive
+            else ""
+        )
         return (
             f"你当前在【{where}】（id：{node.id}）。\n"
             f"{node.prompt}{zone_note}\n\n"
             f"这里的氛围：{node.atmosphere.describe()}\n\n"
             f"这一轮你能写的 type 只有：{type_line}\n\n"
+            f"{exclusive_line}"
             f"你可以执行的动作（工具型动作只要说明想做什么，具体参数由系统转交）：\n"
             f"{action_lines}\n\n"
             f"{tool_lines}\n\n"
-            f"{self.reach_table(node.id)}\n\n"
             "想做只有别处能做的事（比如在书房上网）：**先写一步 walk_to，紧接着把要做的那个动作也写进\n"
             "同一串 actions**，系统会带你走过去再执行；只写移动的话，到了那儿还得再问你一次。\n\n"
             f"# 动作前置条件\n{self.precondition_hints(node.id)}"
@@ -318,6 +330,10 @@ class PromptBuilder:
         text = f"- {action.id}：{action.description or action.name}"
         if action.llm_level == "tool":
             text += "（工具型：只填 intent，说明你想做什么；参数会自动补全）"
+        if action.llm_level == "command":
+            text += "（指令型：只填 intent 说清想让它干什么，参数由系统按指令说明补全）"
+        if getattr(action, "scope", "global") == "node":
+            text += "（只有在这个地点才能做）"
         return text
 
     def global_tool_lines(self, available_tools: dict[str, str]) -> str:
@@ -398,15 +414,18 @@ class PromptBuilder:
             f"# 最近活跃的用户：{user_text}",
         ]
         if now is not None:
-            # 时间放最前面：深夜该睡觉、白天犯困才小睡，模型得先知道"现在几点"
-            blocks.insert(0, self._clock_line(now))
+            # 时间紧跟在"她是谁、在哪、在干嘛"之后：
+            # 这几行在相邻两次调用之间通常是稳定的，放在最前面才能让前缀缓存尽量长；
+            # 时钟每分钟都变，它后面的内容（记忆、群聊…）本来就每轮都变，放这里不浪费。
+            blocks.append(self._clock_line(now))
+        if node is not None:
+            # 可达表只跟"她在哪"有关，比状态稳、比记忆易变得多，放时钟后面
+            blocks.append(self.reach_table(node.id))
         in_progress = self._in_progress_block(state)
         if in_progress:
             blocks.append(in_progress)
         if engagement_hint:
             blocks.append(engagement_hint)
-        if other_context:
-            blocks.append("# 其他插件提供的上下文\n" + other_context)
         blocks.append(
             "# 这里让你想起（会影响你的情绪和语气，但不一定要说出来；"
             "按时间从早到晚，越靠下的事情发生得越近）：\n"
@@ -420,7 +439,16 @@ class PromptBuilder:
             )
         blocks.append(f"# 最近发生的事\n{event_text}")
         blocks.append(f"# 你的内心活动（仅你可见，绝对不要直接复述）\n{thought_text}")
-        blocks.extend(self.chat_blocks(recent_chat, getattr(state, "chat_summary", "")))
+        blocks.extend(
+            self.chat_blocks(
+                recent_chat,
+                getattr(state, "chat_summary", ""),
+                getattr(state, "chat_note", ""),
+            )
+        )
+        # 其他插件注入的内容跟着这条消息走，每轮都不一样，放到靠后的位置
+        if other_context:
+            blocks.append("# 其他插件提供的上下文\n" + other_context)
         if extra_notes:
             blocks.extend(note for note in extra_notes if note)
         return "\n\n".join(blocks)
@@ -544,13 +572,14 @@ class PromptBuilder:
         self,
         recent_chat: list[dict[str, Any]] | None,
         summary: str = "",
+        note: str = "",
     ) -> list[str]:
         """把群聊背景拆成「更早的摘要」「别人在聊」「你说过的话」几段。"""
 
         # 条数上限由调用方（engine.chat_context）按配置决定，这里不再二次截断，
         # 否则「最多携带多少条聊天」调大了也不会生效。
         items = list(recent_chat or [])
-        if not items and not summary:
+        if not items and not summary and not note:
             return []
         others: list[str] = []
         mine: list[str] = []
@@ -566,6 +595,11 @@ class PromptBuilder:
             who = f"{name}({identifier})" if name and identifier else (name or identifier)
             others.append(f"- {who}: {text}")
         blocks: list[str] = []
+        if note:
+            blocks.append(
+                "# 刚才你们聊过（已经回应过，只是背景，不要重复回应）\n"
+                f"- {_one_line(note, 80)}"
+            )
         if summary:
             blocks.append(
                 "# 更早的群聊（摘要，只是背景，不要复述）\n" + _one_line(summary, 400)
@@ -611,6 +645,7 @@ class PromptBuilder:
                 '    "intent": "你打算怎么回应（20 字以内）"\n'
                 "  },\n"
                 '  "memory": "这次对话值得记住的一句话（20 字以内，以你的视角）",\n'
+                '  "chat_note": "刚才你们在聊什么（20 字以内，只在这条消息带群聊背景时才写）",\n'
                 '  "actions": [ ... ]\n'
                 "}\n\n"
                 "关于 reasoning：\n"
@@ -622,6 +657,11 @@ class PromptBuilder:
                 "- 写「对方是谁、聊了什么、你怎么想」，例如「小明说他今天很累，我有点心疼」；\n"
                 "- 纯寒暄、复读、没什么信息量的对话直接给空字符串；\n"
                 "- 它不是回复，不会发到群里。\n\n"
+                "关于 chat_note：\n"
+                "- 它是给下一轮的**话题背景**：一句话说清「刚才这段在聊什么」；\n"
+                "- 下一轮你会看到它，并且**已经回应过的内容不会再重复出现**，"
+                "所以写清楚才不会重复回应老话题；\n"
+                "- 没有群聊背景、或者纯寒暄时留空。\n\n"
             )
         if mode == "plan":
             body = (
@@ -678,9 +718,14 @@ class PromptBuilder:
             '   {"type":"search_web","intent":"查今天的新闻"}]。只写移动不算安排——系统会带你过去，\n'
             "   但不会替你决定到了之后做什么，那会多花一次调用。\n"
             "7. 你在 say 里承诺了要做什么，就必须把对应的动作也写进 actions——只说不动等于没做。\n"
-            "8. 手头正在做的事不用等：你随时可以安排接下来的动作，插进来的安排会排队，"
+            "8. 标着「只有在这个地点才能做」的动作是这里的特色：人在的时候就顺手挑一件，"
+            "但不要每次都做同一件，也别重复最近刚做过的。\n"
+            "9. 这次行动如果指向某个具体的人（踢谁、私聊谁、给谁画画像），"
+            "**必须把对方的 id 一起写进 intent**（例如「把 123456 这个刷屏的踢掉」），"
+            "能填 target 的就顺手填上；只写昵称系统不一定认得。\n"
+            "10. 手头正在做的事不用等：你随时可以安排接下来的动作，插进来的安排会排队，"
             "等手上这件事做完自动接着做。只有对方明确说「别做了 / 不用了 / 停」时才写 cancel。\n"
-            "9. 不要输出解释、Markdown 或代码块，只输出 JSON。"
+            "11. 不要输出解释、Markdown 或代码块，只输出 JSON。"
         )
 
     @staticmethod
@@ -989,6 +1034,107 @@ class PromptBuilder:
         parts.extend(f"- {line}" for line in lines)
         return system, "\n".join(parts)
 
+    def build_command_prompt(
+        self,
+        *,
+        command: str,
+        hint: str,
+        intent: str,
+    ) -> tuple[str, str]:
+        """把「她想让那条指令帮她干什么」拼成一条真正的指令文本（返回 system, user）。"""
+
+        system = (
+            "你在把一句自然语言的意图拼成一条 AstrBot 指令。"
+            "只输出这一条指令本身（以 / 开头，带好参数），不要解释、不要引号、不要 Markdown。"
+        )
+        prompt = (
+            f"要触发的指令：{command}\n"
+            f"这条指令的参数说明：{hint or '（没有额外说明，只填指令本身）'}\n\n"
+            f"她的意图：{intent}\n\n"
+            "要求：参数只能从意图里能确定的信息来写，别编；"
+            "确实缺参数就只输出指令名本身。"
+        )
+        return system, prompt
+
+    def build_schedule_action_prompt(
+        self,
+        *,
+        op: str,
+        intent: str,
+        actions: list[str],
+        current: str,
+        now: Any = None,
+    ) -> tuple[str, str]:
+        """把「每天七点查新闻」翻译成日程参数（返回 system, user）。"""
+
+        clock = ""
+        if now is not None and hasattr(now, "strftime"):
+            weekdays = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+            clock = f"现在是 {now.strftime('%Y-%m-%d')}（{weekdays[now.weekday()]}）{now.strftime('%H:%M')}"
+        system = (
+            "你在帮一个角色管理她自己的日程表。只输出一个 JSON 对象，"
+            "不要解释、不要 Markdown。时间必须是 24 小时制的 HH:MM。"
+        )
+        if op == "add":
+            body = (
+                f"她想加一条日程：{intent}\n\n"
+                f"{clock}\n\n"
+                "可以用的动作（action_chain 里只能用这些 id）：\n"
+                + "\n".join(actions)
+                + "\n\n"
+                "输出格式：\n"
+                '{"time": "07:00", "days": ["mon","tue"],'
+                ' "action_chain": [{"type": "walk_to", "target_node": "study"},'
+                ' {"type": "search_web", "intent": "查今天的新闻"}],'
+                ' "auto_travel": true}\n\n'
+                "说明：\n"
+                "- days 不写就是每天；只挑一次就写对应星期；\n"
+                "- 动作链按先后顺序；只有别处能做的动作，前面加一步 walk_to；\n"
+                "- 说话类动作可以带 content（说什么）。"
+            )
+        else:
+            body = (
+                f"她想删掉一条日程：{intent}\n\n"
+                "她现在的日程表：\n"
+                f"{current}\n\n"
+                "输出格式（三选一，挑最有把握的）：\n"
+                '{"id": "日程 id"}\n'
+                '{"time": "07:00"}\n'
+                '{"keyword": "新闻"}'
+            )
+        return system, body
+
+    def build_recall_query_prompt(
+        self,
+        *,
+        intent: str,
+        node_names: list[str],
+        zone_names: list[str],
+        memory_types: list[str],
+    ) -> tuple[str, str]:
+        """把「想回忆什么」翻译成检索条件（返回 system, user）。"""
+
+        system = (
+            "你在帮一个角色翻自己的记忆。根据她想回忆的内容，输出检索条件。"
+            "只输出一个 JSON 对象，键是 keyword / node / zone / type / limit，"
+            "没有把握的键就省略，不要编造地点名。"
+        )
+        prompt = (
+            f"她想回忆：{intent}\n\n"
+            "# 可以填的地点和区域（只能从这里面选，原样写名字）\n"
+            f"- 地点：{'、'.join(node_names) or '（没有）'}\n"
+            f"- 区域：{'、'.join(zone_names) or '（没有）'}\n\n"
+            "# 记忆类型（可选）\n"
+            f"{'、'.join(memory_types)}\n\n"
+            "# 说明\n"
+            "- keyword：想回忆的主题词，一两个词就够（例如「做饭」「生日」）；\n"
+            "- node / zone：她想的是某个具体地点或整个区域时才填；\n"
+            "- type：只想回忆某一类事情时才填；\n"
+            "- limit：想要几条，默认 3，最多 5。\n\n"
+            '例如 {"keyword": "做饭", "node": "厨房", "limit": 3}'
+        )
+        return system, prompt
+
     def build_tool_params_prompt(
         self,
         *,
@@ -998,6 +1144,7 @@ class PromptBuilder:
         intent: str,
         recent_chat: list[dict[str, Any]] | None = None,
         previous_results: str = "",
+        error_hint: str = "",
     ) -> tuple[str, str]:
         """把「她想干什么」翻译成工具参数时用的提示词（返回 system, user）。"""
 
@@ -1010,6 +1157,11 @@ class PromptBuilder:
             system += (
                 "这次还给了你「上一个工具返回的内容」：如果参数要用到里面的信息"
                 "（比如要抓取的网址、要查询的编号），必须从里面取原样照抄，不许自己编。"
+            )
+        if error_hint:
+            system += (
+                "这次还给了你「上一次调用失败的原因」：说明上一次的参数不对或缺了，"
+                "请针对这条报错把每一个参数都补齐（工具说明里写着「可选」的也可能是它真正需要的）。"
             )
         chat_lines = [
             f"- {item.get('name') or item.get('user_id')}: {_one_line(item.get('text'), 60)}"
@@ -1025,6 +1177,11 @@ class PromptBuilder:
                 "\n\n上一个工具返回的内容（参数要用的信息从这里面找）：\n"
                 + _one_line(previous_results, 1200)
                 if previous_results
+                else ""
+            )
+            + (
+                "\n\n上一次调用失败的原因（照着补齐参数）：\n" + _one_line(error_hint, 300)
+                if error_hint
                 else ""
             )
             + "\n\n请输出参数字典（JSON）。"

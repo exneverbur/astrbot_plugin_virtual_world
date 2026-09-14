@@ -183,6 +183,180 @@ class ConfigStore:
     def raw_sessions(self) -> dict[str, Any]:
         return self._read_json(self.sessions_path, {"sessions": []})
 
+    # ---------------- 预设（成套的世界配置） ----------------
+
+    @property
+    def presets_dir(self) -> Path:
+        return self.data_dir / "presets"
+
+    @property
+    def backups_dir(self) -> Path:
+        return self.presets_dir / "backups"
+
+    @property
+    def active_preset_path(self) -> Path:
+        return self.presets_dir / "active.json"
+
+    @staticmethod
+    def _clean_preset_id(preset_id: str) -> str:
+        text = str(preset_id or "").strip()
+        keep = [ch for ch in text if ch.isalnum() or ch in "._-"]
+        return "".join(keep)[:64]
+
+    def preset_path(self, preset_id: str) -> Path:
+        return self.presets_dir / f"{self._clean_preset_id(preset_id)}.json"
+
+    def list_presets(self) -> list[dict[str, Any]]:
+        """列出所有预设（按更新时间倒序）。"""
+
+        if not self.presets_dir.is_dir():
+            return []
+        items: list[dict[str, Any]] = []
+        for path in sorted(self.presets_dir.glob("*.json")):
+            if path.name == "active.json":
+                continue
+            data = self._read_json(path, {})
+            if not isinstance(data, dict):
+                continue
+            world = data.get("world") if isinstance(data.get("world"), dict) else {}
+            items.append(
+                {
+                    "id": path.stem,
+                    "name": str(data.get("name") or path.stem),
+                    "note": str(data.get("note") or ""),
+                    "updated_at": str(data.get("updated_at") or ""),
+                    "actions": len(world.get("actions") or []),
+                    "nodes": len(world.get("nodes") or []),
+                    "schedules": len(
+                        (data.get("schedules") or {}).get("schedules") or []
+                    ),
+                    "sessions": len(
+                        (data.get("sessions") or {}).get("sessions") or []
+                    ),
+                }
+            )
+        items.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
+        return items
+
+    def active_preset(self) -> str:
+        data = self._read_json(self.active_preset_path, {})
+        return str((data or {}).get("id") or "") if isinstance(data, dict) else ""
+
+    def set_active_preset(self, preset_id: str) -> None:
+        self.presets_dir.mkdir(parents=True, exist_ok=True)
+        self._write_json(self.active_preset_path, {"id": preset_id})
+
+    def save_preset(
+        self,
+        preset_id: str,
+        *,
+        name: str = "",
+        note: str = "",
+    ) -> Path:
+        """把当前三份配置打包成一个预设文件。"""
+
+        clean = self._clean_preset_id(preset_id)
+        if not clean:
+            raise ValueError("预设 id 不能为空")
+        self.presets_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "id": clean,
+            "name": name or clean,
+            "note": note,
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "world": self.raw_world(),
+            "schedules": self.raw_schedules(),
+            "sessions": self.raw_sessions(),
+        }
+        path = self.preset_path(clean)
+        self._write_json(path, payload)
+        self.set_active_preset(clean)
+        return path
+
+    def read_preset(self, preset_id: str) -> dict[str, Any]:
+        data = self._read_json(self.preset_path(preset_id), {})
+        return data if isinstance(data, dict) else {}
+
+    def write_preset(self, preset_id: str, payload: dict[str, Any]) -> list[str]:
+        """整段写一个预设（导入 / 直接编辑 JSON 走这里）。返回校验提示。"""
+
+        clean = self._clean_preset_id(preset_id)
+        if not clean:
+            raise ValueError("预设 id 不能为空")
+        if not isinstance(payload, dict):
+            raise ValueError("预设必须是一个 JSON 对象")
+        world = payload.get("world")
+        if not isinstance(world, dict) or not world.get("nodes"):
+            raise ValueError("预设里必须有 world.nodes")
+        warnings: list[str] = []
+        parsed, world_warnings = parse_world(world)
+        warnings.extend(world_warnings)
+        schedules_raw = payload.get("schedules") or {}
+        _, schedule_warnings = parse_schedules(schedules_raw)
+        warnings.extend(schedule_warnings)
+        sessions_raw = payload.get("sessions") or {}
+        _, session_warnings = parse_sessions(sessions_raw)
+        warnings.extend(session_warnings)
+        self.presets_dir.mkdir(parents=True, exist_ok=True)
+        self._write_json(
+            self.preset_path(clean),
+            {
+                "schema_version": 1,
+                "id": clean,
+                "name": str(payload.get("name") or clean),
+                "note": str(payload.get("note") or ""),
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "world": parsed.model_dump(mode="json"),
+                "schedules": schedules_raw,
+                "sessions": sessions_raw,
+            },
+        )
+        return warnings
+
+    def delete_preset(self, preset_id: str) -> bool:
+        path = self.preset_path(preset_id)
+        if not path.is_file():
+            return False
+        path.unlink()
+        if self.active_preset() == self._clean_preset_id(preset_id):
+            self.set_active_preset("")
+        return True
+
+    def backup_current(self, tag: str = "before-apply") -> Path:
+        """应用预设前先把手头的配置备份一份，随时能翻回来。"""
+
+        self.backups_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = self.backups_dir / f"{tag}-{stamp}.json"
+        self._write_json(
+            path,
+            {
+                "schema_version": 1,
+                "id": path.stem,
+                "name": f"自动备份 {stamp}",
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "world": self.raw_world(),
+                "schedules": self.raw_schedules(),
+                "sessions": self.raw_sessions(),
+            },
+        )
+        return path
+
+    def apply_preset(self, preset_id: str) -> dict[str, Any]:
+        """把预设写进当前配置（不含状态：状态由调用方决定要不要清）。"""
+
+        data = self.read_preset(preset_id)
+        if not data:
+            raise ValueError("找不到这个预设")
+        self.backup_current()
+        world, warnings = parse_world(data.get("world") or {})
+        self.save_world(world.model_dump(mode="json"))
+        self.save_schedules(data.get("schedules") or {})
+        self.save_sessions(data.get("sessions") or {})
+        self.set_active_preset(preset_id)
+        return {"warnings": warnings}
+
     # ---------------- 会话白名单 ----------------
 
     def add_session(

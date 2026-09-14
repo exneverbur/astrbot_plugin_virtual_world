@@ -22,6 +22,8 @@ const ui = {
   valuesEdit: false,
   valueDraft: {},
   selectedSchedule: "",
+  presets: [],
+  activePreset: "",
   token: "",
   statusTimer: null,
 };
@@ -120,6 +122,36 @@ const ECHO_TYPE_CHOICES = [
     hint: "对方明确说别做了时，她停掉了哪个动作、放弃了哪些安排。",
   },
   {
+    key: "vision",
+    icon: "🖼️",
+    label: "图片内容",
+    hint: "她是怎么看图的：转述成功时写了什么、失败是为什么、或者直接把图片交给多模态主模型。",
+  },
+  {
+    key: "recall_start",
+    icon: "💭",
+    label: "回想开始",
+    hint: "她想回忆什么（大模型给的意图），以及解析出来的检索范围（地点 / 区域 / 主题词）。",
+  },
+  {
+    key: "recall_done",
+    icon: "📖",
+    label: "回想完成",
+    hint: "她从记忆里翻出了什么；什么都没翻到时会写明。",
+  },
+  {
+    key: "schedule_edit",
+    icon: "🗓️",
+    label: "改日程",
+    hint: "她自己查看 / 添加 / 删除了哪条日程，成功了还是被拒了（用户配的日程她删不掉）。",
+  },
+  {
+    key: "command",
+    icon: "🧩",
+    label: "触发指令",
+    hint: "她把哪条 AstrBot 指令发出去了、对方返回了什么（指令型动作）。",
+  },
+  {
     key: "engagement",
     icon: "💤",
     label: "进入安静期",
@@ -197,6 +229,11 @@ const LOG_TYPES = {
   wake_up: { icon: "👋", label: "被叫醒" },
   interrupt: { icon: "✋", label: "打断" },
   cancel: { icon: "🛑", label: "按你说的停下" },
+  vision: { icon: "🖼️", label: "图片内容" },
+  recall_start: { icon: "💭", label: "回想开始" },
+  recall_done: { icon: "📖", label: "想起了什么" },
+  schedule_edit: { icon: "🗓️", label: "改日程" },
+  command: { icon: "🧩", label: "触发指令" },
   chain: { icon: "🔗", label: "动作链" },
   cold_start: { icon: "🌅", label: "冷启动" },
   bot_spoke: { icon: "🗣️", label: "发言等待回应" },
@@ -260,6 +297,13 @@ const LLM_LEVELS = [
     key: "tool",
     label: "工具型",
     hint: "调用 AstrBot 里已注册的工具（搜索、天气等）。她只需要说明想干什么，参数由插件自动补全",
+  },
+  {
+    key: "command",
+    label: "指令触发",
+    hint:
+      "触发别的插件的一条指令（例如 /天气）。她只说想干什么，插件把小模型拼好的指令交出去，" +
+      "再把那条指令返回的内容交回给她说一句",
   },
 ];
 
@@ -1725,6 +1769,7 @@ function bindTabs() {
     if (button.dataset.tab === "logs") loadLogs();
     if (button.dataset.tab === "map") loadOverview();
     if (button.dataset.tab === "debug") loadTools();
+    if (button.dataset.tab === "presets") loadPresets();
   });
 }
 
@@ -1822,6 +1867,9 @@ function bindButtons() {
   $("pwd-save").addEventListener("click", savePassword);
   $("restore-default").addEventListener("click", restoreDefault);
   $("debug-inject").addEventListener("click", () => loadPrompt("inject"));
+  $("preset-save").addEventListener("click", saveCurrentAsPreset);
+  $("preset-import").addEventListener("click", importPreset);
+  $("preset-refresh").addEventListener("click", loadPresets);
   $("debug-auto").addEventListener("click", () => loadPrompt("autonomous"));
   $("debug-backup").addEventListener("click", async () => {
     try {
@@ -1882,8 +1930,15 @@ function toolActionWarnings() {
   const missing = actions()
     .filter((action) => action.llm_level === "tool" && !actionToolNames(action).length)
     .map((action) => action.name || action.id);
-  if (!missing.length) return [];
-  return [`这些工具型动作还没选工具，会被跳过：${missing.join("、")}`];
+  const noCommand = actions()
+    .filter((action) => action.llm_level === "command" && !String(action.trigger_command || "").trim())
+    .map((action) => action.name || action.id);
+  const warnings = [];
+  if (missing.length) warnings.push(`这些工具型动作还没选工具，会被跳过：${missing.join("、")}`);
+  if (noCommand.length) {
+    warnings.push(`这些指令型动作还没填要触发的指令，会被跳过：${noCommand.join("、")}`);
+  }
+  return warnings;
 }
 
 /** 一个动作挂了哪些工具（新写法 tool_names 优先，兼容老的 tool_name）。 */
@@ -4014,6 +4069,111 @@ function addEdge() {
 /* 动作库                                                              */
 /* ================================================================== */
 
+/**
+ * 固定参数：填过的参数不再交给模型猜。
+ * 主要用来兜底「schema 把参数写成可选、实现却必须要」的第三方工具（例如查天气的 city）。
+ */
+function fixedParamsEditor(action, toolNames) {
+  action.params =
+    action.params && typeof action.params === "object" ? action.params : {};
+  const wrapper = el("div", "subsection");
+  const title = el("div", "sub-title");
+  title.appendChild(el("span", "", "固定参数"));
+  title.appendChild(
+    tipBox(
+      "填了之后这个参数每次都用你写的值，不再让模型猜。" +
+        "适合「参数写着可选、实现却必须要」的工具，例如查天气固定 city=武汉。",
+    ),
+  );
+  wrapper.appendChild(title);
+
+  const declared = [];
+  (toolNames || []).forEach((name) => {
+    const item = ui.tools.find((tool) => tool.name === name);
+    if (!item) return;
+    Object.keys(normalizeToolSchema(item.parameters).properties || {}).forEach((key) => {
+      if (!declared.includes(key)) declared.push(key);
+    });
+  });
+
+  const rows = Object.entries(action.params).map(([key, spec]) => ({
+    key,
+    value: spec && typeof spec === "object" ? String(spec.value || "") : String(spec || ""),
+    spec: spec && typeof spec === "object" ? { ...spec } : {},
+  }));
+
+  const list = el("div", "rows");
+  function collect() {
+    const next = {};
+    rows.forEach((row) => {
+      const name = String(row.key || "").trim();
+      if (!name) return;
+      const spec = { ...row.spec };
+      spec.type = spec.type || "string";
+      spec.value = String(row.value || "");
+      next[name] = spec;
+    });
+    action.params = next;
+    markDirty();
+  }
+  function draw() {
+    list.innerHTML = "";
+    rows.forEach((row, index) => {
+      const line = el("div", "row-item");
+      const nameInput = document.createElement("input");
+      nameInput.className = "grow";
+      nameInput.placeholder = "参数名，例如 city";
+      nameInput.value = row.key || "";
+      if (declared.length) {
+        const listId = `fp-${index}-${Math.random().toString(36).slice(2, 6)}`;
+        const datalist = document.createElement("datalist");
+        datalist.id = listId;
+        declared.forEach((name) => datalist.appendChild(option(name, name)));
+        line.appendChild(datalist);
+        nameInput.setAttribute("list", listId);
+      }
+      nameInput.addEventListener("input", () => {
+        row.key = nameInput.value;
+        collect();
+      });
+      line.appendChild(nameInput);
+
+      const valueInput = document.createElement("input");
+      valueInput.className = "grow";
+      valueInput.placeholder = "固定值，例如 武汉";
+      valueInput.value = row.value || "";
+      valueInput.addEventListener("input", () => {
+        row.value = valueInput.value;
+        collect();
+      });
+      line.appendChild(valueInput);
+
+      const remove = el("button", "icon-btn danger", "🗑");
+      remove.type = "button";
+      remove.title = "不要这个固定参数";
+      remove.addEventListener("click", () => {
+        rows.splice(index, 1);
+        collect();
+        draw();
+      });
+      line.appendChild(remove);
+      list.appendChild(line);
+    });
+    if (!rows.length) list.appendChild(el("p", "muted", "（没有固定参数）"));
+  }
+  draw();
+  wrapper.appendChild(list);
+
+  const add = el("button", "small ghost", "+ 添加一条固定参数");
+  add.type = "button";
+  add.addEventListener("click", () => {
+    rows.push({ key: "", value: "", spec: {} });
+    draw();
+  });
+  wrapper.appendChild(add);
+  return wrapper;
+}
+
 function renderActionForm() {
   const form = $("action-form");
   form.innerHTML = "";
@@ -4030,6 +4190,7 @@ function renderActionForm() {
   action.on_complete.effects_per_minute = action.on_complete.effects_per_minute || {};
   const isContinuous = action.category === "continuous";
   const isTool = action.llm_level === "tool";
+  const isCommand = action.llm_level === "command";
   const isNodeScoped = action.scope === "node";
 
   form.appendChild(
@@ -4241,6 +4402,7 @@ function renderActionForm() {
     const toolName = currentTools[0] || "";
     const tool = ui.tools.find((item) => item.name === toolName);
     toolBox.appendChild(paramBox);
+    toolBox.appendChild(fixedParamsEditor(action, currentTools));
 
     // 工具型动作最容易踩的坑，直接在表单里点出来
     const missingTools = currentTools.filter(
@@ -4264,6 +4426,49 @@ function renderActionForm() {
       );
     }
     form.appendChild(toolBox);
+  }
+
+  if (isCommand) {
+    const commandBox = el("div", "subsection");
+    const commandTitle = el("div", "sub-title");
+    commandTitle.appendChild(el("span", "", "指令设置"));
+    commandTitle.appendChild(
+      tipBox(
+        "她会把「想干什么」交给辅助模型拼成一条指令，再由插件交给对应插件执行，" +
+          "然后把那条指令返回的内容交回给她说一句。",
+      ),
+    );
+    commandBox.appendChild(commandTitle);
+    commandBox.appendChild(
+      inputField(
+        "要触发的指令",
+        action.trigger_command || "",
+        (value) => (action.trigger_command = value.trim().replace(/^\//, "")),
+        {
+          hint: "别的插件注册的指令名（不用写斜杠），例如 天气、查成分。运行时拼成 /指令 参数 交给它。",
+          placeholder: "例如 天气",
+        },
+      ),
+    );
+    commandBox.appendChild(
+      textareaField(
+        "这条指令的参数说明（给模型看）",
+        action.trigger_hint || "",
+        (value) => (action.trigger_hint = value),
+        {
+          hint:
+            "写清这条指令需要什么参数、怎么给，例如「city：城市名，例如 武汉」。" +
+            "辅助模型只按这里的说明和她的意图拼参数，所以写得越清楚越不容易拼错。",
+          rows: 3,
+        },
+      ),
+    );
+    if (!(action.trigger_command || "").trim()) {
+      commandBox.appendChild(
+        el("p", "warn-line", "⚠ 还没填要触发的指令，这个动作运行时会直接跳过。"),
+      );
+    }
+    form.appendChild(commandBox);
   }
 
   form.appendChild(
@@ -4392,6 +4597,7 @@ function renderActionForm() {
 /* ---------------- 动作库：卡片网格 + 右侧编辑抽屉 ---------------- */
 
 const ACTION_GROUPS = {
+  builtin: "内置（引擎专用，只能停用）",
   interact: "互动（对人）",
   express: "表达（说话 / 分享）",
   life: "生活（睡觉 / 看书 / 做饭）",
@@ -4403,6 +4609,8 @@ const ACTION_GROUPS = {
 function groupOfAction(action) {
   const custom = String(action.group || "").trim();
   if (custom) return custom;
+  // 内置动作单独一组：它们不能被删除，放在一起好管理
+  if (action.builtin) return ACTION_GROUPS.builtin;
   if (action.llm_level === "tool") return ACTION_GROUPS.tool;
   const id = String(action.id || "");
   if (id === "say" || id === "share") return ACTION_GROUPS.express;
@@ -4475,6 +4683,7 @@ function actionCard(action) {
   head.appendChild(el("span", "card-name", action.name || action.id));
   if (action.category === "continuous") head.appendChild(el("span", "badge", "持续"));
   if (action.llm_level === "tool") head.appendChild(el("span", "badge", "工具"));
+  if (action.builtin) head.appendChild(el("span", "badge", "内置"));
   card.appendChild(head);
 
   const meta = el("div", "card-meta");
@@ -4511,7 +4720,13 @@ function actionCard(action) {
   });
   const remove = el("button", "icon-btn danger", "🗑");
   remove.type = "button";
-  remove.title = "删除";
+  remove.title = action.builtin
+    ? "内置动作只能停用、不能删除（关掉左上角的开关即可）"
+    : "删除";
+  if (action.builtin) {
+    remove.disabled = true;
+    remove.classList.add("disabled");
+  }
   remove.addEventListener("click", (event) => {
     event.stopPropagation();
     deleteAction(action.id);
@@ -4592,6 +4807,10 @@ function copyAction(actionId) {
 async function deleteAction(actionId) {
   const action = actions().find((item) => item.id === actionId);
   if (!action) return;
+  if (action.builtin) {
+    toast("内置动作不能删除，用卡片左上角的开关停用就行");
+    return;
+  }
   const ok = await confirmDialog({
     title: "删除这个动作？",
     message:
@@ -5570,6 +5789,11 @@ function renderSettings() {
     ["unanswered_threshold", "连续几次没人理就安静", "达到这个次数进入冷却"],
     ["silence_window_minutes", "多久算一次「没人理」（分钟）", "发出消息后等这么久还没人说话，就记一次"],
     ["cooldown_after_unanswered", "冷却时长（分钟）", "冷却期间不主动发言"],
+    [
+      "after_reply_cooldown_minutes",
+      "刚回过话后的安静时间（分钟）",
+      "被搭话、她也回过之后，这段时间内不主动开口（被动回复不受影响），免得跟刚才的回复挤在一起",
+    ],
   ].forEach(([key, label, hint]) => {
     engagement._fields.appendChild(
       inputField(label, num(world.engagement[key]), (value) => (world.engagement[key] = num(value)), {
@@ -6050,6 +6274,20 @@ function renderSettings() {
       ),
     );
   }
+  contextSection._fields.appendChild(
+    inputField(
+      "一次最多带几张图（没配转述模型时）",
+      num(world.context.image_max, 3),
+      (value) => (world.context.image_max = Math.max(1, Math.round(num(value, 3)))),
+      {
+        hint:
+          "没配「图片转述模型」时，插件会把图片直接交给多模态主模型：" +
+          "自上次回复以来收到的图片 + 这条消息自己的图，最多带这么多张。配了转述模型则走文字转述，不受这里影响。",
+        type: "number",
+        min: 1,
+      },
+    ),
+  );
   form.appendChild(contextSection);
 
   /* --- 群名片 --- */
@@ -6209,6 +6447,268 @@ async function restoreDefault() {
 /* 调试                                                                */
 /* ================================================================== */
 
+/** 把工具的参数定义归一成 {properties, required}（各家写法不一样，跟后端同一套规则）。 */
+function normalizeToolSchema(raw) {
+  if (Array.isArray(raw)) {
+    const properties = {};
+    const required = [];
+    raw.forEach((item) => {
+      if (!item || typeof item !== "object") return;
+      const name = String(item.name || item.key || "").trim();
+      if (!name) return;
+      properties[name] = { description: String(item.description || "") };
+      if (item.required) required.push(name);
+    });
+    return { properties, required };
+  }
+  if (!raw || typeof raw !== "object") return { properties: {}, required: [] };
+  const reserved = ["type", "properties", "required", "title", "description", "additionalProperties", "$schema"];
+  let properties = raw.properties;
+  if (!properties || typeof properties !== "object") {
+    const guessed = {};
+    Object.keys(raw).forEach((key) => {
+      if (!reserved.includes(key)) guessed[key] = raw[key];
+    });
+    properties = guessed;
+  }
+  const required = Array.isArray(raw.required) ? raw.required.map(String) : [];
+  Object.keys(properties).forEach((key) => {
+    const spec = properties[key];
+    if (spec && typeof spec === "object" && spec.required === true && !required.includes(key)) {
+      required.push(key);
+    }
+  });
+  return { properties, required };
+}
+
+/** 工具参数里到底声明了哪些必填：空的话要显眼地写出来。 */
+function toolRequiredSummary(tool) {
+  const schema = normalizeToolSchema(tool.parameters);
+  const names = Object.keys(schema.properties || {});
+  if (!names.length) return "必填：无（工具没声明任何参数）";
+  if (!schema.required.length) {
+    return `必填：未声明（工具声明了 ${names.join("、")}，但都没标必填——插件会自动尝试补全，缺了会带报错重试一次）`;
+  }
+  return `必填：${schema.required.join("、")}`;
+}
+
+/* ================================================================== */
+/* 预设：成套的世界配置                                                */
+/* ================================================================== */
+
+async function loadPresets() {
+  const list = $("preset-list");
+  if (!list) return;
+  list.innerHTML = "";
+  try {
+    const data = await apiGet("presets");
+    ui.presets = data.presets || [];
+    ui.activePreset = data.active || "";
+    renderPresetList();
+  } catch (error) {
+    list.appendChild(el("p", "muted", error.message || "读取预设失败"));
+  }
+}
+
+function renderPresetList() {
+  const list = $("preset-list");
+  list.innerHTML = "";
+  if (!(ui.presets || []).length) {
+    list.appendChild(
+      el("p", "muted", "还没有预设。改好当前配置后点「把当前配置存成预设」，就能随时切回来。"),
+    );
+    return;
+  }
+  ui.presets.forEach((preset) => {
+    const item = el("div", "list-item");
+    const info = el("div", "grow");
+    const head = el("div");
+    head.appendChild(el("strong", "", preset.name || preset.id));
+    if (preset.id === ui.activePreset) head.appendChild(el("span", "badge", "当前"));
+    info.appendChild(head);
+    info.appendChild(
+      el(
+        "div",
+        "meta",
+        `${preset.id}｜${preset.nodes} 地点 / ${preset.actions} 动作 / ${preset.schedules} 日程 / ${preset.sessions} 会话` +
+          (preset.updated_at ? `｜${preset.updated_at}` : ""),
+      ),
+    );
+    if (preset.note) info.appendChild(el("div", "meta", preset.note));
+    item.appendChild(info);
+
+    const actions = el("div", "row-item");
+    const apply = el("button", "small primary", "应用");
+    apply.type = "button";
+    apply.title = "切换到这个预设（会清空所有会话的状态，记忆和日志保留）";
+    apply.addEventListener("click", () => applyPreset(preset));
+    actions.appendChild(apply);
+
+    const rename = el("button", "small", "重命名");
+    rename.type = "button";
+    rename.addEventListener("click", () => renamePreset(preset));
+    actions.appendChild(rename);
+
+    const json = el("button", "small ghost", "JSON");
+    json.type = "button";
+    json.title = "看 / 改 / 复制这个预设的 JSON（方便导入导出）";
+    json.addEventListener("click", () => editPresetJson(preset));
+    actions.appendChild(json);
+
+    const remove = el("button", "small danger", "删除");
+    remove.type = "button";
+    remove.addEventListener("click", () => deletePreset(preset));
+    actions.appendChild(remove);
+    item.appendChild(actions);
+    list.appendChild(item);
+  });
+}
+
+async function saveCurrentAsPreset() {
+  openFormDialog({
+    title: "把当前配置存成预设",
+    hint: "会把当前的地图 / 动作 / 日程 / 会话白名单打包成一个预设文件。",
+    fields: [
+      { key: "id", label: "预设 id", value: `preset_${Date.now().toString(36).slice(-4)}`, hint: "文件名，用英文/数字" },
+      { key: "name", label: "名字", value: "", hint: "给自己看的名字，例如「家里蹲版」" },
+      { key: "note", label: "说明", value: "", hint: "可选" },
+    ],
+    confirmText: "保存",
+    onSubmit: async (values) => {
+      try {
+        const result = await apiPost("presets/save", values);
+        toast(`已保存预设 ${result.id}`);
+        await loadPresets();
+      } catch (error) {
+        toast(error.message || "保存失败");
+        return false;
+      }
+    },
+  });
+}
+
+async function applyPreset(preset) {
+  const ok = await confirmDialog({
+    title: `应用预设「${preset.name || preset.id}」？`,
+    message:
+      "当前配置会先自动备份一份。应用后：地图 / 动作 / 日程 / 会话白名单换成这个预设的内容；" +
+      "所有会话的位置、数值、计划、群聊留档会被清空。\n\n" +
+      "记忆和日志不受影响；需要清理请去「记忆库」「日志」页自己删。",
+    confirmText: "应用",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    const result = await apiPost("presets/apply", { id: preset.id, clear_state: true });
+    toast(
+      `已切换到「${preset.name || preset.id}」，清空状态 ${result.cleared_sessions || 0} 个会话` +
+        ((result.warnings || []).length ? `；提醒：${result.warnings.join("；")}` : ""),
+    );
+    await loadAll();
+    await loadPresets();
+  } catch (error) {
+    toast(error.message || "应用失败");
+  }
+}
+
+function renamePreset(preset) {
+  openFormDialog({
+    title: "重命名预设",
+    fields: [
+      { key: "name", label: "名字", value: preset.name || preset.id },
+      { key: "note", label: "说明", value: preset.note || "" },
+    ],
+    confirmText: "保存",
+    onSubmit: async (values) => {
+      try {
+        await apiPost("presets/rename", { id: preset.id, ...values });
+        await loadPresets();
+      } catch (error) {
+        toast(error.message || "重命名失败");
+        return false;
+      }
+    },
+  });
+}
+
+async function deletePreset(preset) {
+  const ok = await confirmDialog({
+    title: `删除预设「${preset.name || preset.id}」？`,
+    message: "只删除这个预设文件，当前正在用的配置不动。",
+    confirmText: "删除",
+  });
+  if (!ok) return;
+  try {
+    await apiPost("presets/delete", { id: preset.id });
+    toast("已删除");
+    await loadPresets();
+  } catch (error) {
+    toast(error.message || "删除失败");
+  }
+}
+
+async function editPresetJson(preset) {
+  let text = "";
+  try {
+    const data = await apiGet("presets/json", { id: preset.id });
+    text = JSON.stringify(data.preset || {}, null, 2);
+  } catch (error) {
+    toast(error.message || "读取失败");
+    return;
+  }
+  openFormDialog({
+    title: `预设 JSON：${preset.name || preset.id}`,
+    hint: "整段内容都可以改；复制走就是导出，贴别人的进来就是导入。保存时会做结构校验并自动补回必需的内置动作。",
+    wide: true,
+    fields: [{ key: "json", label: "预设（JSON）", type: "textarea", value: text, rows: 20 }],
+    confirmText: "保存",
+    onSubmit: async (values) => {
+      try {
+        const result = await apiPost("presets/json", { id: preset.id, json: values.json });
+        toast(
+          (result.warnings || []).length
+            ? `已保存，提醒：${result.warnings.join("；")}`
+            : "已保存",
+        );
+        await loadPresets();
+      } catch (error) {
+        toast(error.message || "保存失败");
+        return false;
+      }
+    },
+  });
+}
+
+function importPreset() {
+  openFormDialog({
+    title: "粘贴 JSON 导入预设",
+    hint: "把别人分享的预设 JSON 整段贴进来。id 重复时会被覆盖。",
+    wide: true,
+    fields: [
+      { key: "id", label: "存成什么 id", value: `imported_${Date.now().toString(36).slice(-4)}` },
+      { key: "json", label: "预设（JSON）", type: "textarea", value: "", rows: 18 },
+    ],
+    confirmText: "导入",
+    onSubmit: async (values) => {
+      try {
+        const result = await apiPost("presets/json", {
+          id: values.id,
+          json: values.json,
+        });
+        toast(
+          (result.warnings || []).length
+            ? `已导入，提醒：${result.warnings.join("；")}`
+            : "已导入",
+        );
+        await loadPresets();
+      } catch (error) {
+        toast(error.message || "导入失败");
+        return false;
+      }
+    },
+  });
+}
+
 async function loadTools() {
   const list = $("tools-list");
   list.innerHTML = "";
@@ -6220,6 +6720,9 @@ async function loadTools() {
       info.appendChild(el("div", "", tool.name));
       info.appendChild(el("div", "meta", tool.description || ""));
       info.appendChild(el("div", "meta", `参数：${tool.param_text || "（无）"}`));
+      // 工具声明的必填和实现要的经常不一致（schema 写可选、代码里必填），
+      // 这里把原始 required 摆出来，排查「为什么没传参数」时一眼能看到
+      info.appendChild(el("div", "meta", toolRequiredSummary(tool)));
       item.appendChild(info);
       list.appendChild(item);
     });
@@ -6253,6 +6756,3 @@ async function loadPrompt(mode) {
 }
 
 boot();
-
-
-

@@ -67,6 +67,7 @@ DEFAULT_WORLD: dict[str, Any] = {
         "silence_window_minutes": 60,
         "cooldown_after_unanswered": 120,
         "halve_on_cooldown_end": True,
+        "after_reply_cooldown_minutes": 10,
     },
     "nickname_sync": {
         "enabled": True,
@@ -282,6 +283,7 @@ DEFAULT_WORLD: dict[str, Any] = {
         # ---------------- 表达类 ----------------
         {
             "id": "say",
+            "builtin": True,
             "name": "说话",
             "category": "instant",
             "llm_level": "single",
@@ -294,6 +296,7 @@ DEFAULT_WORLD: dict[str, Any] = {
         },
         {
             "id": "think",
+            "builtin": True,
             "name": "想事情",
             "category": "instant",
             "llm_level": "single",
@@ -305,6 +308,7 @@ DEFAULT_WORLD: dict[str, Any] = {
         },
         {
             "id": "share",
+            "builtin": True,
             "name": "分享",
             "category": "instant",
             "llm_level": "single",
@@ -315,6 +319,79 @@ DEFAULT_WORLD: dict[str, Any] = {
             "priority": 5,
             "on_complete": {"effects": {"affect": "+0.10", "loneliness": "-0.05"}},
             "description": "把刚刚的见闻分享到群里。受每小时分享次数限制。",
+        },
+        {
+            "id": "recall",
+            "builtin": True,
+            "name": "回想",
+            "category": "instant",
+            "llm_level": "single",
+            "scope": "global",
+            "target_type": "none",
+            "visible": False,
+            "preconditions": {},
+            "priority": 4,
+            "on_complete": {"trigger": "none"},
+            "description": (
+                "主动回忆。想回忆某段经历、某个地点（或某个区域）发生过的事，"
+                "或者无聊、孤单时想翻一翻美好的记忆，都可以用它。"
+                "只填 intent 说清想回忆什么，例如「想想上次在厨房做饭的事」"
+                "或「回忆一下公园里的事」；想指定地点就填 target_node。"
+                "**回忆完不需要再写别的动作**：系统会去记忆里翻，"
+                "翻完带着结果再问你一次，那时候你再说话。"
+            ),
+        },
+        {
+            "id": "schedule_list",
+            "builtin": True,
+            "name": "查看日程",
+            "category": "instant",
+            "llm_level": "single",
+            "scope": "global",
+            "target_type": "none",
+            "visible": False,
+            "preconditions": {},
+            "priority": 4,
+            "on_complete": {"trigger": "none"},
+            "description": (
+                "看看自己每天安排好要做的事。不用填 intent；"
+                "看完系统会带着日程表再问你一次，你那时候再说话。"
+            ),
+        },
+        {
+            "id": "schedule_add",
+            "builtin": True,
+            "name": "添加日程",
+            "category": "instant",
+            "llm_level": "single",
+            "scope": "global",
+            "target_type": "none",
+            "visible": False,
+            "preconditions": {},
+            "priority": 4,
+            "on_complete": {"trigger": "none"},
+            "description": (
+                "给自己加一条日程（到了点自动做某串动作）。"
+                "把打算写成一句自然语言填进 intent，例如「每天早上七点去书房查新闻」。"
+                "**加完不用再写别的动作**：系统会替你把时间、星期和动作链填好，再带着结果问你一次。"
+            ),
+        },
+        {
+            "id": "schedule_remove",
+            "builtin": True,
+            "name": "删除日程",
+            "category": "instant",
+            "llm_level": "single",
+            "scope": "global",
+            "target_type": "none",
+            "visible": False,
+            "preconditions": {},
+            "priority": 4,
+            "on_complete": {"trigger": "none"},
+            "description": (
+                "删掉自己之前加的一条日程。在 intent 里说清是哪条（时间或名字）即可，"
+                "例如「把七点查新闻那条删了」。**注意**：用户自己配的日程她删不掉，只能删自己加的。"
+            ),
         },
         {
             "id": "sing",
@@ -448,6 +525,7 @@ DEFAULT_WORLD: dict[str, Any] = {
         # ---------------- 生活类（时长交给大模型 + 按分钟结算） ----------------
         {
             "id": "walk_to",
+            "builtin": True,
             "name": "移动",
             "category": "continuous",
             "llm_level": "template",
@@ -462,6 +540,7 @@ DEFAULT_WORLD: dict[str, Any] = {
         },
         {
             "id": "sleep",
+            "builtin": True,
             "name": "睡觉",
             "category": "continuous",
             "llm_level": "template",
@@ -671,6 +750,12 @@ def default_schedules() -> dict[str, Any]:
     """返回默认日程的深拷贝。"""
 
     return copy.deepcopy(DEFAULT_SCHEDULES)
+
+
+def default_actions() -> list[dict[str, Any]]:
+    """返回默认动作列表的深拷贝（用来补回被删掉的内置动作）。"""
+
+    return copy.deepcopy(DEFAULT_WORLD.get("actions") or [])
 
 
 

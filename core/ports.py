@@ -71,6 +71,7 @@ class LLMPort(Protocol):
         contexts: list[dict] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        image_urls: list[str] | None = None,
     ) -> LLMReply: ...
 
 
@@ -84,6 +85,15 @@ class MessagePort(Protocol):
 
     async def fetch_group_card(self, session_id: str) -> str: ...
     """读一下她当前在群里的名片（拿不到就返回空串）。"""
+
+
+@runtime_checkable
+class CommandPort(Protocol):
+    """把别的插件的指令转发出去（「指令触发」型动作用）。"""
+
+    async def trigger(
+        self, session_id: str, command: str, *, event: Any = None
+    ) -> ToolCallResult: ...
 
 
 @runtime_checkable

@@ -187,6 +187,41 @@ def render_event(event: dict[str, Any], world: WorldConfig | None = None) -> str
     if kind == "cancel":
         return f"按对方说的停了：{_clip(detail.get('note'), 60)}"
 
+    if kind == "vision":
+        count = int(detail.get("images") or 0)
+        suffix = f"（{count} 张）" if count else ""
+        if detail.get("ok") is False:
+            return f"图片没看成{suffix}：{_clip(detail.get('detail'), 80)}"
+        return f"图片内容{suffix}：{_clip(detail.get('detail'), 80)}"
+
+    if kind == "recall_start":
+        query = detail.get("query") or {}
+        where = "、".join(query.get("node_names") or []) or query.get("zone") or "任何地方"
+        keyword = str(query.get("keyword") or "").strip()
+        text = f"开始回想：{_clip(detail.get('intent'), 60)}（范围：{where}"
+        text += f"；主题：{keyword}）" if keyword else "）"
+        return text
+
+    if kind == "recall_done":
+        if not int(detail.get("count") or 0):
+            return f"回想完了：什么都没想起来（找的是 {_clip(detail.get('keyword'), 20) or '旧事'}）"
+        return f"回想起来 {int(detail.get('count') or 0)} 件事：{_clip(detail.get('detail'), 120)}"
+
+    if kind == "schedule_edit":
+        what = {"add": "加了一条日程", "remove": "删掉了一条日程", "list": "翻了自己的日程"}.get(
+            str(detail.get("op") or ""), "改了日程"
+        )
+        if detail.get("ok") is False:
+            return f"日程没改成（{what}）：{_clip(detail.get('note'), 80)}"
+        return f"{what}：{_clip(detail.get('note'), 80)}"
+
+    if kind == "command":
+        line = _clip(detail.get("command"), 60)
+        if detail.get("ok") is False:
+            return f"触发指令「{line}」失败：{_clip(detail.get('error'), 60)}"
+        result = _clip(detail.get("result"), 80)
+        return f"触发指令「{line}」　→ {result}" if result else f"触发指令「{line}」"
+
     if kind == "wake_up":
         return f"被 {detail.get('by') or '有人'} 叫醒"
 
