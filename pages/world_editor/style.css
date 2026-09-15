@@ -587,6 +587,20 @@ main {
   font-size: 12px;
 }
 
+/* 列表行的正文与右侧按钮：正文可以压缩，按钮永远贴在右边一排 */
+.list-item .list-main {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.list-item .list-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
 .form {
   display: flex;
   flex-direction: column;

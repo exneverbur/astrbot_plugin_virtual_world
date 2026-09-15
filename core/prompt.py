@@ -1071,6 +1071,34 @@ class PromptBuilder:
         parts.extend(f"- {line}" for line in lines)
         return system, "\n".join(parts)
 
+    def build_smart_schedule_prompt(
+        self,
+        *,
+        schedule_id: str,
+        when: str,
+        outline: str,
+        auto_travel: bool,
+    ) -> str:
+        """智能日程的用户提示：把这条日程排成一份带意图的计划。"""
+
+        travel = (
+            "这条日程开着「自动先走过去」：某个动作只有别处能做时，"
+            "先写一步 walk_to，再紧接着写那个动作（系统不会替你补）。\n"
+            if auto_travel
+            else "地点是硬条件：她不在那个地点时动作会被跳过，需要的话自己补一步 walk_to。\n"
+        )
+        return (
+            f"日程「{schedule_id}」到点了（{when}）。这条日程安排的是这些事：\n"
+            f"{outline}\n\n"
+            "把它排成你要执行的计划，按输出格式那一层给 plan JSON。要求：\n"
+            f"{travel}"
+            "工具型 / 指令型动作**必须写 intent**，用一句自然语言说清这一步想干什么"
+            "（例如 \"看看今天有什么科技新闻\"）；参数由系统按 intent 补全，不要自己编参数。\n"
+            "可以按她此刻的状态、所在地点和群里正在聊的事调整顺序，"
+            "但不要改成和这条日程无关的事。\n"
+            "只输出 JSON。"
+        )
+
     def build_command_prompt(
         self,
         *,

@@ -1542,7 +1542,7 @@ function chainTimeRow(step, definition, emit) {
   return wrap;
 }
 
-function chainEditor(chain, onChange) {
+function chainEditor(chain, onChange, opts = {}) {
   const wrapper = el("div", "subsection");
   const title = el("div", "sub-title");
   title.appendChild(el("span", "", "动作链"));
@@ -1550,7 +1550,10 @@ function chainEditor(chain, onChange) {
     tipBox(
       "按顺序执行。持续动作（睡觉、看书…）会先开始，完成后继续执行后面的步骤。" +
         "注意：地点是硬条件——要求「在书房」的动作，如果她当时不在书房，这一步会被跳过。" +
-        "可以在这里补一步「移动到」，或者打开下面日程的「自动先走过去」。",
+        "可以在这里补一步「移动到」，或者打开下面日程的「自动先走过去」。" +
+        (opts.smart
+          ? "（这条日程开了「智能日程」：由大模型自己排计划。）"
+          : "工具型 / 指令型步骤要填「意图」——说清这一步想干什么，参数才会被补出来。"),
     ),
   );
   wrapper.appendChild(title);
@@ -1615,6 +1618,23 @@ function chainEditor(chain, onChange) {
           emit();
         });
         line.appendChild(messageInput);
+      }
+
+      // 工具型 / 指令型步骤要一句「想干什么」，参数才补得出来。
+      // 智能日程由大模型到点自己排计划，这里就不必填了。
+      if (definition && ["tool", "command"].includes(definition.llm_level) && !opts.smart) {
+        const intentInput = document.createElement("input");
+        intentInput.className = "grow";
+        intentInput.placeholder = "这一步想干什么（例如：看看今天有什么科技新闻）";
+        intentInput.title =
+          "交给辅助模型去补工具 / 指令参数的一句话。留空时保存会尝试自动生成一句，" +
+          "运行时会用动作自己的说明兜底。";
+        intentInput.value = step.intent || "";
+        intentInput.addEventListener("change", () => {
+          step.intent = intentInput.value.trim();
+          emit();
+        });
+        line.appendChild(intentInput);
       }
 
       // 这一步需要某个地点，但前面没安排走过去 → 给一个一键补移动的入口
@@ -2036,6 +2056,8 @@ async function saveAll() {
       ...(sessionResult.warnings || []),
       ...toolActionWarnings(),
     ];
+    // 保存时顺手给缺意图的工具 / 指令步骤补的意图（写进配置了，编辑器里能看到）
+    const autoIntents = scheduleResult.filled || [];
     // 保存即生效：不用再单独点「热加载」
     const reloadResult = await apiPost("reload", {});
     ui.dirty = false;
@@ -2043,6 +2065,8 @@ async function saveAll() {
     toast(
       warnings.length
         ? `已保存并生效，提醒：${warnings.join("；")}`
+        : autoIntents.length
+          ? `已保存并生效，顺手补了这些步骤的意图：${autoIntents.join("；")}`
         : (reloadResult.warnings || []).length
           ? `已保存并生效，提醒：${reloadResult.warnings.join("；")}`
           : "已保存并生效",
@@ -4940,9 +4964,17 @@ function renderActionForm() {
     }),
   );
   advancedBody.appendChild(
-    checkboxField("动作会发到群里", action.visible !== false, (value) => (action.visible = value), {
-      hint: "关掉表示静默执行（例如换位置、发呆），不会在群里说话。",
-    }),
+    checkboxField(
+      "动作会发到群里",
+      action.visible !== false,
+      (value) => (action.visible = value),
+      {
+        hint:
+          "关掉表示静默执行（例如换位置、发呆）。" +
+          "「单轮」动作例外：它的定义就是让大模型说一句，只要目标是「群」或「某个群友」，" +
+          "生成的话一定会发出去（想让它纯粹变成内心活动，用「想事情」那种动作）。",
+      },
+    ),
   );
   advancedBody.appendChild(
     checkboxField(
@@ -5277,7 +5309,7 @@ function renderScheduleList() {
   schedules().forEach((schedule) => {
     const item = el("div", "list-item");
     if (schedule.id === ui.selectedSchedule) item.classList.add("selected");
-    const info = el("div");
+    const info = el("div", "list-main");
     info.appendChild(
       el("div", "", `${schedule.enabled === false ? "⛔" : "✅"} ${schedule.time}　${schedule.id}`),
     );
@@ -5290,12 +5322,14 @@ function renderScheduleList() {
       ),
     );
     item.appendChild(info);
+    // 两个按钮放一起、靠右贴边（不然「立即执行」会飘在中间）
+    const actions = el("div", "list-actions");
     const run = el("button", "small", "▶ 立即执行");
     run.title =
       "现在就跑一遍这条动作链：忽略时间、星期和触发条件，" +
       "也不影响它今天到点的正常触发。";
     run.addEventListener("click", () => runScheduleNow(schedule));
-    item.appendChild(run);
+    actions.appendChild(run);
     const del = el("button", "small danger", "删除");
     del.addEventListener("click", () => {
       ui.config.schedules.schedules = schedules().filter((row) => row.id !== schedule.id);
@@ -5303,7 +5337,8 @@ function renderScheduleList() {
       renderScheduleList();
       renderScheduleForm();
     });
-    item.appendChild(del);
+    actions.appendChild(del);
+    item.appendChild(actions);
     item.addEventListener("click", (event) => {
       if (event.target.tagName === "BUTTON") return;
       ui.selectedSchedule = schedule.id;
@@ -5432,9 +5467,30 @@ function renderScheduleForm() {
   );
 
   form.appendChild(
-    chainEditor(schedule.action_chain, (chain) => {
-      schedule.action_chain = chain;
-    }),
+    checkboxField(
+      "智能日程（到点让大模型自己排计划）",
+      schedule.smart === true,
+      (value) => {
+        schedule.smart = value;
+        renderScheduleForm();
+      },
+      {
+        hint:
+          "开启后，到点会把这条日程的用意交给大模型，让它按当时的时间、地点、状态和群里正在聊的事" +
+          "排一份带「想干什么」的计划再执行（每次到点多一次模型调用，跑法每天可能略有不同）。" +
+          "关掉就是老老实实按下面的动作链跑，工具 / 指令型步骤靠「意图」补参数。",
+      },
+    ),
+  );
+
+  form.appendChild(
+    chainEditor(
+      schedule.action_chain,
+      (chain) => {
+        schedule.action_chain = chain;
+      },
+      { smart: schedule.smart === true },
+    ),
   );
 
   const runRow = el("div", "row");

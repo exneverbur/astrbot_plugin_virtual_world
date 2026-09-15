@@ -1414,6 +1414,13 @@ class VirtualWorldEngine:
             return f"她不在指定地点（现在在 {state.node_id}）"
         return "条件不满足"
 
+    def node_label(self, node_id: Any) -> str:
+        """地点的中文名（拿不到就原样返回 id）。"""
+
+        key = str(node_id or "")
+        node = self.node(key)
+        return (node.name or node.id) if node is not None else key
+
     def _chain_labels(self, chain: list[Any] | None) -> list[str]:
         """动作链里每一步的中文名（日程日志用）。"""
 
@@ -1426,23 +1433,175 @@ class VirtualWorldEngine:
                 (definition.name or definition.id) if definition else action_id
             )
         return [label for label in labels if label]
-        """日程到点却没跑的原因（写进日志，省得用户猜）。"""
 
-        if conditions is None:
-            return ""
-        if conditions.not_state and state.state in conditions.not_state:
-            return f"她现在是「{state.state}」状态"
-        if conditions.state and state.state not in conditions.state:
-            return f"她现在是「{state.state}」状态，不在允许的列表里"
-        if conditions.min_energy is not None and state.energy < conditions.min_energy:
-            return f"精力 {state.energy:.2f} 低于要求的 {conditions.min_energy}"
-        if conditions.max_energy is not None and state.energy > conditions.max_energy:
-            return f"精力 {state.energy:.2f} 高于允许的 {conditions.max_energy}"
-        if conditions.min_loneliness is not None and state.loneliness < conditions.min_loneliness:
-            return f"孤独感 {state.loneliness:.2f} 低于要求的 {conditions.min_loneliness}"
-        if conditions.node_in and state.node_id not in conditions.node_in:
-            return f"她不在指定地点（现在在 {state.node_id}）"
-        return "条件不满足"
+    def _chain_outline(self, chain: list[Any] | None) -> str:
+        """动作链的人话描述：每一步做什么、有什么要求（智能日程与兜底意图用）。"""
+
+        action_map = self.world.action_map()
+        lines: list[str] = []
+        for index, step in enumerate(chain or [], start=1):
+            action_id = str(getattr(step, "type", "") or "")
+            definition = action_map.get(action_id)
+            label = (definition.name or definition.id) if definition else action_id
+            parts = [f"{index}. {label}（id: {action_id}）"]
+            if definition is not None and definition.description:
+                parts.append(definition.description.strip())
+            node_id = str(getattr(step, "target_node", "") or "")
+            if node_id:
+                parts.append(f"地点：{self.node_label(node_id)}")
+            messages = [str(item) for item in (getattr(step, "messages", []) or []) if item]
+            if messages:
+                parts.append("要说的话：" + " / ".join(messages))
+            lines.append("　".join(part for part in parts if part))
+        return "\n".join(lines) if lines else "（这条日程没有配置任何动作）"
+
+    def fallback_intent(self, definition: ActionDef, step: Any = None) -> str:
+        """日程里的工具 / 指令步骤没写意图时的兜底说明。
+
+        动作链本来就没有"想干什么"这一栏，缺了它工具型动作会直接跳过
+        （"没有给出想做什么"）。这里用动作自己的说明拼一句，让它至少能跑起来；
+        用户可以在日程里写清意图把它顶掉。
+        """
+
+        label = definition.name or definition.id
+        parts = [f"做「{label}」这件事"]
+        description = str(definition.description or "").strip()
+        if description:
+            parts.append(description)
+        node_id = str(getattr(step, "target_node", "") or "")
+        if node_id:
+            parts.append(f"地点是{self.node_label(node_id)}")
+        return "：".join([parts[0], "；".join(parts[1:])]) if len(parts) > 1 else parts[0]
+
+    async def fill_schedule_intents(
+        self, payload: dict[str, Any]
+    ) -> tuple[dict[str, Any], list[str]]:
+        """保存日程时，给缺意图的工具 / 指令步骤补一句「想干什么」。
+
+      用内容生成模型（`creator_provider_id`，没配就复用主模型）写，写进日程 JSON 里，
+        编辑器里能看到也能改。这样运行时不用再花钱、也不会因为缺意图被跳过。
+        返回 ``(处理后的配置, 说明列表)``；模型不可用时原样返回。
+        """
+
+        if self.creator_llm is None or not isinstance(payload, dict):
+            return payload, []
+        action_map = self.world.action_map()
+        filled: list[str] = []
+        for schedule in payload.get("schedules") or []:
+            if not isinstance(schedule, dict) or schedule.get("smart"):
+                # 智能日程到点自己排计划，不需要每步的意图
+                continue
+            chain = schedule.get("action_chain") or []
+            for index, step in enumerate(chain, start=1):
+                if not isinstance(step, dict):
+                    continue
+                definition = action_map.get(str(step.get("type") or ""))
+                if definition is None or definition.llm_level not in ("tool", "command"):
+                    continue
+                if str(step.get("intent") or "").strip():
+                    continue
+                intent = await self._generate_intent(definition, schedule)
+                if not intent:
+                    continue
+                step["intent"] = intent
+                label = definition.name or definition.id
+                filled.append(f"{schedule.get('id') or '日程'} 第 {index} 步「{label}」：{intent}")
+        return payload, filled
+
+    async def _generate_intent(self, definition: ActionDef, schedule: Any) -> str:
+        """让内容生成模型给一步工具 / 指令动作写一句意图。"""
+
+        label = definition.name or definition.id
+        schedule_id = str(schedule.get("id") or "") if isinstance(schedule, dict) else ""
+        detail = [f"日程 id：{schedule_id or '（未命名）'}"]
+        detail.append(f"这一步的动作：{label}（{definition.id}）")
+        detail.append(f"动作说明：{definition.description or '（没写）'}")
+        if definition.llm_level == "command":
+            detail.append(f"要触发的指令：{definition.trigger_command or '（没填）'}")
+        else:
+            tools = "、".join(definition.tool_list())
+            detail.append(f"要调用的工具：{tools or '（没选）'}")
+        system_prompt = (
+            "你在帮一个角色把日程里的一步说清楚：她到点要让某个工具或指令替她做什么。"
+            "只输出一句中文，不要解释、不要引号、不要 Markdown。"
+        )
+        prompt = (
+            "\n".join(detail)
+            + "\n\n按这个动作的用途写一句「这一步想干什么」，"
+            "它会交给模型去填工具 / 指令的参数（例如「看看今天有什么科技新闻」）。"
+            "只说这一句，别写参数名。"
+        )
+        reply = await self._ask_creator(self._generator_session_id(), system_prompt, prompt)
+        return " ".join(str(reply or "").split())[:80]
+
+    async def _run_smart_schedule(
+        self,
+        state: WorldState,
+        node: NodeDef | None,
+        outcome: TickOutcome,
+        schedule: Any,
+        slot: str,
+    ) -> bool:
+        """智能日程：把这条日程交给大模型，让它当场排一份带意图的计划。返回是否成功。"""
+
+        if self.llm is None:
+            return False
+        persona_text = await self._persona_text(state.session_id)
+        system_prompt = self.prompts.build_autonomous_system_prompt(
+            persona_text=persona_text,
+            state=state,
+            node=node,
+            available_tools=self.available_tools(),
+            memories=self.memory.recall(
+                session_id=state.session_id,
+                persona_id="",
+                node_id=state.node_id,
+                limit=self.world.limits.max_think_memory,
+            ),
+            engagement_hint=self.engagement.hint(state),
+            max_messages=self.world.limits.max_messages_per_say,
+            recent_chat=self.chat_context(state),
+            mode="plan",
+            reasoning=bool(self.world.reasoning_enabled),
+        )
+        prompt = self.prompts.build_smart_schedule_prompt(
+            schedule_id=str(schedule.id),
+            when=str(slot or schedule.time),
+            outline=self._chain_outline(schedule.action_chain),
+            auto_travel=bool(schedule.auto_travel),
+        )
+        reply = await self._ask_llm(state.session_id, system_prompt, prompt)
+        # 智能日程是用户明确要求的一次调用：不吃"自主决策"的间隔限制，但要记进用量
+        self._count_llm_plan(state)
+        outcome.llm_calls += 1
+        if reply is None:
+            return False
+        # 允许计划里出现这条日程用到的动作：她当前可能不在能用的地点
+        allowed = set(self._parseable_action_ids(state.node_id))
+        for step in schedule.action_chain or []:
+            action_id = str(getattr(step, "type", "") or "")
+            if action_id:
+                allowed.add(action_id)
+        plan, _warnings = parse_plan_payload(
+            reply,
+            available_actions=allowed,
+            valid_nodes=set(self.world.node_map()),
+        )
+        if not plan:
+            return False
+        created = create_plan(
+            steps=plan.get("steps", []),
+            world_time=state.world_time,
+            valid_for=int(plan.get("valid_for", self.world.limits.plan_valid_duration)),
+            reason=str(plan.get("reason") or f"日程「{schedule.id}」到点了"),
+            source="schedule",
+        )
+        if created is None:
+            return False
+        created["raw"] = reply
+        await self._apply_plan(state, node, outcome, created)
+        await self._tick_plan(state, node, outcome, depth=0)
+        return True
 
     async def run_schedules(self) -> list[TickOutcome]:
         """检查并触发到点的日程。
@@ -1533,7 +1692,16 @@ class VirtualWorldEngine:
                             "manual": False,
                         },
                     )
-                    await self._run_chain(state, chain, outcome, depth=0)
+                    if schedule.smart:
+                        # 智能日程：让大模型按当下情况排一份带意图的计划再跑
+                        planned = await self._run_smart_schedule(
+                            state, self.node(state.node_id), outcome, schedule, slot
+                        )
+                        if not planned:
+                            outcome.notes.append("智能日程没排出计划，退回按动作链执行")
+                            await self._run_chain(state, chain, outcome, depth=0)
+                    else:
+                        await self._run_chain(state, chain, outcome, depth=0)
                     outcome.notes.append(f"日程 {schedule.id} 已触发")
                     state.add_event("schedule", {"id": schedule.id})
                     await self._echo_events_since(state, outcome, echo_marker)
@@ -1580,7 +1748,18 @@ class VirtualWorldEngine:
             chain = schedule.action_chain
             if schedule.auto_travel:
                 chain = self.expand_chain_for_travel(state, chain)
-            await self._run_chain(state, chain, outcome, depth=0)
+            planned = False
+            if schedule.smart:
+                # 智能日程手动跑也一样：先让大模型排计划，排不出来再按动作链跑
+                planned = await self._run_smart_schedule(
+                    state,
+                    self.node(state.node_id),
+                    outcome,
+                    schedule,
+                    schedule.time,
+                )
+            if not planned:
+                await self._run_chain(state, chain, outcome, depth=0)
             state.add_event("schedule", {"id": schedule.id, "manual": True})
             await self._log_event(
                 state,
@@ -2612,7 +2791,9 @@ class VirtualWorldEngine:
             return {}, ""
         intent = (action.intent or action.content or "").strip()
         if not intent:
-            return {}, "没有给出想做什么"
+            # 日程里的步骤没有"想干什么"这一栏：用动作自己的说明兜一句，
+            # 否则这条工具动作到点就只会被跳过。
+            intent = self.fallback_intent(definition)
         cache_key = (chosen, intent)
         # 带了上一个工具的结果、或者带了报错时都是"有意重算"，不吃缓存
         cached = (
@@ -2813,13 +2994,8 @@ class VirtualWorldEngine:
             return
         intent = (action.intent or action.content or "").strip()
         if not intent:
-            outcome.notes.append(f"动作 {definition.id} 没有说清想干什么，已跳过")
-            await self._log_event(
-                state,
-                "skip",
-                {"action": definition.id, "note": "指令型动作没有给出 intent"},
-            )
-            return
+            # 日程里的步骤没有"想干什么"这一栏：用动作自己的说明兜一句
+            intent = self.fallback_intent(definition)
 
         line = await self._compose_command(state, definition, command, intent)
         if self.commands is None:
@@ -3466,7 +3642,11 @@ class VirtualWorldEngine:
                     "params": dict(action.params or {}),
                 },
             )
-            if definition.visible and definition.llm_level == "template" and definition.template:
+            if (
+                definition.llm_level == "template"
+                and str(definition.template or "").strip()
+                and self._action_speaks(definition)
+            ):
                 outcome.messages.append(
                     self.render_template(definition.template, state, node, action)
                 )
@@ -3529,7 +3709,7 @@ class VirtualWorldEngine:
             if messages:
                 outcome.messages.extend(messages)
                 self._count_share(state)
-        elif definition.visible:
+        elif self._action_speaks(definition):
             outcome.messages.extend(messages)
         elif definition.id == "think" and action.content:
             state.add_thought(action.content)
@@ -3562,6 +3742,33 @@ class VirtualWorldEngine:
         if from_plan and state.current_plan is not None:
             advance(state)
             await self._tick_plan(state, node, outcome, depth=depth + 1)
+
+    # 「想事情」这类内容型动作：产出的文字是内心活动，永远不发到群里
+    INNER_ACTIONS = ("think",)
+
+    def _action_speaks(self, definition: ActionDef) -> bool:
+        """这个动作产出的文本要不要发到群里。
+
+        「动作会发到群里」这个开关藏得比较深，新建动作时默认还是关的，于是出现过
+        两次同款事故：单轮动作让大模型写的话、模板动作写好的文案，都只进了日志，
+        群里什么都看不到。所以判定改成看"这个动作有没有话要说"：
+
+        - 内心活动类（想事情）永远不发，它的产出只进内心活动与记忆；
+        - 模板写了文案 → 这句话本来就是给群里看的，发；
+        - 单轮动作 → 它的定义就是"让大模型说一句"，发；
+        - 目标写着「群 / 某个群友」的 → 也是明确想说话，发；
+        - 剩下的（没有文案、纯空间动作）保持静默。
+        """
+
+        if definition.visible:
+            return True
+        if definition.id in self.INNER_ACTIONS:
+            return False
+        if definition.llm_level == "template":
+            return bool(str(definition.template or "").strip())
+        if definition.llm_level == "single":
+            return True
+        return definition.target_type in ("group", "user")
 
     async def _instant_output(
         self,

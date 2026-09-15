@@ -2614,9 +2614,14 @@ class VirtualWorldPlugin(Star):
         schedules = payload.get("schedules")
         if not isinstance(schedules, dict):
             return error_response("schedules 必须是对象")
+        # 工具 / 指令型步骤缺「想干什么」时，让内容生成模型补一句写进配置：
+        # 运行时就不用再猜，也不会因为缺意图被跳过。
+        schedules, filled = await self.engine.fill_schedule_intents(schedules)
         warnings = self.store.save_schedules(schedules)
         self.engine.reload_config()
-        return json_response({"ok": True, "warnings": warnings})
+        return json_response(
+            {"ok": True, "warnings": warnings, "filled": filled, "schedules": schedules}
+        )
 
     async def api_put_sessions(self):
         payload = await request.json(default={}) or {}

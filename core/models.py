@@ -774,6 +774,8 @@ class ChainStep(Permissive):
     content: str = ""
     messages: list[str] = Field(default_factory=list)
     params: dict[str, Any] = Field(default_factory=dict)
+    intent: str = ""
+    """这一步"想干什么"。工具型 / 指令型动作靠它补参数，空了会被跳过。"""
 
 
 class ScheduleConditions(Permissive):
@@ -798,6 +800,12 @@ class ScheduleDef(Permissive):
     sessions: list[str] = Field(default_factory=list)
     auto_travel: bool = False
     """开启后，若某一步要求的地点不满足（例如在书房才能上网），会先自动走到那个地点再执行。"""
+
+    smart: bool = False
+    """智能日程：到点时把这条日程交给大模型，让它按当下情况排一份带意图的计划再执行。
+
+    关掉（默认）就是老老实实按动作链跑：每一步想干什么由动作链里的「意图」决定。
+    """
 
     @field_validator("time")
     @classmethod
