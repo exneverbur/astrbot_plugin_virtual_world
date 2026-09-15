@@ -1071,33 +1071,60 @@ class PromptBuilder:
         parts.extend(f"- {line}" for line in lines)
         return system, "\n".join(parts)
 
-    def build_smart_schedule_prompt(
+    def build_schedule_intent_prompt(
         self,
         *,
         schedule_id: str,
         when: str,
-        outline: str,
-        auto_travel: bool,
-    ) -> str:
-        """智能日程的用户提示：把这条日程排成一份带意图的计划。"""
+        where: str,
+        state_hint: str,
+        chat_note: str,
+        persona: str = "",
+        steps: list[dict[str, Any]],
+    ) -> tuple[str, str]:
+        """智能日程：只让模型给这几步写「这一步想干什么」。
 
-        travel = (
-            "这条日程开着「自动先走过去」：某个动作只有别处能做时，"
-            "先写一步 walk_to，再紧接着写那个动作（系统不会替你补）。\n"
-            if auto_travel
-            else "地点是硬条件：她不在那个地点时动作会被跳过，需要的话自己补一步 walk_to。\n"
+        刻意只给最少的信息（人设、几点、在哪、什么状态、一句话题背景 + 要补的这几步），
+        不给她平时的那套提示词：动作链本身是固定的，模型只需要按她的身份把意图说清楚。
+        """
+
+        system = (
+            "你在给一条日程里的几个步骤写「这一步想干什么」。这些步骤会交给工具或指令去执行，"
+            "你的这句话会被用来推断要传什么参数。只输出一个 JSON 对象，不要解释、不要 Markdown。"
         )
-        return (
-            f"日程「{schedule_id}」到点了（{when}）。这条日程安排的是这些事：\n"
-            f"{outline}\n\n"
-            "把它排成你要执行的计划，按输出格式那一层给 plan JSON。要求：\n"
-            f"{travel}"
-            "工具型 / 指令型动作**必须写 intent**，用一句自然语言说清这一步想干什么"
-            "（例如 \"看看今天有什么科技新闻\"）；参数由系统按 intent 补全，不要自己编参数。\n"
-            "可以按她此刻的状态、所在地点和群里正在聊的事调整顺序，"
-            "但不要改成和这条日程无关的事。\n"
-            "只输出 JSON。"
+        persona_text = str(persona or "").strip()
+        if persona_text:
+            system += (
+                "\n\n她的人设（照她的身份和口味选词，但这句话是给工具的明确交代，"
+                "不要写成对群里说的话）：\n" + persona_text
+            )
+        lines = [f"现在是 {when}。" if when else ""]
+        if where:
+            lines.append(f"她这会儿在{where}。")
+        if state_hint:
+            lines.append(f"她的状态：{state_hint}。")
+        if chat_note:
+            lines.append(f"刚才群里在聊：{chat_note}（只是背景，别把日程写成回应它）。")
+        step_lines = [
+            "- 第 {index} 步：{label}（{kind}）——{description}".format(
+                index=item.get("index"),
+                label=item.get("label") or item.get("action_id") or "",
+                kind=item.get("kind") or "工具型",
+                description=item.get("description") or "（没有额外说明）",
+            )
+            for item in steps
+        ]
+        prompt = (
+            "\n".join(line for line in lines if line)
+            + "\n\n这一步一步要补的意图：\n"
+            + "\n".join(step_lines)
+            + "\n\n要求：\n"
+            "1. 每个步骤一句话，说清这一步想让它干什么（例如「看看今天有什么科技新闻」）；\n"
+            "2. 具体一点，别写参数名、别写工具名，也别编不存在的目标；\n"
+            "3. 只写这几步，不要多写、不要改顺序、不要提别的动作；\n"
+            '4. 输出格式：{"intents": [{"step": 1, "intent": "..."}]}'
         )
+        return system, prompt
 
     def build_command_prompt(
         self,

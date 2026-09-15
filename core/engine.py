@@ -43,7 +43,7 @@ from .models import (
 from .nickname import compute_nickname, should_update
 from .pathfinding import find_path, nearest_node, path_ticks
 from .planner import active_plan, advance, create_plan, peek_step
-from .prompt import WEEKDAY_NAMES, PromptBuilder, clock_text
+from .prompt import WEEKDAY_NAMES, PromptBuilder, clock_text, period_of
 from .timeline import render_event
 from .ports import CardResult, ToolCallResult
 from .state import (
@@ -1434,27 +1434,6 @@ class VirtualWorldEngine:
             )
         return [label for label in labels if label]
 
-    def _chain_outline(self, chain: list[Any] | None) -> str:
-        """动作链的人话描述：每一步做什么、有什么要求（智能日程与兜底意图用）。"""
-
-        action_map = self.world.action_map()
-        lines: list[str] = []
-        for index, step in enumerate(chain or [], start=1):
-            action_id = str(getattr(step, "type", "") or "")
-            definition = action_map.get(action_id)
-            label = (definition.name or definition.id) if definition else action_id
-            parts = [f"{index}. {label}（id: {action_id}）"]
-            if definition is not None and definition.description:
-                parts.append(definition.description.strip())
-            node_id = str(getattr(step, "target_node", "") or "")
-            if node_id:
-                parts.append(f"地点：{self.node_label(node_id)}")
-            messages = [str(item) for item in (getattr(step, "messages", []) or []) if item]
-            if messages:
-                parts.append("要说的话：" + " / ".join(messages))
-            lines.append("　".join(part for part in parts if part))
-        return "\n".join(lines) if lines else "（这条日程没有配置任何动作）"
-
     def fallback_intent(self, definition: ActionDef, step: Any = None) -> str:
         """日程里的工具 / 指令步骤没写意图时的兜底说明。
 
@@ -1534,74 +1513,108 @@ class VirtualWorldEngine:
         reply = await self._ask_creator(self._generator_session_id(), system_prompt, prompt)
         return " ".join(str(reply or "").split())[:80]
 
-    async def _run_smart_schedule(
-        self,
-        state: WorldState,
-        node: NodeDef | None,
-        outcome: TickOutcome,
-        schedule: Any,
-        slot: str,
-    ) -> bool:
-        """智能日程：把这条日程交给大模型，让它当场排一份带意图的计划。返回是否成功。"""
+    def _steps_needing_intent(self, chain: list[Any] | None) -> list[tuple[int, ActionDef]]:
+        """动作链里哪几步需要意图（工具型 / 指令型，且还没写）。1-based 下标。"""
 
-        if self.llm is None:
-            return False
-        persona_text = await self._persona_text(state.session_id)
-        system_prompt = self.prompts.build_autonomous_system_prompt(
-            persona_text=persona_text,
-            state=state,
-            node=node,
-            available_tools=self.available_tools(),
-            memories=self.memory.recall(
-                session_id=state.session_id,
-                persona_id="",
-                node_id=state.node_id,
-                limit=self.world.limits.max_think_memory,
-            ),
-            engagement_hint=self.engagement.hint(state),
-            max_messages=self.world.limits.max_messages_per_say,
-            recent_chat=self.chat_context(state),
-            mode="plan",
-            reasoning=bool(self.world.reasoning_enabled),
-        )
-        prompt = self.prompts.build_smart_schedule_prompt(
+        action_map = self.world.action_map()
+        wanted: list[tuple[int, ActionDef]] = []
+        for index, step in enumerate(chain or [], start=1):
+            definition = action_map.get(str(getattr(step, "type", "") or ""))
+            if definition is None or definition.llm_level not in ("tool", "command"):
+                continue
+            if str(getattr(step, "intent", "") or "").strip():
+                continue
+            wanted.append((index, definition))
+        return wanted
+
+    async def _smart_chain(
+        self, state: WorldState, schedule: Any
+    ) -> tuple[list[Any], str]:
+        """智能日程：把动作链交给大模型，让它给几步补「想干什么」。
+
+        **动作链本身一个字都不改**（步数、动作 id、时长、台词都照旧），模型只填意图——
+        这样就不会出现"配的是查热搜新闻、它却去上网搜索"这种事，也不用它操心怎么走路
+        （自动前往由插件补）。
+        返回 ``(处理后的动作链, 说明文字)``。
+        """
+
+        chain = list(schedule.action_chain or [])
+        wanted = self._steps_needing_intent(chain)
+        if self.llm is None or not wanted:
+            return chain, ""
+        now = self.local_now()
+        steps = [
+            {
+                "index": index,
+                "label": definition.name or definition.id,
+                "action_id": definition.id,
+                "kind": "指令型" if definition.llm_level == "command" else "工具型",
+                "description": str(definition.description or "").strip(),
+            }
+            for index, definition in wanted
+        ]
+        system_prompt, prompt = self.prompts.build_schedule_intent_prompt(
             schedule_id=str(schedule.id),
-            when=str(slot or schedule.time),
-            outline=self._chain_outline(schedule.action_chain),
-            auto_travel=bool(schedule.auto_travel),
+            when=f"{now.strftime('%Y-%m-%d %H:%M')}（{period_of(now.hour)}）",
+            where=self.node_label(state.node_id),
+            state_hint=state.mood or "",
+            chat_note=str(getattr(state, "chat_note", "") or ""),
+            persona=_clip_text(await self._persona_text(state.session_id), 800),
+            steps=steps,
         )
         reply = await self._ask_llm(state.session_id, system_prompt, prompt)
-        # 智能日程是用户明确要求的一次调用：不吃"自主决策"的间隔限制，但要记进用量
         self._count_llm_plan(state)
-        outcome.llm_calls += 1
         if reply is None:
-            return False
-        # 允许计划里出现这条日程用到的动作：她当前可能不在能用的地点
-        allowed = set(self._parseable_action_ids(state.node_id))
-        for step in schedule.action_chain or []:
-            action_id = str(getattr(step, "type", "") or "")
-            if action_id:
-                allowed.add(action_id)
-        plan, _warnings = parse_plan_payload(
-            reply,
-            available_actions=allowed,
-            valid_nodes=set(self.world.node_map()),
-        )
-        if not plan:
-            return False
-        created = create_plan(
-            steps=plan.get("steps", []),
-            world_time=state.world_time,
-            valid_for=int(plan.get("valid_for", self.world.limits.plan_valid_duration)),
-            reason=str(plan.get("reason") or f"日程「{schedule.id}」到点了"),
-            source="schedule",
-        )
-        if created is None:
-            return False
-        created["raw"] = reply
-        await self._apply_plan(state, node, outcome, created)
-        await self._tick_plan(state, node, outcome, depth=0)
-        return True
+            return chain, ""
+        intents = self._parse_intents(reply, {index for index, _ in wanted}, len(chain))
+        if not intents:
+            return chain, ""
+        filled: list[Any] = []
+        for index, step in enumerate(chain, start=1):
+            intent = intents.get(index)
+            if intent:
+                filled.append(step.model_copy(update={"intent": intent}))
+            else:
+                filled.append(step)
+        action_map = self.world.action_map()
+        parts: list[str] = []
+        for index in sorted(intents):
+            action_id = str(getattr(chain[index - 1], "type", "") or "")
+            definition = action_map.get(action_id)
+            label = (definition.name or definition.id) if definition else action_id
+            parts.append(f"第 {index} 步「{label}」：{intents[index]}")
+        return filled, "；".join(parts)
+
+    @staticmethod
+    def _parse_intents(reply: str, allowed: set[int], total: int) -> dict[int, str]:
+        """从模型返回里挑出「第几步 → 意图」，写得不对的一律丢掉。"""
+
+        payload = extract_json_object(reply)
+        if not isinstance(payload, dict):
+            return {}
+        raw = payload.get("intents")
+        pairs: list[tuple[Any, Any]] = []
+        if isinstance(raw, dict):
+            pairs = list(raw.items())
+        elif isinstance(raw, list):
+            for position, item in enumerate(raw, start=1):
+                if isinstance(item, dict):
+                    pairs.append(
+                        (item.get("step", item.get("index", position)), item.get("intent"))
+                    )
+                else:
+                    pairs.append((position, item))
+        result: dict[int, str] = {}
+        for key, value in pairs:
+            try:
+                index = int(key)
+            except (TypeError, ValueError):
+                continue
+            text = " ".join(str(value or "").split())
+            if not text or index not in allowed or not (1 <= index <= total):
+                continue
+            result[index] = text[:80]
+        return result
 
     async def run_schedules(self) -> list[TickOutcome]:
         """检查并触发到点的日程。
@@ -1678,6 +1691,10 @@ class VirtualWorldEngine:
                         continue
                     outcome = TickOutcome(session_id=session_id)
                     chain = schedule.action_chain
+                    smart_note = ""
+                    if schedule.smart:
+                        # 智能日程：让大模型给缺意图的步骤补一句（动作链本身不动）
+                        chain, smart_note = await self._smart_chain(state, schedule)
                     if schedule.auto_travel:
                         chain = self.expand_chain_for_travel(state, chain)
                     # 「日程开始执行」要能进日志与调试输出：不然只能看到它的动作，
@@ -1690,18 +1707,11 @@ class VirtualWorldEngine:
                             "time": slot,
                             "actions": " → ".join(self._chain_labels(chain)),
                             "manual": False,
+                            "smart": bool(schedule.smart),
+                            "intents": smart_note,
                         },
                     )
-                    if schedule.smart:
-                        # 智能日程：让大模型按当下情况排一份带意图的计划再跑
-                        planned = await self._run_smart_schedule(
-                            state, self.node(state.node_id), outcome, schedule, slot
-                        )
-                        if not planned:
-                            outcome.notes.append("智能日程没排出计划，退回按动作链执行")
-                            await self._run_chain(state, chain, outcome, depth=0)
-                    else:
-                        await self._run_chain(state, chain, outcome, depth=0)
+                    await self._run_chain(state, chain, outcome, depth=0)
                     outcome.notes.append(f"日程 {schedule.id} 已触发")
                     state.add_event("schedule", {"id": schedule.id})
                     await self._echo_events_since(state, outcome, echo_marker)
@@ -1746,20 +1756,13 @@ class VirtualWorldEngine:
                 }
             echo_marker = await self._event_marker(state)
             chain = schedule.action_chain
+            smart_note = ""
+            if schedule.smart:
+                # 智能日程手动跑也一样：让大模型给缺意图的步骤补一句
+                chain, smart_note = await self._smart_chain(state, schedule)
             if schedule.auto_travel:
                 chain = self.expand_chain_for_travel(state, chain)
-            planned = False
-            if schedule.smart:
-                # 智能日程手动跑也一样：先让大模型排计划，排不出来再按动作链跑
-                planned = await self._run_smart_schedule(
-                    state,
-                    self.node(state.node_id),
-                    outcome,
-                    schedule,
-                    schedule.time,
-                )
-            if not planned:
-                await self._run_chain(state, chain, outcome, depth=0)
+            await self._run_chain(state, chain, outcome, depth=0)
             state.add_event("schedule", {"id": schedule.id, "manual": True})
             await self._log_event(
                 state,
@@ -1769,6 +1772,8 @@ class VirtualWorldEngine:
                     "time": schedule.time,
                     "actions": " → ".join(self._chain_labels(chain)),
                     "manual": True,
+                    "smart": bool(schedule.smart),
+                    "intents": smart_note,
                 },
             )
             await self._echo_events_since(state, outcome, echo_marker)

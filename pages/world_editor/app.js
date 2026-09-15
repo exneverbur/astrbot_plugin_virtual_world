@@ -1552,7 +1552,7 @@ function chainEditor(chain, onChange, opts = {}) {
         "注意：地点是硬条件——要求「在书房」的动作，如果她当时不在书房，这一步会被跳过。" +
         "可以在这里补一步「移动到」，或者打开下面日程的「自动先走过去」。" +
         (opts.smart
-          ? "（这条日程开了「智能日程」：由大模型自己排计划。）"
+          ? "（这条日程开了「智能日程」：到点由大模型给这几步补「想干什么」，这里不用填。）"
           : "工具型 / 指令型步骤要填「意图」——说清这一步想干什么，参数才会被补出来。"),
     ),
   );
@@ -1621,7 +1621,7 @@ function chainEditor(chain, onChange, opts = {}) {
       }
 
       // 工具型 / 指令型步骤要一句「想干什么」，参数才补得出来。
-      // 智能日程由大模型到点自己排计划，这里就不必填了。
+      // 智能日程到点由大模型补这一步的意图，这里就不必填了。
       if (definition && ["tool", "command"].includes(definition.llm_level) && !opts.smart) {
         const intentInput = document.createElement("input");
         intentInput.className = "grow";
@@ -5468,7 +5468,7 @@ function renderScheduleForm() {
 
   form.appendChild(
     checkboxField(
-      "智能日程（到点让大模型自己排计划）",
+      "智能日程（到点让大模型补每步的意图）",
       schedule.smart === true,
       (value) => {
         schedule.smart = value;
@@ -5476,9 +5476,9 @@ function renderScheduleForm() {
       },
       {
         hint:
-          "开启后，到点会把这条日程的用意交给大模型，让它按当时的时间、地点、状态和群里正在聊的事" +
-          "排一份带「想干什么」的计划再执行（每次到点多一次模型调用，跑法每天可能略有不同）。" +
-          "关掉就是老老实实按下面的动作链跑，工具 / 指令型步骤靠「意图」补参数。",
+          "开启后，到点会把这条动作链交给大模型，让它给工具 / 指令型步骤写一句「这一步想干什么」，" +
+          "再**照原样执行**（步数、动作、时长都不改，只会参考当下的时间和状态）。" +
+          "代价是每次到点多一次模型调用；关掉就用你在下面写死的意图。",
       },
     ),
   );
