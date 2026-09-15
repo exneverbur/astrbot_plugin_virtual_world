@@ -1308,9 +1308,9 @@ class EditorAuth:
 
 @register(
     PLUGIN_NAME,
-    "Codex",
+    "exneverbur",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v1.3.1",
+    "v1.3.4",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:

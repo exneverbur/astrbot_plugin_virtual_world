@@ -2006,6 +2006,7 @@ class VirtualWorldEngine:
         action_id = str(action.get("type", ""))
         definition = self.world.action_map().get(action_id)
 
+        handled_followup = False
         if action_id == "walk_to":
             target_node = str(action.get("target_node", "") or "")
             if target_node and target_node in self.world.node_map():
@@ -2021,6 +2022,24 @@ class VirtualWorldEngine:
             # 工具型动作：配了几个工具就按顺序调几个，成功失败都记账，
             # 日志页要能看出"她到底查到了什么 / 为什么没查到"
             await self._run_tool_calls(state, definition, action)
+        elif definition is not None and definition.llm_level == "command":
+            # 持续型的指令动作：和工具型动作一样，到点才把指令发出去。
+            # 以前这里没有这一支，"查天气"这种配成持续动作的指令永远不执行、也一条日志都没有。
+            await self._run_command_action(
+                state,
+                node,
+                outcome,
+                definition,
+                PlannedAction(
+                    type=action_id,
+                    intent=str(action.get("intent") or ""),
+                    content=str(action.get("content") or ""),
+                    target=str(action.get("target") or ""),
+                    target_node=str(action.get("target_node") or ""),
+                    params=dict(action.get("params") or {}),
+                ),
+            )
+            handled_followup = True
 
         effects = (definition.on_complete.effects if definition else {}) or {}
         if effects:
@@ -2064,6 +2083,9 @@ class VirtualWorldEngine:
         want_followup = trigger == "llm_followup"
         is_tool_action = bool(definition is not None and definition.llm_level == "tool")
         tool_failed = is_tool_action and not bool(action.get("tool_ok", True))
+        if handled_followup:
+            # 指令动作自己已经把结果交回给她说过一句了，这里别再问一次
+            want_followup = False
         if want_followup and is_tool_action and not detail:
             # 工具没拿到东西时不要让她"就着空气说话"——那只会编
             want_followup = False
@@ -3080,6 +3102,14 @@ class VirtualWorldEngine:
         self._count_tool_param(state)
         text = " ".join(str(reply or "").split()).strip().strip("`")
         if not text:
+            return base
+        # 补参模型偶尔会回一坨 JSON 或一整句话：那不是指令，宁可只发指令名本身，
+        # 也别往群里发一条 `/{"actions":...}` 这种莫名其妙的东西。
+        if any(mark in text for mark in ('{', '}', '[', ']', '"', "'")):
+            self._log(
+                "debug",
+                f"指令参数补全返回的内容不像指令，已退回指令名：{_clip_text(text, 80)}",
+            )
             return base
         return text if text.startswith("/") else f"/{text}"
 
