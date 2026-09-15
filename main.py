@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import hmac
 import inspect
@@ -35,7 +36,7 @@ from .core.db import AsyncDatabase
 from .core.engine import SELF_INITIATED_FLAG, MessageContext, VirtualWorldEngine
 from .core.models import normalize_edge_keys, normalize_legacy_keys, pronoun_for
 from .core.nickname import compute_nickname
-from .core.ports import CardResult, LLMReply, ToolCallResult, ToolInfo
+from .core.ports import CardResult, LLMReply, PokeResult, ToolCallResult, ToolInfo
 from .core.prompt import prompt_section_index
 from .core.timeline import build_timeline
 
@@ -121,20 +122,105 @@ def _is_command(text: str) -> bool:
     return bool(stripped) and stripped[0] in "/!！.。"
 
 
-def _image_sources(event: Any) -> list[str]:
-    """挑出这条消息里的图片，返回可以喂给多模态模型的地址。"""
+def _component_named(component: Any, name: str) -> bool:
+    return type(component).__name__ == name
+
+
+def _image_components(event: Any) -> list[Any]:
+    """这条消息里的图片组件，以及**被引用消息**里的图片组件。
+
+    引用（回复）消息的图片挂在 ``Reply.chain`` 上，只看当前消息会漏掉
+    「引用了一张图再问她」这种最常见的用法。
+    """
 
     message_obj = getattr(event, "message_obj", None)
-    sources: list[str] = []
+    found: list[Any] = []
     for component in list(getattr(message_obj, "message", []) or []):
-        if type(component).__name__ != "Image":
+        if _component_named(component, "Image"):
+            found.append(component)
             continue
-        source = str(
-            getattr(component, "url", "") or getattr(component, "file", "") or ""
-        ).strip()
-        if source:
-            sources.append(source)
+        if _component_named(component, "Reply"):
+            for inner in list(getattr(component, "chain", None) or []):
+                if _component_named(inner, "Image"):
+                    found.append(inner)
+    return found
+
+
+def _raw_image_ref(component: Any) -> str:
+    """组件里现成的地址：优先 http(s)，其次文件 URI / 本地路径。"""
+
+    for attr in ("url", "file", "path"):
+        value = str(getattr(component, attr, "") or "").strip()
+        if not value:
+            continue
+        if attr == "path" and "://" not in value:
+            try:
+                return Path(value).resolve().as_uri()
+            except Exception:
+                return value
+        return value
+    return ""
+
+
+def _is_usable_image_ref(ref: str) -> bool:
+    """这个地址能不能直接交给 AstrBot 的模型调用（它自己会去下载/解码）。"""
+
+    if not ref:
+        return False
+    try:
+        from astrbot.core.utils.image_ref_utils import is_supported_image_ref
+    except Exception:
+        return ref.startswith(("http://", "https://", "base64://", "file://"))
+    try:
+        return bool(is_supported_image_ref(ref))
+    except Exception:
+        return False
+
+
+async def _resolve_image_ref(component: Any) -> str:
+    """把一个图片组件换成「模型能吃到」的地址。
+
+    NapCat 这类协议端给的 ``file`` 经常只是一个文件名，直接丢给模型是取不到的；
+    这时交给 AstrBot 自己的 ``convert_to_base64()``（http / file / base64 都能处理），
+    换成 ``base64://`` 再送出去。
+    """
+
+    ref = _raw_image_ref(component)
+    if _is_usable_image_ref(ref):
+        return ref
+    converter = getattr(component, "convert_to_base64", None)
+    if callable(converter):
+        try:
+            data = await converter()
+        except Exception:
+            data = ""
+        if data:
+            return f"base64://{data}"
+    return ref
+
+
+async def _image_sources(event: Any) -> list[str]:
+    """挑出这条消息里的图片，返回可以喂给多模态模型的地址。"""
+
+    sources: list[str] = []
+    for component in _image_components(event):
+        ref = await _resolve_image_ref(component)
+        if ref and ref not in sources:
+            sources.append(ref)
     return sources
+
+
+def _image_components_debug(event: Any) -> str:
+    """取不到图片地址时留下的线索：协议端到底给了什么字段。"""
+
+    parts: list[str] = []
+    for component in _image_components(event):
+        fields = {
+            key: str(getattr(component, key, "") or "")
+            for key in ("file", "url", "path", "_type")
+        }
+        parts.append(" ".join(f"{key}={value}" for key, value in fields.items() if value))
+    return " / ".join(part for part in parts if part)
 
 
 def _is_forwarded(event: Any) -> bool:
@@ -166,9 +252,16 @@ def _quoted_text(event: Any) -> str:
 class AstrBotLLM:
     """LLMPort 实现。"""
 
-    def __init__(self, plugin: "VirtualWorldPlugin", provider_id: str = "") -> None:
+    def __init__(
+        self,
+        plugin: "VirtualWorldPlugin",
+        provider_id: str = "",
+        role: str = "main",
+    ) -> None:
         self.plugin = plugin
         self.provider_id = provider_id
+        self.role = role
+        """``main`` = 说话用的主模型（它的原始响应要留给别的插件看），其余是辅助模型。"""
 
     async def generate(
         self,
@@ -216,6 +309,8 @@ class AstrBotLLM:
                     self.plugin.logger.warning(
                         f"[virtual_world] 带图片调用失败（{exc}），已退回纯文字"
                     )
+                    if self.role == "main":
+                        self.plugin.remember_llm_response(session_id, response)
                     text = getattr(response, "completion_text", "") or ""
                     return LLMReply(text=text, ok=True)
                 except Exception as retry_exc:
@@ -235,6 +330,10 @@ class AstrBotLLM:
                 return LLMReply(ok=False, error=str(exc))
         finally:
             self.plugin.reset_self_initiated(token)
+        if self.role == "main":
+            # 主模型的原始响应留给「回复钩子」用：别的插件可能要看 usage / id 这些字段，
+            # 自己拼一个假的响应它们会读不到而报错。
+            self.plugin.remember_llm_response(session_id, response)
         text = getattr(response, "completion_text", "") or ""
         return LLMReply(text=text, ok=True)
 
@@ -527,7 +626,7 @@ class AstrBotMessenger:
         # 一条消息一个消息链：平台侧才会显示成多条（分段回复）。
         # 全部塞进同一个 chain 的话，多数平台会拼成一条发出去。
         ok = False
-        for text in texts:
+        for index, text in enumerate(texts):
             try:
                 result = await self.plugin.context.send_message(
                     session_id, MessageChain(chain=[Plain(text=str(text))])
@@ -537,6 +636,12 @@ class AstrBotMessenger:
                 # 失败就失败：不重试、不补发，后面的几条也不再试（平台已经不通了）
                 self.mark_failed(session_id, exc)
                 break
+            if index == len(texts) - 1:
+                break  # 最后一条不用再等
+            delay = self.plugin.typing_delay_for(text)
+            if delay > 0:
+                # 分段之间停一下，群里看起来像她在一句句打字
+                await asyncio.sleep(delay)
         if ok:
             self.mark_sent(session_id)
         return ok
@@ -600,6 +705,30 @@ class AstrBotMessenger:
         if not isinstance(info, dict):
             return ""
         return str(info.get("card") or info.get("nickname") or "").strip()
+
+    async def poke(self, session_id: str, user_id: str) -> PokeResult:
+        """戳一戳某个群友。
+
+        走 AstrBot 的 ``Poke`` 消息段（OneBot 的 ``poke``），QQ 系平台支持；
+        其它平台会抛错，把原因带回去让她改用一句话说。
+        """
+
+        target = str(user_id or "").strip()
+        if not target:
+            return PokeResult(False, "没有指定要戳谁")
+        if self.blocked(session_id):
+            return PokeResult(False, "上一次发送失败，正在冷却")
+        try:
+            from astrbot.api.message_components import Poke
+        except Exception:
+            return PokeResult(False, "当前 AstrBot 版本没有 Poke 消息段")
+        try:
+            await self.plugin.context.send_message(
+                session_id, MessageChain(chain=[Poke(id=target)])
+            )
+        except Exception as exc:
+            return PokeResult(False, f"{type(exc).__name__}: {exc}")
+        return PokeResult(True)
 
 
 class AstrBotTools:
@@ -992,7 +1121,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "Codex",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v1.2.1",
+    "v1.3.0",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -1023,6 +1152,8 @@ class VirtualWorldPlugin(Star):
         self.auth = EditorAuth(self, str(config.get("web_password") or ""))
 
         self._last_events: "OrderedDict[str, AstrMessageEvent]" = OrderedDict()
+        self._llm_responses: "OrderedDict[str, Any]" = OrderedDict()
+        """最近一次主模型调用的原始响应（按会话存，供回复钩子使用）。"""
         self._tick_task: asyncio.Task | None = None
         self._self_initiated_depth = 0
         # 发送方持有「失败冷却」，所以自己留一份（回退响应路径也要用它判断）
@@ -1077,6 +1208,9 @@ class VirtualWorldPlugin(Star):
             )
 
     async def terminate(self) -> None:
+        # 宿主重载插件时是「先调 terminate()，再解绑事件处理器」，
+        # 这个窗口里进来的消息还会走到这个实例上。标记一下，让所有入口直接装死。
+        self._retired = True
         task, self._tick_task = self._tick_task, None
         if task is not None:
             task.cancel()
@@ -1090,10 +1224,24 @@ class VirtualWorldPlugin(Star):
             pass
         self.logger.info("[virtual_world] 已停止世界时钟")
 
+    @property
+    def retired(self) -> bool:
+        """这个实例已经被终止（重载/卸载）了。"""
+
+        return bool(getattr(self, "_retired", False))
+
     async def _tick_loop(self) -> None:
+        # 固定节拍：按「上一次唤醒 + 间隔」推算下一次唤醒，而不是跑完再睡 60 秒。
+        # 后者会被每轮 tick 自身的耗时（调模型可能要好几秒）一直往后推，
+        # 攒着攒着就整分钟跳过去，那一分钟到点的日程永远等不到。
+        next_at = time.time() + self.tick_interval
         while True:
             try:
-                await asyncio.sleep(self.tick_interval)
+                await asyncio.sleep(max(0.5, next_at - time.time()))
+                next_at += self.tick_interval
+                if next_at < time.time():
+                    # 落后太多（宿主机卡顿 / 长时间睡眠）就重新对齐，别追赶
+                    next_at = time.time() + self.tick_interval
                 outcomes = await self.engine.tick()
                 if self.debug and outcomes:
                     for outcome in outcomes:
@@ -1120,6 +1268,20 @@ class VirtualWorldPlugin(Star):
         if not self._last_events:
             return None
         return next(reversed(self._last_events.values()))
+
+    def remember_llm_response(self, session_id: str, response: Any) -> None:
+        """记下主模型的原始响应（回复钩子要拿它给别的插件看）。"""
+
+        if response is None or not session_id:
+            return
+        self._llm_responses[session_id] = response
+        self._llm_responses.move_to_end(session_id)
+        while len(self._llm_responses) > 50:
+            self._llm_responses.popitem(last=False)
+
+    def take_llm_response(self, session_id: str) -> Any:
+        response = self._llm_responses.pop(session_id, None)
+        return response
 
     def _pronoun(self) -> str:
         """由全局设置里的性别决定称呼：她 / 他 / ta。"""
@@ -1185,48 +1347,65 @@ class VirtualWorldPlugin(Star):
         notes: list[str] = []
         if _is_forwarded(event):
             notes.append("这是一条转发的聊天记录，不是当前群里正在说的话")
-        sources = _image_sources(event)
-        if sources:
-            captions: list[str] = []
-            if getattr(self, "vision", None) is not None and self.vision.enabled:
-                try:
-                    captions = await self.vision.describe(
-                        sources,
-                        question=text,
-                        quoted=_quoted_text(event),
-                        context_lines=await self._recent_chat_lines(event),
-                    )
-                except Exception as exc:
-                    self.logger.debug(f"[virtual_world] 图片转述异常：{exc}")
-                    captions = []
-            described = [
-                f"图片{index + 1}：{caption}"
-                for index, caption in enumerate(captions or [])
-                if caption
-            ]
-            session_id = event.unified_msg_origin
-            if described:
-                # 转述结果同时进日志与调试输出：成功就显示描述
-                await self.engine.note_vision(
-                    session_id,
-                    ok=True,
-                    images=len(sources),
-                    detail="；".join(described),
-                )
-            else:
-                reason = "没配图片转述模型"
-                if getattr(self, "vision", None) is not None and self.vision.enabled:
-                    reason = str(getattr(self.vision, "last_error", "") or "转述没有返回内容")
-                # 失败也记一条：失败原因是排查"模型看不见图片"的唯一线索
-                await self.engine.note_vision(
-                    session_id, ok=False, images=len(sources), detail=reason
-                )
-            notes.append(
-                "；".join(described) if described else "对方发了一张图片，看不清内容"
-            )
+        notes.extend(await self._annotate_images(event, text))
         if not notes:
             return text
         return f"{text}\n［{'；'.join(notes)}］".strip()
+
+    async def _annotate_images(self, event: AstrMessageEvent, text: str) -> list[str]:
+        """图片这一段的处理：转了述就写描述，没配转述模型就交给多模态主模型。
+
+        图片本来在消息里是看不见的，出了任何岔子都要留下一条日志——
+        否则用户只会看到"模型好像没看到图"，却没有任何线索。
+        """
+
+        components = _image_components(event)
+        if not components:
+            return []
+        session_id = event.unified_msg_origin
+        sources = await _image_sources(event)
+        vision = getattr(self, "vision", None)
+        if not sources:
+            detail = "收到图片但拿不到可用地址"
+            debug = _image_components_debug(event)
+            if debug:
+                detail = f"{detail}（组件字段：{debug}）"
+            await self.engine.note_vision(
+                session_id, ok=False, images=len(components), detail=detail
+            )
+            return ["对方发了一张图片，但插件没能取到图片地址（已记进日志）"]
+
+        captions: list[str] = []
+        if vision is not None and vision.enabled:
+            try:
+                captions = await vision.describe(
+                    sources,
+                    question=text,
+                    quoted=_quoted_text(event),
+                    context_lines=await self._recent_chat_lines(event),
+                )
+            except Exception as exc:
+                self.logger.debug(f"[virtual_world] 图片转述异常：{exc}")
+                captions = []
+        described = [
+            f"图片{index + 1}：{caption}"
+            for index, caption in enumerate(captions or [])
+            if caption
+        ]
+        if described:
+            # 转述结果同时进日志与调试输出：成功就显示描述
+            await self.engine.note_vision(
+                session_id, ok=True, images=len(sources), detail="；".join(described)
+            )
+            return described
+        if vision is not None and vision.enabled:
+            reason = str(getattr(vision, "last_error", "") or "转述没有返回内容")
+            await self.engine.note_vision(
+                session_id, ok=False, images=len(sources), detail=reason
+            )
+            return ["对方发了图片，转述模型没能给出内容（已记进日志）"]
+        # 没配转述模型：图片会随这次请求一起交给多模态主模型（见 on_llm_request）
+        return [f"这条消息带了 {len(sources)} 张图片，图片会一起发给你"]
 
     async def _recent_chat_lines(self, event: AstrMessageEvent) -> list[str]:
         """最近几句群聊，用来给图片转述提供话题背景。"""
@@ -1272,6 +1451,8 @@ class VirtualWorldPlugin(Star):
             return
         if event.is_stopped():
             return
+        if self.retired:
+            return
         session_id = event.unified_msg_origin
         if not self.engine.is_enabled(session_id):
             return
@@ -1289,7 +1470,7 @@ class VirtualWorldPlugin(Star):
             # 没配转述模型时，直接把图片交给多模态主模型：
             # 「自上次回复以来收到的图片」+ 这条消息自己的图，按配置的上限截断。
             pending = await self.engine.take_pending_images(session_id)
-            current = _image_sources(event)
+            current = await _image_sources(event)
             limit = max(1, int(self.engine.world.context.image_max))
             merged = list(dict.fromkeys([*pending, *current]))[-limit:]
             if merged:
@@ -1394,13 +1575,15 @@ class VirtualWorldPlugin(Star):
         tool_set.tools = kept
 
     async def _send_reply(self, event: AstrMessageEvent, messages: list[str]) -> None:
-        """把接管产生的消息发回当前会话（逐条发送 = 天然分段回复）。"""
+        """把接管产生的消息发回当前会话（逐条发送 = 天然分段回复）。
+
+        分段之间按上一条的字数停一下：群里看起来就像她在一条条打字，
+        而不是一整坨同时冒出来。停顿有上限，长句子不会等到天荒地老。
+        """
 
         session_id = event.unified_msg_origin
-        for text in messages:
-            content = str(text).strip()
-            if not content:
-                continue
+        pending = [str(item).strip() for item in messages if str(item).strip()]
+        for index, content in enumerate(pending):
             if self.messenger.blocked(session_id):
                 # 刚发送失败过：不再往下试，免得把队列越堆越长
                 break
@@ -1411,6 +1594,24 @@ class VirtualWorldPlugin(Star):
                 # 失败就失败：以前这里会立刻换一条通道再发一次，遇到"超时但其实发出去了"
                 # 的情况就会重复刷屏，所以只保留一次尝试。
                 self.messenger.mark_failed(session_id, exc)
+                continue
+            if index == len(pending) - 1:
+                break  # 最后一条不用再等
+            delay = self.typing_delay_for(content)
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+    def typing_delay_for(self, text: str) -> float:
+        """按字数算这一次的「打字」停顿（秒）。0 表示不等待。"""
+
+        style = getattr(self.engine.world, "reply_style", None)
+        if style is None or not bool(getattr(style, "typing_delay_enabled", True)):
+            return 0.0
+        per_char = max(0.0, float(getattr(style, "typing_delay_per_char", 0.0) or 0.0))
+        cap = max(0.0, float(getattr(style, "typing_delay_max", 0.0) or 0.0))
+        if per_char <= 0 or cap <= 0:
+            return 0.0
+        return min(cap, len(str(text)) * per_char)
 
     @staticmethod
     def split_messages(messages: list[str], *, limit: int = 8) -> list[str]:
@@ -1450,7 +1651,7 @@ class VirtualWorldPlugin(Star):
 
         joined = "\n".join(messages)
         try:
-            response = LLMResponse(role="assistant", completion_text=joined)
+            response = self._hook_response(event, joined, LLMResponse)
             await call_event_hook(event, EventType.OnLLMResponseEvent, response)
             edited = str(getattr(response, "completion_text", "") or "")
             if edited and edited != joined:
@@ -1493,6 +1694,27 @@ class VirtualWorldPlugin(Star):
             self.logger.warning(f"[virtual_world] 回复钩子（发送前）执行出错：{exc}")
         return messages
 
+    def _hook_response(self, event: AstrMessageEvent, text: str, response_cls: Any) -> Any:
+        """给回复钩子准备一个「像真的」的模型响应。
+
+        别的插件可能读 ``usage`` / ``id`` / ``role`` 这些字段，自己拼一个空的响应它们
+        会直接抛异常（异常被宿主吞掉，表现就是"收不到钩子"）。所以优先拿主模型
+        真实响应的浅拷贝，只把文本换成最终要说的话。
+        """
+
+        session_id = str(getattr(event, "unified_msg_origin", "") or "")
+        raw = self.take_llm_response(session_id) if session_id else None
+        if raw is not None:
+            try:
+                response = copy.copy(raw)
+                response.completion_text = text
+                if hasattr(response, "reasoning_content"):
+                    response.reasoning_content = ""
+                return response
+            except Exception:
+                pass
+        return response_cls(role="assistant", completion_text=text)
+
     def _log_takeover_fallback(self, session_id: str, outcome) -> None:
         if not self.debug:
             return
@@ -1517,6 +1739,8 @@ class VirtualWorldPlugin(Star):
             return
         if self._self_initiated_depth > 0:
             return
+        if self.retired:
+            return
         session_id = event.unified_msg_origin
         if not self.engine.is_enabled(session_id):
             return
@@ -1525,6 +1749,10 @@ class VirtualWorldPlugin(Star):
         text = event.get_message_str() or ""
         if _is_command(text):
             return  # 指令照常走（/vw status、/vw 叫醒 这些要能用）
+        if _image_components(event):
+            # 她在睡觉：这里不额外调转述模型（醒来后那条消息会照常转述），
+            # 但留档里要能看出"有人发了张图"，否则这条消息会是空的。
+            text = f"{text}\n［对方发了一张图片］".strip()
         ctx = MessageContext(
             session_id=session_id,
             user_id=event.get_sender_id(),
@@ -1534,7 +1762,7 @@ class VirtualWorldPlugin(Star):
             is_mentioned=_is_at_bot(event) or bool(event.is_private_chat()),
             is_private=bool(event.is_private_chat()),
             # 记下这条消息带的图片，等下次回复时一起给多模态主模型
-            image_urls=_image_sources(event),
+            image_urls=await _image_sources(event),
         )
         if not await self.engine.should_block_sleep(ctx):
             return
@@ -1547,7 +1775,7 @@ class VirtualWorldPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_any_message(self, event: AstrMessageEvent) -> None:
-        if not self.enabled:
+        if not self.enabled or self.retired:
             return
         session_id = event.unified_msg_origin
         if not self.engine.is_enabled(session_id):
@@ -1571,6 +1799,8 @@ class VirtualWorldPlugin(Star):
 
     @filter.command("vw", alias={"世界", "virtualworld"})
     async def cmd_vw(self, event: AstrMessageEvent):
+        if self.retired:
+            return
         args = _command_args(event)
         action = args[0].lower() if args else "help"
         rest = args[1:]

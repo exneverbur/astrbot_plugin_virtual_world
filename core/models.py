@@ -43,6 +43,7 @@ REQUIRED_BUILTIN_ACTIONS: tuple[str, ...] = (
     "think",
     "share",
     "recall",
+    "poke",
     "schedule_list",
     "schedule_add",
     "schedule_remove",
@@ -595,6 +596,25 @@ class ContextConfig(Permissive):
     """没配图片转述模型时，最多把几张图片直接交给多模态主模型（自上次回复以来）。"""
 
 
+class ReplyStyle(Permissive):
+    """说话的节奏：分段之间的打字延迟，以及"话太密"的判定。"""
+
+    typing_delay_enabled: bool = True
+    """分段发送时，按字数在两条之间停顿一下，像真的在打字。"""
+
+    typing_delay_per_char: float = 0.03
+    """每个字停顿多少秒。"""
+
+    typing_delay_max: float = 2.5
+    """单条消息最多停顿多少秒（不设上限的话长句子会等到天荒地老）。"""
+
+    dense_window_minutes: int = 10
+    """统计"她最近说了多少句"的时间窗。"""
+
+    dense_max_lines: int = 4
+    """窗口里她说超过这么多句，就提醒她这轮少说话、多做动作。"""
+
+
 class DefaultState(Permissive):
     mood: str = "平静"
     energy: float = 0.6
@@ -663,6 +683,7 @@ class WorldConfig(Permissive):
     tool_filter_enabled: bool = True
     decider: DeciderConfig = Field(default_factory=DeciderConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
+    reply_style: ReplyStyle = Field(default_factory=ReplyStyle)
     content_safety: ContentSafety = Field(default_factory=ContentSafety)
     zones: list[ZoneDef] = Field(default_factory=list)
     zone_edges: list[ZoneEdgeDef] = Field(default_factory=list)

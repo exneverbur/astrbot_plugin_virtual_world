@@ -58,6 +58,18 @@ class CardResult:
     card: str = ""
 
 
+@dataclass
+class PokeResult:
+    """一次「戳一戳」的结果。
+
+    协议端不一定支持（支持的只有 QQ 系），不支持时 ``reason`` 会写清原因，
+    调用方据此退化成一句文案，而不是让这次动作凭空消失。
+    """
+
+    ok: bool = False
+    reason: str = ""
+
+
 @runtime_checkable
 class LLMPort(Protocol):
     """单次 LLM 调用的入口。"""
@@ -85,6 +97,9 @@ class MessagePort(Protocol):
 
     async def fetch_group_card(self, session_id: str) -> str: ...
     """读一下她当前在群里的名片（拿不到就返回空串）。"""
+
+    async def poke(self, session_id: str, user_id: str) -> PokeResult: ...
+    """戳一戳某个群友（QQ 系平台独有，失败时在 ``reason`` 里说明）。"""
 
 
 @runtime_checkable

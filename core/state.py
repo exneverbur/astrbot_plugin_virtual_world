@@ -141,6 +141,13 @@ class WorldState:
     last_forced_plan_at: float = 0.0
     last_forced_flag: str = ""
     last_interject_at: float = 0.0
+    schedule_cursor: float = 0.0
+    """日程检查游标（现实时间戳）。只处理「游标之后、现在之前」到点的日程。
+
+    以前是拿 `HH:MM` 精确匹配当前这一分钟，tick 一旦漂移就会整分钟跳过去、
+    那一条日程当天再也不会触发；改成游标之后，跳过的分钟会在下一次检查时补上。
+    """
+
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 

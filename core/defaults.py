@@ -125,6 +125,14 @@ DEFAULT_WORLD: dict[str, Any] = {
         "summary_refresh_minutes": 60,
         "history_max_chars": 400,
     },
+    # 说话的节奏：分段之间的打字停顿，以及"话太密"的判定
+    "reply_style": {
+        "typing_delay_enabled": True,
+        "typing_delay_per_char": 0.03,
+        "typing_delay_max": 2.5,
+        "dense_window_minutes": 10,
+        "dense_max_lines": 4,
+    },
     "content_safety": {
         "blocked_words": [],
         "message_blocklist": [],
@@ -319,6 +327,21 @@ DEFAULT_WORLD: dict[str, Any] = {
             "priority": 5,
             "on_complete": {"effects": {"affect": "+0.10", "loneliness": "-0.05"}},
             "description": "把刚刚的见闻分享到群里。受每小时分享次数限制。",
+        },
+        {
+            "id": "poke",
+            "builtin": True,
+            "name": "戳一戳",
+            "category": "instant",
+            "llm_level": "template",
+            "scope": "global",
+            "target_type": "user",
+            "visible": False,
+            "preconditions": {},
+            "priority": 4,
+            "template": "（{bot}戳了戳{user}）",
+            "on_complete": {"effects": {"affect": "+0.06", "loneliness": "-0.04"}},
+            "description": "戳一下某个群友（QQ 的「戳一戳」）。不用说话就能搭个话，适合提醒对方、或者不知道说什么的时候用。目标填对方的 id。",
         },
         {
             "id": "recall",

@@ -74,9 +74,27 @@ CREATE TABLE IF NOT EXISTS schedule_fire (
     session_id TEXT NOT NULL,
     schedule_id TEXT NOT NULL,
     day_key TEXT NOT NULL,
+    slot TEXT NOT NULL DEFAULT '',
     fired_at REAL NOT NULL,
-    PRIMARY KEY (session_id, schedule_id, day_key)
+    PRIMARY KEY (session_id, schedule_id, day_key, slot)
 );
+"""
+
+# 旧版本建的 schedule_fire 没有 slot 列（主键是 会话+日程+日期），
+# 那样「当天改完时间」也不会再触发。这里做一次原地重建。
+_MIGRATE_SCHEDULE_FIRE = """
+ALTER TABLE schedule_fire RENAME TO schedule_fire_legacy;
+CREATE TABLE schedule_fire (
+    session_id TEXT NOT NULL,
+    schedule_id TEXT NOT NULL,
+    day_key TEXT NOT NULL,
+    slot TEXT NOT NULL DEFAULT '',
+    fired_at REAL NOT NULL,
+    PRIMARY KEY (session_id, schedule_id, day_key, slot)
+);
+INSERT OR IGNORE INTO schedule_fire (session_id, schedule_id, day_key, slot, fired_at)
+    SELECT session_id, schedule_id, day_key, '', fired_at FROM schedule_fire_legacy;
+DROP TABLE schedule_fire_legacy;
 """
 
 
@@ -87,14 +105,26 @@ class Database:
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=30000")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
         with self._lock:
-            self._conn.executescript(SCHEMA)
-            self._conn.commit()
+            self._conn = self._connect()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.executescript(SCHEMA)
+        conn.commit()
+        self._migrate(conn)
+        return conn
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(schedule_fire)")}
+        if columns and "slot" not in columns:
+            conn.executescript(_MIGRATE_SCHEDULE_FIRE)
+            conn.commit()
 
     def close(self) -> None:
         with self._lock:
@@ -103,17 +133,51 @@ class Database:
             except Exception:
                 pass
 
+    def _ensure_open(self) -> None:
+        """连接被关掉之后自己重新连上。
+
+        插件热重载时宿主会先调 terminate()（关库），之后才解绑事件处理器，
+        这个窗口里进来的消息还会走到旧实例；与其让它一直报
+        「Cannot operate on a closed database」，不如自己把连接接回来。
+        """
+
+        try:
+            self._conn.execute("SELECT 1")
+            return
+        except sqlite3.ProgrammingError:
+            pass
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+        self._conn = self._connect()
+
     # ---------------- 通用 ----------------
 
     def _execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
         with self._lock:
-            cursor = self._conn.execute(sql, tuple(params))
-            self._conn.commit()
-            return cursor
+            self._ensure_open()
+            try:
+                cursor = self._conn.execute(sql, tuple(params))
+                self._conn.commit()
+                return cursor
+            except sqlite3.ProgrammingError:
+                # 连接是在中途被关掉的：重连一次再试
+                self._conn = self._connect()
+                cursor = self._conn.execute(sql, tuple(params))
+                self._conn.commit()
+                return cursor
 
     def _query(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
         with self._lock:
-            return list(self._conn.execute(sql, tuple(params)))
+            self._ensure_open()
+            try:
+                return list(self._conn.execute(sql, tuple(params)))
+            except sqlite3.ProgrammingError:
+                self._conn = self._connect()
+                return list(self._conn.execute(sql, tuple(params)))
 
     # ---------------- 世界状态 ----------------
 
@@ -551,14 +615,20 @@ class Database:
 
     # ---------------- 日程触发记录 ----------------
 
-    def mark_schedule_fired(self, *, session_id: str, schedule_id: str, day_key: str) -> bool:
-        """记录一次日程触发；如果当天已经触发过，返回 False。"""
+    def mark_schedule_fired(
+        self, *, session_id: str, schedule_id: str, day_key: str, slot: str = ""
+    ) -> bool:
+        """记录一次日程触发；同一个「日期 + 时间点」触发过就返回 False。
+
+        ``slot`` 是配置里的时间（``HH:MM``）：把时间也纳入去重键之后，
+        「当天改完触发时间」也能正常再触发一次。
+        """
 
         try:
             self._execute(
-                "INSERT INTO schedule_fire (session_id, schedule_id, day_key, fired_at) "
-                "VALUES (?, ?, ?, ?)",
-                (session_id, schedule_id, day_key, time.time()),
+                "INSERT INTO schedule_fire (session_id, schedule_id, day_key, slot, fired_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, schedule_id, day_key, str(slot or ""), time.time()),
             )
             return True
         except sqlite3.IntegrityError:

@@ -5538,6 +5538,28 @@ function formatClock(timestamp) {
   )}:${pad(date.getSeconds())}`;
 }
 
+/** 时段：和提示词里给她的说法保持一致（凌晨 / 清晨 / 上午 / 中午 / 下午 / 傍晚 / 晚上 / 深夜）。 */
+function periodOf(date) {
+  const hour = date.getHours();
+  if (hour < 5) return "凌晨";
+  if (hour < 8) return "清晨";
+  if (hour < 11) return "上午";
+  if (hour < 13) return "中午";
+  if (hour < 17) return "下午";
+  if (hour < 19) return "傍晚";
+  if (hour < 23) return "晚上";
+  return "深夜";
+}
+
+/** 记忆的时间标签：月-日 + 时段（她看到的就是这个）。 */
+function memoryStamp(timestamp) {
+  const value = Number(timestamp);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  const date = new Date(value * 1000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${periodOf(date)}`;
+}
+
 /* ---------------- 列表的批量操作（记忆库 / 日志共用） ---------------- */
 
 /** 列表行前面的勾选框，选中状态记在 ui[selectionKey] 里。 */
@@ -5713,9 +5735,11 @@ async function loadMemories() {
         el(
           "div",
           "meta",
-          `[${memory.id}] ${memory.scope} · ${memory.node_id || "无节点"} · ${memory.type} · 权重 ${Number(
-            memory.weight,
-          ).toFixed(2)} · 召回 ${memory.recall_count}`,
+          `${memoryStamp(memory.created_at)} · [${memory.id}] ${memory.scope} · ${
+            memory.node_id || "无节点"
+          } · ${memory.type} · 权重 ${Number(memory.weight).toFixed(
+            2,
+          )} · 召回 ${memory.recall_count}`,
         ),
       );
       item.appendChild(info);
@@ -5893,6 +5917,7 @@ function renderSettings() {
   world.engagement = world.engagement || {};
   world.nickname_sync = world.nickname_sync || {};
   world.content_safety = world.content_safety || {};
+  world.reply_style = world.reply_style || {};
   const form = $("settings-form");
   form.innerHTML = "";
   form.className = "form settings";
@@ -6064,6 +6089,76 @@ function renderSettings() {
     );
   });
   form.appendChild(limits);
+
+  /* --- 说话节奏 --- */
+  const style = settingsSection(
+    "说话节奏",
+    "她一句一句发消息时的停顿，以及「最近话太密」的判定。",
+    "群里分段回复如果同一瞬间全冒出来，一眼就能看出是机器；按字数停一下读起来才像人在打字。",
+  );
+  style._fields.appendChild(
+    checkboxField(
+      "分段回复之间模拟打字停顿",
+      world.reply_style.typing_delay_enabled !== false,
+      (value) => (world.reply_style.typing_delay_enabled = value),
+      {
+        hint:
+          "她一次说好几句时，两条之间会按上一句的字数等一会儿再发。关掉就是几条消息一起冒出来。",
+      },
+    ),
+  );
+  style._fields.appendChild(
+    inputField(
+      "每个字停顿（秒）",
+      num(world.reply_style.typing_delay_per_char, 0.03),
+      (value) => (world.reply_style.typing_delay_per_char = num(value, 0.03)),
+      {
+        hint: "默认 0.03 秒/字：一句话 20 个字大概等 0.6 秒。",
+        type: "number",
+        step: "0.005",
+        min: 0,
+      },
+    ),
+  );
+  style._fields.appendChild(
+    inputField(
+      "单条最多停顿（秒）",
+      num(world.reply_style.typing_delay_max, 2.5),
+      (value) => (world.reply_style.typing_delay_max = num(value, 2.5)),
+      {
+        hint: "上限。长句子不会一直等下去，默认 2.5 秒。",
+        type: "number",
+        step: "0.5",
+        min: 0,
+      },
+    ),
+  );
+  style._fields.appendChild(
+    inputField(
+      "说话密度统计窗口（分钟）",
+      num(world.reply_style.dense_window_minutes, 10),
+      (value) => (world.reply_style.dense_window_minutes = num(value, 10)),
+      {
+        hint: "统计「她最近说了多少句」的时间范围。",
+        type: "number",
+        min: 1,
+      },
+    ),
+  );
+  style._fields.appendChild(
+    inputField(
+      "窗口内说几句算太密",
+      num(world.reply_style.dense_max_lines, 4),
+      (value) => (world.reply_style.dense_max_lines = num(value, 4)),
+      {
+        hint:
+          "超过这个句数，提示词里会提醒她「这轮少说话、多做动作」。她仍然可以开口，只是会被提示收敛。",
+        type: "number",
+        min: 1,
+      },
+    ),
+  );
+  form.appendChild(style);
 
   /* --- 自主决策 --- */
   world.decider = world.decider || {};

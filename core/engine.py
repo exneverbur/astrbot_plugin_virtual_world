@@ -236,6 +236,8 @@ class VirtualWorldEngine:
         self._filled_params: dict[tuple[str, str], dict[str, Any]] = {}
         self._last_llm: dict[str, dict[str, Any]] = {}
         """每个会话最近一次主模型调用的结果（编辑器「模型通道」那行要看）。"""
+        self._schedule_signature: list[tuple[Any, ...]] | None = None
+        self._schedule_reset_pending = False
         self._last_tick_at: float = 0.0
         self._self_initiated = asyncio.Event()
         self._self_initiated_tasks: set[asyncio.Task] = set()
@@ -248,6 +250,22 @@ class VirtualWorldEngine:
         """热加载配置：世界 / 日程 / 会话。"""
 
         world, schedules, sessions, warnings = self.store.reload()
+        # 日程内容变了（改了时间/星期/动作）就把检查游标往回拨一次，
+        # 否则「刚把时间改到现在」的日程会被当成已经检查过的过去。
+        signature = [
+            (
+                item.id,
+                bool(item.enabled),
+                str(item.time),
+                tuple(item.days or []),
+                tuple(item.sessions or []),
+                int(item.priority),
+            )
+            for item in (schedules.schedules if schedules is not None else [])
+        ]
+        if self._schedule_signature is not None and signature != self._schedule_signature:
+            self._schedule_reset_pending = True
+        self._schedule_signature = signature
         self.world = world
         self.schedules = schedules
         self.sessions = sessions
@@ -599,6 +617,9 @@ class VirtualWorldEngine:
                 node = self.node(state.node_id)
 
             extra_notes, woke = self._record_user_message(state, ctx)
+            density = self.speech_density_hint(state)
+            if density:
+                extra_notes.append(density)
             # 刚被搭话（她马上要回一句）：接下来一段时间别再因为孤独感主动开口
             self.engagement.note_passive_reply(state, tick_seconds=self.tick_seconds)
             if woke:
@@ -839,6 +860,65 @@ class VirtualWorldEngine:
             return True
         return not any(word and word in text for word in blocked)
 
+    # ---------------- 这句话是不是「对她说的」 ----------------
+
+    def bot_names(self, state: WorldState) -> list[str]:
+        """她的各种叫法：全局设置里的 Bot 名称 + 当前 / 原始群名片。"""
+
+        names = [
+            str(self.world.bot_name or "").strip(),
+            str(state.bot_current_nickname or "").strip(),
+            str(state.bot_base_nickname or "").strip(),
+        ]
+        return [name for name in dict.fromkeys(names) if name]
+
+    def reply_addressing(self, state: WorldState, ctx: MessageContext) -> str:
+        """这次回复是「对她说」还是「群里在聊、她去插一句」。
+
+        只有 @ 了她、私聊、叫了她的名字，或者紧接着她自己那句话往下说，
+        才算对她说；其余一律按插话处理——否则群里随便一句话都会被她当成
+        "有人在指使我"，答非所问还会乱做动作。
+        """
+
+        if ctx.is_private or ctx.is_mentioned:
+            return "direct"
+        text = str(ctx.text or "")
+        for name in self.bot_names(state):
+            if name and name in text:
+                return "direct"
+        # 上下文里最后一条通常就是刚记下的这条消息（先记后回），
+        # 把它去掉，看前一条是谁说的：她刚说完话就有人接上，多半还在同一个话题里。
+        context = self.chat_context(state)
+        prior = list(context)
+        if prior and not prior[-1].get("is_self"):
+            prior = prior[:-1]
+        if prior and prior[-1].get("is_self"):
+            return "direct"
+        return "interject"
+
+    def speech_density_hint(self, state: WorldState) -> str:
+        """「最近话太密」的提示：把事实摆给模型，让她这轮少说多做。"""
+
+        style = getattr(self.world, "reply_style", None)
+        if style is None:
+            return ""
+        window_minutes = max(1, int(getattr(style, "dense_window_minutes", 10) or 10))
+        limit = max(1, int(getattr(style, "dense_max_lines", 4) or 4))
+        since = self._now() - window_minutes * 60
+        mine = [
+            item
+            for item in state.recent_chat
+            if item.get("is_self") and float(item.get("at") or 0) >= since
+        ]
+        if len(mine) < limit:
+            return ""
+        return (
+            f"# 说话密度提醒\n"
+            f"最近 {window_minutes} 分钟里你已经说了 {len(mine)} 句，密度偏高。"
+            "这一轮尽量少说话：能只做动作（发呆、走动、戳一下、想事情…）就别开口；"
+            "真有必要回一句时，短一点，或者干脆安静地做自己的事。"
+        )
+
     # ================= 接管回复（被 @ 时由本插件回复） =================
 
     async def handle_reply(
@@ -868,7 +948,11 @@ class VirtualWorldEngine:
             node = self.node(state.node_id) or self.node(self.default_node_id())
             # 「刚被叫醒」之类的临时提示：接管模式也要带上，否则她会以完全清醒的状态回话
             wake_note = self._take_wake_note(state)
-            extra_notes = [wake_note] if wake_note else None
+            extra_notes = [wake_note] if wake_note else []
+            density = self.speech_density_hint(state)
+            if density:
+                extra_notes.append(density)
+            extra_notes = extra_notes or None
             memories = self.memory.recall(
                 session_id=state.session_id,
                 persona_id=ctx.persona_id,
@@ -894,6 +978,7 @@ class VirtualWorldEngine:
                 user_name=ctx.user_name,
                 text=ctx.text,
                 is_private=ctx.is_private,
+                addressing=self.reply_addressing(state, ctx),
             )
             node_id = state.node_id
 
@@ -1270,33 +1355,116 @@ class VirtualWorldEngine:
         except Exception:
             return datetime.now()
 
+    # 日程检查游标最多往前回看多久（现实秒）。用于重启 / 刚启用时不要把很久以前
+    # 的日程翻出来补跑。
+    SCHEDULE_LOOKBACK_SECONDS = 90
+    SCHEDULE_MAX_GAP_SECONDS = 600
+
+    def _schedule_moment(self, now: datetime, schedule: Any) -> datetime | None:
+        """这条日程「今天的触发时刻」；时间写得不对就返回 None。"""
+
+        try:
+            hour, minute = (int(part) for part in str(schedule.time).split(":")[:2])
+        except (TypeError, ValueError):
+            return None
+        try:
+            return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        except ValueError:
+            return None
+
+    def _schedule_cursor(self, state: WorldState, now: datetime) -> float:
+        """这个会话上次检查到哪一刻（现实时间戳）。"""
+
+        seconds = now.timestamp()
+        cursor = float(getattr(state, "schedule_cursor", 0.0) or 0.0)
+        if cursor <= 0 or cursor > seconds:
+            return seconds - self.SCHEDULE_LOOKBACK_SECONDS
+        if seconds - cursor > self.SCHEDULE_MAX_GAP_SECONDS:
+            # 停了很久（重启、插件没跑）就别把这段时间里的日程全补一遍
+            return seconds - self.SCHEDULE_LOOKBACK_SECONDS
+        return cursor
+
+    def _schedule_reason(self, state: WorldState, conditions: Any) -> str:
+        """日程到点却没跑的原因（写进日志，省得用户猜）。"""
+
+        if conditions is None:
+            return ""
+        if conditions.not_state and state.state in conditions.not_state:
+            return f"她现在是「{state.state}」状态"
+        if conditions.state and state.state not in conditions.state:
+            return f"她现在是「{state.state}」状态，不在允许的列表里"
+        if conditions.min_energy is not None and state.energy < conditions.min_energy:
+            return f"精力 {state.energy:.2f} 低于要求的 {conditions.min_energy}"
+        if conditions.max_energy is not None and state.energy > conditions.max_energy:
+            return f"精力 {state.energy:.2f} 高于允许的 {conditions.max_energy}"
+        if conditions.min_loneliness is not None and state.loneliness < conditions.min_loneliness:
+            return f"孤独感 {state.loneliness:.2f} 低于要求的 {conditions.min_loneliness}"
+        if conditions.node_in and state.node_id not in conditions.node_in:
+            return f"她不在指定地点（现在在 {state.node_id}）"
+        return "条件不满足"
+
     async def run_schedules(self) -> list[TickOutcome]:
-        """检查并触发到点的日程。同一会话同一日程每天只触发一次。"""
+        """检查并触发到点的日程。
+
+        判定不是「当前这一分钟刚好等于配置时间」，而是「游标之后、现在之前」
+        这段时间里到点的都算——tick 被拖慢、整分钟被跳过时也能补上。
+        """
 
         outcomes: list[TickOutcome] = []
         if self.schedules is None:
             return outcomes
         now = self.local_now()
-        current = now.strftime("%H:%M")
+        seconds = now.timestamp()
         day_key = now.strftime("%Y-%m-%d")
-        weekday = now.strftime("%a").lower()[:3]
-
-        due = [
+        weekday = self.WEEKDAY_KEYS[now.weekday()]
+        candidates = [
             schedule
             for schedule in self.schedules.schedules
-            if schedule.enabled
-            and schedule.time == current
-            and weekday in schedule.days
+            if schedule.enabled and (not schedule.days or weekday in schedule.days)
         ]
-        if not due:
-            return outcomes
 
         for session_id in self.enabled_session_ids():
-            for schedule in sorted(due, key=lambda item: item.priority, reverse=True):
-                if schedule.sessions and session_id not in schedule.sessions:
+            async with self.session_state(session_id) as state:
+                if self._schedule_reset_pending:
+                    cursor = seconds - self.SCHEDULE_LOOKBACK_SECONDS
+                else:
+                    cursor = self._schedule_cursor(state, now)
+                state.schedule_cursor = seconds
+                if not candidates:
                     continue
-                async with self.session_state(session_id) as state:
+                due: list[tuple[Any, str]] = []
+                for schedule in candidates:
+                    moment = self._schedule_moment(now, schedule)
+                    if moment is None:
+                        continue
+                    stamp = moment.timestamp()
+                    if cursor < stamp <= seconds:
+                        due.append((schedule, moment.strftime("%H:%M")))
+                for schedule, slot in sorted(
+                    due, key=lambda item: item[0].priority, reverse=True
+                ):
+                    if schedule.sessions and session_id not in schedule.sessions:
+                        continue
+                    label = schedule.id
+                    if schedule.action_chain:
+                        names = [
+                            (self.world.action_map()[step.type].name or step.type)
+                            if step.type in self.world.action_map()
+                            else step.type
+                            for step in schedule.action_chain
+                        ]
+                        if names:
+                            label = f"{schedule.id}（{' → '.join(names)}）"
                     if not self._conditions_ok(state, schedule.conditions):
+                        reason = self._schedule_reason(state, schedule.conditions) or "条件不满足"
+                        await self._log_event(
+                            state,
+                            "skip",
+                            {
+                                "action": f"schedule:{schedule.id}",
+                                "note": f"日程「{label}」到点了却没跑：{reason}",
+                            },
+                        )
                         continue
                     echo_marker = self._event_marker(state)
                     claimed = await self.db.call(
@@ -1304,6 +1472,7 @@ class VirtualWorldEngine:
                         session_id=session_id,
                         schedule_id=schedule.id,
                         day_key=day_key,
+                        slot=slot,
                     )
                     if not claimed:
                         continue
@@ -1316,6 +1485,7 @@ class VirtualWorldEngine:
                     state.add_event("schedule", {"id": schedule.id})
                     await self._echo_events_since(state, outcome, echo_marker)
                     outcomes.append(outcome)
+        self._schedule_reset_pending = False
         return outcomes
 
     def expand_chain_for_travel(self, state: WorldState, chain: list[Any]) -> list[Any]:
@@ -3148,6 +3318,13 @@ class VirtualWorldEngine:
                 advance(state)
                 await self._tick_plan(state, node, outcome, depth=depth + 1)
             return
+        if definition.id == "poke":
+            # 戳一戳：能戳就戳（群里什么都没说也看得出来她在闹），戳不了就退化成一句文案
+            await self._run_poke(state, node, outcome, definition, action)
+            if from_plan and state.current_plan is not None:
+                advance(state)
+                await self._tick_plan(state, node, outcome, depth=depth + 1)
+            return
         if definition.llm_level == "command":
             # 指令触发：拼一条指令交给 AstrBot 跑，再把结果交回给她
             await self._run_command_action(state, node, outcome, definition, action)
@@ -3276,6 +3453,70 @@ class VirtualWorldEngine:
             return str(record["name"])
         return target
 
+    @staticmethod
+    def _target_display(state: WorldState, target: str) -> str:
+        """写进文案里的称呼：认得出名字就用名字，认不出就别把 QQ 号写进句子里。"""
+
+        if not target:
+            return ""
+        record = state.user_presence.get(target)
+        if record and record.get("name"):
+            return str(record["name"])
+        return ""
+
+    async def _run_poke(
+        self,
+        state: WorldState,
+        node: NodeDef | None,
+        outcome: TickOutcome,
+        definition: ActionDef,
+        action: PlannedAction,
+    ) -> None:
+        """戳一戳：调平台接口戳对方一下；平台不支持就退化成一句动作文案。"""
+
+        target = str(action.target or "").strip()
+        if not target:
+            # 没给目标：挑一个最近说过话的人，谁在就戳谁
+            recent = state.recent_active_users(limit=1)
+            target = str(recent[0].get("user_id") or "") if recent else ""
+
+        ok = False
+        reason = ""
+        poker = getattr(self.messenger, "poke", None)
+        if not target:
+            reason = "不知道要戳谁（群里还没有人说话）"
+        elif not callable(poker):
+            reason = "当前发送通道不支持戳一戳"
+        else:
+            try:
+                result = await poker(state.session_id, target)
+                ok = bool(getattr(result, "ok", result))
+                reason = str(getattr(result, "reason", "") or "")
+            except Exception as exc:
+                reason = f"{type(exc).__name__}: {exc}"
+
+        if ok:
+            outcome.notes.append(f"戳了 {self._target_name(state, target)}")
+        else:
+            text = self.render_template(definition.template, state, node, action)
+            if text:
+                outcome.messages.append(text)
+        self.dynamics.apply_effects(
+            state, definition.on_complete.effects, world=self.world
+        )
+        state.add_event("action", {"type": "poke", "visible": bool(outcome.messages)})
+        await self._log_event(
+            state,
+            "action",
+            {
+                "type": "poke",
+                "target": target,
+                "target_name": self._target_name(state, target),
+                "ok": ok,
+                "note": "戳了一戳" if ok else f"没戳成，改用文案：{reason}",
+            },
+        )
+
     def render_template(
         self,
         text: str,
@@ -3292,7 +3533,7 @@ class VirtualWorldEngine:
             or state.bot_base_nickname
             or pronounce_for(self.world.gender)
         )
-        user = self._target_name(state, action.target) or "你"
+        user = self._target_display(state, action.target) or "你"
         result = (
             text.replace("{bot}", bot)
             .replace("{user}", user)

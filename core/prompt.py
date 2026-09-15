@@ -149,7 +149,11 @@ class PromptBuilder:
         return clock_line(now)
 
     def _memory_stamp(self, created_at: float, now: datetime | None) -> str:
-        """记忆的日期标签：今年只写月-日，往年带上年份。"""
+        """记忆的时间标签：日期 + 时段（今年只写月-日，往年带上年份）。
+
+        只有日期的话，"早上跟她聊了什么"和"半夜跟她聊了什么"在记忆里长得一模一样，
+        她回忆起来就会串。
+        """
 
         if not created_at:
             return ""
@@ -157,9 +161,10 @@ class PromptBuilder:
             moment = datetime.fromtimestamp(created_at, tz=now.tzinfo if now else None)
         except Exception:
             return ""
+        period = period_of(moment.hour)
         if now is not None and moment.year == now.year:
-            return moment.strftime("%m-%d")
-        return moment.strftime("%Y-%m-%d")
+            return f"{moment.strftime('%m-%d')} {period}"
+        return f"{moment.strftime('%Y-%m-%d')} {period}"
 
     def set_world(self, world: WorldConfig) -> None:
         self.world = world
@@ -598,19 +603,20 @@ class PromptBuilder:
         items = list(recent_chat or [])
         if not items and not summary and not note:
             return []
-        others: list[str] = []
-        mine: list[str] = []
+        lines: list[str] = []
         for item in items:
             name = str(item.get("name") or item.get("user_id") or "").strip()
             text = _one_line(item.get("text"))
             if not text:
                 continue
             if item.get("is_self"):
-                mine.append(f"- {text}")
+                # 她自己那一句用「你:」标出来：这是对话流的一部分，
+                # 不能拆成另一块——拆开之后模型看不到谁在接谁的话。
+                lines.append(f"- 你: {text}")
                 continue
             identifier = str(item.get("user_id") or "").strip()
             who = f"{name}({identifier})" if name and identifier else (name or identifier)
-            others.append(f"- {who}: {text}")
+            lines.append(f"- {who}: {text}")
         blocks: list[str] = []
         if note:
             blocks.append(
@@ -621,15 +627,13 @@ class PromptBuilder:
             blocks.append(
                 "# 更早的群聊（摘要，只是背景，不要复述）\n" + _one_line(summary, 400)
             )
-        if others:
+        if lines:
             blocks.append(
-                "# 群里最近在聊（只是背景资料，不要逐条复述、不要总结成列表）\n"
-                + "\n".join(others)
-            )
-        if mine:
-            blocks.append(
-                "# 你最近说过的话（不要重复这些句子，也不要再用同样的开头和句式）\n"
-                + "\n".join(mine)
+                "# 群里刚才的对话（按时间顺序，最后一条最新；带「你:」的是你自己说的）\n"
+                "这一串是原样的聊天记录：谁在跟谁说话、话题怎么接的，都看这里。\n"
+                "不要逐条复述、不要总结成列表；也不要重复你自己说过的那几句、"
+                "不要再用同样的开头和句式。\n"
+                + "\n".join(lines)
             )
         return blocks
 
@@ -868,11 +872,27 @@ class PromptBuilder:
         user_name: str,
         text: str,
         is_private: bool = False,
+        addressing: str = "direct",
     ) -> str:
-        """被 @（或其他插件放行）时的用户消息包装。"""
+        """被 @（或其他插件放行）时的用户消息包装。
+
+        ``addressing``：
+        - ``direct``：这句话是对她说的（@ 了她、叫了她的名字、或者接着她刚才的话）；
+        - ``interject``：群里在聊，只是轮到她插一句——不能当成有人点名找她，
+          更不能把别人之间的话当成对她的请求。
+        """
 
         who = user_name or "群友"
-        parts = [f"{who} 对你说：", text]
+        if addressing == "interject":
+            parts = [
+                f"群里正在聊，这句话是说给大家的（{who}）：",
+                text,
+                "",
+                "没有人点名找你。你可以顺着接一句，也可以觉得没必要说就只做自己的事；"
+                "不要把这句话当成别人对你的请求或指令。",
+            ]
+        else:
+            parts = [f"{who} 对你说：", text]
         if is_private:
             parts.append("（这是私聊）")
         parts.append("")
