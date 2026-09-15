@@ -57,6 +57,7 @@
 | `/vw memory` | 看看她记得你什么 |
 | `/vw forget me [话题]` | 让她忘记关于你的记忆 |
 | `/vw schedule` | 查看全部日程 |
+| `/vw schedule run <id>` | 立刻跑一遍某条日程（管理员） |
 | `/vw map` | 查看地图与连线 |
 | `/vw nickname lock / unlock / set <文本> / reset` | 群名片控制（管理员） |
 | `/vw session list / add [ID] / remove <ID> / enable / disable <ID>` | 会话白名单（管理员） |

@@ -2116,7 +2116,14 @@ async function nicknameAction(action) {
 
 function renderSessionSelects() {
   const ids = ui.sessions.map((item) => item.session_id);
-  ["status-session", "memory-session", "debug-session", "log-session", "map-session"].forEach((id) => {
+  [
+    "status-session",
+    "memory-session",
+    "debug-session",
+    "log-session",
+    "map-session",
+    "schedule-session",
+  ].forEach((id) => {
     const select = $(id);
     const previous = select.value;
     select.innerHTML = "";
@@ -5277,6 +5284,12 @@ function renderScheduleList() {
       ),
     );
     item.appendChild(info);
+    const run = el("button", "small", "▶ 立即执行");
+    run.title =
+      "现在就跑一遍这条动作链：忽略时间、星期和触发条件，" +
+      "也不影响它今天到点的正常触发。";
+    run.addEventListener("click", () => runScheduleNow(schedule));
+    item.appendChild(run);
     const del = el("button", "small danger", "删除");
     del.addEventListener("click", () => {
       ui.config.schedules.schedules = schedules().filter((row) => row.id !== schedule.id);
@@ -5294,6 +5307,38 @@ function renderScheduleList() {
     list.appendChild(item);
   });
   if (!schedules().length) list.appendChild(el("p", "muted", "还没有日程。"));
+}
+
+/** 「立即执行」：现在就跑一遍这条日程的动作链。 */
+async function runScheduleNow(schedule) {
+  const sessionId = $("schedule-session").value;
+  if (!sessionId) {
+    toast("先在右上角选一个会话");
+    return;
+  }
+  const chain =
+    (schedule.action_chain || []).map((step) => step.type).join(" → ") || "（没有动作）";
+  const ok = await confirmDialog({
+    title: "立即执行这条日程？",
+    message:
+      `会在「${sessionId}」里马上跑一遍：\n${schedule.time} ${schedule.id}：${chain}\n\n` +
+      "忽略时间和星期（触发条件也一并忽略），也不会影响它今天到点的正常触发。" +
+      "如果她正在忙别的，新安排会排队。",
+    confirmText: "立即执行",
+  });
+  if (!ok) return;
+  try {
+    const result = await apiPost("state/action", {
+      session: sessionId,
+      action: "run_schedule",
+      schedule_id: schedule.id,
+      force: true,
+    });
+    toast(result.ok ? result.note || "已执行" : result.reason || "没有执行");
+    if (result.ok) refreshStatus();
+  } catch (error) {
+    toast(error.message || "执行失败");
+  }
 }
 
 function renderScheduleForm() {
@@ -5385,6 +5430,22 @@ function renderScheduleForm() {
       schedule.action_chain = chain;
     }),
   );
+
+  const runRow = el("div", "row");
+  const runButton = el("button", "ghost", "▶ 立即执行这条日程");
+  runButton.type = "button";
+  runButton.title =
+    "现在就跑一遍这条动作链：忽略时间、星期和触发条件，也不会影响它今天到点的正常触发。";
+  runButton.addEventListener("click", () => runScheduleNow(schedule));
+  runRow.appendChild(runButton);
+  runRow.appendChild(
+    el(
+      "span",
+      "muted",
+      "调试用：不用等到点，直接看她这条动作链会怎么走；结果会真的发到群里。",
+    ),
+  );
+  form.appendChild(runRow);
 }
 
 function weekdayField(schedule) {

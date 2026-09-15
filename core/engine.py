@@ -1499,6 +1499,68 @@ class VirtualWorldEngine:
         self._schedule_reset_pending = False
         return outcomes
 
+    async def run_schedule_now(
+        self, session_id: str, schedule_id: str, *, force: bool = True
+    ) -> dict[str, Any]:
+        """立刻跑一遍某条日程的动作链（编辑器按钮 / `/vw schedule run` 用）。
+
+        - 不看时间与星期，这是"手动跑一次"，**不占当天的触发名额**，
+          到点之后它照常还会正常触发；
+        - ``force=True``（默认）连触发条件一起忽略，方便测试；
+          传 False 时条件不满足会返回原因，不会硬跑。
+        """
+
+        if not self.is_enabled(session_id):
+            return {"ok": False, "reason": "这个会话不在白名单里"}
+        schedule = next(
+            (
+                item
+                for item in (self.schedules.schedules if self.schedules else [])
+                if item.id == schedule_id
+            ),
+            None,
+        )
+        if schedule is None:
+            return {"ok": False, "reason": f"没有找到日程「{schedule_id}」"}
+        if not schedule.enabled and not force:
+            return {"ok": False, "reason": f"日程「{schedule.id}」是停用状态"}
+
+        outcome = TickOutcome(session_id=session_id)
+        async with self.session_state(session_id) as state:
+            if not force and not self._conditions_ok(state, schedule.conditions):
+                reason = self._schedule_reason(state, schedule.conditions) or "条件不满足"
+                return {
+                    "ok": False,
+                    "reason": f"触发条件不满足：{reason}",
+                    "schedule_id": schedule.id,
+                }
+            echo_marker = await self._event_marker(state)
+            chain = schedule.action_chain
+            if schedule.auto_travel:
+                chain = self.expand_chain_for_travel(state, chain)
+            await self._run_chain(state, chain, outcome, depth=0)
+            state.add_event("schedule", {"id": schedule.id, "manual": True})
+            await self._echo_events_since(state, outcome, echo_marker)
+            running = str((state.current_action or {}).get("desc") or "")
+
+        await self._deliver(outcome)
+        notes = [str(item) for item in outcome.notes if str(item).strip()]
+        if notes:
+            summary = "；".join(notes)
+        elif outcome.messages:
+            summary = "她说：" + " / ".join(outcome.messages)
+        elif running:
+            summary = f"她现在在做：{running}"
+        else:
+            summary = "动作链跑完了"
+        return {
+            "ok": True,
+            "schedule_id": schedule.id,
+            "messages": list(outcome.messages),
+            "notes": notes,
+            "note": _clip_text(f"已执行「{schedule.time} {schedule.id}」：{summary}", 160),
+        }
+
     def expand_chain_for_travel(self, state: WorldState, chain: list[Any]) -> list[Any]:
         """给日程的 auto_travel 用：把"需要先在某处"的动作前面自动插一步移动。
 

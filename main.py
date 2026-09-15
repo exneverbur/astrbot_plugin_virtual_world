@@ -2036,6 +2036,20 @@ class VirtualWorldPlugin(Star):
             return
 
         if action in ("schedule", "日程"):
+            if rest and rest[0].lower() in ("run", "执行", "立即"):
+                if not event.is_admin():
+                    yield event.plain_result("只有管理员可以让日程立刻执行。")
+                    return
+                if len(rest) < 2:
+                    yield event.plain_result("用法：/vw schedule run <日程 id>")
+                    return
+                result = await self.engine.run_schedule_now(
+                    event.unified_msg_origin, rest[1]
+                )
+                yield event.plain_result(
+                    result.get("note") or result.get("reason") or "已执行"
+                )
+                return
             lines = ["当前日程："]
             for schedule in (self.engine.schedules.schedules if self.engine.schedules else []):
                 mark = "✅" if schedule.enabled else "⛔"
@@ -2683,6 +2697,13 @@ class VirtualWorldPlugin(Star):
                 session_id, dict(payload.get("values") or {})
             )
             return json_response({"ok": True, "applied": applied})
+        if action == "run_schedule":
+            result = await self.engine.run_schedule_now(
+                session_id,
+                str(payload.get("schedule_id") or ""),
+                force=bool(payload.get("force", True)),
+            )
+            return json_response(result)
         if action == "set_nickname":
             text = str(payload.get("text") or "").strip()
             if not text:
@@ -3111,6 +3132,7 @@ def _help_text(pronoun: str = "她") -> str:
         f"· /vw memory            看看{pronoun}记得你什么\n"
         f"· /vw forget me [话题]  让{pronoun}忘记关于你的记忆\n"
         "· /vw schedule          查看日程\n"
+        "· /vw schedule run <id> 立刻跑一遍某条日程（管理员）\n"
         "· /vw map               查看地图\n"
         "· /vw nickname lock|unlock|set <文本>|reset   群名片控制（管理员）\n"
         "· /vw session list|add [ID]|remove <ID>|enable|disable <ID>   会话白名单（管理员）\n"
