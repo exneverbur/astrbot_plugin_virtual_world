@@ -480,6 +480,110 @@ function fieldHead(label, hint) {
 
 /* ---- 通用表单控件（每个都支持 hint 悬停说明） ---- */
 
+/**
+ * 组合框：点一下就把候选列表展开，同时也允许直接输入新值。
+ * （原生 datalist 要先打字才会展开，这里换成"点开即显示全部候选 + 输入即过滤"。）
+ */
+function comboField(label, value, options, onChange, opts = {}) {
+  const wrapper = el("div", "field combo-field");
+  wrapper.appendChild(fieldHead(label, opts.hint));
+  const box = el("div", "combo");
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = value ?? "";
+  if (opts.placeholder) input.placeholder = opts.placeholder;
+  box.appendChild(input);
+
+  const caret = el("button", "combo-caret", "▾");
+  caret.type = "button";
+  caret.title = "展开候选";
+  box.appendChild(caret);
+
+  const panel = el("div", "combo-panel hidden");
+  box.appendChild(panel);
+  wrapper.appendChild(box);
+
+  const all = Array.from(new Set((options || []).map((item) => String(item))))
+    .filter((item) => item)
+    .sort();
+  let cursor = -1;
+
+  function visible() {
+    const keyword = input.value.trim().toLowerCase();
+    if (!keyword) return all;
+    return all.filter((item) => item.toLowerCase().includes(keyword));
+  }
+
+  function commit(text) {
+    input.value = text;
+    onChange(text);
+  }
+
+  function close() {
+    panel.classList.add("hidden");
+    cursor = -1;
+  }
+
+  function draw() {
+    const items = visible();
+    panel.innerHTML = "";
+    if (!items.length) {
+      panel.appendChild(
+        el(
+          "div",
+          "combo-empty",
+          all.length ? "没有匹配的分组，直接输入就是新建一个" : "还没有别的分组，直接输入即可",
+        ),
+      );
+    }
+    items.forEach((item, index) => {
+      const row = el("div", `combo-item${index === cursor ? " cursor" : ""}`, item);
+      row.addEventListener("mousedown", (event) => {
+        // mousedown 早于 input 的 blur，先抢下来再关面板
+        event.preventDefault();
+        commit(item);
+        close();
+      });
+      panel.appendChild(row);
+    });
+    panel.classList.remove("hidden");
+  }
+
+  caret.addEventListener("mousedown", (event) => {
+    event.preventDefault();
+    if (panel.classList.contains("hidden")) draw();
+    else close();
+  });
+  input.addEventListener("focus", draw);
+  input.addEventListener("click", draw);
+  input.addEventListener("input", () => {
+    cursor = -1;
+    draw();
+  });
+  input.addEventListener("change", () => commit(input.value.trim()));
+  input.addEventListener("blur", () => window.setTimeout(close, 120));
+  input.addEventListener("keydown", (event) => {
+    const items = visible();
+    if (event.key === "Escape") {
+      close();
+      return;
+    }
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      if (!items.length) return;
+      event.preventDefault();
+      cursor = (cursor + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+      draw();
+      return;
+    }
+    if (event.key === "Enter" && cursor >= 0 && items[cursor]) {
+      event.preventDefault();
+      commit(items[cursor]);
+      close();
+    }
+  });
+  return wrapper;
+}
+
 function inputField(label, value, onChange, opts = {}) {
   const wrapper = el("label");
   wrapper.appendChild(fieldHead(label, opts.hint));
@@ -2135,54 +2239,272 @@ function renderValueRows(values) {
   }
 }
 
+/** 状态卡的一行：左边一个灰色小标签，右边是内容。 */
+function statusLine(box, label, value, tone = "") {
+  const row = el("div", `status-line${tone ? ` ${tone}` : ""}`);
+  if (label) row.appendChild(el("span", "status-key", label));
+  const text = el("span", "status-val");
+  text.textContent = value;
+  row.appendChild(text);
+  box.appendChild(row);
+  return row;
+}
+
+/** 状态卡里带进度条的一行：进度条 + 后面的说明文字。 */
+function statusMeter(box, label, ratio, note) {
+  const row = el("div", "status-line");
+  row.appendChild(el("span", "status-key", label));
+  const meter = el("div", "status-meter");
+  const bar = el("div", "bar");
+  const fill = document.createElement("i");
+  const safe = Math.min(1, Math.max(0, Number(ratio) || 0));
+  fill.style.width = `${Math.round(safe * 100)}%`;
+  bar.appendChild(fill);
+  meter.appendChild(bar);
+  meter.appendChild(el("span", "status-note", note));
+  row.appendChild(meter);
+  box.appendChild(row);
+  return row;
+}
+
+/** 「还有多久」说成人话。 */
+function countdownText(minutes) {
+  const value = Math.max(0, Math.round(Number(minutes) || 0));
+  if (value < 1) return "马上就到";
+  if (value < 60) return `还有 ${value} 分钟`;
+  const hours = Math.floor(value / 60);
+  const rest = value % 60;
+  return rest ? `还有 ${hours} 小时 ${rest} 分` : `还有 ${hours} 小时`;
+}
+
+/** 「多久以前」说成人话。 */
+function agoText(seconds) {
+  const value = Math.max(0, Math.round(Number(seconds) || 0));
+  if (value < 5) return "刚刚";
+  if (value < 60) return `${value} 秒前`;
+  if (value < 3600) return `${Math.floor(value / 60)} 分钟前`;
+  return `${Math.floor(value / 3600)} 小时前`;
+}
+
+/** 「多长时间」说成人话（不加"还有"）。 */
+function durationText(minutes) {
+  const value = Math.max(0, Math.round(Number(minutes) || 0));
+  if (value < 60) return `${value} 分钟`;
+  const hours = Math.floor(value / 60);
+  const rest = value % 60;
+  return rest ? `${hours} 小时 ${rest} 分` : `${hours} 小时`;
+}
+
+/** 一个动作 / 一步计划显示成活的名字。 */
+function actionLabel(id) {
+  if (!id) return "";
+  const definition = actions().find((item) => item.id === id);
+  return definition ? definition.name || definition.id : id;
+}
+
+/** 左栏「当前状态」：没选会话时的占位。 */
+function setStatusEmpty(text) {
+  $("status-head").innerHTML = "";
+  ["status-time", "status-progress", "status-runtime"].forEach((id) => {
+    const box = $(id);
+    if (!box) return;
+    box.innerHTML = "";
+    statusLine(box, "", text, "muted");
+  });
+  $("status-warn").innerHTML = "";
+}
+
+/**
+ * 左栏「当前状态」三小节：
+ *   时间与日程 → 现在几点/时段、世界时间对照、下一条日程倒计时
+ *   正在进行   → 当前动作进度、计划进度、区域 · 地点
+ *   互动与运行 → 最近活跃的人、未回应的群聊、刚聊过什么、本小时额度、通道状态
+ */
+function renderStatusSections(data, stateLabel) {
+  const head = $("status-head");
+  head.innerHTML = "";
+  [
+    `状态：${stateLabel}`,
+    `心情：${data.mood}`,
+    `tick：${data.world_time}`,
+    `名片：${data.nickname || "（未设置）"}`,
+  ].forEach((text) => head.appendChild(el("span", "chip", text)));
+  $("status-warn").innerHTML = "";
+
+  // ---------------- 时间与日程 ----------------
+  const timeBox = $("status-time");
+  timeBox.innerHTML = "";
+  const clock = String(data.clock_text || "").replace(/^现在是：/, "");
+  statusLine(timeBox, "现在", clock || "（读不到系统时间）");
+  const tickSeconds = Math.max(1, Math.round(Number(data.tick_seconds || 60)));
+  statusLine(
+    timeBox,
+    "世界时间",
+    `第 ${data.world_time} 个 tick（1 tick ≈ ${tickSeconds} 秒）· 已推进 ${
+      data.world_elapsed_text || "0 分钟"
+    }`,
+  );
+  const next = data.next_schedule;
+  if (next) {
+    statusLine(
+      timeBox,
+      "下一条日程",
+      `${countdownText(next.in_minutes)} · ${next.weekday} ${next.time} · ${
+        next.actions || "（没配动作）"
+      }${next.auto_travel ? " · 自动先走过去" : ""}`,
+    );
+  } else {
+    statusLine(timeBox, "下一条日程", "没有启用的日程", "muted");
+  }
+
+  // ---------------- 正在进行 ----------------
+  const progressBox = $("status-progress");
+  progressBox.innerHTML = "";
+  const action = data.current_action || {};
+  if (action.type) {
+    const done = Number(action.elapsed_ticks || 0);
+    const total = Math.max(1, Number(action.duration_ticks || 1));
+    const label = action.desc || actionLabel(action.type) || action.type;
+    const totalText = durationText(Math.round((total * tickSeconds) / 60));
+    const doneText = durationText(Math.round((done * tickSeconds) / 60));
+    statusMeter(
+      progressBox,
+      "当前动作",
+      done / total,
+      `${label}（${doneText} / ${totalText}，${done}/${total} tick${
+        action.interruptible === false ? "，不可打断" : ""
+      }）`,
+    );
+  } else {
+    statusMeter(progressBox, "当前动作", 0, "没在做什么");
+  }
+  const plan = data.current_plan;
+  const steps = plan && plan.steps ? plan.steps : [];
+  if (steps.length) {
+    const index = Math.min(Number(plan.current_step || 0), steps.length);
+    const step = steps[Math.min(index, steps.length - 1)] || {};
+    const where = step.target_node ? ` → ${nodeLabel(step.target_node)}` : "";
+    statusMeter(
+      progressBox,
+      "计划进度",
+      index / steps.length,
+      `第 ${Math.min(index + 1, steps.length)}/${steps.length} 步：${actionLabel(
+        step.action,
+      )}${where}`,
+    );
+  } else {
+    statusMeter(progressBox, "计划进度", 0, "没有进行中的计划");
+  }
+  const zoneName = data.zone_name || "（未归属区域）";
+  const nodeName = data.node_name || data.node_id || "未知";
+  statusLine(progressBox, "区域 · 地点", `${zoneName} · ${nodeName}`);
+  const travel = data.travel || [];
+  statusLine(
+    progressBox,
+    "可以走到",
+    travel.length
+      ? travel.map((item) => `${item.name} ${item.ticks} tick`).join("、")
+      : "（这里没有连到别的地方）",
+    travel.length ? "" : "muted",
+  );
+
+  // ---------------- 互动与运行 ----------------
+  const runtimeBox = $("status-runtime");
+  runtimeBox.innerHTML = "";
+  const presence = data.user_presence || [];
+  const tickAgo = (item) => {
+    const ticks = Number(data.world_time || 0) - Number(item.world_time || 0);
+    return ticks > 0 ? `${durationText(Math.round((ticks * tickSeconds) / 60))}前` : "刚刚";
+  };
+  statusLine(
+    runtimeBox,
+    "最近活跃",
+    presence.length
+      ? presence
+          .slice(0, 4)
+          .map((item) => `${item.name || item.user_id}（${tickAgo(item)}）`)
+          .join("、")
+      : "还没人跟她说过话",
+    presence.length ? "" : "muted",
+  );
+  statusLine(
+    runtimeBox,
+    "未回应",
+    `群聊里攒了 ${Number(data.chat_unreplied_count || 0)} 条没回（留档 ${
+      data.chat_history_count || 0
+    } 条）`,
+  );
+  const chatNote = String(data.chat_note || "").trim();
+  statusLine(
+    runtimeBox,
+    "刚聊过",
+    chatNote || "（还没记下之前聊过什么）",
+    chatNote ? "" : "muted",
+  );
+  statusLine(
+    runtimeBox,
+    "决策意愿",
+    `${Number(data.willingness || 0).toFixed(2)}（这一轮问大模型的概率 ${Math.round(
+      Number(data.llm_sample_rate || 0) * 100,
+    )}%）`,
+  );
+  const budget = data.budget || {};
+  const budgetParts = [
+    ["计划", "plan"],
+    ["回话", "text"],
+    ["补参", "tool_param"],
+    ["分享", "share"],
+    ["自主", "autonomous"],
+  ]
+    .filter(([, key]) => budget[key])
+    .map(([label, key]) => `${label} ${budget[key].left}/${budget[key].limit}`);
+  statusLine(
+    runtimeBox,
+    "本小时额度",
+    budgetParts.length ? budgetParts.join(" · ") : "（没有额度配置）",
+    budgetParts.length ? "" : "muted",
+  );
+  const channel = data.channel || {};
+  const blocked = Number(channel.send_blocked_seconds || 0);
+  statusLine(
+    runtimeBox,
+    "发送通道",
+    blocked
+      ? `⚠ 刚发送失败，${blocked} 秒内不再尝试（失败不重发）`
+      : "正常",
+    blocked ? "warn" : "",
+  );
+  const lastLLM = channel.last_llm || {};
+  let llmText = "还没调用过";
+  let llmTone = "muted";
+  if (channel.has_llm === false) {
+    llmText = "没有接上模型";
+    llmTone = "warn";
+  } else if (lastLLM.at) {
+    llmText = `${agoText(lastLLM.ago_seconds)}调用${
+      lastLLM.ok ? "成功" : `失败：${lastLLM.error || "未知原因"}`
+    }`;
+    llmTone = lastLLM.ok ? "" : "warn";
+  }
+  statusLine(
+    runtimeBox,
+    "模型通道",
+    `${channel.llm_provider ? channel.llm_provider : "跟随当前会话供应商"} · ${llmText}`,
+    llmTone,
+  );
+}
+
 async function refreshStatus() {
   const sessionId = $("status-session").value;
   if (!sessionId) {
-    $("status-card").textContent = "还没有添加任何会话白名单。";
+    setStatusEmpty("还没有添加任何会话白名单。");
     return;
   }
   try {
     const data = await apiGet("state", { session: sessionId });
     ui.status = data;
-    const card = $("status-card");
-    card.innerHTML = "";
     const stateLabel = (STATES.find((item) => item.key === data.state) || {}).label || data.state;
-    const chips = [
-      `状态：${stateLabel}`,
-      `心情：${data.mood}`,
-      `tick：${data.world_time}`,
-      `名片：${data.nickname || "（未设置）"}`,
-    ];
-    if (data.unanswered_count) chips.push(`无人回应：${data.unanswered_count}`);
-    chips.push(`上下文留档：${Number(data.chat_history_count || 0)} 条`);
-    if (data.willingness !== undefined) {
-      chips.push(
-        `决策意愿 ${Number(data.willingness).toFixed(2)}（问大模型 ${Math.round(
-          Number(data.llm_sample_rate || 0) * 100,
-        )}%）`,
-      );
-    }
-    chips.forEach((text) => card.appendChild(el("span", "chip", text)));
-    const here = el("div", "status-here");
-    here.appendChild(el("strong", "", "当前位置："));
-    here.appendChild(el("span", "", data.node_name || data.node_id || "未知"));
-    const travel = data.travel || [];
-    here.appendChild(
-      el(
-        "span",
-        "muted",
-        travel.length
-          ? `　从这里出发：${travel
-              .map((item) => `${item.name} ${item.ticks} tick`)
-              .join("、")}`
-          : "　（这里没有连到别的地方）",
-      ),
-    );
-    card.appendChild(here);
-    const action = data.current_action || {};
-    card.appendChild(
-      el("div", "muted", `当前动作：${action.desc || action.type || "没在做什么"}`),
-    );
+    renderStatusSections(data, stateLabel);
     // 地图上标出她此刻所在的地点
     if ($("tab-map")) renderMap();
 
@@ -2247,7 +2569,7 @@ async function refreshStatus() {
         .slice(0, skipIndex)
         .some((item) => item.event_type === "action" || item.event_type === "action_start");
       if (!didSomethingAfter) {
-        card.appendChild(el("div", "warn-line", `⚠ ${events[skipIndex].text}`));
+        $("status-warn").appendChild(el("div", "warn-line", `⚠ ${events[skipIndex].text}`));
       }
     }
   } catch (error) {
@@ -4219,11 +4541,10 @@ function renderActionForm() {
     new Set(actions().map((item) => groupOfAction(item))),
   ).sort();
   form.appendChild(
-    inputField("分组", action.group || "", (value) => (action.group = value.trim()), {
+    comboField("分组", action.group || "", knownGroups, (value) => (action.group = value.trim()), {
       hint:
         "动作库里的归类，随便起名字（下拉里是已有的分组，也可以直接写新的）。" +
         "留空就按用途自动归类。",
-      list: knownGroups,
       placeholder: "例如 互动（对人）",
     }),
   );

@@ -30,6 +30,44 @@ from .tool_policy import allowed_tools
 
 NO_MEMORY_TEXT = "（这里没有特别让你想起什么）"
 
+WEEKDAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+# 小时的时段划分：上界 + 名称，按顺序查第一个命中的
+PERIOD_RANGES = (
+    (5, "凌晨"),
+    (8, "清晨"),
+    (11, "上午"),
+    (13, "中午"),
+    (17, "下午"),
+    (19, "傍晚"),
+    (23, "晚上"),
+    (24, "深夜"),
+)
+
+
+def period_of(hour: int) -> str:
+    """把小时换算成「凌晨 / 清晨 / 上午 / …」。"""
+
+    for limit, name in PERIOD_RANGES:
+        if hour < limit:
+            return name
+    return PERIOD_RANGES[-1][1]
+
+
+def clock_text(now: datetime) -> str:
+    """「日期 + 星期 + 时间 + 时段」。提示词与编辑器共用同一套写法。"""
+
+    return (
+        f"{now.strftime('%Y-%m-%d')}（{WEEKDAY_NAMES[now.weekday()]}）"
+        f"{now.strftime('%H:%M')} —— {period_of(now.hour)}"
+    )
+
+
+def clock_line(now: datetime) -> str:
+    """写进提示词的那一行：``现在是：…``。"""
+
+    return f"现在是：{clock_text(now)}"
+
 
 def prompt_section_index(text: str) -> list[dict[str, Any]]:
     """给一份提示词做分段索引：每段标题 + 字符数。
@@ -108,28 +146,7 @@ class PromptBuilder:
     def _clock_line(now: datetime) -> str:
         """「现在是…」那一行：日期 + 星期 + 时间 + 时段。"""
 
-        weekdays = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
-        hour = now.hour
-        if hour < 5:
-            period = "凌晨"
-        elif hour < 8:
-            period = "清晨"
-        elif hour < 11:
-            period = "上午"
-        elif hour < 13:
-            period = "中午"
-        elif hour < 17:
-            period = "下午"
-        elif hour < 19:
-            period = "傍晚"
-        elif hour < 23:
-            period = "晚上"
-        else:
-            period = "深夜"
-        return (
-            f"现在是：{now.strftime('%Y-%m-%d')}"
-            f"（{weekdays[now.weekday()]}）{now.strftime('%H:%M')} —— {period}"
-        )
+        return clock_line(now)
 
     def _memory_stamp(self, created_at: float, now: datetime | None) -> str:
         """记忆的日期标签：今年只写月-日，往年带上年份。"""

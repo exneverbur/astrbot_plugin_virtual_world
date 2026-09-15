@@ -69,7 +69,22 @@
           <div class="grid two">
             <div class="card">
               <h2>当前状态</h2>
-              <div id="status-card" class="status-card" data-keep-text></div>
+              <div id="status-head" class="status-head" data-keep-text></div>
+              <div class="status-card" data-keep-text>
+                <section class="status-block">
+                  <h3>时间与日程</h3>
+                  <div id="status-time" class="status-lines"></div>
+                </section>
+                <section class="status-block">
+                  <h3>正在进行</h3>
+                  <div id="status-progress" class="status-lines"></div>
+                </section>
+                <section class="status-block">
+                  <h3>互动与运行</h3>
+                  <div id="status-runtime" class="status-lines"></div>
+                </section>
+              </div>
+              <div id="status-warn"></div>
             </div>
             <div class="card">
               <h2 class="values-head">

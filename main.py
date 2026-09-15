@@ -490,6 +490,12 @@ class AstrBotMessenger:
 
         return self._blocked_until.get(session_id, 0.0) > time.time()
 
+    def blocked_seconds(self, session_id: str) -> int:
+        """还要等多少秒才会重新尝试发送（没在冷却里就是 0）。"""
+
+        remain = self._blocked_until.get(session_id, 0.0) - time.time()
+        return max(0, int(remain))
+
     def take_fail_note(self, session_id: str) -> str:
         """取走一次「发送失败」的说明（每个冷却窗口只会有一条）。"""
 
@@ -986,7 +992,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "Codex",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v1.2.0",
+    "v1.2.1",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:

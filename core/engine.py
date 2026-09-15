@@ -43,7 +43,7 @@ from .models import (
 from .nickname import compute_nickname, should_update
 from .pathfinding import find_path, nearest_node, path_ticks
 from .planner import active_plan, advance, create_plan, peek_step
-from .prompt import PromptBuilder
+from .prompt import WEEKDAY_NAMES, PromptBuilder, clock_text
 from .timeline import render_event
 from .ports import CardResult, ToolCallResult
 from .state import (
@@ -234,6 +234,8 @@ class VirtualWorldEngine:
         self._pending_echo: dict[str, list[str]] = {}
         """回复路径之外产生的调试回显，等下一次发送时带出去。"""
         self._filled_params: dict[tuple[str, str], dict[str, Any]] = {}
+        self._last_llm: dict[str, dict[str, Any]] = {}
+        """每个会话最近一次主模型调用的结果（编辑器「模型通道」那行要看）。"""
         self._last_tick_at: float = 0.0
         self._self_initiated = asyncio.Event()
         self._self_initiated_tasks: set[asyncio.Task] = set()
@@ -3496,7 +3498,15 @@ class VirtualWorldEngine:
         contexts: list[dict[str, Any]] | None = None,
         image_urls: list[str] | None = None,
     ) -> str | None:
+        def note(ok: bool, error: str = "") -> None:
+            self._last_llm[session_id] = {
+                "at": self._now(),
+                "ok": bool(ok),
+                "error": str(error)[:200],
+            }
+
         if self.llm is None:
+            note(False, "没有可用的模型")
             return None
         try:
             reply = await self.llm.generate(
@@ -3508,9 +3518,12 @@ class VirtualWorldEngine:
             )
         except Exception as exc:
             self._log("warning", f"LLM 调用失败: {exc}")
+            note(False, f"{type(exc).__name__}: {exc}")
             return None
         if reply is None or not getattr(reply, "ok", True):
+            note(False, getattr(reply, "error", "") or "模型没有返回内容")
             return None
+        note(True)
         return getattr(reply, "text", "") or ""
 
     async def _persona_text(self, session_id: str) -> str:
@@ -4232,9 +4245,145 @@ class VirtualWorldEngine:
 
     # ================= 对外快照 =================
 
+    # ---------------- 编辑器「实时状态」用的几个小查询 ----------------
+
+    WEEKDAY_KEYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+    def _clock_text(self) -> str:
+        """现实时间 + 时段。用的是提示词同一套写法，免得两边说法不一致。"""
+
+        try:
+            return clock_text(self.local_now())
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _duration_text(seconds: Any) -> str:
+        """把秒数说成人话（世界时间对照那一行用）。"""
+
+        try:
+            total = max(0, int(round(float(seconds))))
+        except (TypeError, ValueError):
+            return ""
+        days, rest = divmod(total, 86400)
+        hours, rest = divmod(rest, 3600)
+        minutes = rest // 60
+        if days:
+            return f"{days} 天 {hours} 小时"
+        if hours:
+            return f"{hours} 小时 {minutes} 分"
+        return f"{minutes} 分钟"
+
+    def _next_schedule(self, session_id: str) -> dict[str, Any] | None:
+        """下一条要触发的日程：时间、还有多少分钟、里面有哪些动作。"""
+
+        items = list(getattr(self.schedules, "schedules", None) or [])
+        if not items:
+            return None
+        try:
+            now = self.local_now()
+        except Exception:
+            return None
+        action_map = self.world.action_map()
+        best: dict[str, Any] | None = None
+        for item in items:
+            if not item.enabled:
+                continue
+            sessions = list(item.sessions or [])
+            if sessions and session_id not in sessions:
+                continue
+            try:
+                hour, minute = (int(part) for part in str(item.time).split(":")[:2])
+            except (TypeError, ValueError):
+                continue
+            for offset in range(0, 8):
+                moment = (now + timedelta(days=offset)).replace(
+                    hour=hour, minute=minute, second=0, microsecond=0
+                )
+                if moment <= now:
+                    continue
+                weekday = self.WEEKDAY_KEYS[moment.weekday()]
+                if item.days and weekday not in item.days:
+                    continue
+                minutes = max(0, int(round((moment - now).total_seconds() / 60)))
+                if best is None or minutes < int(best["in_minutes"]):
+                    names = []
+                    for step in item.action_chain or []:
+                        definition = action_map.get(step.type)
+                        names.append(
+                            (definition.name or definition.id) if definition else step.type
+                        )
+                    best = {
+                        "id": item.id,
+                        "time": item.time,
+                        "in_minutes": minutes,
+                        "weekday": WEEKDAY_NAMES[moment.weekday()],
+                        "actions": " → ".join(names),
+                        "auto_travel": bool(item.auto_travel),
+                    }
+                break
+        return best
+
+    def _budget(self, state: WorldState) -> dict[str, dict[str, int]]:
+        """本小时还剩多少额度（跨小时自动归零，和运行时用的是同一套计数）。"""
+
+        hour = self._hour_index(state)
+        limits = self.world.limits
+
+        def quota(count: Any, marker: Any, limit: Any) -> dict[str, int]:
+            total = max(0, int(limit))
+            used = int(count) if int(marker or 0) == hour else 0
+            return {"left": max(0, total - used), "used": min(used, total), "limit": total}
+
+        return {
+            "plan": quota(
+                state.llm_plan_count_hour, state.llm_plan_hour_marker, limits.max_llm_plan_per_hour
+            ),
+            "text": quota(
+                state.llm_text_count_hour, state.llm_text_hour_marker, limits.max_llm_text_per_hour
+            ),
+            "tool_param": quota(
+                state.tool_param_count_hour,
+                state.tool_param_hour_marker,
+                limits.max_tool_param_per_hour,
+            ),
+            "share": quota(
+                state.share_count_hour, state.share_hour_marker, limits.max_share_per_hour
+            ),
+            "autonomous": quota(
+                state.autonomous_count_hour,
+                state.autonomous_hour_marker,
+                limits.max_autonomous_per_hour,
+            ),
+        }
+
+    def _channel_status(self, session_id: str) -> dict[str, Any]:
+        """发送通道与最近一次模型调用的状态（排查"她怎么不说话了"用）。"""
+
+        blocked_seconds = 0
+        try:
+            getter = getattr(self.messenger, "blocked_seconds", None)
+            if callable(getter):
+                blocked_seconds = int(getter(session_id) or 0)
+            elif self.messenger is not None and self.messenger.blocked(session_id):
+                blocked_seconds = -1
+        except Exception:
+            blocked_seconds = 0
+        record = dict(self._last_llm.get(session_id) or {})
+        if record:
+            record["ago_seconds"] = max(0, int(self._now() - float(record.get("at", 0.0))))
+        return {
+            "send_blocked_seconds": blocked_seconds,
+            "last_llm": record,
+            # 空串 = 跟随 AstrBot 当前会话的供应商
+            "llm_provider": str(getattr(self.llm, "provider_id", "") or ""),
+            "has_llm": self.llm is not None,
+        }
+
     async def snapshot(self, session_id: str) -> dict[str, Any]:
         state = await self.load_state(session_id, cold_start=False)
         node = self.node(state.node_id)
+        zone = self.world.zone_map().get(self.world.zone_of(state.node_id))
         return {
             "session_id": session_id,
             "world_time": state.world_time,
@@ -4264,6 +4413,14 @@ class VirtualWorldEngine:
             "chat_summary": str(state.chat_summary or ""),
             "chat_note": str(state.chat_note or ""),
             "nickname": state.bot_current_nickname or state.bot_base_nickname,
+            "zone_id": zone.id if zone is not None else "",
+            "zone_name": zone.name if zone is not None else "",
+            "clock_text": self._clock_text(),
+            "world_elapsed_seconds": int(state.world_time * self.tick_seconds),
+            "world_elapsed_text": self._duration_text(state.world_time * self.tick_seconds),
+            "next_schedule": self._next_schedule(session_id),
+            "budget": self._budget(state),
+            "channel": self._channel_status(session_id),
             # 名片是否被锁住（编辑器里用一个按钮切换，所以要能读到当前状态）
             "nickname_locked": bool(state.bot_nickname_locked),
             "nickname_base": state.bot_base_nickname,
