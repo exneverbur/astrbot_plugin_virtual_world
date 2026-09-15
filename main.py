@@ -33,6 +33,7 @@ from astrbot.api.web import error_response, json_response, request
 
 from .core.config_store import ConfigStore
 from .core.db import AsyncDatabase
+from .core.defaults import DEFAULT_CAPTION_PROMPT
 from .core.engine import SELF_INITIATED_FLAG, MessageContext, VirtualWorldEngine
 from .core.models import normalize_edge_keys, normalize_legacy_keys, pronoun_for
 from .core.nickname import compute_nickname
@@ -338,14 +339,8 @@ class AstrBotLLM:
         return LLMReply(text=text, ok=True)
 
 
-CAPTION_SYSTEM_PROMPT = (
-    "你要帮一个群聊机器人看懂图片。只看图片本身是不够的——还要说清这张图和当前话题的关系，"
-    "这样机器人才知道该怎么接话。\n"
-    "输出一行中文，格式固定为：画面描述｜与话题的关系：…\n"
-    "画面描述：画面里有什么、在做什么、有没有值得注意的文字或表情，40 字以内。\n"
-    "与话题的关系：这张图在回应什么、和正在聊的事有什么关联；确实看不出关系就写「看不出直接关系」。\n"
-    "不要客套、不要分点、不要写「这张图片」、不要编造看不到的内容。"
-)
+CAPTION_SYSTEM_PROMPT = DEFAULT_CAPTION_PROMPT
+"""转述提示词的内置默认值；「全局设置 → 图片转述」里可以改成自己的一套。"""
 
 
 class AstrBotVision:
@@ -361,6 +356,15 @@ class AstrBotVision:
     @property
     def enabled(self) -> bool:
         return bool(self.provider_id.strip())
+
+    def _system_prompt(self) -> str:
+        """当前生效的转述提示词：全局设置里填了就用它，没填用内置默认。"""
+
+        try:
+            prompt = str(self.plugin.engine.world.vision.prompt or "").strip()
+        except Exception:
+            prompt = ""
+        return prompt or CAPTION_SYSTEM_PROMPT
 
     async def describe(
         self,
@@ -410,7 +414,7 @@ class AstrBotVision:
         try:
             response = await self.plugin.context.llm_generate(
                 chat_provider_id=self.provider_id,
-                system_prompt=CAPTION_SYSTEM_PROMPT,
+                system_prompt=self._system_prompt(),
                 prompt=(scene + "\n\n" if scene else "") + "请描述这张图片。",
                 image_urls=[source],
             )
@@ -422,6 +426,44 @@ class AstrBotVision:
         if not text:
             self.last_error = "转述模型没有返回文字（可能不支持图片输入）"
         return " ".join(text.split())[:200]
+
+
+async def _caption_result_images(
+    plugin: "VirtualWorldPlugin",
+    images: list[str],
+    *,
+    scene: str = "",
+) -> tuple[list[str], list[str]]:
+    """工具 / 指令返回的图片：配了转述模型就先转述，没配就原样带回去。
+
+    返回 ``(转述后的描述, 还需要交给多模态模型的图片)``——转述成功就不必再传图片，
+    失败或没配转述模型时把地址原样交上去，由 ``llm_generate`` 那条路处理。
+    """
+
+    if not images:
+        return [], []
+    limit = 3
+    try:
+        limit = max(1, int(plugin.engine.world.context.image_max))
+    except Exception:
+        pass
+    picked = images[:limit]
+    vision = getattr(plugin, "vision", None)
+    if vision is None or not vision.enabled:
+        return [], picked
+    try:
+        captions = await vision.describe(picked, question=scene)
+    except Exception as exc:
+        plugin.logger.debug(f"[virtual_world] 返回内容里的图片转述失败：{exc}")
+        captions = []
+    described = [
+        f"图片{index + 1}：{caption}"
+        for index, caption in enumerate(captions or [])
+        if caption
+    ]
+    if not described:
+        return [], picked
+    return described, []
 
 
 class AstrBotCommands:
@@ -461,21 +503,42 @@ class AstrBotCommands:
         try:
             result = record.handler(real_event, **params)
             texts: list[str] = []
+            images: list[str] = []
             if inspect.isasyncgen(result):
                 async for item in result:
-                    texts.append(_tool_result_text(item))
+                    body, item_images = await _result_text(item)
+                    if body:
+                        texts.append(body)
+                    images.extend(item_images)
             elif inspect.isawaitable(result):
-                texts.append(_tool_result_text(await result))
+                body, item_images = await _result_text(await result)
+                if body:
+                    texts.append(body)
+                images.extend(item_images)
             else:
-                texts.append(_tool_result_text(result))
+                body, item_images = await _result_text(result)
+                if body:
+                    texts.append(body)
+                images.extend(item_images)
         except Exception as exc:
             return ToolCallResult(ok=False, error=f"{type(exc).__name__}: {exc}", tool=word)
         finally:
             restore()
+        captions, pending_images = await _caption_result_images(
+            self.plugin, images, scene=text
+        )
+        if captions:
+            texts.append("；".join(captions))
         body = "\n".join(part for part in texts if part).strip()
         if not body:
-            body = f"（指令「{word}」执行了，但没有返回文字）"
-        return ToolCallResult(ok=True, text=body, tool=word)
+            body = (
+                "（指令执行了，返回了一张图片）"
+                if pending_images
+                else f"（指令「{word}」执行了，但没有返回内容）"
+            )
+        return ToolCallResult(
+            ok=True, text=body, tool=word, image_urls=pending_images
+        )
 
     def _find(self, text: str) -> tuple[Any, Any] | None:
         """按指令名找处理器（含别名）；跳过本插件自己的指令，避免绕回自己。"""
@@ -820,6 +883,18 @@ class AstrBotTools:
             # 拿不到这个会话的事件时用最近一次见过的兜底：工具大多只需要
             # 「谁在什么群说的」，没有事件的话连 call() 都进不去。
             event = self.plugin.last_event_any()
+        if event is None:
+            # 插件刚启动 / 刚重载、群里还没人说话时，一个真实事件都没有。
+            # 这时候硬调只会让工具内部炸出「'NoneType' object has no attribute ...」，
+            # 看不出到底为什么失败——直接说清楚，日志里一眼能懂。
+            return ToolCallResult(
+                ok=False,
+                error=(
+                    "刚启动还没收到过消息，工具需要一条消息当上下文；"
+                    "等群里有人说一句，或者先让她做别的事"
+                ),
+                tool=name,
+            )
         call_params = self._filter_params(name, params, tool)
         # AstrBot 的工具其实有三种写法：@filter.llm_tool 的 handler、新版 call()、
         # 以及老的 run()。MCP 工具和新式工具都没有 handler，只能走 call()。
@@ -831,26 +906,44 @@ class AstrBotTools:
             )
         try:
             result = invoke(event, call_params, self.plugin)
+            images: list[str] = []
             if inspect.isasyncgen(result):
                 last: Any = None
                 async for item in result:
                     last = item
-                text = _tool_result_text(last)
+                text, images = await _result_text(last)
             elif inspect.isawaitable(result):
-                text = _tool_result_text(await result)
+                text, images = await _result_text(await result)
             else:
-                text = _tool_result_text(result)
+                text, images = await _result_text(result)
         except Exception as exc:
             self.plugin.logger.warning(f"[virtual_world] 工具 {name} 调用失败：{exc}")
+            # 工具的报错经常是「event 是 None」这种内部细节，补一句人话更好排查
+            hint = ""
+            if isinstance(exc, AttributeError) and "NoneType" in str(exc):
+                hint = "（工具拿不到消息上下文：插件刚启动或刚重载过，等群里有人说一句再试）"
             return ToolCallResult(
-                ok=False, error=f"调用出错：{exc}", tool=name, params=call_params
+                ok=False, error=f"调用出错：{exc}{hint}", tool=name, params=call_params
             )
+        captions, pending_images = await _caption_result_images(
+            self.plugin, images, scene=str(name)
+        )
+        if captions:
+            text = "\n".join([part for part in (text, "；".join(captions)) if part])
         text = (text or "").strip()
-        if not text:
+        if not text and not pending_images:
             return ToolCallResult(
                 ok=False, error="工具返回了空结果", tool=name, params=call_params
             )
-        return ToolCallResult(ok=True, text=text, tool=name, params=call_params)
+        if not text:
+            text = "（工具返回了一张图片）"
+        return ToolCallResult(
+            ok=True,
+            text=text,
+            tool=name,
+            params=call_params,
+            image_urls=pending_images,
+        )
 
     def _filter_params(
         self, name: str, params: dict[str, Any], tool: Any = None
@@ -945,6 +1038,75 @@ def _tool_result_text(value: Any) -> str:
         if parts:
             return "\n".join(parts)
     return _stringify(value)
+
+
+MAX_RESULT_CHARS = 800
+"""工具 / 指令返回内容进提示词前的截断长度（日志里另有一份更短的）。"""
+
+
+async def _chain_text_and_images(value: Any) -> tuple[str, list[str]] | None:
+    """把 ``MessageChain`` / ``MessageEventResult`` 拆成「人话」和「图片地址」。
+
+    直接 ``str()`` 会得到一坨 dataclass 表示：里面虽然夹着正文，但也塞满了
+    ``Plain(type=...)`` 之类的噪音，既费 token，模型还容易照抄。这里按组件类型
+    老老实实还原——文本归文本、@ 归 @、图片挑出来单独交给多模态模型看。
+
+    返回 ``None`` 表示"这个值不是消息链"，交给别的分支处理。
+    """
+
+    chain = getattr(value, "chain", None)
+    if not isinstance(chain, (list, tuple)):
+        return None
+    texts: list[str] = []
+    images: list[str] = []
+    for component in chain:
+        if _component_named(component, "Plain"):
+            text = str(getattr(component, "text", "") or "")
+            if text:
+                texts.append(text)
+        elif _component_named(component, "At"):
+            who = str(getattr(component, "name", "") or "").strip()
+            qq = str(getattr(component, "qq", "") or "").strip()
+            texts.append(f"@{who or qq}")
+        elif _component_named(component, "Image"):
+            ref = await _resolve_image_ref(component)
+            if ref and ref not in images:
+                images.append(ref)
+            texts.append(f"［图片{len(images)}］" if images else "［图片］")
+        elif _component_named(component, "Face"):
+            texts.append("［表情］")
+        elif _component_named(component, "Reply"):
+            continue
+        else:
+            # 其它组件（语音、文件、转发…）只报个类型名，别把对象表示塞进提示词
+            name = type(component).__name__
+            if name:
+                texts.append(f"［{name}］")
+    return "".join(texts).strip(), images
+
+
+async def _result_text(value: Any) -> tuple[str, list[str]]:
+    """工具 / 指令的返回值 → (文字, 图片地址)。"""
+
+    if value is None:
+        return "", []
+    parts = await _chain_text_and_images(value)
+    if parts is not None:
+        text, images = parts
+        return _clip_brief(text), images
+    if _component_named(value, "Image"):
+        ref = await _resolve_image_ref(value)
+        return "", ([ref] if ref else [])
+    return _clip_brief(_tool_result_text(value)), []
+
+
+def _clip_brief(text: Any) -> str:
+    """返回内容截断：进提示词和进日志都用它，别让一坨 base64 撑爆上下文。"""
+
+    body = str(text or "").strip()
+    if len(body) <= MAX_RESULT_CHARS:
+        return body
+    return body[:MAX_RESULT_CHARS] + "…（内容过长已截断）"
 
 
 class _ToolRunContext:
@@ -1121,7 +1283,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "Codex",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v1.3.0",
+    "v1.3.1",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:

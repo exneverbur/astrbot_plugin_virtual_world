@@ -816,7 +816,7 @@ class VirtualWorldEngine:
         ]
         users = list(dict.fromkeys(users))
         async with self.session_state(session_id) as state:
-            echo_marker = self._event_marker(state)
+            echo_marker = await self._event_marker(state)
             self.memory.remember(
                 session_id=session_id,
                 persona_id=persona_id,
@@ -1017,7 +1017,7 @@ class VirtualWorldEngine:
         # --- 第三阶段：执行动作（重新持锁） ---
         outcome = TickOutcome(session_id=ctx.session_id)
         async with self.session_state(ctx.session_id) as state:
-            echo_marker = self._event_marker(state)
+            echo_marker = await self._event_marker(state)
             node = self.node(state.node_id) or self.node(self.default_node_id())
             state.note_reasoning(parsed.reasoning, source="reply")
             # 对方明确要求停下时，先把她的动作/安排停掉，再执行这一轮的动作
@@ -1360,6 +1360,17 @@ class VirtualWorldEngine:
     SCHEDULE_LOOKBACK_SECONDS = 90
     SCHEDULE_MAX_GAP_SECONDS = 600
 
+    max_followup_chars = 800
+    """动作结果交给大模型续说前的截断长度（base64 图片地址不能整条塞进提示词）。"""
+
+    def _clip_followup(self, text: Any) -> str:
+        """续说前把结果截断：超长内容（例如 base64 图片）不能整条进提示词。"""
+
+        body = str(text or "").strip()
+        if len(body) <= self.max_followup_chars:
+            return body
+        return body[: self.max_followup_chars] + "…（内容过长已截断）"
+
     def _schedule_moment(self, now: datetime, schedule: Any) -> datetime | None:
         """这条日程「今天的触发时刻」；时间写得不对就返回 None。"""
 
@@ -1466,7 +1477,7 @@ class VirtualWorldEngine:
                             },
                         )
                         continue
-                    echo_marker = self._event_marker(state)
+                    echo_marker = await self._event_marker(state)
                     claimed = await self.db.call(
                         "mark_schedule_fired",
                         session_id=session_id,
@@ -1577,7 +1588,7 @@ class VirtualWorldEngine:
     async def _tick_session(self, session_id: str) -> TickOutcome | None:
         outcome = TickOutcome(session_id=session_id)
         async with self.session_state(session_id) as state:
-            echo_marker = self._event_marker(state)
+            echo_marker = await self._event_marker(state)
             node = self.node(state.node_id) or self.node(self.default_node_id())
             state.world_time += 1
 
@@ -1748,6 +1759,9 @@ class VirtualWorldEngine:
 
         trigger = definition.on_complete.trigger if definition else "none"
         detail = str(action.get("tool_result", "") or "")
+        images = list(action.get("tool_images") or [])
+        if not detail and images:
+            detail = "工具返回了一张图片，图片一起发给你了。"
         hint = definition.on_complete.prompt_hint if definition else ""
         want_followup = trigger == "llm_followup"
         is_tool_action = bool(definition is not None and definition.llm_level == "tool")
@@ -1778,7 +1792,10 @@ class VirtualWorldEngine:
                 )
                 label = definition.name or definition.id if definition else ""
                 detail = f"你刚刚做完了「{label}」，用了大约 {minutes} 分钟。"
-            await self._llm_followup(state, node, outcome, hint, detail)
+            detail = self._clip_followup(detail)
+            await self._llm_followup(
+                state, node, outcome, hint, detail, image_urls=images
+            )
         elif trigger == "schedule":
             await self._run_linked_schedule(state, node, outcome, definition, depth=1)
 
@@ -1845,6 +1862,7 @@ class VirtualWorldEngine:
         outcome: TickOutcome,
         hint: str,
         tool_result: str,
+        image_urls: list[str] | None = None,
     ) -> None:
         persona_text = await self._persona_text(state.session_id)
         system_prompt = self.prompts.build_autonomous_system_prompt(
@@ -1864,7 +1882,12 @@ class VirtualWorldEngine:
             reasoning=bool(self.world.reasoning_enabled),
         )
         prompt = self.prompts.build_reply_followup_prompt(hint, tool_result)
-        reply = await self._ask_llm(state.session_id, system_prompt, prompt)
+        reply = await self._ask_llm(
+            state.session_id,
+            system_prompt,
+            prompt,
+            image_urls=list(image_urls or []) or None,
+        )
         outcome.llm_calls += 1
         if reply is None:
             return
@@ -1922,7 +1945,7 @@ class VirtualWorldEngine:
 
         outcome = TickOutcome(session_id=session_id)
         async with self.session_state(session_id) as state:
-            echo_marker = self._event_marker(state)
+            echo_marker = await self._event_marker(state)
             node = self.node(state.node_id) or self.node(self.default_node_id())
             if state.current_action is not None or active_plan(state) is not None:
                 return None
@@ -2689,6 +2712,7 @@ class VirtualWorldEngine:
             outcome.notes.append("没有可用的指令通道，已跳过")
             return
         call = await self.commands.trigger(state.session_id, line)
+        images = list(getattr(call, "image_urls", None) or [])
         await self._log_event(
             state,
             "command",
@@ -2697,6 +2721,7 @@ class VirtualWorldEngine:
                 "command": line,
                 "ok": bool(call.ok),
                 "result": _clip_text(call.text, 400),
+                "images": len(images),
                 "error": call.error,
             },
             outcome=self._echo_into(outcome, state),
@@ -2705,12 +2730,39 @@ class VirtualWorldEngine:
             f"触发指令「{line}」：" + ("成功" if call.ok else f"失败（{call.error}）")
         )
         detail = call.text if call.ok else f"（这条指令没跑成：{call.error}）"
-        hint = (
-            "用你自己的话把这条指令返回的内容讲一句，别照抄格式、别编。"
-            if call.ok
-            else "这条指令没跑成，用一句自然的话说明一下，别编内容。"
+        detail = self._clip_followup(detail)
+        if not detail and images:
+            detail = "这条指令返回了一张图片，图片一起发给你了。"
+
+        # 说完不说一句，看动作里的「完成后」和全局的「工具结果回话」——
+        # 与工具型动作同一套规则，不然用户想让她执行完指令别吭声也关不掉。
+        trigger = str(definition.on_complete.trigger or "none")
+        hint = str(definition.on_complete.prompt_hint or "").strip()
+        want_followup = trigger == "llm_followup"
+        if (
+            not want_followup
+            and trigger == "none"
+            and bool(self.world.tool_result_reply)
+            and (detail or images)
+        ):
+            want_followup = True
+        if not want_followup:
+            outcome.notes.append(f"指令「{line}」已执行，这次不开口")
+            return
+        if not hint:
+            hint = (
+                "用你自己的话把这条指令返回的内容讲一句，别照抄格式、别编。"
+                if call.ok
+                else "这条指令没跑成，用一句自然的话说明一下，别编内容。"
+            )
+        await self._llm_followup(
+            state,
+            node,
+            outcome,
+            hint,
+            detail or "（没有返回内容）",
+            image_urls=images,
         )
-        await self._llm_followup(state, node, outcome, hint, detail or "（没有返回内容）")
 
     async def _compose_command(
         self,
@@ -3095,6 +3147,7 @@ class VirtualWorldEngine:
         stored = dict(action.get("tool_params") or {})
         texts: list[str] = []
         failed: list[str] = []
+        images: list[str] = []
         last_params: dict[str, Any] = {}
         for index, name in enumerate(names):
             params = dict(stored.get(name) or action.get("params") or {})
@@ -3167,6 +3220,7 @@ class VirtualWorldEngine:
                 texts.append(str(call.text))
             elif not call.ok:
                 failed.append(f"{call.tool or name}：{call.error or '没有返回结果'}")
+            images.extend(getattr(call, "image_urls", None) or [])
             state.add_event(
                 "tool",
                 {
@@ -3192,8 +3246,11 @@ class VirtualWorldEngine:
 
         action["tool_names"] = list(names)
         action["tool_name"] = names[-1] if names else ""
-        action["tool_ok"] = bool(texts)
+        # 只有图片也算拿到结果：不然"生成一张图"这类工具会被当成失败
+        action["tool_ok"] = bool(texts or images)
         action["tool_error"] = "；".join(failed)
+        if images:
+            action["tool_images"] = images
         if texts:
             action["tool_result"] = "\n\n".join(texts)
         elif last_params:
@@ -4745,8 +4802,28 @@ class VirtualWorldEngine:
             reasoning=bool(self.world.reasoning_enabled),
         )
 
-    def _event_marker(self, state: WorldState) -> int:
-        return int(self._event_ids.get(state.session_id, 0))
+    async def _event_marker(self, state: WorldState) -> int:
+        """本轮的起点事件 id。
+
+        第一次用到（插件刚启动 / 刚重载）时要从库里取当前最大 id——不能默认 0，
+        否则「把新事件发到群里」会把历史上最后 50 条日志当成新事件重放一遍，
+        变成每个 tick 往群里刷一串老消息。
+        """
+
+        known = self._event_ids.get(state.session_id)
+        if known is not None:
+            return int(known)
+        latest = 0
+        try:
+            rows = await self.db.call(
+                "query_events", session_id=state.session_id, limit=1
+            )
+            if rows:
+                latest = int(rows[0].get("id") or 0)
+        except Exception:
+            latest = 0
+        self._event_ids[state.session_id] = latest
+        return latest
 
     def echo_types(self) -> set[str]:
         """「调试输出」勾选的事件类型（只认认识的 key，空集合 = 关闭）。"""
@@ -4792,7 +4869,14 @@ class VirtualWorldEngine:
         except Exception:
             return
         fresh = [item for item in events if int(item.get("id") or 0) > marker]
-        for item in reversed(fresh):
+        # 处理过就把游标推到最后一条：不然这一批会在下一个 tick 再发一遍
+        # （tick 没有新事件时游标不会自己前进，这就是"同一句话一直刷"的来源）。
+        self._event_ids[state.session_id] = max(
+            [marker] + [int(item.get("id") or 0) for item in events]
+        )
+        # query_events 是新到旧；一次 tick 里最多回显最新的这么多条，
+        # 再按时间正序发出去（连锁动作多的时候不要把群刷了）
+        for item in reversed(fresh[:12]):
             kind = str(item.get("event_type") or "")
             detail = item.get("detail")
             if not isinstance(detail, dict):

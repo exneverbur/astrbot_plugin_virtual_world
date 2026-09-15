@@ -2,7 +2,7 @@ name: astrbot_plugin_virtual_world
 display_name: 虚拟世界VM
 desc: 拟人化插件, 给 Bot 一个私有空间 + 自己的生活节奏：她有自己的地图、动作、日程、场景记忆，能在允许的地点调用 AstrBot 的工具，也会自己走动、做饭、发呆、主动找你说话。致力于让她拥有真正的生活。
 short_desc: Bot 的私有虚拟空间状态机
-version: v1.3.0
+version: v1.3.1
 author: exneverbur
 repo: https://github.com/exneverbur/astrbot_plugin_virtual_world
 astrbot_version: ">=4.20.0"

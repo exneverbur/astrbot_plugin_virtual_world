@@ -48,6 +48,13 @@ class ToolCallResult:
     params: dict[str, Any] = field(default_factory=dict)
     """实际传给工具的参数（已按工具 schema 过滤），日志里记这个才准。"""
 
+    image_urls: list[str] = field(default_factory=list)
+    """工具 / 指令一起返回的图片（http、file://、base64:// 都可能）。
+
+    转述模型可用时会在适配层就换成文字（不会出现在这里）；只有"直接交给多模态主模型"
+    这条路才会把地址带上来。
+    """
+
 
 @dataclass
 class CardResult:

@@ -10,7 +10,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .defaults import DEFAULT_WAKE_WORDS
+from .defaults import DEFAULT_CAPTION_PROMPT, DEFAULT_WAKE_WORDS
 
 
 def _rename_keys(data: Any, mapping: dict[str, str]) -> Any:
@@ -596,6 +596,13 @@ class ContextConfig(Permissive):
     """没配图片转述模型时，最多把几张图片直接交给多模态主模型（自上次回复以来）。"""
 
 
+class VisionCaption(Permissive):
+    """图片转述（把图变成文字再给主模型看）用的提示词。"""
+
+    prompt: str = DEFAULT_CAPTION_PROMPT
+    """转述模型的系统提示词。默认那段会顺带认出「这是不是表情包 / 什么梗」。"""
+
+
 class ReplyStyle(Permissive):
     """说话的节奏：分段之间的打字延迟，以及"话太密"的判定。"""
 
@@ -684,6 +691,7 @@ class WorldConfig(Permissive):
     decider: DeciderConfig = Field(default_factory=DeciderConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
     reply_style: ReplyStyle = Field(default_factory=ReplyStyle)
+    vision: VisionCaption = Field(default_factory=VisionCaption)
     content_safety: ContentSafety = Field(default_factory=ContentSafety)
     zones: list[ZoneDef] = Field(default_factory=list)
     zone_edges: list[ZoneEdgeDef] = Field(default_factory=list)

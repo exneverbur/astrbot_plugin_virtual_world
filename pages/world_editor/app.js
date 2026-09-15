@@ -308,7 +308,13 @@ const LLM_LEVELS = [
 ];
 
 const TRIGGERS = [
-  { key: "none", label: "什么都不做", hint: "动作做完就结束" },
+  {
+    key: "none",
+    label: "什么都不做",
+    hint:
+      "动作做完就结束。工具型 / 指令型动作还看全局设置里的「工具结果回话」：" +
+      "那个开关开着时，拿到的结果会交回大模型说一句；想彻底不开口就把它关掉。",
+  },
   {
     key: "llm_followup",
     label: "让她接着说一句",
@@ -320,6 +326,18 @@ const TRIGGERS = [
     hint: "动作完成后立刻执行指定日程里的动作链",
   },
 ];
+
+/** 图片转述提示词的内置默认值（与后端 core/defaults.py 里那段保持一致）。 */
+const DEFAULT_CAPTION_PROMPT =
+  "你要帮一个群聊机器人看懂图片。只看图片本身是不够的——还要说清这张图和当前话题的关系，" +
+  "这样机器人才知道该怎么接话。\n" +
+  "先判断它是不是表情包 / 梗图：是的话要说清是什么梗、在表达什么情绪" +
+  "（例如「熊猫头，摆烂、无语」），因为接一张梗图和接一张照片的方式完全不同。\n" +
+  "输出一行中文，格式固定为：画面描述｜类型｜与话题的关系：…\n" +
+  "画面描述：画面里有什么、在做什么、有没有值得注意的文字或表情，40 字以内。\n" +
+  "类型：表情包 / 梗图（写明是什么梗、什么情绪）、照片、截图，或者其它。\n" +
+  "与话题的关系：这张图在回应什么、和正在聊的事有什么关联；确实看不出关系就写「看不出直接关系」。\n" +
+  "不要客套、不要分点、不要写「这张图片」、不要编造看不到的内容。";
 
 const TARGET_TYPES = [
   { key: "none", label: "自己 / 空间", hint: "动作只作用于她自己或环境，默认不发到群里" },
@@ -4828,7 +4846,10 @@ function renderActionForm() {
   const triggerTitle = el("div", "sub-title");
   triggerTitle.appendChild(el("span", "", "完成后"));
   triggerTitle.appendChild(
-    tipBox("动作结束后要做什么。默认什么都不做；「接着说一句」会让大模型把结果讲成人话。"),
+    tipBox(
+      "动作结束后要做什么。默认什么都不做；「接着说一句」会让大模型把结果讲成人话。" +
+        "工具型和指令型动作还会受全局设置里的「工具结果回话」影响，结果里的图片会一起交给模型看。",
+    ),
   );
   triggerBox.appendChild(triggerTitle);
   triggerBox.appendChild(
@@ -5918,6 +5939,7 @@ function renderSettings() {
   world.nickname_sync = world.nickname_sync || {};
   world.content_safety = world.content_safety || {};
   world.reply_style = world.reply_style || {};
+  world.vision = world.vision || {};
   const form = $("settings-form");
   form.innerHTML = "";
   form.className = "form settings";
@@ -6720,6 +6742,30 @@ function renderSettings() {
     ),
   );
   form.appendChild(contextSection);
+
+  /* --- 图片转述 --- */
+  const visionSection = settingsSection(
+    "图片转述",
+    "配了「图片转述模型」（插件配置里那个）之后，群里发的图会先用这段提示词转成一句文字，再进上下文。",
+    "转述模型看不到群聊，只知道你在这里写的要求——所以要在这里交代清楚「描述里必须包含什么」。" +
+      "默认那段会额外认出「这是不是表情包 / 什么梗」，因为接梗图和接照片的方式不一样。",
+  );
+  const visionFull = el("div", "full");
+  visionFull.appendChild(
+    textareaField(
+      "转述提示词",
+      world.vision.prompt || "",
+      (value) => (world.vision.prompt = value),
+      {
+        hint:
+          "留空就用内置默认（推荐）。默认要求输出「画面描述｜类型｜与话题的关系」，并写明是不是表情包、什么梗、什么情绪。",
+        rows: 8,
+        placeholder: DEFAULT_CAPTION_PROMPT,
+      },
+    ),
+  );
+  visionSection._fields.appendChild(visionFull);
+  form.appendChild(visionSection);
 
   /* --- 群名片 --- */
   const nickname = settingsSection(
