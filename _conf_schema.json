@@ -83,7 +83,7 @@
   },
   "reply_hook_bridge": {
     "description": "接管回复也过其他插件的钩子",
-    "hint": "接管回复会先过一遍 AstrBot 的「LLM 响应后」「发送前」钩子。好感度这类靠解析回复标记工作的插件需要它。",
+    "hint": "接管时会按同样的时机补发 AstrBot 的钩子：回复过「LLM 响应后 / 发送前」，流程过「等模型 / 用工具 / 用完工具 / 发完消息」。好感度这类解析回复标记的插件、以及靠钩子贴表情的插件都需要它（默认开）。",
     "obvious_hint": true,
     "type": "bool",
     "default": true

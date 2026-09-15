@@ -163,7 +163,13 @@ def render_event(event: dict[str, Any], world: WorldConfig | None = None) -> str
         return f"{text}　→ {result}" if result else text
 
     if kind == "schedule":
-        return f"日程「{detail.get('id', '')}」到点触发"
+        who = "你点了「立即执行」" if detail.get("manual") else "到点触发"
+        when = _clip(detail.get("time"), 8)
+        head = f"日程「{detail.get('id', '')}」{who}"
+        if when:
+            head = f"{head}（{when}）"
+        actions = _clip(detail.get("actions"), 80)
+        return f"{head}：{actions}" if actions else head
 
     if kind == "nickname":
         if detail.get("manual"):
@@ -222,10 +228,12 @@ def render_event(event: dict[str, Any], world: WorldConfig | None = None) -> str
 
     if kind == "command":
         line = _clip(detail.get("command"), 60)
+        action = _clip(detail.get("action"), 20)
+        head = f"执行指令「{line}」" + (f"（动作：{action}）" if action else "")
         if detail.get("ok") is False:
-            return f"触发指令「{line}」失败：{_clip(detail.get('error'), 60)}"
+            return f"{head}失败：{_clip(detail.get('error'), 60)}"
         result = _clip(detail.get("result"), 80)
-        return f"触发指令「{line}」　→ {result}" if result else f"触发指令「{line}」"
+        return f"{head}　→ {result}" if result else head
 
     if kind == "wake_up":
         return f"被 {detail.get('by') or '有人'} 叫醒"

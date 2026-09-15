@@ -905,6 +905,10 @@ class AstrBotTools:
                 ok=False, error=f"工具「{name}」没有可调用的 handler", tool=name
             )
         try:
+            # 工具前后也补一遍钩子：有些插件靠它们显示"正在用工具 / 用完了"
+            await self.plugin._fire_hook(
+                event, "OnUsingLLMToolEvent", tool, dict(call_params)
+            )
             result = invoke(event, call_params, self.plugin)
             images: list[str] = []
             if inspect.isasyncgen(result):
@@ -916,6 +920,13 @@ class AstrBotTools:
                 text, images = await _result_text(await result)
             else:
                 text, images = await _result_text(result)
+            await self.plugin._fire_hook(
+                event,
+                "OnLLMToolRespondEvent",
+                tool,
+                dict(call_params),
+                _as_tool_result(text),
+            )
         except Exception as exc:
             self.plugin.logger.warning(f"[virtual_world] 工具 {name} 调用失败：{exc}")
             # 工具的报错经常是「event 是 None」这种内部细节，补一句人话更好排查
@@ -1107,6 +1118,22 @@ def _clip_brief(text: Any) -> str:
     if len(body) <= MAX_RESULT_CHARS:
         return body
     return body[:MAX_RESULT_CHARS] + "…（内容过长已截断）"
+
+
+def _as_tool_result(text: str) -> Any:
+    """把工具返回的文字包装成 AstrBot 钩子认的 ``CallToolResult``。"""
+
+    try:
+        from mcp.types import CallToolResult, TextContent
+    except Exception:
+        return None
+    try:
+        return CallToolResult(
+            content=[TextContent(type="text", text=str(text or ""))],
+            isError=False,
+        )
+    except Exception:
+        return None
 
 
 class _ToolRunContext:
@@ -1664,6 +1691,7 @@ class VirtualWorldPlugin(Star):
             echo = self.engine.take_pending_echo(session_id)
             if sleep_reply.messages or echo:
                 await self._send_reply(event, list(sleep_reply.messages) + echo)
+                await self._fire_hook(event, "OnAfterMessageSentEvent")
             if self.debug:
                 self.logger.info(
                     f"[virtual_world] 睡觉门禁 {session_id}："
@@ -1678,6 +1706,11 @@ class VirtualWorldPlugin(Star):
 
         # ---- 接管模式：自己回复，并阻止主人格重复回复 ----
         if (self.engine.world.reply_mode or "takeover") == "takeover":
+            # AstrBot 会在「准备调模型」时发一次这个钩子（贴表情的小插件靠它开始处理）。
+            # 我们自己调模型，这里补一遍；被拦下就整条消息都不接管。
+            if await self._fire_hook(event, "OnWaitingLLMRequestEvent"):
+                event.stop_event()
+                return
             outcome = await self.engine.handle_reply(
                 ctx, history=list(getattr(req, "contexts", None) or [])
             )
@@ -1687,6 +1720,8 @@ class VirtualWorldPlugin(Star):
                 bridged = await self._bridge_reply_hooks(event, list(outcome.messages))
                 # 再按换行拆段：一段一条消息，别把好几句挤成一坨
                 await self._send_reply(event, self.split_messages(bridged) + echo)
+                # 「发完了」也要补一遍：靠它摘掉"处理中"标记的插件才不会一直挂着
+                await self._fire_hook(event, "OnAfterMessageSentEvent")
                 if self.debug:
                     self.logger.info(
                         f"[virtual_world] 接管回复 {session_id}："
@@ -1697,6 +1732,7 @@ class VirtualWorldPlugin(Star):
             # 接管没成功、会交回主人格：调试信息照样发出去，不然就看不到了
             if echo:
                 await self._send_reply(event, echo)
+                await self._fire_hook(event, "OnAfterMessageSentEvent")
             self._log_takeover_fallback(session_id, outcome)
 
         # ---- 注入模式（也是接管失败后的兜底）----
@@ -1876,6 +1912,41 @@ class VirtualWorldPlugin(Star):
             except Exception:
                 pass
         return response_cls(role="assistant", completion_text=text)
+
+    # ---------------- 把接管的流程补进 AstrBot 的钩子链 ----------------
+
+    @staticmethod
+    def _hook_type(name: str) -> Any:
+        """按名字取 AstrBot 的钩子类型（老版本没有的钩子就跳过）。"""
+
+        try:
+            from astrbot.core.star.star_handler import EventType
+        except Exception:
+            return None
+        return getattr(EventType, name, None)
+
+    async def _fire_hook(self, event: Any, name: str, *args: Any) -> bool:
+        """补发一个 AstrBot 钩子；返回事件是否被别的插件拦下。
+
+        本插件接管时是自己调模型、自己调工具、自己发消息的，AstrBot 管线里那些
+        「等 LLM」「用完工具」「发完消息」的钩子轮不到跑——靠这些钩子工作的小插件
+        （比如处理中贴表情、用完摘掉）就会漏掉一半。这里在同样的时机补一遍。
+        """
+
+        if not self.reply_hook_bridge or event is None:
+            return False
+        hook_type = self._hook_type(name)
+        if hook_type is None:
+            return False
+        try:
+            from astrbot.core.pipeline.context_utils import call_event_hook
+        except Exception:
+            return False
+        try:
+            return bool(await call_event_hook(event, hook_type, *args))
+        except Exception as exc:
+            self.logger.warning(f"[virtual_world] 钩子 {name} 执行出错：{exc}")
+            return False
 
     def _log_takeover_fallback(self, session_id: str, outcome) -> None:
         if not self.debug:

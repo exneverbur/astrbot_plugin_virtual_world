@@ -1414,6 +1414,36 @@ class VirtualWorldEngine:
             return f"她不在指定地点（现在在 {state.node_id}）"
         return "条件不满足"
 
+    def _chain_labels(self, chain: list[Any] | None) -> list[str]:
+        """动作链里每一步的中文名（日程日志用）。"""
+
+        action_map = self.world.action_map()
+        labels: list[str] = []
+        for step in chain or []:
+            action_id = str(getattr(step, "type", "") or "")
+            definition = action_map.get(action_id)
+            labels.append(
+                (definition.name or definition.id) if definition else action_id
+            )
+        return [label for label in labels if label]
+        """日程到点却没跑的原因（写进日志，省得用户猜）。"""
+
+        if conditions is None:
+            return ""
+        if conditions.not_state and state.state in conditions.not_state:
+            return f"她现在是「{state.state}」状态"
+        if conditions.state and state.state not in conditions.state:
+            return f"她现在是「{state.state}」状态，不在允许的列表里"
+        if conditions.min_energy is not None and state.energy < conditions.min_energy:
+            return f"精力 {state.energy:.2f} 低于要求的 {conditions.min_energy}"
+        if conditions.max_energy is not None and state.energy > conditions.max_energy:
+            return f"精力 {state.energy:.2f} 高于允许的 {conditions.max_energy}"
+        if conditions.min_loneliness is not None and state.loneliness < conditions.min_loneliness:
+            return f"孤独感 {state.loneliness:.2f} 低于要求的 {conditions.min_loneliness}"
+        if conditions.node_in and state.node_id not in conditions.node_in:
+            return f"她不在指定地点（现在在 {state.node_id}）"
+        return "条件不满足"
+
     async def run_schedules(self) -> list[TickOutcome]:
         """检查并触发到点的日程。
 
@@ -1491,6 +1521,18 @@ class VirtualWorldEngine:
                     chain = schedule.action_chain
                     if schedule.auto_travel:
                         chain = self.expand_chain_for_travel(state, chain)
+                    # 「日程开始执行」要能进日志与调试输出：不然只能看到它的动作，
+                    # 不知道这一串是谁安排的。
+                    await self._log_event(
+                        state,
+                        "schedule",
+                        {
+                            "id": schedule.id,
+                            "time": slot,
+                            "actions": " → ".join(self._chain_labels(chain)),
+                            "manual": False,
+                        },
+                    )
                     await self._run_chain(state, chain, outcome, depth=0)
                     outcome.notes.append(f"日程 {schedule.id} 已触发")
                     state.add_event("schedule", {"id": schedule.id})
@@ -1540,6 +1582,16 @@ class VirtualWorldEngine:
                 chain = self.expand_chain_for_travel(state, chain)
             await self._run_chain(state, chain, outcome, depth=0)
             state.add_event("schedule", {"id": schedule.id, "manual": True})
+            await self._log_event(
+                state,
+                "schedule",
+                {
+                    "id": schedule.id,
+                    "time": schedule.time,
+                    "actions": " → ".join(self._chain_labels(chain)),
+                    "manual": True,
+                },
+            )
             await self._echo_events_since(state, outcome, echo_marker)
             running = str((state.current_action or {}).get("desc") or "")
 
@@ -3552,9 +3604,17 @@ class VirtualWorldEngine:
         if definition.llm_level == "template":
             text = self.render_template(definition.template, state, node, action)
             return [text] if text else []
-        # single / tool 级动作：给一句符合动作语义的话
         if action.content:
             return [action.content]
+        # 「单轮」动作：这一轮没有现成台词（日程、计划里的步骤都没有），
+        # 就让大模型按动作语义现写一句——不然只会发一句机械文案。
+        if definition.llm_level == "single" and self.llm is not None:
+            generated = await self._generate_text_actions(
+                state, node, self._single_action_instruction(state, definition, action)
+            )
+            if generated:
+                return generated
+        # 没配模型、发言额度用完、或者它没说出什么：退化成一句动作文案
         label = definition.name or definition.id
         target_name = self._target_name(state, action.target)
         if action.target and target_name:
@@ -3562,6 +3622,27 @@ class VirtualWorldEngine:
                 self.render_template(f"（{{bot}}{label}了 {{user}}）", state, node, action)
             ]
         return [self.render_template(f"（{{bot}}{label}）", state, node, action)]
+
+    def _single_action_instruction(
+        self, state: WorldState, definition: ActionDef, action: PlannedAction
+    ) -> str:
+        """「单轮」动作没现成台词时，给大模型的一句交代。"""
+
+        label = definition.name or definition.id
+        who = self._target_name(state, action.target)
+        lines = [
+            f"你刚刚做了「{label}」这个动作。",
+            f"这个动作是什么意思：{definition.description or label}。",
+        ]
+        if action.intent and action.intent.strip() not in ("", label):
+            lines.append(f"你当时的想法：{action.intent.strip()}")
+        if who:
+            lines.append(f"对象是 {who}。")
+        lines.append(
+            "用你自己的口吻说一句发到群里的话：短、自然、像随口说的，"
+            "不要解释设定、不要分点、不要写成在招呼全场。"
+        )
+        return "\n".join(lines)
 
     @staticmethod
     def _target_name(state: WorldState, target: str) -> str:

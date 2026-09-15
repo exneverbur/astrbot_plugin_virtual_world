@@ -446,6 +446,7 @@ ECHO_EVENT_TYPES: dict[str, str] = {
     "recall_start": "💭",
     "recall_done": "📖",
     "schedule_edit": "🗓️",
+    "schedule": "📅",
     "command": "🧩",
     "engagement": "💤",
     "extreme": "🚨",

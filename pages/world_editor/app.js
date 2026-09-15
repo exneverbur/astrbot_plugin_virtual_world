@@ -146,6 +146,12 @@ const ECHO_TYPE_CHOICES = [
     hint: "她自己查看 / 添加 / 删除了哪条日程，成功了还是被拒了（用户配的日程她删不掉）。",
   },
   {
+    key: "schedule",
+    icon: "📅",
+    label: "日程开始执行",
+    hint: "哪条日程开始执行了、是到点触发的还是你点了「立即执行」、这一串要跑哪些动作。",
+  },
+  {
     key: "command",
     icon: "🧩",
     label: "触发指令",
