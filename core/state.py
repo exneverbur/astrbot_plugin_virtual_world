@@ -69,6 +69,55 @@ class WorldState:
     接近 0 时偏平淡克制。由互动（被夸、被抱、吵架、被冷落）抬高，随时间回落。
     """
 
+    valence: float = 0.5
+    """效价：心情的好坏（0~1，0.5 是中性）。= 基线 + 偏移。
+
+    基线由五维与时段推导（本身不存历史），偏移随事件产生、随时间归零。
+    心潮管"有多激动"，效价管"激动成什么样"。
+    """
+
+    valence_offset: float = 0.0
+    """效价的短期偏移：真正带历史的那个量（-0.5 ~ 0.5，0 = 回到基线）。"""
+
+    affect_synced_at: float = 0.0
+    """上一次结算情绪两维的时间（现实时间戳）。
+
+    情绪两轴按真实时间衰减：事件到来前先补上这一段，所以 tick 长度改了、
+    或者宿主卡顿了，都不会改变曲线形状。
+    """
+
+    storm: bool = False
+    """「正在气头上」标记：高心潮 + 负效价，带滞回，用于提示词与安全阀。"""
+
+    storm_since: float = 0.0
+    """标记是从什么时候开始的（现实时间戳，用来兜底最长持续时间）。"""
+
+    last_style_cell: str = ""
+    """最近一次回复用的表达格（例如 excited+negative）：日志与状态页用来看映射有没有生效。"""
+
+    last_say_limit: int = 0
+    """那一次实际生效的句数上限（风格格、群聊硬顶、配置、密度提醒取更严格者）。"""
+
+    interject_stats: dict[str, int] = field(default_factory=dict)
+    """本小时「她想插话但被拦住」的计数：哪道闸在限流，一眼就能看出来。"""
+
+    interject_hour_marker: int = 0
+    """上面那份计数的所属小时。"""
+
+    interject_closed_until: float = 0.0
+    """「想被注意到」这条插话动机被关到什么时候（现实时间戳）。
+
+    长期低落时关掉它，并保证至少关 15 分钟：否则效价一恢复就立刻打开，
+    看起来像个开关。
+    """
+
+    low_valence_since: float = 0.0
+    """效价持续偏低从什么时候开始（安全阀用）。"""
+
+    ignored_streak: int = 0
+    ignored_at: float = 0.0
+    """被冷落的连续次数与时间：惩罚递减，隔一阵重新算（见 dynamics.ignored_magnitude）。"""
+
     boredom: float = 0.3
     current_action: dict[str, Any] | None = None
     current_plan: dict[str, Any] | None = None
@@ -218,8 +267,16 @@ class WorldState:
         self.loneliness = _clamp01(self.loneliness, 0.5)
         self.curiosity = _clamp01(self.curiosity, 0.5)
         self.affect = _clamp01(self.affect, 0.3)
+        self.valence = _clamp01(self.valence, 0.5)
+        try:
+            offset = float(self.valence_offset)
+        except (TypeError, ValueError):
+            offset = 0.0
+        self.valence_offset = max(-0.5, min(0.5, offset))
         self.boredom = _clamp01(self.boredom, 0.3)
         self.unanswered_count = max(0, int(self.unanswered_count))
+        self.ignored_streak = max(0, int(self.ignored_streak or 0))
+        self.storm = bool(self.storm)
         self.nickname_fail_count = max(0, int(self.nickname_fail_count or 0))
         self.world_time = max(0, int(self.world_time))
         self.cooldown_until = max(0, int(self.cooldown_until))
@@ -227,6 +284,14 @@ class WorldState:
         self.no_sleep_until = max(0, int(self.no_sleep_until))
         self.memory_flush_wanted = bool(self.memory_flush_wanted)
         self.wake_note_until = max(0, int(self.wake_note_until))
+        if not isinstance(self.interject_stats, dict):
+            self.interject_stats = {}
+        else:
+            self.interject_stats = {
+                str(key): max(0, int(value or 0))
+                for key, value in self.interject_stats.items()
+            }
+        self.interject_hour_marker = max(0, int(self.interject_hour_marker or 0))
         if not isinstance(self.pending_memory, list):
             self.pending_memory = []
         else:

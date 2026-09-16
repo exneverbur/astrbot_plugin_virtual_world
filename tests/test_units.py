@@ -21,6 +21,7 @@ from core.json_actions import (  # noqa: E402
     strip_reasoning,
 )
 from core.memory import emotional_weight  # noqa: E402
+from core.mood import cell_for, mood_label, style_block  # noqa: E402
 from core.models import (  # noqa: E402
     DEFAULT_ECHO_TYPES,
     ECHO_EVENT_TYPES,
@@ -43,11 +44,52 @@ def make_world():
     return world
 
 
+class TestMoodGrid(unittest.TestCase):
+    """两轴表达格：九种组合各有心情词与风格约束，且两样东西同源。"""
+
+    def test_every_combination_has_its_own_cell(self):
+        keys = set()
+        for arousal in (0.1, 0.5, 0.9):
+            for valence in (0.1, 0.5, 0.9):
+                cell = cell_for(arousal, valence)
+                keys.add(cell.key)
+                self.assertTrue(cell.mood)
+                self.assertTrue(cell.style)
+                self.assertGreaterEqual(cell.say_limit, 1)
+        self.assertEqual(len(keys), 9)
+
+    def test_boundaries_keep_the_middle_band_wide(self):
+        # 0.36 与 0.64 都算中间档，"正常说话"才是常驻状态
+        self.assertEqual(cell_for(0.36, 0.5).key, "stirred+neutral")
+        self.assertEqual(cell_for(0.64, 0.5).key, "stirred+neutral")
+        self.assertEqual(cell_for(0.2, 0.5).key, "calm+neutral")
+        self.assertEqual(cell_for(0.8, 0.5).key, "excited+neutral")
+
+    def test_style_block_carries_the_effective_cap(self):
+        cell = cell_for(0.2, 0.2)
+        text = style_block(cell, say_limit=1, group=True)
+        self.assertIn(cell.style, text)
+        self.assertIn("最多说 1 条", text)
+        self.assertIn("群聊", text)
+        self.assertIn("私聊", style_block(cell, say_limit=2, group=False))
+
+    def test_energy_is_only_a_modifier(self):
+        self.assertEqual(mood_label(0.2, 0.9, energy=0.8), "舒坦")
+        self.assertEqual(mood_label(0.2, 0.9, energy=0.1), "困倦 · 舒坦")
+
+
 class TestStateDynamics(unittest.TestCase):
     def setUp(self) -> None:
         self.world = make_world()
-        self.dynamics = StateDynamics(self.world.state_dynamics)
+        # 固定成正午，免得测试结果跟着跑测试的机器时钟漂
+        self.dynamics = StateDynamics(self.world.state_dynamics, hour_provider=lambda: 12)
         self.node = self.world.node_map()["bedroom"]
+
+    def set_valence(self, state, value: float) -> float:
+        """按「她看到的心情」设值：落点在偏移上，基线仍由五维决定。"""
+
+        self.dynamics.apply_effects(state, {"valence": f"={value}"})
+        return state.valence
 
     def test_energy_decays_over_an_hour(self):
         state = WorldState(session_id="s1", energy=0.6)
@@ -69,23 +111,29 @@ class TestStateDynamics(unittest.TestCase):
         self.assertGreaterEqual(state.energy, 0.0)
 
     def test_mood_derivation_priority(self):
-        state = WorldState(session_id="s1", energy=0.2, loneliness=0.9, affect=0.9)
-        self.assertEqual(self.dynamics.derive_mood(state), "困倦")
-        state.energy = 0.5
-        # 心潮是"情绪有多强"，最强的时候压过其它状态
-        self.assertEqual(self.dynamics.derive_mood(state), "难以平静")
-        state.affect = 0.6
-        self.assertEqual(self.dynamics.derive_mood(state), "心潮起伏")
-        state.affect = 0.3
-        self.assertEqual(self.dynamics.derive_mood(state), "想念")
-        state.loneliness = 0.1
-        state.curiosity = 0.9
-        self.assertEqual(self.dynamics.derive_mood(state), "好奇")
-        state.curiosity = 0.1
-        state.boredom = 0.9
-        self.assertEqual(self.dynamics.derive_mood(state), "无聊")
-        state.boredom = 0.1
+        """心情词由情绪两轴派生：心潮管"有多激动"，效价管"激动成什么样"。"""
+
+        state = WorldState(session_id="s1", energy=0.5, affect=0.9, valence=0.2)
+        self.assertEqual(self.dynamics.derive_mood(state), "恼火")
+        state.valence = 0.8
+        self.assertEqual(self.dynamics.derive_mood(state), "兴奋")
+        state.affect = 0.5
+        state.valence = 0.5
         self.assertEqual(self.dynamics.derive_mood(state), "平静")
+        state.valence = 0.1
+        self.assertEqual(self.dynamics.derive_mood(state), "不痛快")
+        state.affect = 0.2
+        state.valence = 0.2
+        self.assertEqual(self.dynamics.derive_mood(state), "低落")
+        state.valence = 0.9
+        self.assertEqual(self.dynamics.derive_mood(state), "舒坦")
+        # 精力低只是一个修饰，不另开一格
+        state.energy = 0.2
+        self.assertEqual(self.dynamics.derive_mood(state), "困倦 · 舒坦")
+        # 动作里写的 mood 覆盖期内优先
+        state.mood = "温柔"
+        state.mood_override_until = state.world_time + 10
+        self.assertEqual(self.dynamics.derive_mood(state), "温柔")
 
     def test_effects_syntax(self):
         state = WorldState(session_id="s1", energy=0.5)
@@ -103,11 +151,166 @@ class TestStateDynamics(unittest.TestCase):
         self.assertAlmostEqual(state.loneliness, 1.0, places=4)
 
     def test_event_effects(self):
-        state = WorldState(session_id="s1", affect=0.5, loneliness=0.5)
+        state = WorldState(session_id="s1", affect=0.5, valence=0.5, loneliness=0.5)
         self.dynamics.apply_event(state, "hug_bot")
         self.assertAlmostEqual(state.loneliness, 0.3, places=4)
-        # 抱抱把心潮抬高，但有心潮饱和：0.5 时只加 0.22 × (1-0.75×0.5) = 0.1375
-        self.assertAlmostEqual(state.affect, 0.6375, places=4)
+        # 抱抱把心潮抬高，但有心潮饱和：0.5 时只加 0.15 × (1-0.75×0.5) = 0.09375
+        self.assertAlmostEqual(state.affect, 0.59375, places=4)
+        # 好事会把心情推好一点（效价由基线 + 偏移给出）
+        self.assertGreater(state.valence, 0.5)
+
+    # ---------------- 效价：基线 / 偏移 / 懒衰减 ----------------
+
+    def test_valence_baseline_follows_the_five_dims(self):
+        """效价基线是五维的纯函数：累、孤独、无聊都会把它压低。"""
+
+        good = WorldState(session_id="s1", energy=0.8, loneliness=0.2, boredom=0.2)
+        bad = WorldState(session_id="s1", energy=0.2, loneliness=0.9, boredom=0.9)
+        self.dynamics.refresh(good)
+        self.dynamics.refresh(bad)
+        self.assertGreater(good.valence, 0.5)
+        self.assertLess(bad.valence, 0.4)
+
+    def test_valence_offset_decays_back_to_baseline(self):
+        """事件的偏移会自己归零——效价不会长期挂在一个值上。"""
+
+        state = WorldState(session_id="s1", energy=0.5, loneliness=0.2, boredom=0.2)
+        self.dynamics.refresh(state)
+        self.set_valence(state, 0.9)
+        gap = state.valence_offset
+        self.assertGreater(gap, 0.3)
+        state.affect_synced_at = 1_000_000.0
+        self.dynamics.tick(
+            state, node=self.node, elapsed_seconds=3600, world=self.world, now=1_003_600.0
+        )
+        self.assertLess(state.valence_offset, gap * 0.6, state.valence_offset)
+        # 再走四个小时：偏移基本归零（基线本身会随五维变化，所以看偏移）
+        self.dynamics.tick(
+            state, node=self.node, elapsed_seconds=14400, world=self.world, now=1_017_600.0
+        )
+        self.assertLess(abs(state.valence_offset), 0.03, state.valence_offset)
+
+    def test_emotion_decay_depends_on_real_time_not_tick_length(self):
+        """tick 长度改了，情绪曲线形状不该变（情绪按真实时间结算）。"""
+
+        short = WorldState(session_id="s1", affect=0.9)
+        long = WorldState(session_id="s1", affect=0.9)
+        short.affect_synced_at = long.affect_synced_at = 1_000_000.0
+        for step in range(1, 11):  # 10 个 60 秒的 tick
+            self.dynamics.tick(
+                short,
+                node=self.node,
+                elapsed_seconds=60,
+                world=self.world,
+                now=1_000_000.0 + step * 60,
+            )
+        self.dynamics.tick(  # 1 个 600 秒的 tick
+            long, node=self.node, elapsed_seconds=600, world=self.world, now=1_000_600.0
+        )
+        # 曲线形状一致（非线性衰减是分步走的，允许一点点路径差）
+        self.assertLess(abs(short.affect - long.affect), 0.005)
+
+    def test_old_save_does_not_lose_its_mood(self):
+        """老存档没有同步时间戳：第一次结算从当下开始，不能按 epoch 倒算。"""
+
+        state = WorldState(session_id="s1", affect=0.9, affect_synced_at=0.0)
+        self.dynamics.tick(
+            state, node=self.node, elapsed_seconds=60, world=self.world, now=1_700_000_000.0
+        )
+        self.assertAlmostEqual(state.affect, 0.9, places=4)
+
+    def test_negative_valence_calms_down_faster(self):
+        """负效价 + 高心潮：平复得更快（不留一身火气）。"""
+
+        upset = WorldState(session_id="s1", affect=0.9, valence=0.15)
+        neutral = WorldState(session_id="s1", affect=0.9, valence=0.5)
+        upset.affect_synced_at = neutral.affect_synced_at = 1_000_000.0
+        self.dynamics.tick(
+            upset, node=self.node, elapsed_seconds=600, world=self.world, now=1_000_600.0
+        )
+        self.dynamics.tick(
+            neutral, node=self.node, elapsed_seconds=600, world=self.world, now=1_000_600.0
+        )
+        self.assertLess(upset.affect, neutral.affect)
+
+    def test_positive_events_are_amplified_when_she_is_already_happy(self):
+        """心情好更容易被逗乐：同一条好消息在高效价时带来的心潮更高。"""
+
+        happy = WorldState(session_id="s1", affect=0.4)
+        grumpy = WorldState(session_id="s1", affect=0.4)
+        self.set_valence(happy, 0.9)
+        self.set_valence(grumpy, 0.1)
+        self.dynamics.apply_event(happy, "positive_words")
+        self.dynamics.apply_event(grumpy, "positive_words")
+        self.assertGreater(happy.affect, grumpy.affect)
+
+    def test_storm_flag_has_hysteresis(self):
+        """`storm` 进得难出得也难：不会在阈值边上反复抖。"""
+
+        state = WorldState(session_id="s1", affect=0.8, storm_since=0.0)
+        self.set_valence(state, 0.2)
+        self.dynamics.apply_event(state, "topic_engaged")  # 触发一次结算，顺手更新标记
+        self.assertTrue(state.storm)
+        # 掉到进入线以下、但还在退出线以上：标记要保持
+        state.affect = 0.6
+        self.set_valence(state, 0.45)
+        self.dynamics.apply_event(state, "topic_engaged")
+        self.assertTrue(state.storm)
+        # 掉到退出线以下才清掉
+        state.affect = 0.4
+        self.dynamics.apply_event(state, "topic_engaged")
+        self.assertFalse(state.storm)
+
+    def test_storm_flag_expires_on_its_own(self):
+        state = WorldState(session_id="s1", affect=0.9, storm_since=0.0)
+        self.set_valence(state, 0.2)
+        self.dynamics.apply_event(state, "topic_engaged")
+        self.assertTrue(state.storm)
+        state.affect_synced_at = 1_000_000.0
+        self.dynamics.tick(
+            state,
+            node=self.node,
+            elapsed_seconds=60,
+            world=self.world,
+            now=1_000_000.0 + 121 * 60,  # 超过最长持续时间
+        )
+        self.assertFalse(state.storm)
+
+    def test_safety_valve_halves_the_offset(self):
+        """长期低落时把偏移减半（拉回基线），并告诉调用方可以记日志。"""
+
+        state = WorldState(session_id="s1", energy=0.5, loneliness=0.2, boredom=0.2)
+        self.dynamics.refresh(state)
+        self.set_valence(state, 0.05)
+        offset = state.valence_offset
+        state.affect_synced_at = 1_000_000.0
+        state.low_valence_since = 1_000_000.0
+        fired = self.dynamics.tick(
+            state,
+            node=self.node,
+            elapsed_seconds=60,
+            world=self.world,
+            now=1_000_000.0 + 31 * 60,
+        )
+        self.assertTrue(fired)
+        self.assertLess(abs(state.valence_offset), abs(offset) * 0.6)
+        self.assertGreater(state.valence, 0.05)
+        # 直接验证那一下"减半"本身
+        before = state.valence_offset
+        state.valence = 0.1
+        state.low_valence_since = 1_000_000.0
+        self.assertTrue(self.dynamics._safety_valve(state, now=1_000_000.0 + 1801))
+        self.assertAlmostEqual(state.valence_offset, before * 0.5, places=6)
+
+    def test_ignored_streak_softens_then_resets(self):
+        """被冷落：第一次最疼，之后递减，隔一阵重新算。"""
+
+        state = WorldState(session_id="s1")
+        self.assertEqual(self.dynamics.ignored_magnitude(state, now=1000.0), 1.0)
+        self.assertEqual(self.dynamics.ignored_magnitude(state, now=1100.0), 0.5)
+        self.assertEqual(self.dynamics.ignored_magnitude(state, now=1200.0), 0.0)
+        # 30 分钟后重新开始
+        self.assertEqual(self.dynamics.ignored_magnitude(state, now=1200.0 + 1801), 1.0)
 
     def test_affect_rises_with_diminishing_returns(self):
         """心潮越高，同样的刺激加得越少——否则一两轮聊天就顶满。"""
@@ -161,7 +364,7 @@ class TestEmotionalWeight(unittest.TestCase):
 
     def test_plain_memory_keeps_base_weight(self):
         self.assertAlmostEqual(
-            emotional_weight(0.4, emotion="平静", mood="平静", text="在这里说话"),
+            emotional_weight(0.4, emotion="平静", text="在这里说话"),
             0.4,
             places=4,
         )
@@ -173,9 +376,12 @@ class TestEmotionalWeight(unittest.TestCase):
         self.assertGreaterEqual(intense, 0.6)
 
     def test_affect_adds_a_little(self):
-        low = emotional_weight(0.4, affect=0.0)
-        high = emotional_weight(0.4, affect=1.0)
-        self.assertAlmostEqual(high - low, 0.15, places=4)
+        # 心情平平的热闹：加得少；心情偏得远时同样的心潮记得更牢
+        low = emotional_weight(0.4, affect=0.0, valence=0.5)
+        high = emotional_weight(0.4, affect=1.0, valence=0.5)
+        self.assertAlmostEqual(high - low, 0.06, places=4)
+        upset = emotional_weight(0.4, affect=1.0, valence=0.0)
+        self.assertAlmostEqual(upset - low, 0.20, places=4)
 
     def test_weight_is_clamped(self):
         self.assertLessEqual(emotional_weight(0.95, text="吵架 生气 讨厌 难过"), 1.0)
@@ -543,6 +749,52 @@ class TestDecider(unittest.TestCase):
         state = WorldState(session_id="s1", node_id="study", loneliness=0.2, world_time=10)
         plan = self.decider.rule_plan(state, group_chatting=True, interject_allowed=True)
         self.assertFalse(plan and plan["steps"][0].get("interject"))
+
+    def test_interject_has_two_motives(self):
+        """插话有两条理由：想被注意到（孤独）和想发作（高心潮 + 差心情）。"""
+
+        # 心情不错 + 孤独：动机 A
+        cheerful = WorldState(
+            session_id="s1", node_id="study", loneliness=0.9, valence=0.6, affect=0.2
+        )
+        self.assertEqual(self.decider.interject_motive(cheerful), "群里正聊得热闹，想接一句")
+        # 心情差 + 情绪上来了：动机 B，即使一点也不孤独
+        grumpy = WorldState(
+            session_id="s1", node_id="study", loneliness=0.1, valence=0.2, affect=0.8
+        )
+        self.assertEqual(self.decider.interject_motive(grumpy), "情绪上来了，忍不住想插一句")
+        # 心情差但情绪很平：谁都不想理
+        flat = WorldState(
+            session_id="s1", node_id="study", loneliness=0.9, valence=0.2, affect=0.2
+        )
+        self.assertEqual(self.decider.interject_motive(flat), "")
+
+    def test_interject_threshold_floats_with_mood(self):
+        """心情越差越难开口：阈值浮动，但"开口后什么样"归风格格管。"""
+
+        base = WorldState(session_id="s1", valence=0.5)
+        self.assertAlmostEqual(self.decider.interject_threshold(base), 0.6, places=4)
+        low = WorldState(session_id="s1", valence=0.2)
+        self.assertAlmostEqual(self.decider.interject_threshold(low), 0.7, places=4)
+        closed = WorldState(session_id="s1", valence=0.2)
+        closed.interject_closed_until = self.decider._now() + 600
+        self.assertAlmostEqual(self.decider.interject_threshold(closed), 0.75, places=4)
+
+    def test_low_mood_lowers_blocks_for_self_care(self):
+        """低落时更容易选择"缓一缓"：发呆 / 看书的门槛下调。"""
+
+        bored = WorldState(
+            session_id="s1", node_id="bedroom", boredom=0.6, valence=0.3, energy=0.6
+        )
+        plan = self.decider.rule_plan(bored)
+        self.assertIsNotNone(plan)
+        self.assertIn(plan["steps"][-1]["action"], ("stare", "read"))
+        # 心情正常时同样的无聊还不到发呆线（0.8），也不会去看书（0.45）——看书线还是够的
+        happy = WorldState(
+            session_id="s1", node_id="bedroom", boredom=0.5, valence=0.6, energy=0.6
+        )
+        plan2 = self.decider.rule_plan(happy)
+        self.assertTrue(plan2 is None or plan2["steps"][-1]["action"] in ("stare", "read"))
 
 
 class TestPlanKeepsIntent(unittest.TestCase):

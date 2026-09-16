@@ -450,6 +450,231 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         await self.engine.run_schedules()
         self.assertEqual([name for name, _params in self.tools.calls], ["web_search_tavily"])
 
+    # ---------------- 情绪两轴 → 表达方式 ----------------
+
+    async def test_style_cell_follows_her_mood(self):
+        """心情差 + 情绪高 → 恼火格：只允许 1 条，而且要她少说多做。"""
+
+        await self.set_state(affect=0.8, valence=0.15)
+        state = await self.get_state()
+        cell, limit, text = self.engine.style_for(state, SESSION)
+        self.assertIsNotNone(cell)
+        self.assertEqual(cell.key, "excited+negative")
+        self.assertEqual(limit, 1)
+        self.assertIn("这一轮的表达方式", text)
+        self.assertIn("最多说 1 条", text)
+        self.assertEqual(state.last_style_cell, "excited+negative")
+
+    async def test_group_chat_caps_replies_at_two(self):
+        """群聊里最多 2 条：连发 3 条在群里已经很显眼，还容易撞上发送冷却。"""
+
+        await self.set_state(affect=0.9, valence=0.9)
+        state = await self.get_state()
+        cell, limit, _text = self.engine.style_for(state, SESSION)
+        self.assertEqual(cell.key, "excited+positive")
+        self.assertEqual(limit, 2)
+
+    async def test_style_can_be_turned_off(self):
+        raw = self.store.raw_world()
+        raw["style_injection"] = False
+        self.store.save_world(raw)
+        self.engine.reload_config()
+        state = await self.get_state()
+        cell, limit, text = self.engine.style_for(state, SESSION)
+        self.assertIsNone(cell)
+        self.assertEqual(text, "")
+        self.assertEqual(limit, 3)
+        self.assertEqual(state.last_style_cell, "")
+
+    async def test_say_messages_are_capped_by_the_style_cell(self):
+        """模型一口气写三条，群里只会发出两条（格子 + 群聊硬顶一起收紧）。"""
+
+        self.llm.replies = [
+            '{"actions":[{"type":"say","messages":["第一句","第二句","第三句"]}]}'
+        ]
+        ctx = self.ctx(text="在吗")
+        await self.engine.handle_incoming(ctx)
+        outcome = await self.engine.handle_reply(ctx)
+        self.assertEqual(outcome.messages, ["第一句", "第二句"])
+        events = await self.db.call("query_events", session_id=SESSION, limit=10)
+        replies = [item for item in events if item["event_type"] == "reply"]
+        self.assertTrue(replies)
+        self.assertEqual(replies[0]["detail"]["say_limit"], 2)
+        self.assertTrue(replies[0]["detail"]["style_cell"])
+
+    # ---------------- 数值历史与插话闸门统计 ----------------
+
+    async def test_every_tick_records_a_value_snapshot(self):
+        await self.engine.tick()
+        rows = await self.db.call(
+            "query_state_history", session_id=SESSION, since=0.0, limit=50
+        )
+        self.assertTrue(rows, rows)
+        self.assertIn("affect", rows[-1])
+        self.assertIn("valence", rows[-1])
+        self.assertGreater(rows[-1]["at"], 0)
+
+    async def test_history_summarises_the_window(self):
+        base = self.clock.now()
+        for index in range(6):
+            await self.db.call(
+                "add_state_history",
+                session_id=SESSION,
+                world_time=index,
+                at=base + index * 600,
+                values={
+                    "affect": 0.2 + index * 0.1,
+                    "valence": 0.6 - index * 0.1,
+                    "energy": 0.5,
+                    "loneliness": 0.5,
+                    "curiosity": 0.5,
+                    "boredom": 0.3,
+                },
+            )
+        self.clock.advance(3600)
+        data = await self.engine.state_history(SESSION, hours=1)
+        self.assertEqual(len(data["points"]), 6)
+        metrics = data["metrics"]
+        self.assertGreater(metrics["swing_per_hour"], 0)
+        self.assertAlmostEqual(metrics["peak_arousal"], 0.7, places=4)
+        # 后两帧效价低于 0.35，各占 10 分钟
+        self.assertGreater(metrics["low_minutes"], 0)
+
+    async def test_interject_gate_reports_which_one_blocks(self):
+        """插话被拦住时要能说清是哪一道闸。"""
+
+        state = await self.get_state()
+        self.assertEqual(self.engine.interject_gate(state), "")
+        await self.set_state(last_interject_at=self.clock.now())
+        state = await self.get_state()
+        self.assertEqual(self.engine.interject_gate(state), "cooldown")
+        await self.set_state(last_interject_at=0.0, cooldown_until=999999)
+        state = await self.get_state()
+        self.assertEqual(self.engine.interject_gate(state), "engage")
+        await self.set_state(cooldown_until=0, autonomous_count_hour=99)
+        state = await self.get_state()
+        self.assertEqual(self.engine.interject_gate(state), "hourly")
+
+    async def test_blocked_interjections_are_counted(self):
+        """她想插话却被拦住时按闸门计数：光看频率看不出是谁在限流。"""
+
+        async with self.engine.session_state(SESSION) as live:
+            for index in range(3):
+                live.note_chat(
+                    user_id=f"u{index}",
+                    name="小明",
+                    text=f"第 {index} 句",
+                    now=self.clock.now(),
+                    keep=12,
+                )
+        await self.set_state(loneliness=0.95, last_interject_at=self.clock.now())
+        await self.engine.maybe_decide(SESSION, force=True)
+        state = await self.get_state()
+        self.assertEqual(state.interject_stats.get("cooldown"), 1)
+        self.assertTrue(state.interject_stats)
+
+    # ---------------- 生活事件与心情 ----------------
+
+    async def test_ignored_only_sours_the_mood(self):
+        """被冷落只压心情，不抬心潮：否则她会从"退缩"直接跳成"发作"。"""
+
+        async with self.engine.session_state(SESSION) as live:
+            before_affect = live.affect
+            before_valence = live.valence
+            self.engine.dynamics.apply_event(live, "ignored", now=self.clock.now())
+            after_affect = live.affect
+            after_valence = live.valence
+        self.assertLess(after_valence, before_valence)
+        self.assertLessEqual(after_affect, before_affect + 1e-6)
+
+    async def test_ignored_penalty_softens_then_resets(self):
+        """第一次被冷落最疼，之后递减，隔一阵重新算。"""
+
+        state = await self.get_state()
+        now = self.clock.now()
+        magnitudes = [
+            self.engine.dynamics.ignored_magnitude(state, now=now + index * 60)
+            for index in range(3)
+        ]
+        self.assertEqual(magnitudes, [1.0, 0.5, 0.0])
+        self.assertEqual(
+            self.engine.dynamics.ignored_magnitude(state, now=now + 3600), 1.0
+        )
+
+    async def test_tool_failure_sours_her_mood(self):
+        """工具调用失败 = 挫败感：线上一眼看不见，但确实影响心情。"""
+
+        self.tools.failures["web_search"] = "调用出错：连接超时"
+        self.add_schedule(
+            id="fail_news",
+            time="12:00",
+            action_chain=[{"type": "search_web", "params": {"query": "今天的新闻"}}],
+        )
+        await self.set_state(node_id="study")
+        self.clock.set_struct(datetime(2026, 9, 10, 12, 0))
+        before = (await self.get_state()).valence
+        await self.engine.run_schedules()
+        after = (await self.get_state()).valence
+        self.assertLess(after, before)
+
+    async def test_silent_interruption_leaves_a_trace(self):
+        """正在做的事被顶掉时，日志里要留痕，心情上也要有反应。"""
+
+        await self.set_state(
+            node_id="kitchen",
+            current_action={
+                "type": "cook",
+                "duration_ticks": 30,
+                "elapsed_ticks": 5,
+                "desc": "做饭",
+            },
+        )
+        before = (await self.get_state()).valence
+        self.llm.replies = [
+            '{"actions":[{"type":"walk_to","target_node":"window"}]}'
+        ]
+        ctx = self.ctx(text="去窗边")
+        await self.engine.handle_incoming(ctx)
+        await self.engine.handle_reply(ctx)
+        state = await self.get_state()
+        self.assertEqual((state.current_action or {}).get("type"), "walk_to")
+        self.assertLess(state.valence, before)
+        events = await self.db.call("query_events", session_id=SESSION, limit=20)
+        interrupts = [item for item in events if item["event_type"] == "interrupt"]
+        self.assertTrue(interrupts, events)
+        self.assertEqual(interrupts[0]["detail"]["action"], "cook")
+
+    async def test_model_valence_delta_moves_her_mood(self):
+        """主模型按提示词给的 valence_delta 会真的改变她的心情。"""
+
+        self.llm.replies = [
+            '{"valence_delta":-0.9,"actions":[{"type":"say","messages":["……"]}]}'
+        ]
+        before = (await self.get_state()).valence
+        ctx = self.ctx(text="你好烦")
+        await self.engine.handle_incoming(ctx)
+        await self.engine.handle_reply(ctx)
+        state = await self.get_state()
+        self.assertLess(state.valence, before)
+        events = await self.db.call("query_events", session_id=SESSION, limit=10)
+        replies = [item for item in events if item["event_type"] == "reply"]
+        self.assertEqual(replies[0]["detail"]["valence_delta"], -0.9)
+
+    async def test_lively_group_stirs_her_up(self):
+        """群里突然热闹起来：轻微带动一下心潮。"""
+
+        async with self.engine.session_state(SESSION) as live:
+            self.assertFalse(self.engine._group_is_lively(live, now=self.clock.now()))
+            for index in range(5):
+                live.note_chat(
+                    user_id=f"u{index}",
+                    name="小明",
+                    text=f"第 {index} 句",
+                    now=self.clock.now(),
+                    keep=12,
+                )
+            self.assertTrue(self.engine._group_is_lively(live, now=self.clock.now()))
+
     async def test_schedule_auto_travel_walks_to_required_node_first(self):
         """日程只写「上网搜索」，开启 auto_travel 后她会自己先走到书房。"""
 

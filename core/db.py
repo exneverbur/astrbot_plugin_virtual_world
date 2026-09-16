@@ -70,6 +70,20 @@ CREATE TABLE IF NOT EXISTS kv (
     updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS state_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    world_time INTEGER NOT NULL DEFAULT 0,
+    at REAL NOT NULL,
+    affect REAL NOT NULL DEFAULT 0,
+    valence REAL NOT NULL DEFAULT 0.5,
+    energy REAL NOT NULL DEFAULT 0,
+    loneliness REAL NOT NULL DEFAULT 0,
+    curiosity REAL NOT NULL DEFAULT 0,
+    boredom REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_state_history ON state_history (session_id, at);
+
 CREATE TABLE IF NOT EXISTS schedule_fire (
     session_id TEXT NOT NULL,
     schedule_id TEXT NOT NULL,
@@ -155,6 +169,16 @@ class Database:
         self._conn = self._connect()
 
     # ---------------- 通用 ----------------
+
+    @staticmethod
+    def _as_float(value: Any, default: float = 0.0) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        if number != number:  # NaN
+            return default
+        return number
 
     def _execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
         with self._lock:
@@ -544,6 +568,62 @@ class Database:
             ),
         )
         return int(cursor.lastrowid or 0)
+
+    # ---------------- 数值历史（给编辑器画曲线） ----------------
+
+    def add_state_history(
+        self,
+        *,
+        session_id: str,
+        world_time: int = 0,
+        at: float,
+        values: dict[str, Any] | None = None,
+    ) -> None:
+        """记一帧数值快照。
+
+        每个 tick 一行（默认 1 分钟），一个会话一天 1440 行——为了画"她这几天
+        过得怎么样"的曲线，这是最便宜的存法。
+        """
+
+        data = dict(values or {})
+        self._execute(
+            "INSERT INTO state_history (session_id, world_time, at, affect, valence, energy,"
+            " loneliness, curiosity, boredom) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                int(world_time),
+                float(at),
+                self._as_float(data.get("affect"), 0.0),
+                self._as_float(data.get("valence"), 0.5),
+                self._as_float(data.get("energy"), 0.0),
+                self._as_float(data.get("loneliness"), 0.0),
+                self._as_float(data.get("curiosity"), 0.0),
+                self._as_float(data.get("boredom"), 0.0),
+            ),
+        )
+
+    def query_state_history(
+        self, *, session_id: str, since: float = 0.0, limit: int = 6000
+    ) -> list[dict[str, Any]]:
+        """按时间正序取一段历史（越靠后越新）。"""
+
+        rows = self._query(
+            "SELECT world_time, at, affect, valence, energy, loneliness, curiosity, boredom"
+            " FROM state_history WHERE session_id = ? AND at >= ? ORDER BY at ASC LIMIT ?",
+            (session_id, float(since), int(limit)),
+        )
+        return [dict(row) for row in rows]
+
+    def trim_state_history(self, *, session_id: str, keep: int) -> int:
+        """只保留最近 N 行。"""
+
+        limit = max(1, int(keep))
+        cursor = self._execute(
+            "DELETE FROM state_history WHERE session_id = ? AND id NOT IN ("
+            " SELECT id FROM state_history WHERE session_id = ? ORDER BY id DESC LIMIT ?)",
+            (session_id, session_id, limit),
+        )
+        return int(cursor.rowcount or 0)
 
     def query_events(
         self,

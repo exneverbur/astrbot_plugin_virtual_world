@@ -105,6 +105,17 @@
             </div>
           </div>
           <div class="card">
+            <h2 class="values-head">
+              <span>她最近过得怎么样</span>
+              <span class="row-item" id="history-windows"></span>
+            </h2>
+            <canvas id="history-canvas" class="history-canvas"></canvas>
+            <p class="muted" id="history-metrics">还没有足够的数据</p>
+            <p class="muted hidden" id="history-empty">
+              每个 tick 会记一帧数值；跑一会儿再回来看，就能看到她的心情曲线。
+            </p>
+          </div>
+          <div class="card">
             <h2>事件日志</h2>
             <pre id="status-logs" class="pre tall" data-keep-text></pre>
           </div>

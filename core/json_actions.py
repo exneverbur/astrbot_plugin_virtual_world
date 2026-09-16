@@ -146,6 +146,9 @@ class ParseResult:
     chat_note: str = ""
     """一句话交代「刚才这段在聊什么」，下一轮当背景用，避免重复回应老话题。"""
 
+    valence_delta: float = 0.0
+    """这一轮的心情变化（模型给的 -1~1，正=变好、负=变差）。缺失当 0。"""
+
     tail: str = ""
     """JSON 之后残留下来的短尾巴（例如别的插件要求模型追加的 `[好感度 持平]`）。
 
@@ -359,8 +362,23 @@ def parse_action_payload(
         memory=parse_memory(payload.get("memory")),
         cancel=parse_cancel(payload.get("cancel")),
         chat_note=_clean_note(payload.get("chat_note")),
+        valence_delta=_parse_valence_delta(payload.get("valence_delta")),
         tail=_json_tail(cleaned_text),
     )
+
+
+def _parse_valence_delta(value: Any) -> float:
+    """模型给的心情变化：-1 ~ 1，缺失或写坏都当 0（不影响这一轮）。"""
+
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if number != number:  # NaN
+        return 0.0
+    return max(-1.0, min(1.0, number))
 
 
 def _json_tail(text: str, limit: int = 60) -> str:

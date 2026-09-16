@@ -1310,7 +1310,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "exneverbur",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v1.3.5",
+    "v1.4.0",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -1497,6 +1497,9 @@ class VirtualWorldPlugin(Star):
             # affect 是「心潮」；social 是老名字，保留给还没更新的联动方
             "affect": round(state.affect, 4),
             "social": round(state.affect, 4),
+            # 效价：心情好坏（0.5 中性）。联动方可以据此区分"孤独想聊"和"恼火想怼"
+            "valence": round(state.valence, 4),
+            "storm": bool(state.storm),
             "loneliness": round(state.loneliness, 4),
             "energy": round(state.energy, 4),
             "curiosity": round(state.curiosity, 4),
@@ -1504,6 +1507,7 @@ class VirtualWorldPlugin(Star):
             "willingness": round(self.engine.willingness(state), 4),
             "mood": state.mood,
             "state": state.state,
+            "style_cell": state.last_style_cell,
             # 睡着时联动方最好直接不判断（意图路由会拿它当硬门）
             "sleeping": bool(self.engine.is_asleep(state)),
             "node_id": state.node_id,
@@ -2539,6 +2543,7 @@ class VirtualWorldPlugin(Star):
         register(f"/{p}/memories/export", self.api_memory_export, ["GET"], "导出记忆")
         register(f"/{p}/memories/import", self.api_memory_import, ["POST"], "导入记忆")
         register(f"/{p}/prompt", self.api_prompt, ["GET"], "预览提示词")
+        register(f"/{p}/history", self.api_history, ["GET"], "数值历史")
         register(f"/{p}/backup", self.api_backup, ["POST"], "备份配置")
         register(f"/{p}/presets", self.api_presets, ["GET"], "预设列表")
         register(f"/{p}/presets/save", self.api_preset_save, ["POST"], "把当前配置存成预设")
@@ -3111,6 +3116,21 @@ class VirtualWorldPlugin(Star):
         )
 
     # ---------------- 预设：成套的世界配置 ----------------
+
+    async def api_history(self):
+        """数值历史：给编辑器画「她最近过得怎么样」。"""
+
+        guard = self._guard()
+        if guard is not None:
+            return guard
+        session_id = request.query.get("session", "") or ""
+        if not session_id:
+            return error_response("缺少 session 参数")
+        try:
+            hours = int(request.query.get("hours", 24) or 24)
+        except (TypeError, ValueError):
+            hours = 24
+        return json_response(await self.engine.state_history(session_id, hours=hours))
 
     async def api_presets(self):
         guard = self._guard()

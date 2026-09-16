@@ -431,6 +431,7 @@ class PromptBuilder:
         generic_memories: list[str] | None = None,
         focus_user: str = "",
         recent_chat: list[dict[str, Any]] | None = None,
+        style_block: str = "",
     ) -> str:
         now = self._now()
         # 记忆按时间从早到晚排，越靠下越新——模型读提示词时最后的更"近"。
@@ -516,6 +517,9 @@ class PromptBuilder:
             blocks.append("# 其他插件提供的上下文\n" + other_context)
         if extra_notes:
             blocks.extend(note for note in extra_notes if note)
+        # 风格段放在最后：近因效应最强，而且是"这一轮这么说话"的直接指令
+        if style_block:
+            blocks.append(style_block)
         return "\n\n".join(blocks)
 
     # ---------------- 第 4 层的分段构件 ----------------
@@ -533,6 +537,10 @@ class PromptBuilder:
             f"- 心潮 {state.affect:.2f}：情绪被激起的强度（不是开心程度），"
             f"现在是「{_affect_hint(state.affect)}」；"
             "越高，内心活动越翻涌、说出来的感情越浓、越容易做亲昵或冲动的举动",
+            f"- 效价 {state.valence:.2f}：心情的好坏（0.5 是中性），"
+            f"现在是「{_valence_hint(state.valence)}」；"
+            "它管的是情绪朝哪个方向，和心潮一起决定你这一轮的表达形态——"
+            "两者都只是内部感受，不要报数字。",
             f"- 无聊 {state.boredom:.2f}：超过 0.8 待不住，想换个地方；超过 0.45 想找点事做",
             "这些是你的内部感受，不要报数字，但语气、动作和用词要能体现出来。",
         ]
@@ -717,6 +725,7 @@ class PromptBuilder:
                 "  },\n"
                 '  "memory": "这次对话值得记住的一句话（20 字以内，以你的视角）",\n'
                 '  "chat_note": "刚才你们在聊什么（20 字以内，只在这条消息带群聊背景时才写）",\n'
+                '  "valence_delta": -0.2,\n'
                 '  "actions": [ ... ]\n'
                 "}\n\n"
                 "关于 reasoning：\n"
@@ -733,6 +742,12 @@ class PromptBuilder:
                 "- 下一轮你会看到它，并且**已经回应过的内容不会再重复出现**，"
                 "所以写清楚才不会重复回应老话题；\n"
                 "- 没有群聊背景、或者纯寒暄时留空。\n\n"
+                "关于 valence_delta：\n"
+                "- 它是**这次互动让你的心情变好还是变差**，取 -1 ~ 1：\n"
+                "  被认真接话、被夸、玩得开心写成 +0.2 ~ +0.5；\n"
+                "  被冷落、被怼、说了半天没人理写成 -0.2 ~ -0.5；\n"
+                "  普普通通的闲聊写 0 或者不写这一项；\n"
+                "- 它衡量的是**你的感受**，不是对方的语气；一句话很冲但你其实不在意，就写 0。\n\n"
             )
         if mode == "plan":
             body = (
@@ -831,6 +846,7 @@ class PromptBuilder:
         extra_notes: list[str] | None = None,
         focus_user: str = "",
         recent_chat: list[dict[str, Any]] | None = None,
+        style_block: str = "",
     ) -> str:
         """注入模式：给主人格的一层「世界认知」。"""
 
@@ -843,6 +859,7 @@ class PromptBuilder:
             extra_notes=extra_notes,
             focus_user=focus_user,
             recent_chat=recent_chat,
+            style_block=style_block,
         )
         return (
             "\n\n# ===== 虚拟世界状态（这是你此刻真实的处境）=====\n"
@@ -879,6 +896,7 @@ class PromptBuilder:
         other_context: str = "",
         reasoning: bool = True,
         mode: str = "actions",
+        style_block: str = "",
     ) -> str:
         """接管模式：完整五层，含 JSON 输出约束。
 
@@ -911,6 +929,7 @@ class PromptBuilder:
                 extra_notes=extra_notes,
                 recent_chat=recent_chat,
                 other_context=other_context,
+                style_block=style_block,
             )
         )
         layers.append(self.reminder_layer(mode))
@@ -1349,3 +1368,18 @@ def _affect_hint(affect: float) -> str:
     if value >= 0.2:
         return "比较平静"
     return "情绪很淡，不太想表达"
+
+
+def _valence_hint(valence: float) -> str:
+    """把效价数值翻译成给大模型看的方向描述。"""
+
+    value = float(valence if valence is not None else 0.5)
+    if value >= 0.7:
+        return "心情很好"
+    if value >= 0.58:
+        return "心情偏好"
+    if value > 0.42:
+        return "心情一般"
+    if value > 0.3:
+        return "心情有点差"
+    return "心情很差"

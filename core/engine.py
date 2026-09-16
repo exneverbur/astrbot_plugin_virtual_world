@@ -55,6 +55,13 @@ from .state import (
 )
 from .state_dynamics import StateDynamics
 from .tool_policy import allowed_tools, is_self_send_tool
+from .mood import (
+    SELF_CARE_NOTE,
+    StyleCell,
+    cell_for,
+    keyword_signal,
+    style_block as render_style_block,
+)
 
 from .generator import (
     auto_layout,
@@ -291,6 +298,7 @@ class VirtualWorldEngine:
         self._last_decider_at: dict[str, float] = {}
         self._last_presence_at: dict[str, float] = {}
         self._event_writes: dict[str, int] = {}
+        self._history_writes: dict[str, int] = {}
         self._event_ids: dict[str, int] = {}
         """每个会话最后写入的事件 id，用来给「把动作发到群里」划一条起跑线。"""
         self._pending_echo: dict[str, list[str]] = {}
@@ -334,9 +342,15 @@ class VirtualWorldEngine:
         self._sessions_index = {item.session_id: item for item in sessions.sessions}
         self.load_warnings = warnings
 
-        self.dynamics = StateDynamics(world.state_dynamics)
+        # 情绪两轴需要"现在是几点"和"现实时间"：交给演化器自己取，
+        # 免得每个调用点都要把 now / hour 传一遍。
+        self.dynamics = StateDynamics(
+            world.state_dynamics,
+            now_provider=self._now,
+            hour_provider=lambda: self.local_now().hour,
+        )
         self.memory = MemoryEngine(self.db.raw, world)
-        self.decider = Decider(world)
+        self.decider = Decider(world, now_provider=self._now)
         self.engagement = EngagementTracker(world)
         self.prompts = PromptBuilder(
             world, tick_seconds=self.tick_seconds, now_provider=self.local_now
@@ -844,6 +858,7 @@ class VirtualWorldEngine:
             )
             mood = state.mood
             affect = float(state.affect)
+            valence = float(state.valence)
             state.pending_memory = []
             state.memory_hints = []
             state.pending_memory_node = ""
@@ -890,6 +905,7 @@ class VirtualWorldEngine:
                 weight=0.5,
                 source="llm" if summary else "runtime",
                 affect=affect,
+                valence=valence,
             )
             await self._log_event(
                 state,
@@ -981,6 +997,140 @@ class VirtualWorldEngine:
             "真有必要回一句时，短一点，或者干脆安静地做自己的事。"
         )
 
+    def chat_is_group(self, session_id: str) -> bool:
+        """这个会话是不是群聊。续说那条路径拿不到 ctx，所以从会话配置取。"""
+
+        session = self.session_config(session_id)
+        return getattr(session, "type", "group") != "private"
+
+    def _group_is_lively(self, state: WorldState, *, now: float | None = None) -> bool:
+        """群里这几分钟是不是聊得很热闹（带动一下她的心潮）。"""
+
+        stamp = self._now() if now is None else float(now)
+        window = min(300.0, max(60.0, float(self.world.decider.chat_window_minutes) * 60))
+        recent = [
+            item
+            for item in state.recent_chat
+            if not item.get("is_self") and stamp - float(item.get("at") or 0.0) <= window
+        ]
+        need = max(3, int(self.world.decider.min_messages_to_interject) + 2)
+        return len(recent) >= need
+
+    def _apply_valence_delta(self, state: WorldState, raw: float) -> None:
+        """把模型给的 -1~1 心情变化落到效价上（单轮最多 ±0.2）。"""
+
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return
+        delta = max(-1.0, min(1.0, value)) * 0.2
+        if not delta:
+            return
+        self.dynamics.apply_event_delta(state, "valence", delta, now=self._now())
+
+    # ---------------- 数值历史（给编辑器画曲线） ----------------
+
+    async def _record_history(self, state: WorldState, node: NodeDef | None) -> None:
+        """每个 tick 记一帧数值快照，顺手做数量裁剪。"""
+
+        try:
+            await self.db.call(
+                "add_state_history",
+                session_id=state.session_id,
+                world_time=state.world_time,
+                at=self._now(),
+                values=self.dynamics.values(state),
+            )
+        except Exception as exc:  # 画曲线失败不能影响世界运行
+            self._log("debug", f"写数值历史失败：{exc}")
+            return
+        count = self._history_writes.get(state.session_id, 0) + 1
+        self._history_writes[state.session_id] = count
+        if count % 60 == 0:
+            try:
+                await self.db.call(
+                    "trim_state_history",
+                    session_id=state.session_id,
+                    keep=max(120, int(self.world.limits.max_history_rows)),
+                )
+            except Exception:
+                pass
+
+    async def state_history(self, session_id: str, *, hours: int = 24) -> dict[str, Any]:
+        """取最近一段数值历史，并算出「她这段时间过得怎么样」的三个指标。"""
+
+        span = max(1, int(hours)) * 3600
+        since = self._now() - span
+        rows = await self.db.call(
+            "query_state_history",
+            session_id=session_id,
+            since=since,
+            limit=max(120, int(self.world.limits.max_history_rows)),
+        )
+        series: list[dict[str, Any]] = []
+        swing = 0.0
+        peak_arousal = 0.0
+        low_minutes = 0.0
+        previous: dict[str, Any] | None = None
+        for row in rows:
+            item = {
+                "at": float(row.get("at") or 0.0),
+                "world_time": int(row.get("world_time") or 0),
+                "affect": round(_as_float(row.get("affect")), 4),
+                "valence": round(_as_float(row.get("valence"), 0.5), 4),
+            }
+            series.append(item)
+            peak_arousal = max(peak_arousal, item["affect"])
+            if previous is not None:
+                minutes = max(0.0, (item["at"] - previous["at"]) / 60.0)
+                swing += abs(item["affect"] - previous["affect"]) + abs(
+                    item["valence"] - previous["valence"]
+                )
+                if item["valence"] < 0.35:
+                    low_minutes += minutes
+            previous = item
+        return {
+            "session_id": session_id,
+            "hours": int(hours),
+            "points": series,
+            # 起伏：单位时间内的平均变化量；峰值：这段时间最激动到哪
+            "metrics": {
+                "swing_per_hour": round(swing / max(1.0, int(hours)), 3),
+                "peak_arousal": round(peak_arousal, 3),
+                "low_minutes": round(low_minutes, 1),
+            },
+        }
+
+    def style_for(
+        self, state: WorldState, session_id: str
+    ) -> tuple[StyleCell | None, int, str]:
+        """这一轮的表达方式：（格子、生效句数上限、进提示词的文字）。
+
+        句数上限取**更严格者**：配置上限、格子上限、群聊硬顶（2 条），
+        再加上"最近话太密"时的收紧——两条指令同时出现时不能互相抵消。
+        """
+
+        configured = int(self.world.limits.max_messages_per_say or 3)
+        if not bool(getattr(self.world, "style_injection", True)):
+            state.last_style_cell = ""
+            state.last_say_limit = max(1, configured)
+            return None, state.last_say_limit, ""
+        cell = cell_for(state.affect, state.valence)
+        group = self.chat_is_group(session_id)
+        limit = min(configured, cell.say_limit, 2 if group else 3)
+        if self.speech_density_hint(state):
+            limit = min(limit, 1)
+        limit = max(1, limit)
+        state.last_style_cell = cell.key
+        state.last_say_limit = limit
+        # 长期低落时补一句"想自己待会儿"：安全阀是行为倾向，不是给她安排动作
+        note = ""
+        if float(state.valence) < 0.35:
+            note = SELF_CARE_NOTE
+        return cell, limit, render_style_block(
+            cell, say_limit=limit, group=group, note=note
+        )
+
     # ================= 接管回复（被 @ 时由本插件回复） =================
 
     async def handle_reply(
@@ -1023,6 +1173,7 @@ class VirtualWorldEngine:
                 limit=self.world.limits.max_think_memory,
             )
             persona_text = await self._persona_text(state.session_id)
+            _cell, say_limit, style_text = self.style_for(state, ctx.session_id)
             system_prompt = self.prompts.build_autonomous_system_prompt(
                 persona_text=persona_text,
                 state=state,
@@ -1033,8 +1184,9 @@ class VirtualWorldEngine:
                 recent_chat=self.chat_context_for_reply(state, ctx),
                 other_context=ctx.other_context,
                 extra_notes=extra_notes,
-                max_messages=self.world.limits.max_messages_per_say,
+                max_messages=say_limit,
                 reasoning=bool(self.world.reasoning_enabled),
+                style_block=style_text,
             )
             user_prompt = self.prompts.build_reply_user_prompt(
                 user_name=ctx.user_name,
@@ -1060,7 +1212,7 @@ class VirtualWorldEngine:
             available_actions=self._parseable_action_ids(node_id),
             valid_nodes=set(self.world.node_map()),
             max_actions=self.world.limits.max_actions_per_message,
-            max_messages=self.world.limits.max_messages_per_say,
+            max_messages=say_limit,
         )
         # 空内容的 say 直接丢掉：模型没想好要说什么时不该发一条空气泡
         actions = [
@@ -1103,6 +1255,10 @@ class VirtualWorldEngine:
                 # 她真的回了：把已回应水位线推上去，并记下"刚才在聊什么"
                 self.mark_chat_replied(state)
             self.note_chat_note(state, parsed.chat_note)
+            # 模型自己标的心情变化（主路径）：只在这一轮是她真的跟人说话时接受，
+            # 自主轮不写，免得她凭空给自己加心情。
+            if parsed.valence_delta:
+                self._apply_valence_delta(state, parsed.valence_delta)
             await self._echo_events_since(state, outcome, echo_marker)
             # 模型顺手给的总结只当"写记忆时的提示"，不单独落成一条记忆
             self.note_memory_hint(state, parsed.memory)
@@ -1119,6 +1275,11 @@ class VirtualWorldEngine:
                     "raw": _clip_text(parsed.raw_text, 500),
                     "warnings": list(parsed.warnings),
                     "auto_travel": list(outcome.auto_travel),
+                    # 这一轮用的是哪个表达格、实际允许几条：日志页能直接对照
+                    "style_cell": state.last_style_cell,
+                    "say_limit": int(state.last_say_limit or 0),
+                    # 模型自己标的心情变化（正 = 变好，负 = 变差）
+                    "valence_delta": round(float(parsed.valence_delta or 0.0), 3),
                 },
                 persona_id=ctx.persona_id,
             )
@@ -1147,6 +1308,7 @@ class VirtualWorldEngine:
         第二个返回值表示这次是不是把她叫醒了（调用方负责写一条事件日志）。
         """
 
+        now = self._now()
         self._note_images(state, ctx.image_urls)
         state.touch_user(
             ctx.user_id or "unknown",
@@ -1158,22 +1320,27 @@ class VirtualWorldEngine:
             user_id=ctx.user_id or "unknown",
             name=ctx.user_name,
             text=ctx.text,
-            now=self._now(),
+            now=now,
             keep=self.chat_history_limit(),
         )
-        state.last_user_activity_at = self._now()
+        state.last_user_activity_at = now
         self.engagement.on_user_replied(state)
-        self.dynamics.apply_event(state, "topic_engaged")
+        self.dynamics.apply_event(state, "topic_engaged", now=now)
+        # 关键词兜底：主模型会在 JSON 里给 valence_delta，那是主路径；
+        # 这条只在消息明显带情绪时先垫一点，免得小模型漏字段时完全没有反应。
+        signal = ctx.mood_signal or (
+            keyword_signal(ctx.text) if (ctx.is_wake or ctx.is_mentioned) else ""
+        )
         if ctx.is_wake:
-            self.dynamics.apply_event(state, "mention_bot")
-        if ctx.mood_signal == "positive":
-            self.dynamics.apply_event(state, "positive_words")
-        elif ctx.mood_signal == "negative":
-            self.dynamics.apply_event(state, "negative_words")
-        elif ctx.mood_signal == "hug":
-            self.dynamics.apply_event(state, "hug_bot")
-        if ctx.is_group_lively:
-            self.dynamics.apply_event(state, "group_lively")
+            self.dynamics.apply_event(state, "mention_bot", now=now)
+        if signal == "positive":
+            self.dynamics.apply_event(state, "positive_words", now=now)
+        elif signal == "negative":
+            self.dynamics.apply_event(state, "negative_words", now=now)
+        elif signal == "hug":
+            self.dynamics.apply_event(state, "hug_bot", now=now)
+        if ctx.is_group_lively or self._group_is_lively(state, now=now):
+            self.dynamics.apply_event(state, "group_lively", now=now)
 
         # 醒来：冷启动之后第一次有消息，从"刚醒"转成空闲
         if state.state == STATE_AWAKENING and state.world_time > 0:
@@ -1981,17 +2148,39 @@ class VirtualWorldEngine:
                 await self.decide_after_arrival(state, self.node(state.node_id) or node, outcome)
 
             # 3) 数值演化
-            self.dynamics.tick(
-                state, node=node, elapsed_seconds=self.tick_seconds, world=self.world
+            was_storm = bool(state.storm)
+            mood_reset = self.dynamics.tick(
+                state,
+                node=node,
+                elapsed_seconds=self.tick_seconds,
+                world=self.world,
+                now=self._now(),
             )
             state.mood = self.dynamics.derive_mood(state)
+            if mood_reset:
+                await self._log_event(state, "mood_reset", {"valence": round(state.valence, 3)})
+            if bool(state.storm) != was_storm:
+                await self._log_event(
+                    state,
+                    "storm",
+                    {"on": bool(state.storm), "valence": round(state.valence, 3)},
+                )
+            await self._record_history(state, node)
 
             # 4) 群聊留档攒太多时压成摘要（只在配置成"压缩"时才会跑）
             await self._maybe_compress_chat(state, outcome)
 
             # 4) 无人回应保护
             was_cooling = bool(state.cooldown_until and state.world_time < state.cooldown_until)
+            before_unanswered = int(state.unanswered_count or 0)
             verdict = self.engagement.evaluate(state, tick_seconds=self.tick_seconds)
+            if int(state.unanswered_count or 0) > before_unanswered:
+                # 主动说话没人理 = 被冷落：只压心情，不抬心潮（否则她会从退缩跳成发作）
+                magnitude = self.dynamics.ignored_magnitude(state, now=self._now())
+                if magnitude:
+                    self.dynamics.apply_event(
+                        state, "ignored", magnitude=magnitude, now=self._now()
+                    )
             if verdict.in_cooldown and not was_cooling:
                 await self._log_event(
                     state,
@@ -2107,7 +2296,7 @@ class VirtualWorldEngine:
 
         effects = (definition.on_complete.effects if definition else {}) or {}
         if effects:
-            self.dynamics.apply_effects(state, effects, world=self.world)
+            self.dynamics.apply_effects(state, effects, world=self.world, now=self._now())
 
         # 按「实际持续时间」缩放的效果：例如小睡 30 分钟 → 精力 +0.002×30
         per_minute = (definition.on_complete.effects_per_minute if definition else {}) or {}
@@ -2116,7 +2305,7 @@ class VirtualWorldEngine:
             minutes = max(0.0, elapsed_seconds / 60.0)
             if minutes > 0:
                 self.dynamics.apply_effects(
-                    state, per_minute, world=self.world, scale=minutes
+                    state, per_minute, world=self.world, scale=minutes, now=self._now()
                 )
 
         # 行动完成 -> 记忆
@@ -2226,6 +2415,7 @@ class VirtualWorldEngine:
                     emotion=state.mood,
                     weight=0.35,
                     affect=state.affect,
+                    valence=state.valence,
                 )
             return
         self.memory.remember(
@@ -2237,6 +2427,7 @@ class VirtualWorldEngine:
             emotion=state.mood,
             weight=0.3,
             affect=state.affect,
+            valence=state.valence,
         )
 
     async def _llm_followup(
@@ -2249,6 +2440,7 @@ class VirtualWorldEngine:
         image_urls: list[str] | None = None,
     ) -> None:
         persona_text = await self._persona_text(state.session_id)
+        _cell, say_limit, style_text = self.style_for(state, state.session_id)
         system_prompt = self.prompts.build_autonomous_system_prompt(
             persona_text=persona_text,
             state=state,
@@ -2261,9 +2453,10 @@ class VirtualWorldEngine:
                 limit=3,
             ),
             engagement_hint=self.engagement.hint(state),
-            max_messages=self.world.limits.max_messages_per_say,
+            max_messages=say_limit,
             recent_chat=self.chat_context(state),
             reasoning=bool(self.world.reasoning_enabled),
+            style_block=style_text,
         )
         prompt = self.prompts.build_reply_followup_prompt(hint, tool_result)
         reply = await self._ask_llm(
@@ -2280,7 +2473,7 @@ class VirtualWorldEngine:
             available_actions=self._parseable_action_ids(state.node_id),
             valid_nodes=set(self.world.node_map()),
             max_actions=self.world.limits.max_actions_per_message,
-            max_messages=self.world.limits.max_messages_per_say,
+            max_messages=say_limit,
         )
         await self._execute_actions(state, node, outcome, result.actions, depth=1, autonomous=True)
 
@@ -2340,10 +2533,19 @@ class VirtualWorldEngine:
             elif not self._within_hourly_limit(state):
                 outcome.notes.append("达到每小时自主行为上限")
             else:
+                # 长期低落会关掉「想被注意到」这条动机（带最小关闭时长）
+                self._refresh_interject_closed(state)
+                # 「她想插话但被拦住」按闸门分类计数：单看频率数字没法知道是谁在限流
+                gate = self.interject_gate(state)
+                wants_interject = self.group_is_chatting(state) and float(
+                    state.loneliness
+                ) >= float(self.world.decider.interject_threshold)
+                if wants_interject:
+                    self._count_interject_gate(state, gate)
                 plan = self.decider.rule_plan(
                     state,
                     group_chatting=self.group_is_chatting(state),
-                    interject_allowed=self.interject_allowed(state),
+                    interject_allowed=gate == "",
                 )
                 # 要不要交给大模型，由「决策意愿」算出的概率决定；
                 # 规则决策不受影响，命中就直接执行。
@@ -2478,6 +2680,7 @@ class VirtualWorldEngine:
             outcome.notes.append("LLM 计划预算已用完，本轮只用规则决策")
             return None
         persona_text = await self._persona_text(state.session_id)
+        _cell, say_limit, style_text = self.style_for(state, state.session_id)
         system_prompt = self.prompts.build_autonomous_system_prompt(
             persona_text=persona_text,
             state=state,
@@ -2487,10 +2690,11 @@ class VirtualWorldEngine:
                 session_id=state.session_id, persona_id="", node_id=state.node_id, limit=4
             ),
             engagement_hint=self.engagement.hint(state),
-            max_messages=self.world.limits.max_messages_per_say,
+            max_messages=say_limit,
             recent_chat=self.chat_context(state),
             mode="plan",
             reasoning=bool(self.world.reasoning_enabled),
+            style_block=style_text,
         )
         prompt = (
             (f"{hint}\n\n" if hint else "")
@@ -3679,6 +3883,8 @@ class VirtualWorldEngine:
                 texts.append(str(call.text))
             elif not call.ok:
                 failed.append(f"{call.tool or name}：{call.error or '没有返回结果'}")
+                # 工具没跑成 = 挫败感：这条线上一眼看不见，但确实影响她的心情
+                self.dynamics.apply_event(state, "tool_failed", now=self._now())
             images.extend(getattr(call, "image_urls", None) or [])
             state.add_event(
                 "tool_result",
@@ -3794,9 +4000,24 @@ class VirtualWorldEngine:
                 else:
                     outcome.notes.append(f"找不到目标 {target}，移动取消")
                     return
-            state.current_action = payload
+            # 正在做的事被顶掉时留个痕迹：以前是"无声替换"，
+            # 日志里既看不到她原本在干什么，心情上也没有任何反应。
             if definition.during.state:
                 state.state = definition.during.state
+            previous = state.current_action if isinstance(state.current_action, dict) else None
+            if previous and str(previous.get("type") or "") != definition.id:
+                self.dynamics.apply_event(state, "interrupted", now=self._now())
+                state.add_event("interrupt", {"action": previous.get("type")})
+                await self._log_event(
+                    state,
+                    "interrupt",
+                    {
+                        "action": previous.get("type"),
+                        "note": f"她正在做「{previous.get('desc') or previous.get('type')}」，"
+                        f"这一步把它顶掉了",
+                    },
+                )
+            state.current_action = payload
             state.add_event("action_start", {"type": definition.id})
             await self._log_event(
                 state,
@@ -3888,8 +4109,11 @@ class VirtualWorldEngine:
                 emotion=state.mood,
                 weight=0.35,
                 affect=state.affect,
+                valence=state.valence,
             )
-        self.dynamics.apply_effects(state, definition.on_complete.effects, world=self.world)
+        self.dynamics.apply_effects(
+            state, definition.on_complete.effects, world=self.world, now=self._now()
+        )
         state.add_event("action", {"type": definition.id, "visible": definition.visible})
         await self._log_event(
             state,
@@ -4075,7 +4299,7 @@ class VirtualWorldEngine:
             if text:
                 outcome.messages.append(text)
         self.dynamics.apply_effects(
-            state, definition.on_complete.effects, world=self.world
+            state, definition.on_complete.effects, world=self.world, now=self._now()
         )
         state.add_event("action", {"type": "poke", "visible": bool(outcome.messages)})
         await self._log_event(
@@ -4124,6 +4348,7 @@ class VirtualWorldEngine:
     ) -> None:
         """执行日程动作链：瞬时动作立即执行；持续动作启动后，剩余步骤转为计划。"""
 
+        skipped = 0
         for index, step in enumerate(chain or []):
             action = PlannedAction(
                 type=str(getattr(step, "type", "") or ""),
@@ -4137,6 +4362,7 @@ class VirtualWorldEngine:
             definition = self.world.action_map().get(action.type)
             if definition is None:
                 outcome.notes.append(f"日程里的动作 {action.type} 不存在，已跳过")
+                skipped += 1
                 await self._log_event(
                     state,
                     "skip",
@@ -4146,6 +4372,7 @@ class VirtualWorldEngine:
             if not definition.enabled:
                 # 停用 = 当作根本没有这个动作（日程里排到的这一步也跳过）
                 outcome.notes.append(f"日程动作 {action.type} 已停用，已跳过")
+                skipped += 1
                 await self._log_event(
                     state,
                     "skip",
@@ -4160,6 +4387,7 @@ class VirtualWorldEngine:
                 outcome.notes.append(
                     f"日程动作 {action.type} 前置条件不满足（{reason}），已跳过"
                 )
+                skipped += 1
                 # 日程被跳过的原因必须进事件日志，否则日志页看不出"她为什么没做这件事"。
                 await self._log_event(
                     state,
@@ -4208,6 +4436,9 @@ class VirtualWorldEngine:
                 # 到了别处这一步就跳过，而不是悄悄替她走一趟。
                 allow_remote_travel=False,
             )
+        if chain and not skipped:
+            # 整条日程顺顺利利跑完：心情上给一点正反馈
+            self.dynamics.apply_event(state, "schedule_done", now=self._now())
 
     async def _generate_text_actions(
         self,
@@ -4224,15 +4455,17 @@ class VirtualWorldEngine:
         if not self._llm_text_allowed(state):
             return [self._fallback_text()] if allow_fallback else []
         persona_text = await self._persona_text(state.session_id)
+        _cell, say_limit, style_text = self.style_for(state, state.session_id)
         system_prompt = self.prompts.build_autonomous_system_prompt(
             persona_text=persona_text,
             state=state,
             node=node,
             available_tools=self.available_tools(),
             engagement_hint=self.engagement.hint(state),
-            max_messages=self.world.limits.max_messages_per_say,
+            max_messages=say_limit,
             recent_chat=self.chat_context(state),
             reasoning=bool(self.world.reasoning_enabled),
+            style_block=style_text,
         )
         prompt = instruction + '\n只输出 JSON：{"actions":[{"type":"say","messages":["..."]}]}'
         reply = await self._ask_llm(state.session_id, system_prompt, prompt)
@@ -4243,7 +4476,7 @@ class VirtualWorldEngine:
             reply,
             available_actions={"say"},
             max_actions=1,
-            max_messages=self.world.limits.max_messages_per_say,
+            max_messages=say_limit,
         )
         for item in result.actions:
             if item.type == "say" and item.messages:
@@ -4494,7 +4727,7 @@ class VirtualWorldEngine:
     ) -> dict[str, float]:
         """手改她的数值（编辑器「实时状态」用）：只认已知字段，自动夹到 0~1，并记一条日志。"""
 
-        allowed = ("energy", "loneliness", "curiosity", "affect", "boredom")
+        allowed = ("energy", "loneliness", "curiosity", "affect", "valence", "boredom")
         applied: dict[str, float] = {}
         async with self.session_state(session_id) as state:
             for key, value in (values or {}).items():
@@ -4504,9 +4737,14 @@ class VirtualWorldEngine:
                     number = max(0.0, min(1.0, float(value)))
                 except (TypeError, ValueError):
                     continue
-                setattr(state, key, number)
+                if key == "valence":
+                    # 手改的是"她看到的心情"，所以落成基线 + 新偏移
+                    self.dynamics.apply_effects(state, {"valence": f"={number}"})
+                else:
+                    setattr(state, key, number)
                 applied[key] = round(number, 4)
             if applied:
+                self.dynamics.refresh(state, now=self._now())
                 state.mood = self.dynamics.derive_mood(state)
                 await self._log_event(state, "manual", {"values": applied})
         return applied
@@ -4939,12 +5177,56 @@ class VirtualWorldEngine:
     def interject_allowed(self, state: WorldState) -> bool:
         """是否允许主动插话：插话冷却 + 无人回应冷却 + 每小时上限。"""
 
+        return self.interject_gate(state) == ""
+
+    def interject_gate(self, state: WorldState) -> str:
+        """插话被哪道闸拦住（空字符串 = 放行）。
+
+        分工：`cooldown` 是两次插话的间隔，`engage` 是无人回应保护，
+        `hourly` 是每小时自主额度，`reply_cd` 是"刚回过话就别主动开口"。
+        把它们分开报出来，才能知道到底是谁在限流。
+        """
+
         if not self.world.decider.enabled:
-            return False
+            return "disabled"
         cooldown = max(0, int(self.world.decider.interject_cooldown_minutes)) * 60
         if self._now() - float(state.last_interject_at or 0.0) < cooldown:
-            return False
-        return self.engagement.can_speak(state) and self._within_hourly_limit(state)
+            return "cooldown"
+        if not self.engagement.can_speak(state):
+            return "engage"
+        if not self._within_hourly_limit(state):
+            return "hourly"
+        if self.engagement.proactive_blocked(state):
+            return "reply_cd"
+        return ""
+
+    def _count_interject_gate(self, state: WorldState, gate: str) -> None:
+        """记一笔「她这轮想插话，结果如何」——按小时归零。"""
+
+        hour = int(self._now() // 3600)
+        if state.interject_hour_marker != hour:
+            state.interject_hour_marker = hour
+            state.interject_stats = {}
+        key = gate or "allowed"
+        stats = dict(state.interject_stats or {})
+        stats[key] = int(stats.get(key, 0)) + 1
+        state.interject_stats = stats
+
+    def _refresh_interject_closed(self, state: WorldState) -> None:
+        """长期低落时关掉「想被注意到」这条插话动机，并且至少关 15 分钟。
+
+        动机 B（想发作）不受影响：被惹毛的人反而是想开口的。
+        """
+
+        now = self._now()
+        if float(state.valence) >= 0.2:
+            return
+        started = float(state.low_valence_since or 0.0)
+        if not started or now - started < 30 * 60:
+            return
+        state.interject_closed_until = max(
+            float(state.interject_closed_until or 0.0), now + 15 * 60
+        )
 
     def _forced_plan_allowed(self, state: WorldState) -> bool:
         """极端保护也要守规矩：间隔、每小时上限、无人回应冷却一个都不能少。"""
@@ -5057,7 +5339,15 @@ class VirtualWorldEngine:
         async with self.session_state(outcome.session_id) as state:
             if said:
                 self.engagement.on_bot_spoke(state)
-                await self._log_event(state, "bot_message", {"messages": said})
+                await self._log_event(
+                    state,
+                    "bot_message",
+                    {
+                        "messages": said,
+                        "style_cell": state.last_style_cell,
+                        "say_limit": int(state.last_say_limit or 0),
+                    },
+                )
                 # 自己说过的话也进聊天上下文：模型才知道"刚才那句是我说的"，
                 # 并被要求换一种说法，避免每轮都用同一个句式开场。
                 for message in said:
@@ -5077,6 +5367,7 @@ class VirtualWorldEngine:
         if failed_note:
             # 没发出去这件事也要留痕：日志里能看到"这条她说过、但平台没收"
             async with self.session_state(outcome.session_id) as state:
+                self.dynamics.apply_event(state, "send_failed", now=self._now())
                 await self._log_event(
                     state,
                     "send_failed",
@@ -5235,6 +5526,13 @@ class VirtualWorldEngine:
             "state": state.state,
             "mood": state.mood,
             "values": self.dynamics.values(state),
+            # 情绪两轴的派生结果：心情词、正在气头上的标记、这一轮的表达格
+            "storm": bool(state.storm),
+            "style": {
+                "cell": state.last_style_cell,
+                "say_limit": int(state.last_say_limit or 0),
+            },
+            "interject": dict(state.interject_stats or {}),
             "current_action": state.current_action,
             "current_plan": state.current_plan,
             "last_reasoning": state.last_reasoning,
@@ -5331,6 +5629,7 @@ class VirtualWorldEngine:
 
         state = await self.load_state(session_id, cold_start=False)
         node = self.node(state.node_id)
+        _cell, say_limit, style_text = self.style_for(state, session_id)
         return self.prompts.build_autonomous_system_prompt(
             persona_text=await self._persona_text(session_id),
             state=state,
@@ -5343,9 +5642,10 @@ class VirtualWorldEngine:
                 limit=self.world.limits.max_think_memory,
             ),
             engagement_hint=self.engagement.hint(state),
-            max_messages=self.world.limits.max_messages_per_say,
+            max_messages=say_limit,
             recent_chat=self.chat_context(state),
             reasoning=bool(self.world.reasoning_enabled),
+            style_block=style_text,
         )
 
     async def _event_marker(self, state: WorldState) -> int:
@@ -5634,6 +5934,18 @@ def render_param_text(schema: dict[str, Any]) -> str:
         text += "）"
         parts.append(text)
     return "、".join(parts)
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    """尽量转成 float，坏值退回默认值（数值历史是给人看的，不能因为一帧脏数据炸掉）。"""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number:  # NaN
+        return default
+    return number
 
 
 def _clip_text(value: Any, limit: int = 200) -> str:

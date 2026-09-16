@@ -1666,6 +1666,25 @@ details.raw-json summary {
   gap: 8px;
 }
 
+/* 数值曲线：心潮与效价两条线 */
+.history-canvas {
+  width: 100%;
+  height: 160px;
+  display: block;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+#history-windows {
+  gap: 4px;
+}
+
+#history-windows .pill {
+  font-size: 11px;
+  padding: 2px 8px;
+}
+
 .value-label {
   color: var(--muted);
 }

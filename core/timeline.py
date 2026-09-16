@@ -264,6 +264,16 @@ def render_event(
     if kind == "wake_up":
         return f"被 {detail.get('by') or '有人'} 叫醒"
 
+    if kind == "mood_reset":
+        return (
+            f"心情低落太久了，她自己缓了缓（效价回到 {float(detail.get('valence') or 0):.2f}）"
+        )
+
+    if kind == "storm":
+        if detail.get("on"):
+            return "被惹到了：情绪上来了，还在气头上"
+        return "气消了"
+
     if kind == "sleep_reply":
         return (
             "她在睡觉，只回了一句固定文案："

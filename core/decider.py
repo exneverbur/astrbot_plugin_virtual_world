@@ -7,6 +7,7 @@ LLM（复杂情境，低频抽样）。这里只负责「规则决策」和「�
 from __future__ import annotations
 
 import random
+import time
 from typing import Any
 
 from .models import WorldConfig
@@ -24,6 +25,20 @@ WILLINGNESS_WEIGHTS = {
     "tired": 0.35,
     "unanswered": 0.25,
 }
+
+# 插话的两条动机（详见 rule_plan 的第 0 条）：
+# - A「想被注意到」：孤独感高、而且心情不太差时才愿意主动social；
+# - B「想发作」：情绪上来了、心情又差，会憋不住呛一句。
+INTERJECT_SOCIAL_VALENCE_FLOOR = 0.35
+INTERJECT_VENT_AROUSAL = 0.6
+INTERJECT_THRESHOLD_BUMP_MAX = 0.10
+INTERJECT_THRESHOLD_BUMP_CLOSED = 0.15
+
+# 心情低落时，自我调节类动作（发呆、看书）的门槛下调：
+# 安全阀不是"触发一个动作"，而是让她的行为自然偏向自我修复。
+SELF_CARE_VALENCE = 0.4
+SELF_CARE_BOREDOM = 0.55
+SELF_CARE_IDLE = 0.3
 
 
 def reply_willingness(state: WorldState, weights: dict[str, float] | None = None) -> float:
@@ -49,9 +64,24 @@ def reply_willingness(state: WorldState, weights: dict[str, float] | None = None
 class Decider:
     """规则决策器。"""
 
-    def __init__(self, world: WorldConfig, rng: random.Random | None = None) -> None:
+    def __init__(
+        self,
+        world: WorldConfig,
+        rng: random.Random | None = None,
+        *,
+        now_provider: Any = None,
+    ) -> None:
         self.world = world
         self.rng = rng or random.Random()
+        self._now_provider = now_provider
+
+    def _now(self) -> float:
+        if self._now_provider is None:
+            return time.time()
+        try:
+            return float(self._now_provider())
+        except Exception:
+            return time.time()
 
     def set_world(self, world: WorldConfig) -> None:
         self.world = world
@@ -111,21 +141,20 @@ class Decider:
         graph = self.world.adjacent()
         home = self.world.default_node_id()
 
-        # 0) 群里正热闹 + 孤独感高 -> 主动插一句（说不出来就保持安静）
-        #    孤独感负责"想不想说话"，心潮只负责"说得有多动情"，两件事分开。
-        if (
-            self.world.decider.enabled
-            and interject_allowed
-            and group_chatting
-            and state.loneliness >= float(self.world.decider.interject_threshold)
-        ):
-            return create_plan(
-                steps=[{"action": "say", "interject": True}],
-                world_time=state.world_time,
-                valid_for=min(600, self._plan_valid()),
-                reason="群里正聊得热闹，想接一句",
-                source="rule",
-            )
+        # 0) 群里正热闹 -> 主动插一句。两条动机分开算：
+        #    A「想被注意到」：孤独感够了、心情也不太差才愿意主动social；
+        #    B「想发作」：情绪上来了、心情又差，会憋不住呛一句（形态由风格格决定）。
+        #    孤独感管"想不想说话"，心潮/效价管"说成什么样"。
+        if self.world.decider.enabled and interject_allowed and group_chatting:
+            motive = self.interject_motive(state)
+            if motive:
+                return create_plan(
+                    steps=[{"action": "say", "interject": True}],
+                    world_time=state.world_time,
+                    valid_for=min(600, self._plan_valid()),
+                    reason=motive,
+                    source="rule",
+                )
 
         # 1) 精力过低 -> 回卧室睡觉（刚被叫醒的保护期里不安排，免得叫醒几分钟又被抓回去睡）
         if state.energy < 0.25 and state.world_time >= state.no_sleep_until:
@@ -161,8 +190,12 @@ class Decider:
                 source="rule",
             )
 
+        # 心情低落时，自我调节类动作的门槛下调：她更容易选择"缓一缓"，
+        # 而不是等着谁来看穿她（安全阀是行为倾向，不是触发一个动作）。
+        low_mood = float(state.valence) < SELF_CARE_VALENCE
+
         # 4) 无聊 -> 换个地方发呆
-        if state.boredom > 0.8:
+        if state.boredom > (SELF_CARE_BOREDOM if low_mood else 0.8):
             target = self._pick_idle_node(exclude=node_id)
             steps = self._travel_then(node_id, target, graph) if target else []
             steps.append({"action": "stare"})
@@ -175,7 +208,11 @@ class Decider:
             )
 
         # 5) 精力尚可且是白天 -> 去书房看书
-        if state.energy > 0.5 and state.boredom > 0.45 and node_id != "study":
+        if (
+            state.energy > 0.5
+            and state.boredom > (SELF_CARE_IDLE if low_mood else 0.45)
+            and node_id != "study"
+        ):
             steps = self._travel_then(node_id, "study", graph)
             steps.append({"action": "read", "duration": self._action_duration("read")})
             return create_plan(
@@ -282,3 +319,41 @@ class Decider:
         if action.llm_level == "tool":
             return bool(action.tool_list())
         return True
+
+    # ---------------- 插话 ----------------
+
+    def interject_threshold(self, state: WorldState) -> float:
+        """这一刻要多少孤独感才愿意主动接话。
+
+        **浮动阈值**（不是浮动意愿值）：心情差的时候更难开口，但一旦开口，
+        说成什么样仍归风格格管——两件事不混在一起。
+        """
+
+        base = float(self.world.decider.interject_threshold)
+        bump = max(
+            0.0,
+            min(
+                INTERJECT_THRESHOLD_BUMP_MAX,
+                (0.5 - float(state.valence)) / 3.0,
+            ),
+        )
+        if self.motive_a_closed(state):
+            # 长期低落：动机 A 关闭，而且至少关 15 分钟（避免阈值边上反复抖）
+            bump = INTERJECT_THRESHOLD_BUMP_CLOSED
+        return base + bump
+
+    def motive_a_closed(self, state: WorldState) -> bool:
+        """「想被注意到」这条动机是不是被关掉了。"""
+
+        return self._now() < float(state.interject_closed_until or 0.0)
+
+    def interject_motive(self, state: WorldState) -> str:
+        """她想插话的理由；不想插话时返回空字符串。"""
+
+        valence = float(state.valence)
+        if valence > INTERJECT_SOCIAL_VALENCE_FLOOR and not self.motive_a_closed(state):
+            if state.loneliness >= self.interject_threshold(state):
+                return "群里正聊得热闹，想接一句"
+        if valence < INTERJECT_SOCIAL_VALENCE_FLOOR and float(state.affect) >= INTERJECT_VENT_AROUSAL:
+            return "情绪上来了，忍不住想插一句"
+        return ""

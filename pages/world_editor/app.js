@@ -26,6 +26,8 @@ const ui = {
   activePreset: "",
   token: "",
   statusTimer: null,
+  historyHours: 24,
+  historyBusy: false,
 };
 
 /* ================================================================== */
@@ -42,6 +44,13 @@ const ATTRS = [
     hint:
       "情绪被激起的强度（不是开心程度）。越高，她的内心活动越翻涌、说出来的感情越浓、越容易做出亲昵或冲动的举动；" +
       "被夸、被抱、吵架、被冷落都会把它推高，然后随时间回落。",
+  },
+  {
+    key: "valence",
+    label: "效价",
+    hint:
+      "心情的好坏（0.5 是中性，越高越偏正面）。它有一个由精力 / 孤独 / 无聊 / 好奇推导的基线，" +
+      "事件只在基线上产生短期偏移，过一阵会自己回落——所以\"今天心情不太好\"需要慢慢积累，不是一条消息就能翻转。",
   },
   { key: "boredom", label: "无聊", hint: "越高越想换个地方待着" },
 ];
@@ -228,6 +237,13 @@ const ECHO_TYPE_CHOICES = [
     hint: "睡着时被消息叫到，但按配置保持安静。",
     group: "sleep",
   },
+  {
+    key: "mood_reset",
+    icon: "🌤️",
+    label: "心情缓过来了",
+    hint: "心情低落持续太久时，她自己缓一缓：效价朝基线拉回一半。",
+    group: "sleep",
+  },
 ];
 
 /** 调试输出的分组：类型多了以后按用途分块，找起来快。 */
@@ -289,6 +305,8 @@ const LOG_TYPES = {
   command_result: { icon: "📤", label: "指令返回" },
   tool_call: { icon: "🔧", label: "调用工具" },
   tool_result: { icon: "📥", label: "工具返回" },
+  mood_reset: { icon: "🌤️", label: "心情缓过来" },
+  storm: { icon: "🌩️", label: "情绪上头 / 平复" },
   chain: { icon: "🔗", label: "动作链" },
   cold_start: { icon: "🌅", label: "冷启动" },
   bot_spoke: { icon: "🗣️", label: "发言等待回应" },
@@ -1972,6 +1990,7 @@ async function startApp() {
   $("app").classList.remove("hidden");
   bindTabs();
   bindButtons();
+  renderHistoryWindows();
   watchPronoun();
   await loadAll();
 }
@@ -2403,13 +2422,16 @@ const VALUE_TONES = {
   boredom: "low",
   curiosity: "neutral",
   affect: "neutral",
+  valence: "polar",
 };
 
 function valueToneClass(key, value) {
   const tone = VALUE_TONES[key] || "neutral";
   if (tone === "neutral") return "neutral";
-  // 换算成"该不该留神"：值越大越需要留神
-  const worry = tone === "high" ? 1 - value : value;
+  // 换算成"该不该留神"：值越大越需要留神；
+  // polar 是"以 0.5 为中性"的两极量（效价），只有偏负才需要留神。
+  const worry =
+    tone === "high" ? 1 - value : tone === "polar" ? Math.max(0, 0.5 - value) * 2 : value;
   if (worry < 0.4) return "good";
   if (worry < 0.7) return "mid";
   return "bad";
@@ -2579,12 +2601,32 @@ function setStatusEmpty(text) {
 function renderStatusSections(data, stateLabel) {
   const head = $("status-head");
   head.innerHTML = "";
+  const style = data.style || {};
+  const styleCell = String(style.cell || "").trim();
+  const cellLabels = {
+    "calm+positive": "舒坦",
+    "calm+neutral": "平静",
+    "calm+negative": "低落",
+    "stirred+positive": "轻快",
+    "stirred+neutral": "平静",
+    "stirred+negative": "不痛快",
+    "excited+positive": "兴奋",
+    "excited+neutral": "心潮起伏",
+    "excited+negative": "恼火",
+  };
   [
     `状态：${stateLabel}`,
     `心情：${data.mood}`,
+    styleCell
+      ? `这一轮：${cellLabels[styleCell] || styleCell}${
+          Number(style.say_limit || 0) ? ` · 最多 ${style.say_limit} 条` : ""
+        }${data.storm ? " · 正在气头上" : ""}`
+      : "",
     `tick：${data.world_time}`,
     `名片：${data.nickname || "（未设置）"}`,
-  ].forEach((text) => head.appendChild(el("span", "chip", text)));
+  ]
+    .filter(Boolean)
+    .forEach((text) => head.appendChild(el("span", "chip", text)));
   $("status-warn").innerHTML = "";
 
   // ---------------- 时间与日程 ----------------
@@ -2714,6 +2756,26 @@ function renderStatusSections(data, stateLabel) {
       Number(data.llm_sample_rate || 0) * 100,
     )}%）`,
   );
+  // 插话被哪道闸拦住：光看频率看不出瓶颈在哪
+  const interjectLabels = {
+    allowed: "开口",
+    cooldown: "插话冷却",
+    engage: "无人回应冷却",
+    hourly: "每小时上限",
+    reply_cd: "刚回过话",
+    disabled: "插话已关闭",
+  };
+  const interject = data.interject || {};
+  const interjectParts = Object.keys(interject).map(
+    (key) => `${interjectLabels[key] || key} ${interject[key]}`,
+  );
+  if (interjectParts.length) {
+    statusLine(
+      runtimeBox,
+      "插话（本小时）",
+      `想插话时被拦住：${interjectParts.join(" · ")}`,
+    );
+  }
   const budget = data.budget || {};
   const budgetParts = [
     ["计划", "plan"],
@@ -2760,6 +2822,130 @@ function renderStatusSections(data, stateLabel) {
   );
 }
 
+/* ---------------- 数值曲线：她最近过得怎么样 ---------------- */
+
+const HISTORY_WINDOWS = [
+  { hours: 6, label: "6 小时" },
+  { hours: 24, label: "24 小时" },
+  { hours: 72, label: "3 天" },
+];
+
+function renderHistoryWindows() {
+  const box = $("history-windows");
+  if (!box) return;
+  box.innerHTML = "";
+  HISTORY_WINDOWS.forEach((item) => {
+    const button = el("button", `pill${ui.historyHours === item.hours ? " on" : ""}`, item.label);
+    button.type = "button";
+    button.addEventListener("click", () => {
+      ui.historyHours = item.hours;
+      renderHistoryWindows();
+      renderHistory();
+    });
+    box.appendChild(button);
+  });
+}
+
+async function renderHistory() {
+  const sessionId = $("status-session").value;
+  const canvas = $("history-canvas");
+  if (!canvas || !sessionId || ui.historyBusy) return;
+  ui.historyBusy = true;
+  let data = null;
+  try {
+    data = await apiGet("history", { session: sessionId, hours: ui.historyHours });
+  } catch (error) {
+    data = null;
+  } finally {
+    ui.historyBusy = false;
+  }
+  const points = (data && data.points) || [];
+  drawHistoryChart(canvas, points);
+  const metrics = (data && data.metrics) || {};
+  $("history-metrics").textContent = points.length
+    ? `起伏 ${num(metrics.swing_per_hour, 0).toFixed(2)}/小时 · 峰值心潮 ${num(
+        metrics.peak_arousal,
+        0,
+      ).toFixed(2)} · 低谷 ${Math.round(num(metrics.low_minutes, 0))} 分钟`
+    : "还没有足够的数据";
+  $("history-empty").classList.toggle("hidden", points.length >= 2);
+}
+
+/** 两条线：心潮（蓝）与效价（橙），虚线是效价的中性位。 */
+function drawHistoryChart(canvas, points) {
+  const ratio = window.devicePixelRatio || 1;
+  const width = Math.max(320, canvas.clientWidth || 640);
+  const height = 160;
+  canvas.width = Math.round(width * ratio);
+  canvas.height = Math.round(height * ratio);
+  canvas.style.height = `${height}px`;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  const pad = { left: 26, right: 8, top: 8, bottom: 16 };
+  const innerW = width - pad.left - pad.right;
+  const innerH = height - pad.top - pad.bottom;
+  const style = getComputedStyle(document.body);
+  const line = style.getPropertyValue("--line").trim() || "#e2e6ec";
+  const muted = style.getPropertyValue("--muted").trim() || "#7a8798";
+
+  ctx.strokeStyle = line;
+  ctx.fillStyle = muted;
+  ctx.font = "10px sans-serif";
+  ctx.lineWidth = 1;
+  [0, 0.5, 1].forEach((level) => {
+    const y = pad.top + innerH * (1 - level);
+    ctx.beginPath();
+    ctx.moveTo(pad.left, y);
+    ctx.lineTo(width - pad.right, y);
+    ctx.stroke();
+    ctx.fillText(level.toFixed(1), 4, y + 3);
+  });
+  if (points.length < 2) return;
+
+  const first = points[0].at;
+  const last = points[points.length - 1].at;
+  const span = Math.max(1, last - first);
+  const xOf = (at) => pad.left + (innerW * (at - first)) / span;
+  const yOf = (value) => pad.top + innerH * (1 - Math.max(0, Math.min(1, value)));
+
+  // 效价的中性位：0.5
+  ctx.setLineDash([3, 3]);
+  ctx.strokeStyle = line;
+  ctx.beginPath();
+  ctx.moveTo(pad.left, yOf(0.5));
+  ctx.lineTo(width - pad.right, yOf(0.5));
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  const series = [
+    { key: "affect", color: "#5b7cfa", label: "心潮" },
+    { key: "valence", color: "#e08c3c", label: "效价" },
+  ];
+  series.forEach((item) => {
+    ctx.strokeStyle = item.color;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    points.forEach((point, index) => {
+      const x = xOf(point.at);
+      const y = yOf(num(point[item.key], 0.5));
+      if (index === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  });
+  ctx.font = "10px sans-serif";
+  let legendX = pad.left;
+  series.forEach((item) => {
+    ctx.fillStyle = item.color;
+    ctx.fillRect(legendX, height - 10, 8, 3);
+    ctx.fillStyle = muted;
+    ctx.fillText(item.label, legendX + 12, height - 7);
+    legendX += 46;
+  });
+}
+
 async function refreshStatus() {
   const sessionId = $("status-session").value;
   if (!sessionId) {
@@ -2772,6 +2958,7 @@ async function refreshStatus() {
     const stateLabel = (STATES.find((item) => item.key === data.state) || {}).label || data.state;
     renderStatusSections(data, stateLabel);
     renderToolWarnings();
+    renderHistory();
     // 地图上标出她此刻所在的地点
     if ($("tab-map")) renderMap();
 
@@ -6452,6 +6639,20 @@ function renderSettings() {
     "说话节奏",
     "她一句一句发消息时的停顿，以及「最近话太密」的判定。",
     "群里分段回复如果同一瞬间全冒出来，一眼就能看出是机器；按字数停一下读起来才像人在打字。",
+  );
+  style._fields.appendChild(
+    checkboxField(
+      "让心情影响这一轮的说话形态",
+      world.style_injection !== false,
+      (value) => (world.style_injection = value),
+      {
+        hint:
+          "开启后，提示词末尾会多一段「这一轮的表达方式」：由心潮 × 效价两个数值决定" +
+          "（几条、多长、能不能分段、要不要用动作代替说话）。\n" +
+          "心情好的时候话多一点、心情差的时候话短一点，都是这一段在起作用。\n" +
+          "关掉 = 完全交给人设：她任何心情下都按同一种风格说话。",
+      },
+    ),
   );
   style._fields.appendChild(
     checkboxField(

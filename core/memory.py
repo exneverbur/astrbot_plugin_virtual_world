@@ -44,46 +44,37 @@ _INTENSE_WORDS: dict[str, float] = {
     "谢谢": 0.10, "安慰": 0.14, "陪我": 0.14, "别走": 0.22, "秘密": 0.16,
 }
 
-# 情绪越强的 mood 本身也加成
-_MOOD_INTENSITY: dict[str, float] = {
-    "难以平静": 0.25,
-    "心潮起伏": 0.18,
-    "开心": 0.15,
-    "想念": 0.15,
-    "委屈": 0.2,
-    "生气": 0.22,
-    "害羞": 0.14,
-}
-
-
 def emotional_weight(
     base: float,
     *,
     emotion: str = "",
-    mood: str = "",
     text: str = "",
     affect: float = 0.0,
+    valence: float = 0.5,
 ) -> float:
     """按"这段记忆的情绪有多强"给权重加成。
 
-    加成来源（取最大的一项 + 心潮的一小部分，避免叠加爆炸）：
+    加成来源（取最大的一项 + 情绪两轴的一小部分，避免叠加爆炸）：
     - 显式情绪标签（动作/编辑器里填的）
     - 正文里出现的强情绪词
-    - 当时的 mood
-    - 当时的心潮（affect）
+    - 当时的情绪两轴：心潮（有多激动）× 效价离中性有多远
+
+    以前这里还查一张「mood 词 → 强度」的表；心情词改成由两轴派生之后，
+    那张表就成了第二套映射（改词表就会悄悄失效），所以这里直接用数值算。
     """
 
     scored: list[float] = []
     if emotion:
         scored.append(max((_INTENSE_WORDS.get(word, 0.0) for word in _emotion_tokens(emotion)), default=0.12))
-    if mood and mood in _MOOD_INTENSITY:
-        scored.append(_MOOD_INTENSITY[mood])
     if text:
         hits = [value for word, value in _INTENSE_WORDS.items() if word in text]
         if hits:
             scored.append(max(hits))
     bonus = max(scored) if scored else 0.0
-    bonus += max(0.0, min(1.0, float(affect))) * 0.15
+    # 越激动、心情偏得越远，记得越牢（心潮高但心情平平，只是一时热闹）
+    arousal = max(0.0, min(1.0, float(affect)))
+    distance = abs(max(0.0, min(1.0, float(valence))) - 0.5) * 2.0
+    bonus += arousal * (0.06 + 0.14 * distance)
     return max(0.0, min(1.0, float(base) + bonus))
 
 
@@ -141,6 +132,7 @@ class MemoryEngine:
         source: str = "runtime",
         conflict_policy: str | None = None,
         affect: float = 0.0,
+        valence: float = 0.5,
     ) -> int | None:
         """写入一条记忆。返回记忆 id；因冲突被跳过时返回 None。
 
@@ -157,7 +149,11 @@ class MemoryEngine:
         )
         related_users = [str(u) for u in (related_users or [])]
         weight = emotional_weight(
-            weight, emotion=emotion, mood=emotion, text=text, affect=affect
+            weight,
+            emotion=emotion,
+            text=text,
+            affect=affect,
+            valence=valence,
         )
 
         conflict = self._find_conflict(

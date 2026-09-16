@@ -394,6 +394,9 @@ class Limits(Permissive):
     max_log_events: int = 1500
     """每个会话最多保留多少条事件日志（超过会自动删掉最旧的）。"""
 
+    max_history_rows: int = 4320
+    """每个会话最多保留多少帧数值历史（默认 1 tick 一行 ≈ 3 天）。"""
+
     llm_plan_min_interval_seconds: int = 900
     """两次「问 LLM 要计划」之间的最小间隔，避免每轮决策都烧 token。"""
 
@@ -470,6 +473,7 @@ ECHO_EVENT_TYPES: dict[str, str] = {
     "wake_up": "🌅",
     "sleep_reply": "😴",
     "sleep_skip": "🤐",
+    "mood_reset": "🌤️",
 }
 # 「常用」那一档：决定、动作、工具、跳过——排查她"为什么这么做"最需要的几类
 DEFAULT_ECHO_TYPES: tuple[str, ...] = (
@@ -689,6 +693,9 @@ class WorldConfig(Permissive):
     echo_compact: bool = False
     """调试输出的精简模式：只发事件本身（谁调用了什么、决定了什么），
     不带参数、返回值、模型原话这些细节。"""
+
+    style_injection: bool = True
+    """把情绪两轴翻译成「这一轮的表达方式」写进提示词（关掉 = 完全交给人设）。"""
 
     reply_mode: Literal["takeover", "inject"] = "takeover"
     """被 @（或消息走到大模型）时的处理方式。
