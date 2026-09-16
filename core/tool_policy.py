@@ -37,14 +37,46 @@ def action_tool_name(action: ActionDef | None) -> str:
     return str(getattr(action, "tool_name", "") or "").strip()
 
 
+def action_tool_names(action: ActionDef | None) -> list[str]:
+    """动作声明的全部工具名：候选写法（内置搜索 / 查天气）也要算进来。"""
+
+    if action is None or getattr(action, "llm_level", "") != "tool":
+        return []
+    candidates = getattr(action, "tool_candidates", None)
+    if callable(candidates):
+        return [str(item).strip() for item in candidates() if str(item).strip()]
+    single = str(getattr(action, "tool_name", "") or "").strip()
+    return [single] if single else []
+
+
 def node_tool_names(world: WorldConfig, node_id: str) -> set[str]:
     """这个地点能用到的工具 = 该地点可用动作绑定的工具。"""
 
-    return {
-        name
-        for name in (action_tool_name(action) for action in world.actions_in(node_id))
-        if name
-    }
+    names: set[str] = set()
+    for action in world.actions_in(node_id):
+        names.update(action_tool_names(action))
+    return names
+
+
+def tool_name_matches(installed: set[str], candidates: list[str]) -> bool:
+    """配的工具能不能用上：同名的算，只有一个候选时按前缀算。
+
+    官方搜索工具实际叫 ``web_search_tavily`` 这类，内置动作默认写的 ``web_search``
+    要能对上它（只配一个工具的动作才这么放宽）。
+    """
+
+    names = [str(item).strip() for item in candidates if str(item).strip()]
+    if not names:
+        return False
+    installed_set = {str(item).strip() for item in installed}
+    if any(name in installed_set for name in names):
+        return True
+    if len(names) > 1:
+        return False
+    wanted = names[0].lower()
+    return len(wanted) >= 5 and any(
+        name.lower().startswith(wanted) for name in installed_set
+    )
 
 
 def allowed_tools(world: WorldConfig, node: NodeDef | None) -> set[str]:

@@ -123,6 +123,41 @@ class TickOutcome:
     debug_messages: list[str] = field(default_factory=list)
     """开启「把动作发到群里」时，这些行会作为普通消息发出去（不计入"她说了话"）。"""
 
+    debug_positions: list[int] = field(default_factory=list)
+    """与 ``debug_messages`` 一一对应：记下它产生时 ``messages`` 里已经有多少条。
+
+    发送时按这个下标把两类消息重新插回真实顺序——她先调了工具、拿到结果才说话，
+    群里也该是这个次序，而不是"话发完再补一句我刚查了天气"。
+    """
+
+    def add_debug(self, line: str) -> None:
+        """记一条调试回显，并记住它落在哪两条正式回复之间。"""
+
+        if not str(line).strip():
+            return
+        self.debug_messages.append(str(line))
+        self.debug_positions.append(len(self.messages))
+
+    def ordered_messages(self) -> list[str]:
+        """正式回复 + 调试回显，按实际发生的先后排好。"""
+
+        if not self.debug_messages:
+            return list(self.messages)
+        buckets: dict[int, list[str]] = {}
+        for index, line in enumerate(self.debug_messages):
+            position = (
+                self.debug_positions[index]
+                if index < len(self.debug_positions)
+                else len(self.messages)
+            )
+            buckets.setdefault(min(position, len(self.messages)), []).append(line)
+        result: list[str] = []
+        for slot in range(len(self.messages) + 1):
+            result.extend(buckets.get(slot, []))
+            if slot < len(self.messages):
+                result.append(self.messages[slot])
+        return result
+
 
 @dataclass
 class MessageContext:
@@ -175,7 +210,34 @@ class ReplyOutcome:
     warnings: list[str] = field(default_factory=list)
     debug_messages: list[str] = field(default_factory=list)
     """开启「把动作发到群里」时，决定/动作/工具调用的说明行。"""
+    debug_positions: list[int] = field(default_factory=list)
+    """与 ``debug_messages`` 一一对应：产生时 ``messages`` 里已有多少条。"""
+    tail: str = ""
+    """JSON 之后留下的短尾巴（例如别的插件要求模型追加的 `[好感度 持平]`）。
+
+    只交给「回复钩子」那一步，让靠标记工作的插件还能读到；不会跟着她的话发出去。
+    """
     error: str = ""
+
+    def ordered_messages(self) -> list[str]:
+        """正式回复 + 调试回显，按实际发生的先后排好。"""
+
+        if not self.debug_messages:
+            return list(self.messages)
+        buckets: dict[int, list[str]] = {}
+        for index, line in enumerate(self.debug_messages):
+            position = (
+                self.debug_positions[index]
+                if index < len(self.debug_positions)
+                else len(self.messages)
+            )
+            buckets.setdefault(min(position, len(self.messages)), []).append(line)
+        result: list[str] = []
+        for slot in range(len(self.messages) + 1):
+            result.extend(buckets.get(slot, []))
+            if slot < len(self.messages):
+                result.append(self.messages[slot])
+        return result
 
 
 class VirtualWorldEngine:
@@ -968,7 +1030,7 @@ class VirtualWorldEngine:
                 available_tools=self.available_tools(),
                 memories=memories,
                 engagement_hint=self.engagement.hint(state),
-                recent_chat=self.chat_context(state),
+                recent_chat=self.chat_context_for_reply(state, ctx),
                 other_context=ctx.other_context,
                 extra_notes=extra_notes,
                 max_messages=self.world.limits.max_messages_per_say,
@@ -1063,14 +1125,16 @@ class VirtualWorldEngine:
 
         # 没有对外发言（例如她只 think / 只换了个地方）就交回主人格，
         # 保证用户不会因为"她今天不想说话"而收不到任何回应。
+        # 前面的门禁（被叫醒等）攒下的回显排在最前面——它们本来就发生在这轮之前。
+        pending = self.take_pending_echo(ctx.session_id)
         return ReplyOutcome(
             ok=bool(outcome.messages),
             messages=list(outcome.messages),
             reasoning=parsed.reasoning,
             warnings=parsed.warnings,
-            # 前面的门禁（被叫醒等）攒下的回显也一起带出去
-            debug_messages=self.take_pending_echo(ctx.session_id)
-            + list(outcome.debug_messages),
+            tail=parsed.tail,
+            debug_messages=pending + list(outcome.debug_messages),
+            debug_positions=[0] * len(pending) + list(outcome.debug_positions),
             error="" if outcome.messages else "模型没有产生对外发言",
         )
 
@@ -2562,8 +2626,13 @@ class VirtualWorldEngine:
         depth: int,
         autonomous: bool,
         from_plan: bool = False,
+        allow_remote_travel: bool = True,
     ) -> bool:
-        """执行一串动作。返回"有没有真的执行到至少一个"。"""
+        """执行一串动作。返回"有没有真的执行到至少一个"。
+
+        ``allow_remote_travel=False`` 时不做「她想去别处做这件事」的兜底：
+        日程链的地点限制由日程自己的开关决定，不能偷偷替它补一步移动。
+        """
 
         if depth > self.world.limits.max_action_chain_depth:
             outcome.notes.append("动作链超过深度上限，已停止")
@@ -2598,7 +2667,7 @@ class VirtualWorldEngine:
                 # A2 兜底：她想去别处做这件事，自己又没写移动 —— 插件带她过去
                 target = (
                     self._nearest_node_with_action(state.node_id, definition)
-                    if bool(self.world.remote_action_travel)
+                    if bool(self.world.remote_action_travel) and allow_remote_travel
                     else ""
                 )
                 if target:
@@ -2689,12 +2758,14 @@ class VirtualWorldEngine:
         outcome.auto_travel.append(target_node)
         # 她把"说一句"排在移动后面时，这一轮会一个字都不发、还会被判定成接管失败。
         # 瞬时动作不占时间，先执行掉——用户立刻看到回应，剩下的等走过去再做。
-        instant = [
-            item
-            for item in pending
-            if (self.world.action_map().get(item.type) is not None)
-            and self.world.action_map()[item.type].category == "instant"
-        ]
+        # 只有当前地点就做得成的才算：要换地方才做得成的那一步正是"为什么先走过去"。
+        instant = []
+        for item in pending:
+            candidate = self.world.action_map().get(item.type)
+            if candidate is None or candidate.category != "instant":
+                continue
+            if candidate.available_in(state.node_id):
+                instant.append(item)
         for item in instant:
             await self._start_action(
                 state,
@@ -2773,14 +2844,51 @@ class VirtualWorldEngine:
             return ""
         return name
 
-    def resolve_tools(self, definition: ActionDef, node_id: str = "") -> list[str]:
-        """这个动作最终会用到的工具：配了几个就返回几个，按配置顺序。"""
+    def resolve_tool_prefix(self, tool_name: str) -> str:
+        """按前缀找一个装了的工具：``web_search`` 能对上官方的 ``web_search_tavily``。
 
+        只用在"只配了一个工具"的动作上：用户明确挑了哪几个工具的多工具链不做替换。
+        """
+
+        wanted = str(tool_name or "").strip().lower()
+        if len(wanted) < 5:
+            return ""
+        for installed in sorted(self.available_tools()):
+            if is_self_send_tool(installed):
+                continue
+            if str(installed).lower().startswith(wanted):
+                return str(installed)
+        return ""
+
+    def resolve_tools(self, definition: ActionDef, node_id: str = "") -> list[str]:
+        """这个动作最终会用到的工具：配了几个就返回几个，按配置顺序。
+
+        ``tool_names`` 一个都没装时才轮到 ``tool_fallbacks``（内置搜索 / 查天气用得上），
+        那时只取备选里第一个装了的——同一个意思的工具没必要挨个调一遍。
+        """
+
+        names = definition.tool_list()
         result: list[str] = []
-        for name in definition.tool_list():
+        for name in names:
             chosen = self.resolve_tool(definition.id, node_id, name)
             if chosen and chosen not in result:
                 result.append(chosen)
+        if result:
+            return result
+        # 只配了一个工具的动作允许按前缀找（官方搜索工具叫 web_search_tavily 这种）
+        allow_prefix = len(names) <= 1
+        if allow_prefix:
+            for name in names:
+                chosen = self.resolve_tool_prefix(name)
+                if chosen:
+                    return [chosen]
+        for name in definition.tool_fallbacks or []:
+            chosen = self.resolve_tool(definition.id, node_id, name) or (
+                self.resolve_tool_prefix(name) if allow_prefix else ""
+            )
+            if chosen and chosen not in result:
+                result.append(chosen)
+                break
         return result
 
     async def fill_tool_params(
@@ -2930,11 +3038,14 @@ class VirtualWorldEngine:
 
         names = self.resolve_tools(definition, state.node_id)
         if not names:
-            picked = "、".join(definition.tool_list())
+            picked = "、".join(definition.tool_candidates())
             if not picked:
                 reason = "工具型动作必须选一个工具，这个动作还没选"
-            elif is_self_send_tool(definition.tool_list()[0]):
-                reason = f"「{definition.tool_list()[0]}」是直发消息的工具，插件不会调用（会绕过回复管线）"
+            elif is_self_send_tool(definition.tool_list()[0] if definition.tool_list() else ""):
+                reason = (
+                    f"「{definition.tool_list()[0]}」是直发消息的工具，"
+                    "插件不会调用（会绕过回复管线）"
+                )
             else:
                 reason = f"选的工具「{picked}」在 AstrBot 里没注册{self._tool_hint()}"
             outcome.notes.append(f"工具动作 {definition.id} 找不到可用工具，已跳过")
@@ -3028,11 +3139,17 @@ class VirtualWorldEngine:
         if self.commands is None:
             outcome.notes.append("没有可用的指令通道，已跳过")
             return
+        await self._log_event(
+            state,
+            "command_call",
+            {"action": definition.id, "command": line, "intent": intent},
+            outcome=self._echo_into(outcome, state),
+        )
         call = await self.commands.trigger(state.session_id, line)
         images = list(getattr(call, "image_urls", None) or [])
         await self._log_event(
             state,
-            "command",
+            "command_result",
             {
                 "action": definition.id,
                 "command": line,
@@ -3519,25 +3636,42 @@ class VirtualWorldEngine:
                 )
                 if retried:
                     retry_params = {**params, **retried}
+                    await self._log_event(
+                        state,
+                        "tool_call",
+                        {
+                            "action": definition.id,
+                            "tool": name,
+                            "params": dict(retry_params),
+                            "note": "按报错补了一次参数" + (f"：{note}" if note else ""),
+                        },
+                    )
                     again = await self._call_tool(
                         definition.id, retry_params, state, tool_name=name
                     )
                     await self._log_event(
                         state,
-                        "tool",
+                        "tool_result",
                         {
                             "action": definition.id,
                             "tool": again.tool or name,
-                            "params": dict(again.params or retry_params),
                             "ok": bool(again.ok),
                             "result": _clip_text(again.text, 400),
                             "error": again.error,
-                            "note": "按报错补了一次参数" + (f"：{note}" if note else ""),
                         },
                     )
                     if again.ok or again.text:
                         call = again
                         params = retry_params
+            await self._log_event(
+                state,
+                "tool_call",
+                {
+                    "action": definition.id,
+                    "tool": name,
+                    "params": dict(params),
+                },
+            )
             sent = dict(call.params or params)
             if not last_params:
                 last_params = sent
@@ -3547,22 +3681,19 @@ class VirtualWorldEngine:
                 failed.append(f"{call.tool or name}：{call.error or '没有返回结果'}")
             images.extend(getattr(call, "image_urls", None) or [])
             state.add_event(
-                "tool",
+                "tool_result",
                 {
                     "action": definition.id,
                     "tool": call.tool or name,
                     "ok": bool(call.ok),
-                    "params": sent,
-                    "error": call.error,
                 },
             )
             await self._log_event(
                 state,
-                "tool",
+                "tool_result",
                 {
                     "action": definition.id,
                     "tool": call.tool or name,
-                    "params": sent,
                     "ok": bool(call.ok),
                     "result": _clip_text(call.text, 400),
                     "error": call.error,
@@ -4073,6 +4204,9 @@ class VirtualWorldEngine:
                 [action],
                 depth=depth,
                 autonomous=True,
+                # 地点限制由日程的「自动先走过去」开关决定：没开就是硬条件，
+                # 到了别处这一步就跳过，而不是悄悄替她走一趟。
+                allow_remote_travel=False,
             )
 
     async def _generate_text_actions(
@@ -4642,6 +4776,26 @@ class VirtualWorldEngine:
             after=float(state.chat_replied_until or 0.0),
         )
 
+    def chat_context_for_reply(
+        self, state: WorldState, ctx: MessageContext
+    ) -> list[dict[str, Any]]:
+        """接管回复用的群聊背景：把"刚进来的这一条"从背景里摘掉。
+
+        这条消息紧接着会以「XX 对你说：…」的形式单独交给模型，留在背景里
+        等于同一句话在提示词里出现两遍——模型会以为对方把话重复说了好几次。
+        """
+
+        context = self.chat_context(state)
+        if not context:
+            return context
+        last = context[-1]
+        if last.get("is_self"):
+            return context
+        same_user = str(last.get("user_id") or "") == str(ctx.user_id or "unknown")
+        if same_user and _same_text(str(last.get("text") or ""), str(ctx.text or "")):
+            return context[:-1]
+        return context
+
     def mark_chat_replied(self, state: WorldState) -> None:
         """她真的回了一句：把"已回应水位线"推到当前，并清掉上一轮的背景句。"""
 
@@ -4886,11 +5040,16 @@ class VirtualWorldEngine:
         if self.messenger is None:
             return
         said = [m for m in outcome.messages if m and str(m).strip()]
-        echoed = self.take_pending_echo(outcome.session_id) + [
-            m for m in outcome.debug_messages if m and str(m).strip()
-        ]
-        if not said and not echoed:
+        pending = self.take_pending_echo(outcome.session_id)
+        if not said and not outcome.debug_messages and not pending:
             return
+        # 让她的话和调试回显按真实顺序出现：先调工具、再说话。
+        # 门禁攒下的回显（被叫醒之类）发生在这轮之前，排在最前面。
+        ordered = [
+            m
+            for m in (pending + outcome.ordered_messages())
+            if m and str(m).strip()
+        ]
         state = await self.load_state(outcome.session_id, cold_start=False)
         if not self.engagement.can_speak(state):
             outcome.notes.append("冷却期内不发送")
@@ -4912,7 +5071,7 @@ class VirtualWorldEngine:
                     )
                     self.note_dialogue(state, text=message, is_self=True)
             # 调试用的动作回显不算"她说过的话"：不进聊天上下文、不计无人回应保护
-        sent = await self.messenger.send_text(outcome.session_id, said + echoed)
+        sent = await self.messenger.send_text(outcome.session_id, ordered)
         note = getattr(self.messenger, "take_fail_note", None)
         failed_note = note(outcome.session_id) if callable(note) else ""
         if failed_note:
@@ -4921,7 +5080,7 @@ class VirtualWorldEngine:
                 await self._log_event(
                     state,
                     "send_failed",
-                    {"messages": said + echoed, "note": failed_note},
+                    {"messages": ordered, "note": failed_note},
                 )
         elif not sent and said:
             outcome.notes.append("平台没有接收这批消息")
@@ -5107,7 +5266,9 @@ class VirtualWorldEngine:
             # 名片是否被锁住（编辑器里用一个按钮切换，所以要能读到当前状态）
             "nickname_locked": bool(state.bot_nickname_locked),
             "nickname_base": state.bot_base_nickname,
-            "user_presence": list(state.user_presence.values())[:20],
+            # 按最近说话时间排好、只带前几个：状态页一行放得下，也不会越攒越长
+            "user_presence": state.recent_active_users(8),
+            "user_presence_total": len(state.user_presence),
             # 从当前位置能直达哪里、各需要多少 tick（给编辑器和调试看）
             "travel": [
                 {
@@ -5219,6 +5380,11 @@ class VirtualWorldEngine:
             if str(name).strip() in ECHO_EVENT_TYPES
         }
 
+    def echo_compact(self) -> bool:
+        """精简模式：调试输出只发事件本身，不带参数与结果。"""
+
+        return bool(getattr(self.world, "echo_compact", False))
+
     def _queue_echo(self, session_id: str, lines: list[str]) -> None:
         """回复路径之外的调试回显先存着，等下一次发送时一起带出去。
 
@@ -5261,6 +5427,7 @@ class VirtualWorldEngine:
         )
         # query_events 是新到旧；一次 tick 里最多回显最新的这么多条，
         # 再按时间正序发出去（连锁动作多的时候不要把群刷了）
+        compact = self.echo_compact()
         for item in reversed(fresh[:12]):
             kind = str(item.get("event_type") or "")
             detail = item.get("detail")
@@ -5269,11 +5436,11 @@ class VirtualWorldEngine:
             if not _echo_payload(kind, detail, enabled):
                 continue
             try:
-                line = render_event(item, self.world)
+                line = render_event(item, self.world, compact=compact)
             except Exception:
                 continue
             if line:
-                outcome.debug_messages.append(f"{ECHO_EVENT_TYPES[kind]} {line}")
+                outcome.add_debug(f"{ECHO_EVENT_TYPES[kind]} {line}")
 
     def _log(self, level: str, message: str) -> None:
         if self.logger is None:
@@ -5313,13 +5480,12 @@ class VirtualWorldEngine:
                         "world_time": state.world_time,
                     },
                     self.world,
+                    compact=self.echo_compact(),
                 )
             except Exception:
                 line = ""
             if line:
-                outcome.debug_messages.append(
-                    f"{ECHO_EVENT_TYPES.get(event_type, '•')} {line}"
-                )
+                outcome.add_debug(f"{ECHO_EVENT_TYPES.get(event_type, '•')} {line}")
 
         try:
             new_id = await self.db.call(
@@ -5477,6 +5643,21 @@ def _clip_text(value: Any, limit: int = 200) -> str:
         return ""
     text = str(value).strip().replace("\n", " ")
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _same_text(left: str, right: str) -> bool:
+    """两段文本算不算"同一条消息"：忽略空白标点，也容忍一方被管线改写。"""
+
+    def squeeze(text: str) -> str:
+        return "".join(ch for ch in str(text or "").lower() if ch.isalnum())
+
+    a = squeeze(left)
+    b = squeeze(right)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return len(min(a, b, key=len)) >= 4 and (a in b or b in a)
 
 
 

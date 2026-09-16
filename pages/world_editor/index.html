@@ -69,6 +69,7 @@
           <div class="grid two">
             <div class="card">
               <h2>当前状态</h2>
+              <div id="status-banner" class="banner hidden" data-keep-text></div>
               <div id="status-head" class="status-head" data-keep-text></div>
               <div class="status-card" data-keep-text>
                 <section class="status-block">
@@ -157,6 +158,7 @@
 
         <!-- 动作库 -->
         <section id="tab-actions" class="tab">
+          <div id="action-banner" class="banner hidden"></div>
           <div class="row">
             <button id="action-add" class="primary">新增动作</button>
             <input id="action-search" class="grow" placeholder="搜索动作（名称 / id / 说明 / 工具）" />
@@ -344,6 +346,7 @@
         </section>
 
         <section id="tab-debug" class="tab">
+          <div id="debug-banner" class="banner hidden"></div>
           <div class="row">
             <label class="field grow">
               <span>会话</span>

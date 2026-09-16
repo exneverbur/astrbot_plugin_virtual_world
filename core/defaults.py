@@ -692,46 +692,66 @@ DEFAULT_WORLD: dict[str, Any] = {
         # ---------------- 工具型（需要 AstrBot 里已注册对应工具） ----------------
         {
             "id": "search_web",
+            "builtin": True,
             "name": "上网搜索",
-            "category": "continuous",
+            # 瞬时动作：动作一开始就真的去查，拿到结果紧接着用她自己的话讲出来。
+            # 做成持续动作的话要等"上网中"结束才调用工具，群里要等好几分钟才看得到结果。
+            "category": "instant",
             "llm_level": "tool",
-            "tool_name": "web_search",
+            # 默认走 web_search；本机没装它就按备选顺序自动换成本机装了的那个，
+            # 一个都没有时这一步会被跳过，并在日志里写明。
+            "tool_names": ["web_search"],
+            "tool_fallbacks": ["anysearch_search", "search", "tavily_search"],
             "scope": "node",
             "allowed_nodes": ["study"],
             "target_type": "none",
-            "duration_mode": "llm",
-            "duration_min": 60,
-            "duration_max": 900,
             "interruptible": True,
             "preconditions": {},
             "params": {},
-            "during": {"state": "searching"},
             "on_complete": {
                 "trigger": "llm_followup",
-                "prompt_hint": "把搜索结果转成你的见闻，用第一人称，简短自然",
-                "effects_per_minute": {"curiosity": "-0.002", "boredom": "-0.003"},
+                "prompt_hint": (
+                    "把查到的内容讲给群里听：用你自己的口吻，挑最有用的两三点，别照抄原文、别念网址；"
+                    "查到什么说什么，查不到就直说没查到，别拿印象里的东西凑"
+                ),
+                "effects": {"curiosity": "-0.06", "boredom": "-0.05"},
             },
             "visible": False,
             "priority": 5,
-            "description": "在书房上网查东西。参数由工具自己定义，不需要你填。",
+            "description": (
+                "上网查东西（在书房用电脑）。**不知道、拿不准、或者涉及最新消息的事就用它查，"
+                "不要凭印象猜、也不要编**：谁、什么时候、哪方面，写进 intent 说清楚就行，"
+                "关键词由系统补全。查直播比分、天气、新闻、某个东西现在什么样，都走这个动作。"
+            ),
         },
         {
             "id": "check_weather",
+            "builtin": True,
             "name": "查天气",
-            "category": "continuous",
+            "category": "instant",
             "llm_level": "tool",
-            "tool_name": "get_weather",
+            "tool_names": ["get_weather"],
+            "tool_fallbacks": ["get_current_weather", "weather"],
             "scope": "node",
             "allowed_nodes": ["study", "window"],
             "target_type": "none",
-            "duration": 30,
             "interruptible": True,
             "preconditions": {},
             "params": {},
-            "on_complete": {"trigger": "llm_followup", "prompt_hint": "用一句话说说天气"},
+            "on_complete": {
+                "trigger": "llm_followup",
+                "prompt_hint": (
+                    "用两句讲讲天气本身：温度多少、体感怎么样（闷/干/风大）、要不要带伞或加衣、"
+                    "适合做点什么。别只感叹一句「好热」「好冷」，也别自己编温度；"
+                    "没查到就直说没查到"
+                ),
+            },
             "visible": False,
             "priority": 4,
-            "description": "看一眼天气，需要 AstrBot 已注册 get_weather 工具。",
+            "description": (
+                "查今天/现在的天气。有人问天气、或者你想提醒对方带伞加衣时用它；"
+                "必须真的查到再说，工具没装或没查到就别猜。"
+            ),
         },
     ],
 }

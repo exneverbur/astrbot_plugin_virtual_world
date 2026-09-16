@@ -44,6 +44,8 @@ REQUIRED_BUILTIN_ACTIONS: tuple[str, ...] = (
     "share",
     "recall",
     "poke",
+    "search_web",
+    "check_weather",
     "schedule_list",
     "schedule_add",
     "schedule_remove",
@@ -294,6 +296,13 @@ class ActionDef(Permissive):
     tool_names: list[str] = Field(default_factory=list)
     """工具型动作要用到的工具，可以配多个，执行时按顺序调用并汇总结果。"""
 
+    tool_fallbacks: list[str] = Field(default_factory=list)
+    """``tool_names`` 一个都没装时按顺序顶上的备选工具。
+
+    内置的「上网搜索 / 查天气」用它做到"本机装了哪个就用哪个"：用户自己挑的工具名
+    始终排在前面，不会被悄悄改掉。
+    """
+
     trigger_command: str = ""
     """「指令触发」型动作要触发的 AstrBot 指令，例如 ``情感分析`` 或 ``/天气``。"""
 
@@ -324,6 +333,11 @@ class ActionDef(Permissive):
         """这个动作要用到的工具（只写了 ``tool_name`` 的老配置也能读出来）。"""
 
         return _clean_names(self.tool_names or [], self.tool_name)
+
+    def tool_candidates(self) -> list[str]:
+        """主选 + 备选的全部工具名。"""
+
+        return _clean_names([*self.tool_list(), *(self.tool_fallbacks or [])])
 
     def set_tools(self, names: list[str]) -> None:
         """设置工具列表，同时把兼容字段 ``tool_name`` 同步成第一个。"""
@@ -437,7 +451,10 @@ ECHO_EVENT_TYPES: dict[str, str] = {
     "action_start": "▶️",
     "action_done": "✅",
     "action": "🎬",
-    "tool": "🔧",
+    "tool_call": "🔧",
+    "tool_result": "📥",
+    "command_call": "🧩",
+    "command_result": "📤",
     "skip": "⏭️",
     "memory": "📝",
     "nickname": "🏷️",
@@ -447,7 +464,6 @@ ECHO_EVENT_TYPES: dict[str, str] = {
     "recall_done": "📖",
     "schedule_edit": "🗓️",
     "schedule": "📅",
-    "command": "🧩",
     "engagement": "💤",
     "extreme": "🚨",
     "context": "🗜️",
@@ -461,9 +477,16 @@ DEFAULT_ECHO_TYPES: tuple[str, ...] = (
     "action_start",
     "action_done",
     "action",
-    "tool",
+    "tool_call",
+    "tool_result",
     "skip",
 )
+
+# 老配置里一个事件同时带着"调用"和"返回"，拆成两栏之后要一一对上
+ECHO_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
+    "tool": ("tool_call", "tool_result"),
+    "command": ("command_call", "command_result"),
+}
 
 
 class MemoryConfig(Permissive):
@@ -663,12 +686,27 @@ class WorldConfig(Permissive):
     可选项见 :data:`ECHO_EVENT_TYPES`。
     """
 
+    echo_compact: bool = False
+    """调试输出的精简模式：只发事件本身（谁调用了什么、决定了什么），
+    不带参数、返回值、模型原话这些细节。"""
+
     reply_mode: Literal["takeover", "inject"] = "takeover"
     """被 @（或消息走到大模型）时的处理方式。
 
     - ``takeover``：本插件接管这次回复，自己调大模型、按 JSON 动作执行并发送，同时阻止主人格重复回复；
     - ``inject``：只追加世界认知，由主人格用自然语言回复。
     """
+
+    @field_validator("echo_types", mode="before")
+    @classmethod
+    def _clean_echo_types(cls, value: Any) -> list[str]:
+        """老配置里的类型名换成新的，不认识的直接丢掉。"""
+
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        return _expand_echo_types([str(item) for item in value])
 
     reasoning_enabled: bool = True
     """是否要求大模型在 actions 之前先输出 reasoning（推理草稿）。"""
@@ -890,7 +928,76 @@ _DEFAULT_TEXT_UPGRADES: dict[str, dict[str, dict[str, str]]] = {
             )
         }
     },
+    "search_web": {
+        "description": {
+            "在书房上网查东西。参数由工具自己定义，不需要你填。": (
+                "上网查东西（在书房用电脑）。**不知道、拿不准、或者涉及最新消息的事就用它查，"
+                "不要凭印象猜、也不要编**：谁、什么时候、哪方面，写进 intent 说清楚就行，"
+                "关键词由系统补全。查直播比分、天气、新闻、某个东西现在什么样，都走这个动作。"
+            )
+        },
+        "prompt_hint": {
+            "把搜索结果转成你的见闻，用第一人称，简短自然": (
+                "把查到的内容讲给群里听：用你自己的口吻，挑最有用的两三点，别照抄原文、别念网址；"
+                "查到什么说什么，查不到就直说没查到，别拿印象里的东西凑"
+            )
+        },
+    },
+    "check_weather": {
+        "description": {
+            "看一眼天气，需要 AstrBot 已注册 get_weather 工具。": (
+                "查今天/现在的天气。有人问天气、或者你想提醒对方带伞加衣时用它；"
+                "必须真的查到再说，工具没装或没查到就别猜。"
+            )
+        },
+        "prompt_hint": {
+            "用一句话说说天气": (
+                "用两句讲讲天气本身：温度多少、体感怎么样（闷/干/风大）、要不要带伞或加衣、"
+                "适合做点什么。别只感叹一句「好热」「好冷」，也别自己编温度；"
+                "没查到就直说没查到"
+            )
+        },
+    },
 }
+
+
+def _upgrade_builtin_tool_action(action: dict[str, Any]) -> dict[str, Any]:
+    """把内置工具动作从"旧默认值"升级到新版写法（只动还是旧默认值的那些）。"""
+
+    action_id = str(action.get("id") or "")
+    if action_id not in ("search_web", "check_weather"):
+        return action
+
+    changed = dict(action)
+    if action.get("category") == "continuous" and (
+        (action_id == "search_web" and action.get("duration_mode") == "llm")
+        or (action_id == "check_weather" and int(action.get("duration") or 0) == 30)
+    ):
+        # 立刻调工具、拿到结果马上讲，而不是等"上网中"结束
+        changed.update(
+            {
+                "category": "instant",
+                "duration_mode": "fixed",
+                "duration": 0,
+                "duration_min": 0,
+                "duration_max": 0,
+            }
+        )
+    # 备选工具：只有在还写着旧默认工具名时才补，用户挑过的工具名一律不动
+    legacy = {
+        "search_web": ("web_search", ["anysearch_search", "search", "tavily_search"]),
+        "check_weather": ("get_weather", ["get_current_weather", "weather"]),
+    }[action_id]
+    names = [str(item) for item in (changed.get("tool_names") or []) if str(item).strip()]
+    if not names:
+        single = str(changed.get("tool_name") or "").strip()
+        if single:
+            names = [single]
+            changed["tool_names"] = list(names)
+            changed["tool_name"] = single
+    if names == [legacy[0]] and not (changed.get("tool_fallbacks") or []):
+        changed["tool_fallbacks"] = list(legacy[1])
+    return changed
 
 
 def normalize_legacy_keys(data: dict[str, Any]) -> dict[str, Any]:
@@ -1028,6 +1135,9 @@ def normalize_legacy_keys(data: dict[str, Any]) -> dict[str, Any]:
                 current = action.get("description")
                 if isinstance(current, str) and current in table:
                     action = {**action, "description": table[current]}
+            # 内置的「上网搜索 / 查天气」以前是持续动作：要等"上网中"结束才真的调工具，
+            # 群里等好几分钟才看得到结果。还是旧默认值的话就改成瞬时动作（立刻查、立刻讲）。
+            action = _upgrade_builtin_tool_action(action)
             cleaned_actions.append(action)
         result = {**result, "actions": cleaned_actions}
     if "echo_actions" in result:
@@ -1040,8 +1150,21 @@ def normalize_legacy_keys(data: dict[str, Any]) -> dict[str, Any]:
         result = {
             key: value for key, value in result.items() if key != "echo_actions"
         }
-        result["echo_types"] = [name for name in migrated if name in ECHO_EVENT_TYPES]
+        result["echo_types"] = _expand_echo_types(migrated)
     return result
+
+
+def _expand_echo_types(names: list[str]) -> list[str]:
+    """把老的事件名换成新的事件名，顺手丢掉不认识的。"""
+
+    expanded: list[str] = []
+    for name in names:
+        key = str(name).strip()
+        targets = ECHO_TYPE_ALIASES.get(key) or ((key,) if key in ECHO_EVENT_TYPES else ())
+        for item in targets:
+            if item not in expanded:
+                expanded.append(item)
+    return expanded
 
 
 def parse_world(data: dict[str, Any]) -> tuple[WorldConfig, list[str]]:

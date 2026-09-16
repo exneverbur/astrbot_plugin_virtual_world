@@ -117,6 +117,12 @@ def _one_line(value: Any, limit: int = 140) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
+def _fingerprint(text: str) -> str:
+    """给一句话算个"指纹"：只留字母数字，用来干掉提示词里的重复行。"""
+
+    return "".join(ch for ch in str(text or "").lower() if ch.isalnum())
+
+
 class PromptBuilder:
     """把世界状态渲染成提示词。"""
 
@@ -334,6 +340,7 @@ class PromptBuilder:
             if exclusive
             else ""
         )
+        search_hint = self.search_hint(actions)
         return (
             f"你当前在【{where}】（id：{node.id}）。\n"
             f"{node.prompt}{zone_note}\n\n"
@@ -343,9 +350,45 @@ class PromptBuilder:
             f"你可以执行的动作（工具型动作只要说明想做什么，具体参数由系统转交）：\n"
             f"{action_lines}\n\n"
             f"{tool_lines}\n\n"
+            f"{search_hint}"
             "想做只有别处能做的事（比如在书房上网）：**先写一步 walk_to，紧接着把要做的那个动作也写进\n"
             "同一串 actions**，系统会带你走过去再执行；只写移动的话，到了那儿还得再问你一次。\n\n"
             f"# 动作前置条件\n{self.precondition_hints(node.id)}"
+        )
+
+    @staticmethod
+    def _looks_like_lookup(action: Any) -> bool:
+        """这个动作是不是"去查外面的信息"（搜索、天气这类）。"""
+
+        if str(getattr(action, "llm_level", "")) not in ("tool", "command"):
+            return False
+        haystack = " ".join(
+            [
+                str(getattr(action, "id", "") or ""),
+                str(getattr(action, "name", "") or ""),
+                str(getattr(action, "description", "") or ""),
+                " ".join(str(item) for item in (action.tool_list() or [])),
+            ]
+        ).lower()
+        return any(
+            keyword in haystack
+            for keyword in ("search", "web", "news", "weather", "查", "搜")
+        )
+
+    def search_hint(self, actions: list[Any]) -> str:
+        """场景里有"能查东西"的动作时，加一段"不确定就去查、别瞎猜"的规矩。
+
+        没有这类动作时不写——省得她以为有个能查的工具、凭空编一个。
+        """
+
+        if not any(self._looks_like_lookup(action) for action in actions):
+            return ""
+        return (
+            "**不知道就先查，别猜。** 涉及最新消息、实时数据（比分/股价/天气/热搜）、具体数字、"
+            "你不熟悉的人或事，先用上面能查的动作查一遍再回答；不要凭印象编，也不要含糊带过。\n"
+            "查的时候把「查什么」写清楚（谁、什么时候、哪方面）；查到了用你自己的话讲重点，"
+            "别照抄原文、别念网址；查不到或结果不相关，就照实说没查到，别拿旧印象凑。\n"
+            "已经查过、结果里已经有的，不要重复再查。\n\n"
         )
 
     def _action_line(self, action: Any) -> str:
@@ -516,7 +559,7 @@ class PromptBuilder:
             return f"- 走到了：{self.node_label(detail.get('to'))}"
         if kind == "plan":
             return f"- 安排：{_short(detail.get('reason'), 40)}"
-        if kind == "tool":
+        if kind in ("tool", "tool_result"):
             return f"- 查了资料：{self.action_label(detail.get('action'))}"
         if kind == "chain":
             return f"- 接着执行日程：{detail.get('schedule')}"
@@ -604,11 +647,18 @@ class PromptBuilder:
         if not items and not summary and not note:
             return []
         lines: list[str] = []
+        seen: set[str] = set()
         for item in items:
             name = str(item.get("name") or item.get("user_id") or "").strip()
             text = _one_line(item.get("text"))
             if not text:
                 continue
+            # 同一条消息被两个钩子各记一次时，这里只留一行：
+            # 提示词里同一句话出现两三遍，模型会以为对方反复说了同样的话。
+            fingerprint = f"{item.get('is_self')}:{_fingerprint(text)}"
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
             if item.get("is_self"):
                 # 她自己那一句用「你:」标出来：这是对话流的一部分，
                 # 不能拆成另一块——拆开之后模型看不到谁在接谁的话。

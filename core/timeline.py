@@ -63,8 +63,17 @@ def _reasoning_text(reasoning: Any) -> str:
     return "；".join(parts)
 
 
-def render_event(event: dict[str, Any], world: WorldConfig | None = None) -> str:
-    """把一个事件渲染成一行中文说明。"""
+def render_event(
+    event: dict[str, Any],
+    world: WorldConfig | None = None,
+    *,
+    compact: bool = False,
+) -> str:
+    """把一个事件渲染成一行中文说明。
+
+    ``compact`` 是调试输出的精简模式：只留"发生了什么"，去掉参数、返回值、
+    模型原话这些需要展开看的细节。
+    """
 
     kind = str(event.get("event_type") or "")
     detail = event.get("detail") or {}
@@ -115,6 +124,8 @@ def render_event(event: dict[str, Any], world: WorldConfig | None = None) -> str
             text += f"；来源：{source}〕" if source else "〕"
         elif source:
             text += f"　〔来源：{source}〕"
+        if compact:
+            return text
         raw = _clip(detail.get("raw"), 160)
         return f"{text}\n　　模型原话：{raw}" if raw else text
 
@@ -132,6 +143,8 @@ def render_event(event: dict[str, Any], world: WorldConfig | None = None) -> str
     if kind == "action_done":
         name = action_name(str(detail.get("type", "")), world)
         text = f"做完「{name}」"
+        if compact:
+            return text
         result = _clip(detail.get("tool_result"), 80)
         return f"{text}：{result}" if result else text
 
@@ -152,15 +165,22 @@ def render_event(event: dict[str, Any], world: WorldConfig | None = None) -> str
     if kind == "move":
         return f"走到「{node_name(str(detail.get('to', '')), world)}」"
 
-    if kind == "tool":
+    if kind in ("tool_call", "tool"):
         name = str(detail.get("tool") or detail.get("action") or "工具")
+        if compact:
+            return f"调用「{name}」"
         params = _clip(detail.get("params"), 80)
+        return f"调用「{name}」参数 {params}" if params else f"调用「{name}」"
+
+    if kind == "tool_result":
+        name = str(detail.get("tool") or detail.get("action") or "工具")
+        if compact:
+            return f"「{name}」返回"
         result = _clip(detail.get("result"), 80)
-        text = f"调用「{name}」参数 {params}" if params else f"调用「{name}」"
         if detail.get("ok") is False:
             reason = _clip(detail.get("error"), 80) or "没有返回结果"
-            return f"{text}　✗ 失败：{reason}"
-        return f"{text}　→ {result}" if result else text
+            return f"「{name}」没成功：{reason}"
+        return f"「{name}」返回：{result}" if result else f"「{name}」没有返回内容"
 
     if kind == "schedule":
         who = "你点了「立即执行」" if detail.get("manual") else "到点触发"
@@ -201,6 +221,8 @@ def render_event(event: dict[str, Any], world: WorldConfig | None = None) -> str
     if kind == "vision":
         count = int(detail.get("images") or 0)
         suffix = f"（{count} 张）" if count else ""
+        if compact:
+            return f"图片内容{suffix}"
         if detail.get("ok") is False:
             return f"图片没看成{suffix}：{_clip(detail.get('detail'), 80)}"
         return f"图片内容{suffix}：{_clip(detail.get('detail'), 80)}"
@@ -214,6 +236,8 @@ def render_event(event: dict[str, Any], world: WorldConfig | None = None) -> str
         return text
 
     if kind == "recall_done":
+        if compact:
+            return f"回想起 {int(detail.get('count') or 0)} 件事"
         if not int(detail.get("count") or 0):
             return f"回想完了：什么都没想起来（找的是 {_clip(detail.get('keyword'), 20) or '旧事'}）"
         return f"回想起来 {int(detail.get('count') or 0)} 件事：{_clip(detail.get('detail'), 120)}"
@@ -226,10 +250,12 @@ def render_event(event: dict[str, Any], world: WorldConfig | None = None) -> str
             return f"日程没改成（{what}）：{_clip(detail.get('note'), 80)}"
         return f"{what}：{_clip(detail.get('note'), 80)}"
 
-    if kind == "command":
+    if kind in ("command", "command_call", "command_result"):
         line = _clip(detail.get("command"), 60)
         action = _clip(detail.get("action"), 20)
         head = f"执行指令「{line}」" + (f"（动作：{action}）" if action else "")
+        if kind == "command_call" or compact:
+            return head
         if detail.get("ok") is False:
             return f"{head}失败：{_clip(detail.get('error'), 60)}"
         result = _clip(detail.get("result"), 80)

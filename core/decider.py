@@ -152,7 +152,7 @@ class Decider:
             )
 
         # 3) 好奇心高且在书房 -> 上网搜索并分享
-        if state.curiosity > 0.7 and node_id == "study" and self.has_tool("web_search"):
+        if state.curiosity > 0.7 and node_id == "study" and self.action_usable("search_web"):
             return create_plan(
                 steps=[{"action": "search_web", "params": {}}],
                 world_time=state.world_time,
@@ -269,6 +269,16 @@ class Decider:
         if wanted in {str(item).strip() for item in (self.world.global_allowed_tools or [])}:
             return True
         return any(
-            action.llm_level == "tool" and str(action.tool_name or "").strip() == wanted
+            action.llm_level == "tool" and wanted in action.tool_list()
             for action in self.world.actions
         )
+
+    def action_usable(self, action_id: str) -> bool:
+        """这个动作现在真的跑得起来吗（存在、没停用、需要工具时至少配了一个）。"""
+
+        action = self.world.action_map().get(str(action_id or "").strip())
+        if action is None or not action.enabled:
+            return False
+        if action.llm_level == "tool":
+            return bool(action.tool_list())
+        return True

@@ -241,6 +241,29 @@ main {
   margin-bottom: 10px;
 }
 
+/* 顶部四个小标签：状态最显眼，其余是次要信息 */
+.status-head .chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-head .chip:first-child {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.status-head .chip:nth-child(n + 3) {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--line);
+}
+
 .status-card {
   display: flex;
   flex-direction: column;
@@ -251,10 +274,32 @@ main {
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 10px 12px;
+  background: rgba(127, 127, 127, 0.04);
+  transition: border-color 0.15s ease;
+}
+
+.status-block:hover {
+  border-color: var(--accent);
 }
 
 .status-block h3 {
   margin: 0 0 8px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.status-block h3::before {
+  content: "";
+  width: 3px;
+  height: 12px;
+  border-radius: 999px;
+  background: var(--accent);
+  opacity: 0.75;
 }
 
 .status-lines {
@@ -1196,8 +1241,137 @@ details.raw-json summary {
   margin-top: 2px;
 }
 
-.echo-grid label.inline span {
+/* 页头横幅：工具不存在这类"会被静默跳过"的问题摆到明面上 */
+.banner {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  border: 1px solid var(--warn, #d9a441);
+  border-left-width: 4px;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  background: rgba(217, 164, 65, 0.1);
+}
+
+.banner.hidden {
+  display: none;
+}
+
+.banner-icon {
+  font-size: 16px;
+  line-height: 1.2;
+}
+
+.banner-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.banner-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.banner-detail {
   font-size: 12px;
+  color: var(--text);
+  word-break: break-word;
+}
+
+.banner-hint {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* 调试输出：分组的开关卡片 */
+.echo-field {
+  gap: 8px;
+}
+
+.echo-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.echo-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.echo-group {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 10px 10px;
+  background: rgba(127, 127, 127, 0.04);
+}
+
+.echo-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.echo-group-title {
+  font-size: 12px;
+  font-weight: 600;
+  cursor: help;
+}
+
+.echo-group-head .hint {
+  margin: 0;
+}
+
+.echo-group-head button.tiny {
+  margin-left: auto;
+  font-size: 11px;
+  padding: 1px 8px;
+}
+
+.echo-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+
+.echo-chip:hover {
+  border-color: var(--accent);
+}
+
+.echo-chip.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.echo-chip .echo-icon {
+  font-size: 13px;
+  line-height: 1;
+}
+
+@media (max-width: 720px) {
+  .echo-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 /* ---------------- 动作卡片网格 + 编辑抽屉 ---------------- */

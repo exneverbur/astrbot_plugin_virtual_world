@@ -1310,7 +1310,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "exneverbur",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v1.3.4",
+    "v1.3.5",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -1717,9 +1717,16 @@ class VirtualWorldPlugin(Star):
             echo = list(getattr(outcome, "debug_messages", []) or [])
             if outcome.ok and outcome.messages:
                 # 先让别的插件的回复钩子过一遍（它们可能在回复里读写标记）
-                bridged = await self._bridge_reply_hooks(event, list(outcome.messages))
-                # 再按换行拆段：一段一条消息，别把好几句挤成一坨
-                await self._send_reply(event, self.split_messages(bridged) + echo)
+                bridged = await self._bridge_reply_hooks(
+                    event,
+                    list(outcome.messages),
+                    str(getattr(outcome, "tail", "") or ""),
+                )
+                # 再按换行拆段：一段一条消息，别把好几句挤成一坨；
+                # 调试回显按它实际发生的位置插进去（先调工具、再说话，群里也是这个顺序）
+                await self._send_reply(
+                    event, self._merge_with_echo(bridged, outcome, echo)
+                )
                 # 「发完了」也要补一遍：靠它摘掉"处理中"标记的插件才不会一直挂着
                 await self._fire_hook(event, "OnAfterMessageSentEvent")
                 if self.debug:
@@ -1827,8 +1834,35 @@ class VirtualWorldPlugin(Star):
                     result.append(text)
         return result[:limit] if result else [str(item).strip() for item in messages if str(item).strip()]
 
+    def _merge_with_echo(
+        self, bridged: list[str], outcome, echo: list[str]
+    ) -> list[str]:
+        """把正式回复和调试回显按"实际发生的先后"合成一串消息。
+
+        她这一轮可能是"先调工具、拿到结果才开口"：那种情况下调试行本来就该排在
+        她的话前面。没有回显时就是普通的分段回复。
+        """
+
+        if not echo:
+            return self.split_messages(bridged)
+        raw = list(getattr(outcome, "messages", []) or [])
+        if len(bridged) != len(raw):
+            # 钩子改过条数，位置对不上了：宁可把回显放在后面，也不要错位
+            return self.split_messages(bridged) + list(echo)
+        positions = list(getattr(outcome, "debug_positions", []) or [])
+        buckets: dict[int, list[str]] = {}
+        for index, line in enumerate(echo):
+            slot = positions[index] if index < len(positions) else len(raw)
+            buckets.setdefault(min(int(slot), len(raw)), []).append(line)
+        result: list[str] = []
+        for slot in range(len(raw) + 1):
+            result.extend(buckets.get(slot, []))
+            if slot < len(raw):
+                result.extend(self.split_messages([raw[slot]]))
+        return result
+
     async def _bridge_reply_hooks(
-        self, event: AstrMessageEvent, messages: list[str]
+        self, event: AstrMessageEvent, messages: list[str], tail: str = ""
     ) -> list[str]:
         """让别的插件也能"看到"这次接管的回复。
 
@@ -1836,6 +1870,9 @@ class VirtualWorldPlugin(Star):
         那些靠在回复里解析标记的插件（好感度、统计、改写语气之类）就永远收不到内容。
         这里把回复补送进同一条钩子链：先过 ``on_llm_response``，
         再过 ``on_decorating_result``（发送前的最后一道），拿回它们改过的文本再发。
+
+        ``tail`` 是模型写在 JSON 之后的那一小截（例如 `[好感度 持平]`）：只跟这次钩子调用走，
+        给靠标记工作的插件解析用，**不会**跟着她的话发到群里。
         """
 
         if not self.reply_hook_bridge or not messages:
@@ -1848,13 +1885,18 @@ class VirtualWorldPlugin(Star):
             return messages
 
         joined = "\n".join(messages)
+        # 标记只加在"给钩子看的文本"里：插件解析完（通常会把标记抹掉）再返回，
+        # 真正发到群里的 messages 不会带上它。
+        hook_text = f"{joined}\n{tail}".strip() if tail else joined
         try:
-            response = self._hook_response(event, joined, LLMResponse)
+            response = self._hook_response(event, hook_text, LLMResponse)
             await call_event_hook(event, EventType.OnLLMResponseEvent, response)
             edited = str(getattr(response, "completion_text", "") or "")
-            if edited and edited != joined:
+            if edited and edited != hook_text:
                 lines = [line.strip() for line in edited.splitlines() if line.strip()]
-                messages = lines or [edited]
+                # 插件可能把标记那一行抹掉了：只用它给的内容，标记本身不发
+                cleaned = [line for line in (lines or [edited]) if line != tail.strip()]
+                messages = cleaned or lines or [edited]
         except Exception as exc:
             self.logger.warning(f"[virtual_world] 回复钩子（LLM 响应）执行出错：{exc}")
 

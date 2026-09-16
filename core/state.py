@@ -17,6 +17,9 @@ STATE_READING = "reading"
 STATE_WALKING = "walking"
 STATE_THINKING = "thinking"
 
+# 同一个人在这段时间内发的内容差不多，就认为是同一条消息（两个钩子重复记一次）
+_CHAT_DEDUPE_SECONDS = 60.0
+
 
 def _clamp01(value: Any, default: float = 0.5) -> float:
     try:
@@ -26,6 +29,25 @@ def _clamp01(value: Any, default: float = 0.5) -> float:
     if number != number:  # NaN
         return default
     return max(0.0, min(1.0, number))
+
+
+def _same_chat_text(left: str, right: str) -> bool:
+    """两条聊天文本算不算"同一句"。
+
+    两个钩子拿到的文本可能一个带 @ 前缀、一个被别的插件改写过，
+    所以去掉空白和标点后比较，并且容忍一方是另一方的子串。
+    """
+
+    def squeeze(text: str) -> str:
+        return "".join(ch for ch in str(text or "") if ch.isalnum())
+
+    a = squeeze(left)
+    b = squeeze(right)
+    if not a or not b:
+        return not a and not b
+    if a == b:
+        return True
+    return len(min(a, b, key=len)) >= 4 and (a in b or b in a)
 
 
 @dataclass
@@ -311,14 +333,16 @@ class WorldState:
         if not clean:
             return
         # 同一条消息可能同时经过"旁观监听"和"LLM 请求"两个钩子，去重避免上下文里重复出现
-        if self.recent_chat:
-            last = self.recent_chat[-1]
-            if (
-                str(last.get("user_id")) == str(user_id)
-                and str(last.get("text")) == clean
-                and now - float(last.get("at", 0)) <= 3.0
-            ):
+        # （两个钩子拿到的文本可能差一点点：一个带 @ 前缀、一个被管线改写过，
+        #   所以不是逐字比较，而是"同一个人、短时间内、内容基本一样"。）
+        for item in reversed(self.recent_chat[-4:]):
+            if str(item.get("user_id")) != str(user_id):
+                continue
+            if now - float(item.get("at", 0)) > _CHAT_DEDUPE_SECONDS:
+                continue
+            if _same_chat_text(str(item.get("text") or ""), clean):
                 return
+            break
         self.recent_chat.append(
             {
                 "user_id": user_id,

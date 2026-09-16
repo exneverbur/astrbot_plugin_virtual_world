@@ -72,127 +72,172 @@ const ECHO_TYPE_CHOICES = [
     icon: "🧠",
     label: "她的决定",
     hint: "这一轮打算做什么、为什么这么做、是谁定的（规则 / 大模型 / 日程 / 极端保护）。",
+    group: "core",
   },
   {
     key: "action_start",
     icon: "▶️",
     label: "开始动作",
     hint: "开始一个动作，带预计耗时；移动还会写明去哪个地点。",
+    group: "core",
   },
   {
     key: "action_done",
     icon: "✅",
     label: "动作完成",
-    hint: "持续动作做完，带工具返回的结果。",
+    hint: "持续动作做完；精简模式下只显示做完了哪个动作。",
+    group: "core",
   },
   {
     key: "action",
     icon: "🎬",
     label: "静默动作的内容",
     hint: "想事情这类本来不发到群里的动作写了什么。她自己说过的话不会重复发。",
+    group: "core",
   },
   {
-    key: "tool",
+    key: "tool_call",
     icon: "🔧",
-    label: "工具调用",
-    hint: "真正传出去的参数和返回结果，用来核对她说的是不是编的。",
+    label: "调用工具",
+    hint: "她调了哪个工具、实际传出去的参数；精简模式下只留工具名。",
+    group: "tool",
+  },
+  {
+    key: "tool_result",
+    icon: "📥",
+    label: "工具返回",
+    hint: "工具返回了什么、失败了报什么错，用来核对她说的是不是编的。",
+    group: "tool",
+  },
+  {
+    key: "command_call",
+    icon: "🧩",
+    label: "触发指令",
+    hint: "她把哪条 AstrBot 指令发出去了（指令型动作）。",
+    group: "tool",
+  },
+  {
+    key: "command_result",
+    icon: "📤",
+    label: "指令返回",
+    hint: "那条指令返回了什么、有没有跑失败。",
+    group: "tool",
   },
   {
     key: "skip",
     icon: "⏭️",
     label: "被跳过的动作",
     hint: "某个动作没做成的具体原因（缺参数、地点不对、工具不存在…）。",
+    group: "core",
   },
   {
     key: "memory",
     icon: "📝",
     label: "写了一条记忆",
     hint: "一段对话被总结成记忆时发出来，方便对着看记得准不准。",
+    group: "mind",
   },
   {
     key: "nickname",
     icon: "🏷️",
     label: "群名片变化",
     hint: "她的群名片改成什么、有没有改失败。",
+    group: "misc",
   },
   {
     key: "cancel",
     icon: "🛑",
     label: "按你说的停下",
     hint: "对方明确说别做了时，她停掉了哪个动作、放弃了哪些安排。",
+    group: "sleep",
   },
   {
     key: "vision",
     icon: "🖼️",
     label: "图片内容",
     hint: "她是怎么看图的：转述成功时写了什么、失败是为什么、或者直接把图片交给多模态主模型。",
+    group: "misc",
   },
   {
     key: "recall_start",
     icon: "💭",
     label: "回想开始",
     hint: "她想回忆什么（大模型给的意图），以及解析出来的检索范围（地点 / 区域 / 主题词）。",
+    group: "mind",
   },
   {
     key: "recall_done",
     icon: "📖",
     label: "回想完成",
     hint: "她从记忆里翻出了什么；什么都没翻到时会写明。",
+    group: "mind",
   },
   {
     key: "schedule_edit",
     icon: "🗓️",
     label: "改日程",
     hint: "她自己查看 / 添加 / 删除了哪条日程，成功了还是被拒了（用户配的日程她删不掉）。",
+    group: "schedule",
   },
   {
     key: "schedule",
     icon: "📅",
     label: "日程开始执行",
     hint: "哪条日程开始执行了、是到点触发的还是你点了「立即执行」、这一串要跑哪些动作。",
-  },
-  {
-    key: "command",
-    icon: "🧩",
-    label: "触发指令",
-    hint: "她把哪条 AstrBot 指令发出去了、对方返回了什么（指令型动作）。",
+    group: "schedule",
   },
   {
     key: "engagement",
     icon: "💤",
     label: "进入安静期",
     hint: "连续主动说话没人回应，触发无人回应保护。",
+    group: "sleep",
   },
   {
     key: "extreme",
     icon: "🚨",
     label: "极端保护",
     hint: "精力透支、太久没人说话这类兜底规则被触发。",
+    group: "sleep",
   },
   {
     key: "context",
     icon: "🗜️",
     label: "上下文压缩",
     hint: "群聊留档攒太多、被压成摘要的时候。",
+    group: "misc",
   },
   {
     key: "wake_up",
     icon: "🌅",
     label: "被叫醒",
     hint: "她睡觉时被唤醒词叫起来。",
+    group: "sleep",
   },
   {
     key: "sleep_reply",
     icon: "😴",
     label: "睡着时的回话",
     hint: "睡着时被 @，只回了一句固定文案。",
+    group: "sleep",
   },
   {
     key: "sleep_skip",
     icon: "🤐",
     label: "睡着时没回复",
     hint: "睡着时被消息叫到，但按配置保持安静。",
+    group: "sleep",
   },
+];
+
+/** 调试输出的分组：类型多了以后按用途分块，找起来快。 */
+const ECHO_GROUPS = [
+  { key: "core", label: "决定与动作", hint: "她这一轮想做什么、做成了没有" },
+  { key: "tool", label: "工具与指令", hint: "调用了哪个工具 / 指令，拿回了什么" },
+  { key: "mind", label: "记忆与回想", hint: "记忆写成什么样、主动回想翻到了什么" },
+  { key: "schedule", label: "日程", hint: "日程什么时候被触发、她怎么改自己的日程" },
+  { key: "sleep", label: "睡眠与保护", hint: "睡觉门禁、被叫醒、打断、兜底保护" },
+  { key: "misc", label: "图片 · 上下文 · 名片", hint: "看图、上下文压缩、群名片变化" },
 ];
 
 /** 「状态 → 名片文案」的候选：内置状态 + 动作里定义的执行状态 + 已经在用的键。 */
@@ -240,6 +285,10 @@ const LOG_TYPES = {
   recall_done: { icon: "📖", label: "想起了什么" },
   schedule_edit: { icon: "🗓️", label: "改日程" },
   command: { icon: "🧩", label: "触发指令" },
+  command_call: { icon: "🧩", label: "触发指令" },
+  command_result: { icon: "📤", label: "指令返回" },
+  tool_call: { icon: "🔧", label: "调用工具" },
+  tool_result: { icon: "📥", label: "工具返回" },
   chain: { icon: "🔗", label: "动作链" },
   cold_start: { icon: "🌅", label: "冷启动" },
   bot_spoke: { icon: "🗣️", label: "发言等待回应" },
@@ -691,13 +740,14 @@ function pillsField(label, value, choices, onChange, opts = {}) {
   return wrapper;
 }
 
-/** 「调试输出」：整块列出来，想发哪几类就勾哪几类。 */
+/** 「调试输出」：按用途分块列出，想发哪几类就勾哪几类。 */
 function echoTypesField(world) {
-  const wrapper = el("div", "field");
+  const wrapper = el("div", "field echo-field");
   wrapper.appendChild(
     fieldHead(
-      "要发到群里的类型",
-      "只补上群里本来听不到的部分（她自己说的话照常只发一次，不会重复）。\n" +
+      "调试输出",
+      "把群里本来看不见的事作为消息发出来，用来排查「她为什么这么做」。\n" +
+        "只补上听不到的部分：她自己说过的话照常只发一次，不会重复。\n" +
         "一个都不勾 = 关闭调试输出。\n" +
         "这些消息不会被当成「她说的话」：不进聊天上下文、不计无人回应保护、不影响数值。",
     ),
@@ -708,10 +758,24 @@ function echoTypesField(world) {
     world.echo_types = Array.from(new Set(names));
   };
 
+  const toolbar = el("div", "echo-toolbar");
+  const counted = el(
+    "span",
+    "hint",
+    `已选 ${chosen().length} / ${ECHO_TYPE_CHOICES.length} 类`,
+  );
   const buttons = el("div", "row-item");
   const quick = [
     ["全选", () => ECHO_TYPE_CHOICES.map((item) => item.key)],
-    ["常用", () => ECHO_TYPE_CHOICES.slice(0, 6).map((item) => item.key)],
+    [
+      "常用",
+      () =>
+        ECHO_TYPE_CHOICES.filter((item) =>
+          ["plan", "action_start", "action_done", "action", "tool_call", "tool_result", "skip"].includes(
+            item.key,
+          ),
+        ).map((item) => item.key),
+    ],
     ["清空", () => []],
   ];
   quick.forEach(([text, pick]) => {
@@ -723,29 +787,75 @@ function echoTypesField(world) {
     });
     buttons.appendChild(button);
   });
+  toolbar.appendChild(counted);
+  toolbar.appendChild(buttons);
 
-  const grid = el("div", "echo-grid");
-  ECHO_TYPE_CHOICES.forEach((choice) => {
-    const on = chosen().includes(choice.key);
-    const box = el("label", "inline");
-    const input = document.createElement("input");
-    input.type = "checkbox";
-    input.checked = on;
-    input.addEventListener("change", () => {
-      const next = chosen().filter((name) => name !== choice.key);
-      setChosen(input.checked ? next.concat([choice.key]) : next);
-    });
-    box.appendChild(input);
-    box.appendChild(el("span", "", `${choice.icon} ${choice.label}`));
+  /** 每一类一个可点的小卡片：图标 + 名字，说明放在悬停提示里。 */
+  const typeButton = (choice) => {
+    const box = el("button", `echo-chip${chosen().includes(choice.key) ? " on" : ""}`);
+    box.type = "button";
+    box.appendChild(el("span", "echo-icon", choice.icon));
+    box.appendChild(el("span", "", choice.label));
     if (choice.hint) {
       box.setAttribute("data-tip", choice.hint);
       box.setAttribute("title", choice.hint);
     }
-    grid.appendChild(box);
+    box.addEventListener("click", () => {
+      const next = chosen().filter((name) => name !== choice.key);
+      setChosen(chosen().includes(choice.key) ? next : next.concat([choice.key]));
+      renderSettings();
+    });
+    return box;
+  };
+
+  const groups = el("div", "echo-groups");
+  ECHO_GROUPS.forEach((group) => {
+    const items = ECHO_TYPE_CHOICES.filter((item) => (item.group || "core") === group.key);
+    if (!items.length) return;
+    const block = el("div", "echo-group");
+    const head = el("div", "echo-group-head");
+    const title = el("span", "echo-group-title", group.label);
+    if (group.hint) {
+      title.setAttribute("data-tip", group.hint);
+      title.setAttribute("title", group.hint);
+    }
+    head.appendChild(title);
+    const onCount = items.filter((item) => chosen().includes(item.key)).length;
+    head.appendChild(el("span", "hint", `${onCount}/${items.length}`));
+    const toggle = el("button", "ghost tiny", onCount === items.length ? "取消本组" : "全选本组");
+    toggle.type = "button";
+    toggle.addEventListener("click", () => {
+      const keys = items.map((item) => item.key);
+      const rest = chosen().filter((name) => !keys.includes(name));
+      setChosen(onCount === items.length ? rest : rest.concat(keys));
+      renderSettings();
+    });
+    head.appendChild(toggle);
+    block.appendChild(head);
+    const row = el("div", "echo-grid");
+    items.forEach((item) => row.appendChild(typeButton(item)));
+    block.appendChild(row);
+    groups.appendChild(block);
   });
 
-  wrapper.appendChild(buttons);
-  wrapper.appendChild(grid);
+  wrapper.appendChild(toolbar);
+  wrapper.appendChild(
+    checkboxField(
+      "精简模式",
+      !!world.echo_compact,
+      (value) => {
+        world.echo_compact = !!value;
+      },
+      {
+        hint:
+          "打开后只发要点，不带参数和结果：\n" +
+          "🔧 调用「anysearch_extract」\n" +
+          "📥 「anysearch_extract」返回\n" +
+          "排查「她做了什么」够用，内容不会刷屏。",
+      },
+    ),
+  );
+  wrapper.appendChild(groups);
   return wrapper;
 }
 
@@ -1896,6 +2006,7 @@ function renderEverything() {
   renderSessionList();
   renderMemoryFilters();
   renderSettings();
+  renderToolWarnings();
   refreshStatus();
   loadTools();
   loadOverview();
@@ -2091,7 +2202,97 @@ function toolActionWarnings() {
   if (noCommand.length) {
     warnings.push(`这些指令型动作还没填要触发的指令，会被跳过：${noCommand.join("、")}`);
   }
-  return warnings;
+  return warnings.concat(missingToolActionWarnings());
+}
+
+/**
+ * 工具型动作里，配的工具在 AstrBot 里一个都不存在的那些。
+ *
+ * 「找不到工具」只会体现在运行时的跳过日志里，用户不点开日志根本不知道，
+ * 所以在状态页和动作页都挂一条横幅直接说出来。
+ */
+function missingToolActions() {
+  const installed = new Set((ui.tools || []).map((item) => item.name));
+  const installedList = Array.from(installed);
+  // 只配了一个工具的动作允许按前缀对上（官方搜索工具叫 web_search_tavily 这类）
+  const usable = (names) => {
+    if (!names.length) return false;
+    if (names.some((name) => installed.has(name))) return true;
+    if (names.length > 1) return false;
+    const wanted = String(names[0]).toLowerCase();
+    return wanted.length >= 5 && installedList.some((name) => name.toLowerCase().startsWith(wanted));
+  };
+  return actions()
+    .filter((action) => action.llm_level === "tool")
+    .map((action) => {
+      const names = actionToolNames(action);
+      const fallbacks = Array.isArray(action.tool_fallbacks)
+        ? action.tool_fallbacks.filter(Boolean)
+        : [];
+      const all = Array.from(new Set(names.concat(fallbacks)));
+      if (!all.length) return null; // 一个工具都没选：上面那条提醒负责
+      if (usable(names) || fallbacks.some((name) => usable([name]))) return null;
+      return { name: action.name || action.id, tools: all };
+    })
+    .filter(Boolean);
+}
+
+function missingToolActionWarnings() {
+  const missing = missingToolActions();
+  if (!missing.length) return [];
+  const detail = missing
+    .map((item) => `${item.name}（${item.tools.join(" / ")}）`)
+    .join("；");
+  return [
+    `有 ${missing.length} 个工具型动作对应的工具在 AstrBot 里不存在，点了会被跳过：${detail}`,
+  ];
+}
+
+/** 把「工具不存在」提醒画到状态页和动作页的横幅上。 */
+function renderToolWarnings() {
+  const missing = missingToolActions();
+  const targets = [
+    $("status-banner"),
+    $("action-banner"),
+    $("debug-banner"),
+  ].filter(Boolean);
+  targets.forEach((box) => {
+    if (!missing.length) {
+      box.classList.add("hidden");
+      box.innerHTML = "";
+      return;
+    }
+    box.classList.remove("hidden");
+    box.innerHTML = "";
+    box.appendChild(
+      el("span", "banner-icon", "⚠"),
+    );
+    const body = el("div", "banner-body");
+    body.appendChild(
+      el(
+        "div",
+        "banner-title",
+        `有 ${missing.length} 个工具型动作对应的工具不存在，执行时会被跳过`,
+      ),
+    );
+    body.appendChild(
+      el(
+        "div",
+        "banner-detail",
+        missing
+          .map((item) => `${item.name} → ${item.tools.join(" / ")}`)
+          .join("　·　"),
+      ),
+    );
+    body.appendChild(
+      el(
+        "div",
+        "banner-hint",
+        "在动作里把工具换成 AstrBot 里已经装好的那个（搜索、天气这类内置动作也带备选，装任意一个搜索工具就能用）。",
+      ),
+    );
+    box.appendChild(body);
+  });
 }
 
 /** 一个动作挂了哪些工具（新写法 tool_names 优先，兼容老的 tool_name）。 */
@@ -2471,15 +2672,25 @@ function renderStatusSections(data, stateLabel) {
     const ticks = Number(data.world_time || 0) - Number(item.world_time || 0);
     return ticks > 0 ? `${durationText(Math.round((ticks * tickSeconds) / 60))}前` : "刚刚";
   };
+  // 一行最多摆这么多人：再多就变成一堵墙，想知道全量去看日志
+  const presenceShown = 4;
+  const presenceTotal = Math.max(Number(data.user_presence_total || 0), presence.length);
+  const presenceText = presence.length
+    ? presence
+        .slice(0, presenceShown)
+        .map((item) => `${item.name || item.user_id}（${tickAgo(item)}）`)
+        .join("、") +
+      (presenceTotal > Math.min(presence.length, presenceShown)
+        ? `　等 ${presenceTotal} 人`
+        : "")
+    : "还没人跟她说过话";
   statusLine(
     runtimeBox,
-    "最近活跃",
-    presence.length
-      ? presence
-          .slice(0, 4)
-          .map((item) => `${item.name || item.user_id}（${tickAgo(item)}）`)
-          .join("、")
-      : "还没人跟她说过话",
+    `最近活跃${presenceTotal ? `（共 ${presenceTotal} 人，显示 ${Math.min(
+      presence.length,
+      presenceShown,
+    )} 个）` : ""}`,
+    presenceText,
     presence.length ? "" : "muted",
   );
   statusLine(
@@ -2560,6 +2771,7 @@ async function refreshStatus() {
     ui.status = data;
     const stateLabel = (STATES.find((item) => item.key === data.state) || {}).label || data.state;
     renderStatusSections(data, stateLabel);
+    renderToolWarnings();
     // 地图上标出她此刻所在的地点
     if ($("tab-map")) renderMap();
 

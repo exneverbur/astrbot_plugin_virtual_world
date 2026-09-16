@@ -9,6 +9,83 @@ from typing import Any
 
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
+# 模型的思考段：有的模型即使关了思考开关也会吐出来（有时还漏掉开标签）。
+# 这些内容既不能进群，也不能挡着后面的 JSON 解析。
+_THINK_NAME = r"(?:thinking|think|reasoning|analysis|reflection|思考|反思)"
+_THINK_BLOCK = re.compile(
+    rf"<\s*{_THINK_NAME}\s*>.*?</\s*{_THINK_NAME}\s*>", re.DOTALL | re.IGNORECASE
+)
+_THINK_FENCE = re.compile(
+    rf"```\s*{_THINK_NAME}\s*.*?```", re.DOTALL | re.IGNORECASE
+)
+_THINK_CLOSE = re.compile(rf"</\s*{_THINK_NAME}\s*>", re.IGNORECASE)
+_THINK_OPEN = re.compile(rf"<\s*{_THINK_NAME}\s*>", re.IGNORECASE)
+
+
+def strip_reasoning(text: str) -> str:
+    """把模型可能吐出来的思考段剥掉，只留它真正要对外的内容。
+
+    处理三种真实出现过的情况：
+
+    1. 完整块：``<thinking>…</thinking>`` / ```` ```thinking … ``` ````；
+    2. 只有闭合标签（漏了开标签，或 Provider 把开标签吃掉了）：
+       丢掉最后一个闭合标签之前的所有内容；
+    3. 只有开标签：从开标签后第一个 ``{`` 开始留。
+
+    剥完之后的文本才拿去做 JSON 解析、才可能被当成"她直接说了句话"。
+    """
+
+    body = str(text or "")
+    if not body:
+        return ""
+    body = _THINK_FENCE.sub(" ", body)
+    body = _THINK_BLOCK.sub(" ", body)
+    closes = list(_THINK_CLOSE.finditer(body))
+    if closes:
+        return body[closes[-1].end() :].strip()
+    opener = _THINK_OPEN.search(body)
+    if opener:
+        tail = body[opener.end() :]
+        index = tail.find("{")
+        return tail[index:].strip() if index >= 0 else ""
+    return body.strip()
+
+
+def _balanced_slices(text: str) -> list[str]:
+    """切出文本里**最外层**的、花括号配对的片段（忽略字符串里的括号）。
+
+    只收最外层：``{"actions":[{"type":"say"}]}`` 会得到一个整体，
+    不会把里面那个动作对象也当成候选（否则会解析出半截 JSON）。
+    """
+
+    slices: list[str] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index, current in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif current == "\\":
+                escaped = True
+            elif current == '"':
+                in_string = False
+            continue
+        if current == '"':
+            in_string = True
+        elif current == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif current == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    slices.append(text[start : index + 1])
+                    start = -1
+    return slices
+
 
 @dataclass
 class PlannedAction:
@@ -68,6 +145,12 @@ class ParseResult:
 
     chat_note: str = ""
     """一句话交代「刚才这段在聊什么」，下一轮当背景用，避免重复回应老话题。"""
+
+    tail: str = ""
+    """JSON 之后残留下来的短尾巴（例如别的插件要求模型追加的 `[好感度 持平]`）。
+
+    它不会跟着她的话发到群里，只在「回复钩子」那一步带上，让靠标记工作的插件还能读到。
+    """
 
 
 REASONING_KEYS = ("env", "state", "mood", "who", "intent")
@@ -131,22 +214,29 @@ def parse_reasoning(payload: Any) -> dict[str, str]:
 
 
 def extract_json_object(text: str) -> dict[str, Any] | None:
-    """从模型输出里挖出第一个合法 JSON 对象。"""
+    """从模型输出里挖出合法 JSON 对象（会先剥掉思考段）。
+
+    候选顺序：代码块 → 整段文本 → 每个 ``{`` 起的花括号配对片段（从后往前试）。
+    最后这一步是为"模型在思考里贴了一段示例 JSON、正文才是真 JSON"这种情况准备的。
+    """
 
     if not text:
         return None
+    body = strip_reasoning(text)
+    if not body:
+        return None
     candidates: list[str] = []
-    match = _JSON_BLOCK.search(text)
+    match = _JSON_BLOCK.search(body)
     if match:
         candidates.append(match.group(1))
-    candidates.append(text)
-    # 退一步：截取第一个 { 到最后一个 }
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end > start:
-        candidates.append(text[start : end + 1])
+    candidates.append(body)
+    # 一路退：从后往前试每个 { 起头的配对片段，先命中"最后那个完整的 JSON"
+    candidates.extend(reversed(_balanced_slices(body)))
     for candidate in candidates:
         stripped = candidate.strip()
         if not stripped:
+            continue
+        if stripped.startswith("```"):
             continue
         try:
             data = json.loads(stripped)
@@ -180,18 +270,16 @@ def parse_action_payload(
 
     warnings: list[str] = []
     raw = text or ""
+    # 思考段先剥掉：既不能让"她其实在思考"的内容被当成发言发出去，
+    # 也不能让它挡着后面的 JSON。
+    cleaned_text = strip_reasoning(raw)
     payload = extract_json_object(raw)
     if payload is None:
-        cleaned = raw.strip().strip("`").strip()
-        actions = [PlannedAction(type="say", messages=[cleaned])] if cleaned else []
-        return ParseResult(
-            actions=actions, warnings=["模型输出不是合法 JSON，已降级为直接发言"],
-            fallback_used=True, raw_text=raw,
-        )
+        return _fallback_result(cleaned_text, raw)
 
     items = payload.get("actions")
     if not isinstance(items, list):
-        cleaned = raw.strip()
+        cleaned = cleaned_text.strip().strip("`").strip()
         return ParseResult(
             actions=[PlannedAction(type="say", messages=[cleaned])] if cleaned else [],
             warnings=["模型输出缺少 actions 字段，已降级为直接发言"],
@@ -271,10 +359,68 @@ def parse_action_payload(
         memory=parse_memory(payload.get("memory")),
         cancel=parse_cancel(payload.get("cancel")),
         chat_note=_clean_note(payload.get("chat_note")),
+        tail=_json_tail(cleaned_text),
     )
 
 
+def _json_tail(text: str, limit: int = 60) -> str:
+    """JSON 之后剩下的短尾巴（给「靠标记工作的插件」用，不会发到群里）。"""
+
+    body = str(text or "").strip()
+    if not body:
+        return ""
+    end = body.rfind("}")
+    if end < 0 or end >= len(body) - 1:
+        return ""
+    tail = body[end + 1 :].strip().strip("`").strip()
+    if not tail or len(tail) > limit:
+        return ""
+    # 只认"看起来是标记"的短尾巴，避免把模型多写的一句废话带进钩子
+    return tail if tail[0] in "[【(" else ""
+
+
 def _clean_note(payload: Any) -> str:
+    """群聊背景句：只取一句话，太长就截断。"""
+
+    if payload is None:
+        return ""
+    text = " ".join(str(payload).split())
+    return text[:80]
+
+
+# 兜底发言的长度上限：超过这个长度、或者还残留 JSON 结构的，就不当"她说了句话"处理。
+# （模型偶尔会把整段思考当成回复，把它发到群里比什么都不说糟得多。）
+_FALLBACK_MAX_CHARS = 160
+
+
+def _fallback_result(cleaned: str, raw: str) -> ParseResult:
+    """模型没给出 JSON 时的兜底。
+
+    - 剩下来的是一句正常的话（短、不含 JSON 残留）→ 当成她说的一句，照发；
+    - 剩下来的还是长文/思考/半个 JSON → 什么都不发，只在日志里留个警告。
+    """
+
+    body = str(cleaned or "").strip().strip("`").strip()
+    looks_like_reasoning = (
+        len(body) > _FALLBACK_MAX_CHARS
+        or "{" in body
+        or "}" in body
+        or '"actions"' in body
+        or "```" in body
+    )
+    if not body or looks_like_reasoning:
+        return ParseResult(
+            actions=[],
+            warnings=["模型输出既不是 JSON 也不是一句话，已忽略（没有发到群里）"],
+            fallback_used=True,
+            raw_text=raw,
+        )
+    return ParseResult(
+        actions=[PlannedAction(type="say", messages=[body])],
+        warnings=["模型输出不是合法 JSON，已降级为直接发言"],
+        fallback_used=True,
+        raw_text=raw,
+    )
     """群聊背景句：只取一句话，太长就截断。"""
 
     if payload is None:
