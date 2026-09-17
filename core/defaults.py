@@ -90,26 +90,10 @@ DEFAULT_WORLD: dict[str, Any] = {
         "cooldown_seconds": 60,
         "restore_on_idle": True,
         "restore_on_idle_delay": 30,
-        "status_map": {
-            "awakening": "刚醒",
-            "sleeping": "睡觉中",
-            "napping": "小睡中",
-            "staring": "发呆中",
-            "searching": "上网中",
-            "reading": "看书",
-            "cooking": "做饭中",
-            "walking": "移动中",
-            "thinking": "沉思中",
-            "idle": "",
-        },
-        "node_status": {
-            "study": "在书房",
-            "bedroom": "在卧室",
-            "window": "在窗边",
-            "bar": "在吧台",
-            "kitchen": "在厨房",
-            "lobby": "",
-        },
+        # 文案现在写在动作和地点自己身上（动作 → 执行中名片文案、地点 → 在这里时名片文案）。
+        # 这两张表留作老配置的兜底：新装用户是空的，老配置里的映射会在解析时搬到动作 / 地点上。
+        "status_map": {},
+        "node_status": {},
     },
     "memory_scope_mode": "group_persona",
     "memory_scope_fallback": True,
@@ -178,6 +162,7 @@ DEFAULT_WORLD: dict[str, Any] = {
             "icon": "bed",
             "color": "#8B7DD8",
             "prompt": "安静、私密、适合休息。在这里你更容易困倦，也更容易做梦。",
+            "nickname_text": "在卧室",
             "atmosphere": {
                 "calm": 0.9,
                 "intimacy": 0.8,
@@ -204,6 +189,7 @@ DEFAULT_WORLD: dict[str, Any] = {
             "icon": "book",
             "color": "#4C8BF5",
             "prompt": "堆着书和旧笔记，桌上有一台电脑。适合看书、上网、想事情。",
+            "nickname_text": "在书房",
             "atmosphere": {
                 "calm": 0.7,
                 "intimacy": 0.4,
@@ -230,6 +216,7 @@ DEFAULT_WORLD: dict[str, Any] = {
             "icon": "window",
             "color": "#67C2A5",
             "prompt": "能看见外面天色和偶尔路过的云。发呆最合适的地方。",
+            "nickname_text": "在窗边",
             "atmosphere": {
                 "calm": 0.8,
                 "intimacy": 0.6,
@@ -249,6 +236,7 @@ DEFAULT_WORLD: dict[str, Any] = {
             "icon": "cup",
             "color": "#E0A458",
             "prompt": "有水、杯子和一点零食。适合边喝东西边和人聊天。",
+            "nickname_text": "在吧台",
             "atmosphere": {
                 "calm": 0.5,
                 "intimacy": 0.7,
@@ -268,6 +256,7 @@ DEFAULT_WORLD: dict[str, Any] = {
             "icon": "pot",
             "color": "#D9805F",
             "prompt": "有锅、有冰箱、有一排调料。做饭的时候你心情通常会变好，桌上很快就有热的东西。",
+            "nickname_text": "在厨房",
             "atmosphere": {
                 "calm": 0.4,
                 "intimacy": 0.6,
@@ -566,6 +555,7 @@ DEFAULT_WORLD: dict[str, Any] = {
         # ---------------- 生活类（时长交给大模型 + 按分钟结算） ----------------
         {
             "id": "walk_to",
+            "nickname_text": "移动中",
             "builtin": True,
             "name": "移动",
             "category": "continuous",
@@ -581,6 +571,7 @@ DEFAULT_WORLD: dict[str, Any] = {
         },
         {
             "id": "sleep",
+            "nickname_text": "睡觉中",
             "builtin": True,
             "name": "睡觉",
             "category": "continuous",
@@ -602,6 +593,7 @@ DEFAULT_WORLD: dict[str, Any] = {
         },
         {
             "id": "nap",
+            "nickname_text": "小睡中",
             "name": "小睡",
             "category": "continuous",
             "llm_level": "template",
@@ -623,6 +615,7 @@ DEFAULT_WORLD: dict[str, Any] = {
         },
         {
             "id": "stare",
+            "nickname_text": "发呆中",
             "name": "发呆",
             "category": "continuous",
             "llm_level": "template",
@@ -644,6 +637,7 @@ DEFAULT_WORLD: dict[str, Any] = {
         },
         {
             "id": "read",
+            "nickname_text": "看书",
             "name": "看书",
             "category": "continuous",
             "llm_level": "template",
@@ -667,6 +661,7 @@ DEFAULT_WORLD: dict[str, Any] = {
         },
         {
             "id": "cook",
+            "nickname_text": "做饭中",
             "name": "做饭",
             "category": "continuous",
             "llm_level": "template",

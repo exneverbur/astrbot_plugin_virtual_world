@@ -5,6 +5,12 @@ from __future__ import annotations
 from .models import NodeDef, WorldConfig
 from .state import WorldState
 
+# 有些状态不来自任何动作（例如冷启动后的「刚醒」），它们没有地方写文案，
+# 所以在代码里留一张极小的内置表——这不是给用户配的。
+_BUILTIN_STATUS_TEXT = {
+    "awakening": "刚醒",
+}
+
 
 def compute_nickname(
     world: WorldConfig,
@@ -28,13 +34,31 @@ def compute_nickname(
         return ""
 
     status = ""
-    state_label = (config.status_map or {}).get(state.state, "")
-    if state_label:
-        status = state_label
+    # 优先用「她正在做的这个动作」自己写的文案：文案跟着动作走，
+    # 换预设（动作跟着预设换）时名片也就配套了，不用再手动维护一份映射。
+    current = state.current_action if isinstance(state.current_action, dict) else None
+    action_id = str((current or {}).get("type") or "")
+    definition = world.action_map().get(action_id) if action_id else None
+    action_label = str(getattr(definition, "nickname_text", "") or "").strip()
+    if action_label:
+        status = action_label
     else:
-        node_label = (config.node_status or {}).get(node.id if node else "", "")
-        if node_label:
-            status = node_label
+        # 「她在做什么」优先于「她在哪儿」：睡觉时名片该写「睡觉中」而不是「在卧室」
+        state_label = (config.status_map or {}).get(state.state, "") or _BUILTIN_STATUS_TEXT.get(
+            state.state, ""
+        )
+        if state_label:
+            status = state_label
+        else:
+            # 状态没有文案时看地点自己的（「在书房」这种）
+            node_text = str(getattr(node, "nickname_text", "") or "").strip()
+            if node_text:
+                status = node_text
+            else:
+                # 兜底：老配置里的「地点 → 文案」表
+                node_label = (config.node_status or {}).get(node.id if node else "", "")
+                if node_label:
+                    status = node_label
 
     if not status:
         return original

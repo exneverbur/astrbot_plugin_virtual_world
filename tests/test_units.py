@@ -622,13 +622,35 @@ class TestNickname(unittest.TestCase):
         self.bedroom = self.world.node_map()["bedroom"]
         self.lobby = self.world.node_map()["lobby"]
 
-    def test_state_label_has_priority(self):
-        state = WorldState(session_id="s1", state="sleeping", bot_base_nickname="小鲸鱼")
+    def test_action_text_beats_where_she_is(self):
+        """「在做什么」优先于「在哪儿」：睡觉时名片该写睡觉而不是在卧室。"""
+
+        state = WorldState(
+            session_id="s1",
+            state="sleeping",
+            current_action={"type": "sleep"},
+            bot_base_nickname="小鲸鱼",
+        )
         self.assertEqual(compute_nickname(self.world, state, self.bedroom), "小鲸鱼 | 睡觉中")
 
-    def test_node_label_when_state_idle(self):
+    def test_node_text_when_she_is_just_there(self):
+        """文案写在地点上：人在书房、又没在做带文案的动作时就显示它。"""
+
         state = WorldState(session_id="s1", state="idle", bot_base_nickname="小鲸鱼")
-        self.assertEqual(compute_nickname(self.world, state, self.bedroom), "小鲸鱼 | 在卧室")
+        self.assertEqual(
+            compute_nickname(self.world, state, self.world.node_map()["study"]),
+            "小鲸鱼 | 在书房",
+        )
+
+    def test_legacy_maps_still_work_as_fallback(self):
+        """老配置里的「状态 / 地点 → 文案」两张表还认，只是不再出现在编辑器里。"""
+
+        raw = default_world()
+        raw["nickname_sync"]["status_map"] = {"pondering": "发呆中"}
+        raw["nickname_sync"]["node_status"] = {"attic": "在阁楼"}
+        world, _warnings = parse_world(raw)
+        state = WorldState(session_id="s1", state="pondering", bot_base_nickname="小鲸鱼")
+        self.assertEqual(compute_nickname(world, state, None), "小鲸鱼 | 发呆中")
 
     def test_plain_name_when_nothing_matches(self):
         state = WorldState(session_id="s1", state="idle", bot_base_nickname="小鲸鱼")
@@ -1429,7 +1451,7 @@ class TestPromptBuilder(unittest.TestCase):
             ],
         )
         titles = [item["title"] for item in prompt_section_index(text)]
-        self.assertTrue(any("群里刚才的对话" in title for title in titles), titles)
+        self.assertTrue(any("最近在聊什么" in title for title in titles), titles)
         self.assertTrue(any("你的内心活动" in title for title in titles), titles)
         self.assertTrue(all(len(title) <= 20 for title in titles), titles)
 
@@ -1488,11 +1510,11 @@ class TestPromptBuilder(unittest.TestCase):
             ]
         )
         joined = "\n".join(blocks)
-        self.assertIn("群里刚才的对话", joined)
+        self.assertIn("最近在聊什么", joined)
         self.assertIn("小明(42)", joined)
-        self.assertIn("- 你: 随便呀", joined)
+        self.assertIn("你: 随便呀", joined)
         # 顺序不能乱：别人的话在她那句前面
-        self.assertLess(joined.index("小明(42)"), joined.index("- 你: 随便呀"))
+        self.assertLess(joined.index("小明(42)"), joined.index("你: 随便呀"))
 
     def test_chat_blocks_keep_everything_they_are_given(self):
         """条数上限由调用方决定，渲染层不再二次截断。"""
@@ -1512,8 +1534,54 @@ class TestPromptBuilder(unittest.TestCase):
             [{"user_id": "42", "name": "小明", "text": "在吗", "is_self": False}],
             "更早的时候大家在聊搬家。",
         )
-        self.assertIn("更早的群聊", blocks[0])
+        self.assertIn("之前的群聊", blocks[0])
         self.assertIn("搬家", blocks[0])
+
+    def test_replied_batch_becomes_history_not_fresh(self):
+        """水位线以内的是"已经回应过"：压成概览进历史块，不原样重复。"""
+
+        chat = [
+            {"user_id": "42", "name": "小明", "text": "晚饭吃什么", "at": 100.0},
+            {"user_id": "7", "name": "阿May", "text": "吃鱼吧", "at": 110.0},
+            {"user_id": "__self__", "name": "她", "text": "好呀", "at": 115.0, "is_self": True},
+            {"user_id": "42", "name": "小明", "text": "那就这么定了", "at": 200.0},
+        ]
+        blocks = self.builder.chat_blocks(
+            chat,
+            preview="小明：晚饭吃什么；阿May：吃鱼吧；你：好呀",
+            replied_until=115.0,
+        )
+        history, fresh = blocks[0], blocks[1]
+        self.assertIn("之前的群聊", history)
+        self.assertIn("晚饭吃什么", history)
+        # 还没回应过的那条原样出现在「最近在聊什么」里，并带上时间
+        self.assertIn("最近在聊什么", fresh)
+        self.assertIn("那就这么定了", fresh)
+        self.assertIn("小明(42)", fresh)
+        self.assertNotIn("晚饭吃什么", fresh)
+        self.assertIn(":", fresh)
+
+    def test_consecutive_lines_from_the_same_person_merge(self):
+        """同一个人连着说的几句合并成一行，读起来才像对话。"""
+
+        blocks = self.builder.chat_blocks(
+            [
+                {"user_id": "42", "name": "小明", "text": "在吗", "at": 100.0},
+                {"user_id": "42", "name": "小明", "text": "帮我看个东西", "at": 130.0},
+            ]
+        )
+        joined = "\n".join(blocks)
+        self.assertIn("在吗 / 帮我看个东西", joined)
+        self.assertEqual(joined.count("小明(42)"), 1)
+
+    def test_her_recent_replies_are_listed_for_style_avoidance(self):
+        blocks = self.builder.chat_blocks(
+            [],
+            recent_replies=["早～", "……等等", "都下午三点了呀主人！"],
+        )
+        joined = "\n".join(blocks)
+        self.assertIn("你最近说过的话", joined)
+        self.assertIn("都下午三点了呀主人！", joined)
 
     def test_inner_voice_prefers_reasoning(self):
         state = WorldState(

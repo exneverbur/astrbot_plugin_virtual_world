@@ -244,6 +244,13 @@ const ECHO_TYPE_CHOICES = [
     hint: "心情低落持续太久时，她自己缓一缓：效价朝基线拉回一半。",
     group: "sleep",
   },
+  {
+    key: "poke",
+    icon: "👉",
+    label: "戳一戳",
+    hint: "她戳某个群友的结果；没戳成时会写明原因（协议端不支持 / 冷却中…）。",
+    group: "tool",
+  },
 ];
 
 /** 调试输出的分组：类型多了以后按用途分块，找起来快。 */
@@ -255,27 +262,6 @@ const ECHO_GROUPS = [
   { key: "sleep", label: "睡眠与保护", hint: "睡觉门禁、被叫醒、打断、兜底保护" },
   { key: "misc", label: "图片 · 上下文 · 名片", hint: "看图、上下文压缩、群名片变化" },
 ];
-
-/** 「状态 → 名片文案」的候选：内置状态 + 动作里定义的执行状态 + 已经在用的键。 */
-function nicknameStateChoices(world) {
-  const choices = [];
-  const seen = new Set();
-  const push = (key, label) => {
-    const id = String(key || "").trim();
-    if (!id || seen.has(id)) return;
-    seen.add(id);
-    choices.push({ key: id, label: label || id });
-  };
-  STATES.forEach((item) => push(item.key, item.label));
-  actions().forEach((action) => {
-    const during = action.during || {};
-    if (during.state) push(during.state, `${action.name || action.id}执行中`);
-  });
-  Object.keys(((world.nickname_sync || {}).status_map) || {}).forEach((key) =>
-    push(key, `${key}（当前配置里在用）`),
-  );
-  return choices;
-}
 
 /** 日志页：事件类型 → 图标与中文名。 */
 const LOG_TYPES = {
@@ -307,6 +293,7 @@ const LOG_TYPES = {
   tool_result: { icon: "📥", label: "工具返回" },
   mood_reset: { icon: "🌤️", label: "心情缓过来" },
   storm: { icon: "🌩️", label: "情绪上头 / 平复" },
+  poke: { icon: "👉", label: "戳一戳" },
   chain: { icon: "🔗", label: "动作链" },
   cold_start: { icon: "🌅", label: "冷启动" },
   bot_spoke: { icon: "🗣️", label: "发言等待回应" },
@@ -1697,21 +1684,37 @@ function chainEditor(chain, onChange, opts = {}) {
     list.innerHTML = "";
     state.forEach((step, index) => {
       const line = el("div", "row-item");
-      const actionSelect = document.createElement("select");
-      actionSelect.className = "grow";
-      actions().forEach((action) =>
-        actionSelect.appendChild(option(action.id, actionChainLabel(action))),
+      // 动作多了以后下拉很难用：和地点里选动作一样，点开弹窗（可搜索、按分组筛）
+      const currentAction = actions().find((item) => item.id === step.type);
+      const actionButton = el(
+        "button",
+        "ghost grow action-pick",
+        currentAction ? actionChainLabel(currentAction) : step.type || "选择动作…",
       );
-      actionSelect.value = step.type;
-      actionSelect.addEventListener("change", () => {
-        step.type = actionSelect.value;
-        if (step.type === "walk_to" && !step.target_node) {
-          step.target_node = nodes()[0]?.id || "";
-        }
-        render();
-        emit();
+      actionButton.type = "button";
+      actionButton.title = "点开选择动作：可以搜索、按分组只看一类";
+      actionButton.addEventListener("click", () => {
+        openPicker({
+          title: `第 ${index + 1} 步做什么？`,
+          hint: "和地点里选动作是同一个窗口：可以搜索、按分组筛选；这里只能选一个。",
+          items: actionItems(),
+          selected: step.type ? [step.type] : [],
+          multi: false,
+          col1: "动作",
+          col2: "说明",
+          onConfirm: (chosen) => {
+            const chosenId = chosen[0];
+            if (!chosenId || chosenId === step.type) return;
+            step.type = chosenId;
+            if (chosenId === "walk_to" && !step.target_node) {
+              step.target_node = nodes()[0]?.id || "";
+            }
+            render();
+            emit();
+          },
+        });
       });
-      line.appendChild(actionSelect);
+      line.appendChild(actionButton);
 
       const definition = actions().find((action) => action.id === step.type);
       if (step.type === "walk_to") {
@@ -3650,6 +3653,27 @@ function zoneGeneratorBox(zone) {
   row2.appendChild(el("span", "muted", "个地点"));
   row2.appendChild(runNodes);
   wrapper.appendChild(row2);
+
+  // 批量给这个区域里的每个地点生成动作（每个地点各生成几个）
+  const row3 = el("div", "row-item");
+  const actionCount = document.createElement("input");
+  actionCount.type = "number";
+  actionCount.min = "1";
+  actionCount.max = "5";
+  actionCount.value = "3";
+  actionCount.className = "w-sm";
+  actionCount.title = "每个地点各生成几个动作（最多 5 个）";
+  const runActions = el("button", "ghost", "生成动作");
+  runActions.type = "button";
+  runActions.title = "给这个区域里的每个地点分别生成几个动作，弹窗里勾选后才写进配置";
+  runActions.addEventListener("click", () =>
+    generateZoneActions(zone.id, actionCount.value, runActions),
+  );
+  row3.appendChild(el("span", "muted", "每个地点生成"));
+  row3.appendChild(actionCount);
+  row3.appendChild(el("span", "muted", "个动作"));
+  row3.appendChild(runActions);
+  wrapper.appendChild(row3);
   return wrapper;
 }
 
@@ -3720,6 +3744,32 @@ async function generateNodeActions(nodeId, perNode, button) {
         title: `生成的动作（${drafts.length} 个）`,
         hint:
           "先看清楚再决定：可以改名字、改归属地点、勾掉不要的。「确认加入」会直接写进配置并生效，不用再点保存。",
+        confirmText: "确认加入选中的",
+        build: (body) => buildActionDraftList(body, drafts, result.problems || []),
+        onSubmit: () => commitGeneratedActions(drafts),
+      });
+    } catch (error) {
+      toast(error.message || "生成失败");
+    }
+  });
+}
+
+/** 区域级批量生成动作：和单个地点走同一套草稿弹窗。 */
+async function generateZoneActions(zoneId, perNode, button) {
+  return withLoading(button, "生成中…", async () => {
+    try {
+      const result = await apiPost("generate/actions", {
+        zone: zoneId,
+        per_node: num(perNode, 3),
+      });
+      const drafts = result.actions || [];
+      if (!drafts.length) {
+        toast((result.problems || []).join("；") || "没有生成出可用的动作");
+        return;
+      }
+      openCustomDialog({
+        title: `生成的动作（${drafts.length} 个）`,
+        hint: "每个地点各自的候选动作；改完、勾选之后才会写进配置。",
         confirmText: "确认加入选中的",
         build: (body) => buildActionDraftList(body, drafts, result.problems || []),
         onSubmit: () => commitGeneratedActions(drafts),
@@ -4349,6 +4399,14 @@ function renderNodeForm() {
   form.appendChild(
     textareaField("地点描述", node.prompt || "", (value) => (node.prompt = value), {
       hint: "这个地点是什么样子的。会写进提示词，影响她在这里的行为和语气。",
+    }),
+  );
+  form.appendChild(
+    inputField("在这里时名片文案", node.nickname_text || "", (value) => (node.nickname_text = value.trim()), {
+      hint:
+        "她人在这个地点、又没在做带文案的动作时，群名片上显示什么（例如「在书房」）。\n" +
+        "留空就不改名片。文案写在地点上：换预设时地点跟着换，名片也就配套了。",
+      placeholder: "例如 在书房",
     }),
   );
 
@@ -5117,6 +5175,19 @@ function renderActionForm() {
           hint:
             "执行期间她的状态会变成这个标识，会影响群名片文案与状态判断（例如 sleeping、reading）。可留空。",
           placeholder: "例如 sleeping",
+        },
+      ),
+    );
+    durationBox.appendChild(
+      inputField(
+        "执行中名片文案",
+        action.nickname_text || "",
+        (value) => (action.nickname_text = value.trim()),
+        {
+          hint:
+            "她正在做这个动作时，群名片上显示什么（例如「做饭中」）。留空就用「状态 → 文案」的兜底映射。\n" +
+            "写在动作里而不是全局设置里：换预设时动作跟着换，文案也就配套了。",
+          placeholder: "例如 做饭中",
         },
       ),
     );
@@ -6546,6 +6617,23 @@ function renderSettings() {
       hint: "日程按这个时区判断几点。系统缺少时区数据时自动退回本机时间。",
     }),
   );
+  basic._fields.appendChild(
+    tagField(
+      "管理员 QQ",
+      world.admin_ids || [],
+      (value) => {
+        world.admin_ids = value;
+      },
+      {
+        hint:
+          "这些 QQ 号也能用管理类指令（重载配置、重置状态、改群名片、跑日程、调试）。\n" +
+          "AstrBot 自己的管理员始终可以用，所以不用担心把自己锁在外面。\n" +
+          "输入 QQ 号后按回车添加。",
+        placeholder: "输入 QQ 号后按回车",
+        emptyText: "（没有额外管理员：只有 AstrBot 的管理员能用管理指令）",
+      },
+    ),
+  );
   form.appendChild(basic);
 
   /* --- 她的基础状态 --- */
@@ -7332,36 +7420,14 @@ function renderSettings() {
       world.nickname_sync.cooldown_seconds = num(value, 60);
     }, { hint: "两次改名片之间至少隔多久，防止频繁调用平台接口。", type: "number" }),
   );
-  const nicknameKv = el("div", "full");
-  nicknameKv.appendChild(
-    kvEditor(
-      "状态 → 名片文案",
-      "她在某个状态时名片上显示什么。留空表示这个状态不改名片（例如空闲时就显示原名）。",
-      world.nickname_sync.status_map,
-      (value) => {
-        world.nickname_sync.status_map = value;
-      },
-      {
-        // 候选来自「内置状态 + 动作里定义的执行状态 + 你已经写过的键」，
-        // 但也可以直接手输一个没见过的状态 id。
-        keyChoices: nicknameStateChoices(world),
-        keyPlaceholder: "可下拉选择，也可直接输入状态标识",
-        valuePlaceholder: "名片文案，例如 睡觉中",
-      },
+  nickname._fields.appendChild(
+    el(
+      "p",
+      "muted full",
+      "「显示什么文案」现在写在它自己身上：动作编辑页的「执行中名片文案」、地点属性里的「在这里时名片文案」；" +
+        "这里只保留开关、模板这些通用规则。",
     ),
   );
-  nicknameKv.appendChild(
-    kvEditor(
-      "地点 → 名片文案",
-      "状态没有对应文案时，用地点来显示（例如「在书房」）。",
-      world.nickname_sync.node_status,
-      (value) => {
-        world.nickname_sync.node_status = value;
-      },
-      { keyPlaceholder: "地点 ID", valuePlaceholder: "名片文案，例如 在书房" },
-    ),
-  );
-  nickname._fields.appendChild(nicknameKv);
   form.appendChild(nickname);
 
   /* --- 内容安全 --- */

@@ -24,7 +24,7 @@ from typing import Any
 
 from .memory import RecalledMemory
 from .models import NodeDef, WorldConfig
-from .state import WorldState
+from .state import WorldState, chat_item_is_fresh
 from .pathfinding import travel_cost
 from .tool_policy import allowed_tools
 
@@ -510,6 +510,10 @@ class PromptBuilder:
                 recent_chat,
                 getattr(state, "chat_summary", ""),
                 getattr(state, "chat_note", ""),
+                preview=getattr(state, "chat_preview", ""),
+                replied_until=float(getattr(state, "chat_replied_until", 0.0) or 0.0),
+                replied_seq=int(getattr(state, "chat_replied_seq", 0) or 0),
+                recent_replies=list(getattr(state, "recent_replies", []) or []),
             )
         )
         # 其他插件注入的内容跟着这条消息走，每轮都不一样，放到靠后的位置
@@ -646,17 +650,52 @@ class PromptBuilder:
         recent_chat: list[dict[str, Any]] | None,
         summary: str = "",
         note: str = "",
+        *,
+        preview: str = "",
+        replied_until: float = 0.0,
+        replied_seq: int = 0,
+        recent_replies: list[str] | None = None,
     ) -> list[str]:
-        """把群聊背景拆成「更早的摘要」「别人在聊」「你说过的话」几段。"""
+        """把群聊背景拆成三块：之前聊过的概览、现在在聊什么、她刚说过的话。
 
-        # 条数上限由调用方（engine.chat_context）按配置决定，这里不再二次截断，
+        - **之前的群聊**：她上一轮已经回应过的那批（压缩成一条概览）+ 更早的压缩摘要。
+          这些不该再被回应，但也不能凭空消失——否则她下一轮会忘了上下文。
+        - **最近在聊什么**：水位线之后的原文，带时间；同一个人连着说的几句合并成一行；
+          图片的转述描述跟着消息一起带进来。
+        - **你最近说过的话**：最近几条她自己发出去的，用来避免重复同样的开头和句式。
+        """
+
+        # 条数上限由调用方（engine.chat_window）按配置决定，这里不再二次截断，
         # 否则「最多携带多少条聊天」调大了也不会生效。
         items = list(recent_chat or [])
-        if not items and not summary and not note:
-            return []
-        lines: list[str] = []
+        fresh = [
+            item
+            for item in items
+            if chat_item_is_fresh(
+                item, replied_until=replied_until, replied_seq=replied_seq
+            )
+        ]
+        now = self._now()
+        blocks: list[str] = []
+
+        history: list[str] = []
         seen: set[str] = set()
-        for item in items:
+        if preview:
+            history.append(f"- 你刚回应过的那批：{_one_line(preview, 160)}")
+        elif note:
+            history.append(f"- 你刚回应过的那批：{_one_line(note, 80)}")
+        if summary:
+            history.append(f"- 更早聊过的：{_one_line(summary, 300)}")
+        if history:
+            blocks.append(
+                "# 之前的群聊（已经回应过，只是背景：不要复述、不要重新回应）\n"
+                + "\n".join(history)
+            )
+
+        lines: list[str] = []
+        last_who = ""
+        last_at = 0.0
+        for item in fresh:
             name = str(item.get("name") or item.get("user_id") or "").strip()
             text = _one_line(item.get("text"))
             if not text:
@@ -668,32 +707,47 @@ class PromptBuilder:
                 continue
             seen.add(fingerprint)
             if item.get("is_self"):
-                # 她自己那一句用「你:」标出来：这是对话流的一部分，
-                # 不能拆成另一块——拆开之后模型看不到谁在接谁的话。
-                lines.append(f"- 你: {text}")
+                who = "你"
+            else:
+                identifier = str(item.get("user_id") or "").strip()
+                who = f"{name}({identifier})" if name and identifier else (name or identifier)
+            at = float(item.get("at", 0) or 0.0)
+            stamp = self._chat_time(at, now)
+            # 同一个人接着说的几句并成一行（隔着太久就另起一行，免得时间对不上）
+            if lines and who == last_who and at - last_at <= 300:
+                lines[-1] = f"{lines[-1]} / {text}"
+                last_at = at
                 continue
-            identifier = str(item.get("user_id") or "").strip()
-            who = f"{name}({identifier})" if name and identifier else (name or identifier)
-            lines.append(f"- {who}: {text}")
-        blocks: list[str] = []
-        if note:
-            blocks.append(
-                "# 刚才你们聊过（已经回应过，只是背景，不要重复回应）\n"
-                f"- {_one_line(note, 80)}"
-            )
-        if summary:
-            blocks.append(
-                "# 更早的群聊（摘要，只是背景，不要复述）\n" + _one_line(summary, 400)
-            )
+            lines.append(f"- [{stamp}] {who}: {text}")
+            last_who = who
+            last_at = at
         if lines:
             blocks.append(
-                "# 群里刚才的对话（按时间顺序，最后一条最新；带「你:」的是你自己说的）\n"
+                "# 最近在聊什么（按时间顺序，最后一条最新；带「你:」的是你自己说的）\n"
                 "这一串是原样的聊天记录：谁在跟谁说话、话题怎么接的，都看这里。\n"
-                "不要逐条复述、不要总结成列表；也不要重复你自己说过的那几句、"
-                "不要再用同样的开头和句式。\n"
+                "不要逐条复述、不要总结成列表。\n"
                 + "\n".join(lines)
             )
+
+        mine = [" ".join(str(text).split()) for text in (recent_replies or [])]
+        mine = [text for text in mine if text][-3:]
+        if mine:
+            blocks.append(
+                "# 你最近说过的话（别再重复这些句式和开头）\n"
+                + "\n".join(f"- {_one_line(text, 60)}" for text in mine)
+            )
         return blocks
+
+    def _chat_time(self, at: float, now: datetime | None) -> str:
+        """群聊记录里的时间戳：几点几分。"""
+
+        if not at:
+            return "--:--"
+        try:
+            moment = datetime.fromtimestamp(float(at), tz=now.tzinfo if now else None)
+        except Exception:
+            return "--:--"
+        return moment.strftime("%H:%M")
 
     # ---------------- 第 3 层 ----------------
 

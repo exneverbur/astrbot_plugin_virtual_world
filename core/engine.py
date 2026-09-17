@@ -52,6 +52,7 @@ from .state import (
     STATE_NAPPING,
     STATE_SLEEPING,
     WorldState,
+    chat_item_is_fresh,
 )
 from .state_dynamics import StateDynamics
 from .tool_policy import allowed_tools, is_self_send_tool
@@ -723,7 +724,7 @@ class VirtualWorldEngine:
                 engagement_hint=self.engagement.hint(state),
                 extra_notes=extra_notes,
                 focus_user=ctx.user_name or ctx.user_id,
-                recent_chat=self.chat_context(state),
+                recent_chat=self.chat_window(state),
             )
             if ctx.other_context:
                 injection += f"\n\n# 其他插件提供的上下文\n{ctx.other_context}"
@@ -1250,6 +1251,7 @@ class VirtualWorldEngine:
                     keep=self.chat_history_limit(),
                     is_self=True,
                 )
+                state.note_reply(message)
                 self.note_dialogue(state, text=message, is_self=True)
             if outcome.messages:
                 # 她真的回了：把已回应水位线推上去，并记下"刚才在聊什么"
@@ -2454,7 +2456,7 @@ class VirtualWorldEngine:
             ),
             engagement_hint=self.engagement.hint(state),
             max_messages=say_limit,
-            recent_chat=self.chat_context(state),
+            recent_chat=self.chat_window(state),
             reasoning=bool(self.world.reasoning_enabled),
             style_block=style_text,
         )
@@ -2691,7 +2693,7 @@ class VirtualWorldEngine:
             ),
             engagement_hint=self.engagement.hint(state),
             max_messages=say_limit,
-            recent_chat=self.chat_context(state),
+            recent_chat=self.chat_window(state),
             mode="plan",
             reasoning=bool(self.world.reasoning_enabled),
             style_block=style_text,
@@ -3152,7 +3154,7 @@ class VirtualWorldEngine:
             tool_description=description,
             param_text=render_param_text(schema),
             intent=intent,
-            recent_chat=self.chat_context(state),
+            recent_chat=self.chat_window(state),
             previous_results=previous_results,
             error_hint=error_hint,
         )
@@ -4294,7 +4296,24 @@ class VirtualWorldEngine:
 
         if ok:
             outcome.notes.append(f"戳了 {self._target_name(state, target)}")
+            await self._log_event(
+                state,
+                "poke",
+                {"target": target, "name": self._target_name(state, target), "ok": True},
+            )
         else:
+            # 戳不动也要留痕：不然只看到她"变成了固定文案"，不知道是为什么
+            outcome.notes.append(f"戳不动 {target}：{reason or '未知原因'}")
+            await self._log_event(
+                state,
+                "poke",
+                {
+                    "target": target,
+                    "name": self._target_name(state, target),
+                    "ok": False,
+                    "note": reason or "没有可用的戳一戳通道",
+                },
+            )
             text = self.render_template(definition.template, state, node, action)
             if text:
                 outcome.messages.append(text)
@@ -4463,7 +4482,7 @@ class VirtualWorldEngine:
             available_tools=self.available_tools(),
             engagement_hint=self.engagement.hint(state),
             max_messages=say_limit,
-            recent_chat=self.chat_context(state),
+            recent_chat=self.chat_window(state),
             reasoning=bool(self.world.reasoning_enabled),
             style_block=style_text,
         )
@@ -5012,6 +5031,21 @@ class VirtualWorldEngine:
             limit=max(1, int(config.chat_max_messages)),
             # 已经回应过的消息不再回放：她对那些话已经答过了，再带进去只会重复回应
             after=float(state.chat_replied_until or 0.0),
+            after_seq=int(state.chat_replied_seq or 0),
+        )
+
+    def chat_window(self, state: WorldState) -> list[dict[str, Any]]:
+        """时间窗内的全部群聊（含她已经回应过的那批）。
+
+        提示词需要完整的一段：水位线以前的内容会被压成一条概览、之后的原样列出，
+        但两边都不该从上下文里消失（否则她下一轮就像失忆）。
+        """
+
+        config = self.world.decider
+        return state.chat_window(
+            now=self._now(),
+            seconds=max(60, int(config.chat_window_minutes) * 60),
+            limit=max(1, int(config.chat_max_messages)),
         )
 
     def chat_context_for_reply(
@@ -5023,7 +5057,7 @@ class VirtualWorldEngine:
         等于同一句话在提示词里出现两遍——模型会以为对方把话重复说了好几次。
         """
 
-        context = self.chat_context(state)
+        context = self.chat_window(state)
         if not context:
             return context
         last = context[-1]
@@ -5035,9 +5069,29 @@ class VirtualWorldEngine:
         return context
 
     def mark_chat_replied(self, state: WorldState) -> None:
-        """她真的回了一句：把"已回应水位线"推到当前，并清掉上一轮的背景句。"""
+        """她真的开口了：把这一批群聊压成概览，并把"已回应水位线"推到当前。
 
-        state.chat_replied_until = self._now()
+        水位线之后的消息才是"还没回应过的"，会原样进提示词；水位线以内（也就是她刚
+        回应过的这批）压成一条概览，供下一轮了解背景，不再重复回应。
+        """
+
+        now = self._now()
+        previous = float(state.chat_replied_until or 0.0)
+        previous_seq = int(state.chat_replied_seq or 0)
+        batch = [
+            item
+            for item in state.recent_chat
+            if chat_item_is_fresh(
+                item,
+                replied_until=previous,
+                replied_seq=previous_seq,
+            )
+        ]
+        preview = _summarize_batch(batch)
+        if preview:
+            state.chat_preview = preview
+        state.chat_replied_until = now
+        state.chat_replied_seq = int(state.chat_seq or 0)
 
     async def mark_chat_replied_by_session(self, session_id: str) -> None:
         """按会话推进"已回应水位线"（注入模式下主人格替她回复时用）。"""
@@ -5359,6 +5413,7 @@ class VirtualWorldEngine:
                         keep=self.chat_history_limit(),
                         is_self=True,
                     )
+                    state.note_reply(message)
                     self.note_dialogue(state, text=message, is_self=True)
             # 调试用的动作回显不算"她说过的话"：不进聊天上下文、不计无人回应保护
         sent = await self.messenger.send_text(outcome.session_id, ordered)
@@ -5599,7 +5654,7 @@ class VirtualWorldEngine:
             node=node,
             memories=memories,
             engagement_hint=self.engagement.hint(state),
-            recent_chat=self.chat_context(state),
+            recent_chat=self.chat_window(state),
         )
 
     async def overview(self) -> list[dict[str, Any]]:
@@ -5643,7 +5698,7 @@ class VirtualWorldEngine:
             ),
             engagement_hint=self.engagement.hint(state),
             max_messages=say_limit,
-            recent_chat=self.chat_context(state),
+            recent_chat=self.chat_window(state),
             reasoning=bool(self.world.reasoning_enabled),
             style_block=style_text,
         )
@@ -5937,7 +5992,7 @@ def render_param_text(schema: dict[str, Any]) -> str:
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
-    """尽量转成 float，坏值退回默认值（数值历史是给人看的，不能因为一帧脏数据炸掉）。"""
+    """尽量转成 float，坏值退回默认值。"""
 
     try:
         number = float(value)
@@ -5946,6 +6001,25 @@ def _as_float(value: Any, default: float = 0.0) -> float:
     if number != number:  # NaN
         return default
     return number
+
+
+def _summarize_batch(items: list[dict[str, Any]], *, limit: int = 160) -> str:
+    """把一批群聊压成一条概览：「小明：123；你：来了来了」。
+
+    她回应过的那批不再原样重复给模型，但也不能凭空消失——这一行就是下一轮的背景。
+    """
+
+    parts: list[str] = []
+    for item in items or []:
+        text = " ".join(str(item.get("text") or "").split())
+        if not text:
+            continue
+        who = "你" if item.get("is_self") else str(
+            item.get("name") or item.get("user_id") or "有人"
+        )
+        parts.append(f"{who}：{text[:24]}")
+    text = "；".join(parts)
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _clip_text(value: Any, limit: int = 200) -> str:

@@ -116,6 +116,35 @@ def _is_at_bot(event: Any) -> bool:
     return False
 
 
+def _mention_note(event: Any) -> str:
+    """这条消息 @ 了谁——包括"@ 了她自己"。
+
+    她不知道自己的 QQ 号，所以别人 @ 她的时候，光看文本里的 ``@昵称`` 她分不清
+    那是不是在叫她。这里把 id 一起写出来，并且把她自己标成「你」。
+    """
+
+    self_id = str(getattr(event, "get_self_id", lambda: "")() or "")
+    message_obj = getattr(event, "message_obj", None)
+    targets: list[str] = []
+    for component in list(getattr(message_obj, "message", []) or []):
+        if type(component).__name__ not in ("At", "AtAll"):
+            continue
+        qq = str(getattr(component, "qq", "") or "").strip()
+        name = str(getattr(component, "name", "") or "").strip()
+        if qq == "all":
+            targets.append("所有人")
+            continue
+        label = f"{name}({qq})" if name and qq else (name or qq)
+        if not label:
+            continue
+        if qq and self_id and qq == self_id:
+            label = f"你（{label}）"
+        targets.append(label)
+    if not targets:
+        return ""
+    return f"这条消息 @ 了：{'、'.join(dict.fromkeys(targets))}"
+
+
 def _is_command(text: str) -> bool:
     """看起来是一条指令（/xxx、！xxx 这类）。指令永远不该被她睡觉挡住。"""
 
@@ -772,8 +801,9 @@ class AstrBotMessenger:
     async def poke(self, session_id: str, user_id: str) -> PokeResult:
         """戳一戳某个群友。
 
-        走 AstrBot 的 ``Poke`` 消息段（OneBot 的 ``poke``），QQ 系平台支持；
-        其它平台会抛错，把原因带回去让她改用一句话说。
+        两条路依次试：AstrBot 的 ``Poke`` 消息段，以及协议端自己的 ``send_poke``
+        接口（NapCat / go-cqhttp 系都支持）。两条都失败就把原因带回去——她会
+        退化成一句话说，而日志里要能看出究竟是为什么。
         """
 
         target = str(user_id or "").strip()
@@ -781,17 +811,42 @@ class AstrBotMessenger:
             return PokeResult(False, "没有指定要戳谁")
         if self.blocked(session_id):
             return PokeResult(False, "上一次发送失败，正在冷却")
+        group_id = ""
+        parts = str(session_id).split(":")
+        if len(parts) >= 3 and "group" in parts[1].lower():
+            group_id = parts[-1]
+        errors: list[str] = []
+        # 路线一：消息段（新版适配器会把它转成协议端的 poke 段）
         try:
             from astrbot.api.message_components import Poke
-        except Exception:
-            return PokeResult(False, "当前 AstrBot 版本没有 Poke 消息段")
-        try:
+
             await self.plugin.context.send_message(
                 session_id, MessageChain(chain=[Poke(id=target)])
             )
+            return PokeResult(True)
         except Exception as exc:
-            return PokeResult(False, f"{type(exc).__name__}: {exc}")
-        return PokeResult(True)
+            errors.append(f"消息段：{type(exc).__name__}: {exc}")
+        # 路线二：直接调协议端接口
+        event = getattr(self.plugin, "_last_events", {}).get(session_id)
+        bot = getattr(event, "bot", None)
+        if bot is not None:
+            payload: dict[str, Any] = {
+                "user_id": int(target) if target.isdigit() else target
+            }
+            if group_id.isdigit():
+                payload["group_id"] = int(group_id)
+            names = (
+                ("send_poke", "group_poke")
+                if group_id
+                else ("send_poke", "friend_poke")
+            )
+            for name in names:
+                try:
+                    await bot.call_action(name, **payload)
+                    return PokeResult(True)
+                except Exception as exc:
+                    errors.append(f"{name}：{type(exc).__name__}: {exc}")
+        return PokeResult(False, "；".join(errors) or "没有可用的戳一戳通道")
 
 
 class AstrBotTools:
@@ -1310,7 +1365,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "exneverbur",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v1.4.0",
+    "v1.4.1",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -1477,6 +1532,22 @@ class VirtualWorldPlugin(Star):
 
         return pronoun_for(self.engine.world.gender)
 
+    def _can_admin(self, event: AstrMessageEvent) -> bool:
+        """能不能执行管理类指令。
+
+        AstrBot 自己的管理员永远可以；另外「全局设置 → 管理员 QQ」里列出来的人也可以
+        （有些群不希望为了用几条指令就去动 AstrBot 的管理员配置）。
+        """
+
+        try:
+            if event.is_admin():
+                return True
+        except Exception:
+            pass
+        listed = {str(item).strip() for item in (self.engine.world.admin_ids or [])}
+        sender = str(getattr(event, "get_sender_id", lambda: "")() or "").strip()
+        return bool(sender) and sender in listed
+
     # ================= 给其他插件用的只读接口 =================
 
     async def social_snapshot(self, session_id: str) -> dict[str, Any] | None:
@@ -1540,6 +1611,9 @@ class VirtualWorldPlugin(Star):
         notes: list[str] = []
         if _is_forwarded(event):
             notes.append("这是一条转发的聊天记录，不是当前群里正在说的话")
+        mention = _mention_note(event)
+        if mention:
+            notes.append(mention)
         notes.extend(await self._annotate_images(event, text))
         if not notes:
             return text
@@ -2154,7 +2228,7 @@ class VirtualWorldPlugin(Star):
 
         if action in ("schedule", "日程"):
             if rest and rest[0].lower() in ("run", "执行", "立即"):
-                if not event.is_admin():
+                if not self._can_admin(event):
                     yield event.plain_result("只有管理员可以让日程立刻执行。")
                     return
                 if len(rest) < 2:
@@ -2218,7 +2292,7 @@ class VirtualWorldPlugin(Star):
             return
 
         if action in ("reload", "重载"):
-            if not event.is_admin():
+            if not self._can_admin(event):
                 yield event.plain_result("只有管理员可以重载配置。")
                 return
             warnings = self.engine.reload_config()
@@ -2229,7 +2303,7 @@ class VirtualWorldPlugin(Star):
             return
 
         if action in ("reset", "重置"):
-            if not event.is_admin():
+            if not self._can_admin(event):
                 yield event.plain_result("只有管理员可以重置会话状态。")
                 return
             target = rest[0] if rest else event.unified_msg_origin
@@ -2238,7 +2312,7 @@ class VirtualWorldPlugin(Star):
             return
 
         if action in ("restore-default", "恢复默认"):
-            if not event.is_admin():
+            if not self._can_admin(event):
                 yield event.plain_result("只有管理员可以恢复默认配置。")
                 return
             restored = self.store.restore_default("all")
@@ -2323,7 +2397,7 @@ class VirtualWorldPlugin(Star):
         session_id = event.unified_msg_origin
         if not self.engine.is_enabled(session_id):
             return "这个会话还没有启用虚拟世界。"
-        if not event.is_admin():
+        if not self._can_admin(event):
             return "只有管理员可以控制群名片。"
         text = " ".join(rest[1:]).strip()
         async with self.engine.session_state(session_id) as state:
@@ -2375,7 +2449,7 @@ class VirtualWorldPlugin(Star):
         return "用法：/vw nickname status|lock|unlock|set <文本>|reset"
 
     async def _handle_debug_command(self, event: AstrMessageEvent, rest: list[str]) -> str:
-        if not event.is_admin():
+        if not self._can_admin(event):
             return "只有管理员可以使用调试命令。"
         sub = rest[0].lower() if rest else "state"
         session_id = rest[1] if len(rest) > 1 else event.unified_msg_origin
@@ -2473,7 +2547,7 @@ class VirtualWorldPlugin(Star):
         return "\n".join(lines)
 
     async def _handle_session_command(self, event: AstrMessageEvent, rest: list[str]) -> str:
-        if not event.is_admin():
+        if not self._can_admin(event):
             return "只有管理员可以管理会话白名单。"
         sub = rest[0].lower() if rest else "list"
         if sub in ("list", "列表"):

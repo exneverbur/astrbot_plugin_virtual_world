@@ -141,6 +141,12 @@ class NodeDef(Permissive):
     icon: str = ""
     color: str = "#8B7DD8"
     prompt: str = ""
+    nickname_text: str = ""
+    """她人在这个地点时，群名片上显示什么（留空则不改名片）。
+
+    和动作上的同名文案一样：写在地点自己身上，换预设时跟着地点一起走。
+    """
+
     atmosphere: Atmosphere = Field(default_factory=Atmosphere)
     preset_memories: list[MemoryPreset] = Field(default_factory=list)
     zone_id: str = ""
@@ -290,6 +296,12 @@ class ActionDef(Permissive):
     during: During = Field(default_factory=During)
     on_complete: OnComplete = Field(default_factory=OnComplete)
     template: str = ""
+    nickname_text: str = ""
+    """她正在做这个动作时，群名片上显示什么（留空则退回"状态 → 文案"的兜底映射）。
+
+    文案放在动作上而不是全局字典里：换预设时动作跟着一起换，名片文案也就配套了。
+    """
+
     tool_name: str = ""
     """工具型动作调用的工具名。是 ``tool_names`` 的兼容写法，永远等于列表里的第一个。"""
 
@@ -474,6 +486,7 @@ ECHO_EVENT_TYPES: dict[str, str] = {
     "sleep_reply": "😴",
     "sleep_skip": "🤐",
     "mood_reset": "🌤️",
+    "poke": "👉",
 }
 # 「常用」那一档：决定、动作、工具、跳过——排查她"为什么这么做"最需要的几类
 DEFAULT_ECHO_TYPES: tuple[str, ...] = (
@@ -696,6 +709,9 @@ class WorldConfig(Permissive):
 
     style_injection: bool = True
     """把情绪两轴翻译成「这一轮的表达方式」写进提示词（关掉 = 完全交给人设）。"""
+
+    admin_ids: list[str] = Field(default_factory=list)
+    """改用管理指令的 QQ 号（可多人）。AstrBot 自己的管理员始终可以执行。"""
 
     reply_mode: Literal["takeover", "inject"] = "takeover"
     """被 @（或消息走到大模型）时的处理方式。
@@ -968,8 +984,39 @@ _DEFAULT_TEXT_UPGRADES: dict[str, dict[str, dict[str, str]]] = {
 }
 
 
+def _migrate_nickname_text(result: dict[str, Any], nodes: Any) -> None:
+    """把老配置里的「状态 / 地点 → 名片文案」搬到动作与地点自己身上。
+
+    以前文案躺在 `nickname_sync` 的一张全局表里，换预设时和动作对不上；现在文案跟着
+    动作 / 地点走。这里做一次性搬迁，搬完那张表只当兜底（不再出现在编辑器里）。
+    """
+
+    config = result.get("nickname_sync")
+    if not isinstance(config, dict):
+        return
+    status_map = config.get("status_map") if isinstance(config.get("status_map"), dict) else {}
+    node_status = config.get("node_status") if isinstance(config.get("node_status"), dict) else {}
+    if node_status and isinstance(nodes, list):
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            label = str(node_status.get(str(node.get("id") or "")) or "").strip()
+            if label and not str(node.get("nickname_text") or "").strip():
+                node["nickname_text"] = label
+    actions = result.get("actions")
+    if status_map and isinstance(actions, list):
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            during = action.get("during") if isinstance(action.get("during"), dict) else {}
+            label = str(status_map.get(str(during.get("state") or "")) or "").strip()
+            if label and not str(action.get("nickname_text") or "").strip():
+                action["nickname_text"] = label
+
+
 def _upgrade_builtin_tool_action(action: dict[str, Any]) -> dict[str, Any]:
     """把内置工具动作从"旧默认值"升级到新版写法（只动还是旧默认值的那些）。"""
+
 
     action_id = str(action.get("id") or "")
     if action_id not in ("search_web", "check_weather"):
@@ -1078,6 +1125,9 @@ def normalize_legacy_keys(data: dict[str, Any]) -> dict[str, Any]:
                     node_id = str(node.get("id") or "")
                     if node_id and node_id not in allowed:
                         action["allowed_nodes"] = allowed + [node_id]
+        # 群名片文案：以前是一张「状态 / 地点 → 文案」的全局表，现在文案写在动作和地点上。
+        # 老配置里填过的映射在这里一次性搬过去，之后那张表只当兜底。
+        _migrate_nickname_text(result, nodes)
         result = {
             **result,
             "nodes": [

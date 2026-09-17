@@ -675,6 +675,36 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertTrue(self.engine._group_is_lively(live, now=self.clock.now()))
 
+    async def test_poke_failure_is_logged_with_the_reason(self):
+        """戳不动时要留下原因，而不是只看到她变成固定文案。"""
+
+        self.messenger.poke_result = False
+        await self.set_state(node_id="study")
+        self.use_action_chain([{"type": "poke", "target": "3397734465"}])
+        outcomes = await self.engine.run_schedules()
+
+        events = await self.db.call("query_events", session_id=SESSION, limit=20)
+        pokes = [item for item in events if item["event_type"] == "poke"]
+        self.assertTrue(pokes, events)
+        self.assertFalse(pokes[0]["detail"]["ok"])
+        self.assertIn("戳不动", pokes[0]["detail"]["note"])
+        # 失败时退化成动作自己的文案（这一轮要说的话）
+        self.assertTrue(outcomes[0].messages, outcomes[0].notes)
+
+    async def test_same_second_messages_are_still_fresh(self):
+        """时钟精度只有秒：她刚说完的同一秒里进来的消息不能被当成"已回应过"。"""
+
+        ctx = self.ctx(text="第一句")
+        await self.engine.handle_incoming(ctx)
+        self.llm.replies = ['{"actions":[{"type":"say","messages":["嗯"]}]}']
+        await self.engine.handle_reply(ctx)
+        # 同一个时间戳（测试里时钟是冻结的）再来一条
+        await self.engine.handle_incoming(self.ctx(text="第二句"))
+        state = await self.get_state()
+        fresh = " ".join(str(item.get("text")) for item in self.engine.chat_context(state))
+        self.assertIn("第二句", fresh)
+        self.assertNotIn("第一句", fresh)
+
     async def test_schedule_auto_travel_walks_to_required_node_first(self):
         """日程只写「上网搜索」，开启 auto_travel 后她会自己先走到书房。"""
 
@@ -805,7 +835,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
 
         # 摘要会出现在提示词里
         injection = await self.engine.preview_injection(SESSION)
-        self.assertIn("更早的群聊", injection)
+        self.assertIn("更早聊过的", injection)
 
     async def test_clear_chat_context(self):
         """清空上下文：留档与摘要一起清掉，其它状态不受影响。"""
@@ -1530,8 +1560,8 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok, note)
         self.assertIn("不存在", note)
 
-    async def test_replied_chat_is_not_replayed_but_her_words_stay(self):
-        """回应过的群聊不再回放；她自己说过的话要留着，才能要求她别重复。"""
+    async def test_replied_chat_becomes_a_summary_next_round(self):
+        """回应过的那批压成一条概览；她说过的话留着用来提醒别重复句式。"""
 
         await self.engine.handle_incoming(self.ctx(text="第一句：晚饭吃什么"))
         self.llm.replies = [
@@ -1542,15 +1572,29 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outcome.ok, outcome.error)
 
         state = await self.engine.load_state(SESSION, cold_start=False)
-        texts = " ".join(str(item.get("text")) for item in self.engine.chat_context(state))
-        self.assertNotIn("第一句", texts)
-        self.assertNotIn("第二句", texts)
-        self.assertIn("吃鱼吧", texts)
-        self.assertEqual(state.chat_note, "在聊晚饭吃什么")
+        # 水位线之内：不再原样回放（规则判断"有没有新话"用这份）
+        fresh = " ".join(str(item.get("text")) for item in self.engine.chat_context(state))
+        self.assertNotIn("第一句", fresh)
+        self.assertNotIn("第二句", fresh)
+        # 但提示词用的是完整窗口：老的压成概览，她自己的话单独列出来
+        window = " ".join(str(item.get("text")) for item in self.engine.chat_window(state))
+        self.assertIn("第一句", window)
+        self.assertIn("吃鱼吧", window)
+        self.assertIn("第一句：晚饭吃什么", state.chat_preview)
+        self.assertIn("你：吃鱼吧", state.chat_preview)
+        self.assertIn("吃鱼吧", state.recent_replies)
 
         prompt = self.prompts_prompt(state)
-        self.assertIn("刚才你们聊过", prompt)
-        self.assertIn("在聊晚饭吃什么", prompt)
+        self.assertIn("之前的群聊", prompt)
+        self.assertIn("第一句：晚饭吃什么", prompt)
+        self.assertIn("你最近说过的话", prompt)
+
+        # 有人又说了一句：新的那句原样出现在「最近在聊什么」里
+        await self.engine.handle_incoming(self.ctx(text="第三句：那我也吃鱼"))
+        state = await self.engine.load_state(SESSION, cold_start=False)
+        prompt = self.prompts_prompt(state)
+        self.assertIn("最近在聊什么", prompt)
+        self.assertIn("第三句：那我也吃鱼", prompt)
 
     def prompts_prompt(self, state) -> str:
         return self.engine.prompts.build_autonomous_system_prompt(
@@ -1558,7 +1602,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
             state=state,
             node=self.engine.node(state.node_id),
             available_tools=self.engine.available_tools(),
-            recent_chat=self.engine.chat_context(state),
+            recent_chat=self.engine.chat_window(state),
         )
 
     async def test_recall_reads_memories_and_asks_again(self):
@@ -2427,7 +2471,11 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         """改名片失败要能在日志里看到原因，而不是静默什么都不发生。"""
 
         self.messenger.card_result = False
-        await self.set_state(state="sleeping", bot_base_nickname="小鲸鱼")
+        await self.set_state(
+            state="sleeping",
+            current_action={"type": "sleep", "duration_ticks": 900, "elapsed_ticks": 0},
+            bot_base_nickname="小鲸鱼",
+        )
         await self.engine.tick()
         events = await self.db.call("query_events", session_id=SESSION, limit=20)
         nicknames = [item for item in events if item["event_type"] == "nickname"]
@@ -2439,7 +2487,11 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         """协议端挂掉时，群名片不能每 tick 都重试（否则日志一直刷）。"""
 
         self.messenger.card_result = False
-        await self.set_state(state="sleeping", bot_base_nickname="小鲸鱼")
+        await self.set_state(
+            state="sleeping",
+            current_action={"type": "sleep", "duration_ticks": 900, "elapsed_ticks": 0},
+            bot_base_nickname="小鲸鱼",
+        )
         await self.engine.tick()
         state = await self.get_state()
         self.assertEqual(state.nickname_fail_count, 1)
@@ -2451,7 +2503,11 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_nickname_backoff_resets_after_success(self):
         self.messenger.card_result = False
-        await self.set_state(state="sleeping", bot_base_nickname="小鲸鱼")
+        await self.set_state(
+            state="sleeping",
+            current_action={"type": "sleep", "duration_ticks": 900, "elapsed_ticks": 0},
+            bot_base_nickname="小鲸鱼",
+        )
         await self.engine.tick()
         self.assertEqual((await self.get_state()).nickname_fail_count, 1)
 
@@ -2496,7 +2552,11 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Timeout", failed[0]["detail"]["note"])
 
     async def test_nickname_success_is_logged(self):
-        await self.set_state(state="sleeping", bot_base_nickname="小鲸鱼")
+        await self.set_state(
+            state="sleeping",
+            current_action={"type": "sleep", "duration_ticks": 900, "elapsed_ticks": 0},
+            bot_base_nickname="小鲸鱼",
+        )
         await self.engine.tick()
         state = await self.get_state()
         self.assertIn("睡觉中", state.bot_current_nickname)
@@ -2506,7 +2566,11 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(nicknames[0]["detail"]["ok"])
 
     async def test_nickname_sync_sets_group_card(self):
-        await self.set_state(state="sleeping", bot_base_nickname="小鲸鱼")
+        await self.set_state(
+            state="sleeping",
+            current_action={"type": "sleep", "duration_ticks": 900, "elapsed_ticks": 0},
+            bot_base_nickname="小鲸鱼",
+        )
         await self.engine.tick()
         cards = [card for _session, card in self.messenger.cards]
         self.assertIn("小鲸鱼 | 睡觉中", cards)
@@ -4102,7 +4166,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("没有人点名找你", prompt)
         self.assertNotIn("对你说", prompt)
-        self.assertIn("群里刚才的对话", system)
+        self.assertIn("最近在聊什么", system)
 
     async def test_speech_density_hint_appears_after_talking_a_lot(self):
         state = await self.get_state()

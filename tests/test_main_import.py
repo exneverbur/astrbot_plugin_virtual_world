@@ -236,6 +236,95 @@ class TestMainImport(unittest.TestCase):
             ],
         )
 
+    # ---------------- @ 记录 / 戳一戳 / 管理员名单 ----------------
+
+    def test_mention_note_marks_herself(self):
+        """别人 @ 她的时候要写清楚"@ 的是你"：她并不知道自己的 QQ 号。"""
+
+        class At:
+            def __init__(self, qq, name=""):
+                self.qq = qq
+                self.name = name
+
+        class _Msg:
+            def __init__(self, items):
+                self.message = items
+
+        class _Ev:
+            def __init__(self, items):
+                self.message_obj = _Msg(items)
+
+            def get_self_id(self):
+                return "10001"
+
+        note = self.module._mention_note(_Ev([At("10001", "小鲸鱼"), At("42", "小明")]))
+        self.assertIn("你（小鲸鱼(10001)）", note)
+        self.assertIn("小明(42)", note)
+        self.assertEqual(self.module._mention_note(_Ev([])), "")
+
+    def test_poke_falls_back_to_the_platform_api(self):
+        """消息段发不出去时，改用协议端的 send_poke。"""
+
+        plugin = self.module.VirtualWorldPlugin
+        instance = plugin(
+            self.module.Context(),
+            self.module.AstrBotConfig({"enabled": True, "tick_interval": 60}),
+        )
+        calls: list[tuple[str, dict]] = []
+
+        class _Bot:
+            async def call_action(self, name, **kwargs):
+                calls.append((name, kwargs))
+                return {"status": "ok"}
+
+        class _Ev:
+            bot = _Bot()
+
+        async def scenario():
+            async def boom(*_args, **_kwargs):
+                raise RuntimeError("消息段这条路不通")
+
+            instance.context.send_message = boom
+            instance._last_events["aiocqhttp:GroupMessage:1001"] = _Ev()
+            return await instance.messenger.poke("aiocqhttp:GroupMessage:1001", "3397734465")
+
+        try:
+            result = asyncio.run(scenario())
+        finally:
+            instance.db.raw.close()
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(calls[0][0], "send_poke")
+        self.assertEqual(calls[0][1]["user_id"], 3397734465)
+        self.assertEqual(calls[0][1]["group_id"], 1001)
+
+    def test_admin_ids_can_run_management_commands(self):
+        """「全局设置 → 管理员 QQ」里的人也能用管理指令。"""
+
+        plugin = self.module.VirtualWorldPlugin
+        instance = plugin(
+            self.module.Context(),
+            self.module.AstrBotConfig({"enabled": True, "tick_interval": 60}),
+        )
+
+        class _Ev:
+            def __init__(self, sender: str, admin: bool):
+                self._sender = sender
+                self._admin = admin
+
+            def is_admin(self):
+                return self._admin
+
+            def get_sender_id(self):
+                return self._sender
+
+        try:
+            instance.engine.world.admin_ids = ["3525522255"]
+            self.assertTrue(instance._can_admin(_Ev("9999", True)))
+            self.assertTrue(instance._can_admin(_Ev("3525522255", False)))
+            self.assertFalse(instance._can_admin(_Ev("9999", False)))
+        finally:
+            instance.db.raw.close()
+
     def test_nickname_buttons_do_not_wipe_session_state(self):
         """「恢复原名」以前发的动作名是 reset，正好撞上"删掉整个会话状态"的那个动作。
 

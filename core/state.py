@@ -50,6 +50,28 @@ def _same_chat_text(left: str, right: str) -> bool:
     return len(min(a, b, key=len)) >= 4 and (a in b or b in a)
 
 
+def chat_item_is_fresh(
+    item: dict[str, Any], *, replied_until: float = 0.0, replied_seq: int = 0
+) -> bool:
+    """这条群聊是不是"她还没回应过的"。
+
+    优先用**序号**判断：时间戳的精度只有秒，她刚说完的同一秒里进来的消息会被
+    误判成"已经回应过"。序号不够用时（老存档、内存里造的测试数据）退回时间比较，
+    没有时间的则一律当成新消息——宁可多给她看，也别把话藏起来。
+    """
+
+    seq = item.get("seq")
+    if seq is not None and int(replied_seq or 0) > 0:
+        try:
+            return int(seq) > int(replied_seq)
+        except (TypeError, ValueError):
+            pass
+    at = float(item.get("at") or 0.0)
+    if at <= 0:
+        return True
+    return at > float(replied_until or 0.0)
+
+
 @dataclass
 class WorldState:
     """一个会话的完整运行时状态。"""
@@ -152,6 +174,22 @@ class WorldState:
 
     chat_note: str = ""
     """上一次回复时顺手写下的一句「刚才在聊什么」，只作为下一轮的话题背景。"""
+
+    chat_preview: str = ""
+    """她刚回应过的那一批群聊的概览（谁说了什么、她回了什么）。
+
+    每次她开口后由规则生成，下一轮作为"之前的群聊"背景出现——
+    这些内容已经回应过，所以不再原样重复给她，只留一条概览。
+    """
+
+    recent_replies: list[str] = field(default_factory=list)
+    """她最近说过的几句话（给"别用同样的句式"那一段用）。"""
+
+    chat_seq: int = 0
+    """群聊留档的递增序号（时间戳只有秒，判断"谁是新消息"不够用）。"""
+
+    chat_replied_seq: int = 0
+    """已回应水位线（序号版）：大于它的群聊才是"还没回应过的"。"""
 
     user_presence: dict[str, dict[str, Any]] = field(default_factory=dict)
     bot_base_nickname: str = ""
@@ -292,6 +330,14 @@ class WorldState:
                 for key, value in self.interject_stats.items()
             }
         self.interject_hour_marker = max(0, int(self.interject_hour_marker or 0))
+        if not isinstance(self.recent_replies, list):
+            self.recent_replies = []
+        else:
+            self.recent_replies = [
+                " ".join(str(item).split())
+                for item in self.recent_replies
+                if str(item or "").strip()
+            ][-6:]
         if not isinstance(self.pending_memory, list):
             self.pending_memory = []
         else:
@@ -416,13 +462,21 @@ class WorldState:
                 "at": now,
                 "world_time": self.world_time,
                 "is_self": bool(is_self),
+                "seq": self.chat_seq + 1,
             }
         )
+        self.chat_seq = int(self.chat_seq) + 1
         if len(self.recent_chat) > keep:
             self.recent_chat = self.recent_chat[-keep:]
 
     def recent_chat_within(
-        self, *, now: float, seconds: float, limit: int = 0, after: float = 0.0
+        self,
+        *,
+        now: float,
+        seconds: float,
+        limit: int = 0,
+        after: float = 0.0,
+        after_seq: int = 0,
     ) -> list[dict[str, Any]]:
         """取时间窗内的聊天记录。
 
@@ -436,8 +490,39 @@ class WorldState:
             if now - float(item.get("at", 0)) <= max(0.0, seconds)
             # 水位线只挡「别人说过的、已经回应过的」；她自己说过的话要留着，
             # 下一轮才能要求她「别重复刚才那句」。
-            and (float(item.get("at", 0)) > float(after or 0.0) or item.get("is_self"))
+            and (
+                chat_item_is_fresh(item, replied_until=after, replied_seq=after_seq)
+                or item.get("is_self")
+            )
         ]
         if limit > 0:
             kept = kept[-limit:]
         return kept
+
+    def chat_window(
+        self, *, now: float, seconds: float, limit: int = 0
+    ) -> list[dict[str, Any]]:
+        """时间窗内的全部聊天（不过滤"已回应过的"）。
+
+        提示词要用这份：水位线以前的内容会被压缩成一条概览、之后的内容原样列出，
+        但两边都不该从上下文里消失。
+        """
+
+        kept = [
+            item
+            for item in self.recent_chat
+            if now - float(item.get("at", 0)) <= max(0.0, seconds)
+        ]
+        if limit > 0:
+            kept = kept[-limit:]
+        return kept
+
+    def note_reply(self, text: str, *, keep: int = 6) -> None:
+        """记一句她刚说过的话（提示词里用来提醒她别重复句式）。"""
+
+        clean = " ".join(str(text or "").split())
+        if not clean:
+            return
+        if self.recent_replies and self.recent_replies[-1] == clean:
+            return
+        self.recent_replies = [*self.recent_replies, clean][-max(1, int(keep)) :]

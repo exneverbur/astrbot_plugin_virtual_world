@@ -1667,6 +1667,13 @@ details.raw-json summary {
 }
 
 /* 数值曲线：心潮与效价两条线 */
+.action-pick {
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .history-canvas {
   width: 100%;
   height: 160px;

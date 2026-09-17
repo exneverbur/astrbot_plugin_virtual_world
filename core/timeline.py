@@ -269,6 +269,12 @@ def render_event(
             f"心情低落太久了，她自己缓了缓（效价回到 {float(detail.get('valence') or 0):.2f}）"
         )
 
+    if kind == "poke":
+        who = _clip(detail.get("name") or detail.get("target") or "对方", 20)
+        if detail.get("ok") is False:
+            return f"想戳 {who} 但没戳成：{_clip(detail.get('note'), 90)}"
+        return f"戳了 {who} 一下"
+
     if kind == "storm":
         if detail.get("on"):
             return "被惹到了：情绪上来了，还在气头上"
