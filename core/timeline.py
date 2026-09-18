@@ -275,6 +275,19 @@ def render_event(
             return f"想戳 {who} 但没戳成：{_clip(detail.get('note'), 90)}"
         return f"戳了 {who} 一下"
 
+    if kind == "search_sources":
+        count = int(detail.get("count") or 0)
+        queries = [str(item) for item in (detail.get("queries") or []) if str(item)]
+        head = f"查到 {count} 条可用来源"
+        if queries:
+            head = f"查了「{'、'.join(_clip(item, 20) for item in queries)}」：{count} 条来源"
+        sources = [str(item) for item in (detail.get("sources") or []) if str(item)]
+        if not sources:
+            return head
+        if compact:
+            return f"{head}（{sources[0]}）"
+        return head + "\n" + "\n".join(f"　　· {item}" for item in sources[:5])
+
     if kind == "storm":
         if detail.get("on"):
             return "被惹到了：情绪上来了，还在气头上"

@@ -33,6 +33,8 @@ def create_plan(
                 "content": str(step.get("content", "") or ""),
                 # 工具型动作靠 intent 说明"想做什么"，丢了它参数就补不出来
                 "intent": str(step.get("intent", "") or ""),
+                # 检索型动作自己写的查询词同理：丢了会退化成按主题兜一条
+                "queries": [str(item) for item in (step.get("queries") or []) if str(item)],
                 "messages": list(step.get("messages") or []),
                 "params": dict(step.get("params") or {}),
                 "interject": bool(step.get("interject", False)),

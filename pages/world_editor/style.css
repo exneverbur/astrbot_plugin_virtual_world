@@ -510,6 +510,46 @@ main {
   pointer-events: none;
 }
 
+/* 地图内部上方的天气条：不挡住节点拖动，所以只占顶部一条 */
+.map-weather {
+  position: sticky;
+  top: 8px;
+  left: 8px;
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100% - 16px);
+  margin: 8px 0 0 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--card, #fff);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+  font-size: 13px;
+}
+
+.map-weather .weather-icon {
+  font-size: 16px;
+  line-height: 1;
+}
+
+.map-weather .weather-main {
+  font-weight: 600;
+}
+
+.map-weather .weather-age {
+  color: var(--muted, #888);
+}
+
+.map-weather .weather-line {
+  color: var(--muted, #888);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 380px;
+}
+
 .node {
   position: absolute;
   width: 96px;
@@ -1667,6 +1707,19 @@ details.raw-json summary {
 }
 
 /* 数值曲线：心潮与效价两条线 */
+/* 「恢复默认」小图标：放在字段标题行右侧 */
+.restore-btn {
+  margin-left: auto;
+  font-size: 13px;
+  line-height: 1;
+  padding: 1px 6px;
+  opacity: 0.65;
+}
+
+.restore-btn:hover {
+  opacity: 1;
+}
+
 .action-pick {
   text-align: left;
   overflow: hidden;

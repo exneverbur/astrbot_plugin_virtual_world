@@ -4,7 +4,7 @@
 - **注入模式**：用户 @Bot 时，AstrBot 主人格正常回复，本插件只把「她此刻在哪、什么状态、
   想起什么」追加进 system_prompt，并顺带按区域裁剪可用工具（`on_llm_request`）。
 - **接管模式**：自主行为（日程、发呆、搜索、主动搭话）由插件自己调 LLM 并用 JSON 约束输出，
-  自己发送消息。本插件自己发起的请求会带 `SELF_INITIATED_FLAG`，绝不重复注入。
+  自己发送消息。自己发起的调用按协程打标记，绝不会被自己重复注入 / 接管。
 
 配置热加载、Web 编辑器、状态与记忆都在 core/ 里实现，本文件只做 AstrBot 适配。
 """
@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import hashlib
 import hmac
@@ -21,6 +22,7 @@ import os
 import secrets
 import time
 import types
+import urllib.parse
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -33,8 +35,12 @@ from astrbot.api.web import error_response, json_response, request
 
 from .core.config_store import ConfigStore
 from .core.db import AsyncDatabase
-from .core.defaults import DEFAULT_CAPTION_PROMPT
-from .core.engine import SELF_INITIATED_FLAG, MessageContext, VirtualWorldEngine
+from .core.defaults import (
+    DEFAULT_CAPTION_PROMPT,
+    DEFAULT_CAPTION_RELATION_PROMPT,
+    DEFAULT_WORLD,
+)
+from .core.engine import MessageContext, VirtualWorldEngine
 from .core.models import normalize_edge_keys, normalize_legacy_keys, pronoun_for
 from .core.nickname import compute_nickname
 from .core.ports import CardResult, LLMReply, PokeResult, ToolCallResult, ToolInfo
@@ -48,6 +54,8 @@ LLM_HOOK_PRIORITY = -100
 # 睡觉门禁要抢在「意图路由」这类消息级插件前面：它们通常注册在 100 左右，
 # 取值比它们高才会先执行；一旦这里 stop_event()，后面的处理器都不会跑。
 SLEEP_GUARD_PRIORITY = 200
+# 同一条会话的前一条回复最多让后一条等这么久；超时就不再排队（宁可多说一句，也别一直不说话）
+REPLY_TURN_WAIT_SECONDS = 25.0
 TOKEN_TTL_SECONDS = 24 * 3600
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_SECONDS = 300
@@ -369,7 +377,78 @@ class AstrBotLLM:
 
 
 CAPTION_SYSTEM_PROMPT = DEFAULT_CAPTION_PROMPT
-"""转述提示词的内置默认值；「全局设置 → 图片转述」里可以改成自己的一套。"""
+"""看图提示词的内置默认值；「全局设置 → 图片转述」里可以改成自己的一套。"""
+
+CAPTION_RELATION_PROMPT = DEFAULT_CAPTION_RELATION_PROMPT
+"""关系提示词的内置默认值；同样可以在「全局设置 → 图片转述」里改。"""
+
+# 多图合并成一次调用时，要模型按「图1：…」逐行输出；解析不出来就退回逐张。
+_MULTI_IMAGE_RULE = (
+    "\n\n这次一次给你 {count} 张图：每张图各一行，"
+    "以「图1：」「图2：」这样开头，顺序和图片顺序一致，不要合并成一行。"
+)
+
+
+def _split_multi_caption(text: str, count: int) -> list[str]:
+    """把「图1：… 图2：…」拆成逐图结果；对不上就返回空列表（调用方退回逐张）。"""
+
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if len(lines) < count:
+        return []
+    picked: list[str] = []
+    for index, line in enumerate(lines[:count], start=1):
+        for prefix in (f"图{index}：", f"图{index}:", f"{index}：", f"{index}.", f"{index})", f"{index}）"):
+            if line.startswith(prefix):
+                line = line[len(prefix) :].strip()
+                break
+        picked.append(line)
+    return picked if all(picked) else []
+
+# 「与话题的关系」之后的内容是会过期的：换个话题再说同一张图，这半句就不对了。
+# 命中缓存时只复用前面的画面/类型描述，关系交回主模型判断。
+_CAPTION_RELATION_MARKERS = ("与话题的关系", "和话题的关系", "与当前话题", "关系：")
+
+
+def _caption_prefix(caption: str) -> str:
+    """从一整条转述里切出"与话题无关"的那半句。切不出来就整条返回。"""
+
+    text = " ".join(str(caption or "").split())
+    if not text:
+        return ""
+    cut = len(text)
+    for marker in _CAPTION_RELATION_MARKERS:
+        index = text.find(marker)
+        if index > 0:
+            cut = min(cut, index)
+    prefix = text[:cut].strip(" ｜|，,。;；")
+    return prefix or text
+
+
+def _image_fingerprint(source: str) -> str:
+    """一张图的稳定指纹：同一个文件换链接也能认出来。
+
+    - ``base64://`` 直接对内容算 sha1（协议端把图转成 base64 时最可靠）；
+    - http(s) 去掉 query（临时签名/token 每次都变）、只留路径；
+    - 其它（本地文件、协议端给的 md5 名）原样取用。
+    """
+
+    raw = str(source or "").strip()
+    if not raw:
+        return ""
+    digest = ""
+    if raw.startswith("base64://"):
+        payload = raw[len("base64://") :]
+        digest = hashlib.sha1(payload.encode("utf-8", "ignore")).hexdigest()
+    elif raw.startswith("data:"):
+        digest = hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()
+    elif raw.startswith(("http://", "https://")):
+        parsed = urllib.parse.urlsplit(raw)
+        digest = hashlib.sha1(
+            f"{parsed.netloc}{parsed.path}".encode("utf-8", "ignore")
+        ).hexdigest()
+    else:
+        digest = hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()
+    return f"img:{digest}"
 
 
 class AstrBotVision:
@@ -378,7 +457,15 @@ class AstrBotVision:
     def __init__(self, plugin: "VirtualWorldPlugin", provider_id: str = "") -> None:
         self.plugin = plugin
         self.provider_id = provider_id
-        self._cache: dict[str, str] = {}
+        self._negative: dict[str, float] = {}
+        """失败过的指纹 → 时间：短时内不再重试，但**不**写进持久缓存。"""
+
+        self._inflight: dict[str, asyncio.Future] = {}
+        """同一张图正在识别时，其它消息先等它——不然一张图会被认好几遍。"""
+
+        self.hits = 0
+        """本次运行命中了多少次缓存（省下的转述调用）。"""
+
         self.last_error: str = ""
         """最近一次转述失败的原因（写进日志，方便排查"模型看不见图片"）。"""
 
@@ -387,13 +474,28 @@ class AstrBotVision:
         return bool(self.provider_id.strip())
 
     def _system_prompt(self) -> str:
-        """当前生效的转述提示词：全局设置里填了就用它，没填用内置默认。"""
+        """当前生效的**看图**提示词：全局设置里填了就用它，没填用内置默认。"""
 
         try:
             prompt = str(self.plugin.engine.world.vision.prompt or "").strip()
         except Exception:
             prompt = ""
         return prompt or CAPTION_SYSTEM_PROMPT
+
+    def _relation_prompt(self) -> str:
+        """当前生效的**关系**提示词。"""
+
+        try:
+            prompt = str(self.plugin.engine.world.vision.relation_prompt or "").strip()
+        except Exception:
+            prompt = ""
+        return prompt or CAPTION_RELATION_PROMPT
+
+    def _relation_enabled(self) -> bool:
+        try:
+            return bool(getattr(self.plugin.engine.world.vision, "relation_enabled", True))
+        except Exception:
+            return True
 
     async def describe(
         self,
@@ -403,24 +505,247 @@ class AstrBotVision:
         quoted: str = "",
         context_lines: list[str] | None = None,
     ) -> list[str]:
-        """把图片逐个转述成文字。失败或未配置时返回空串（调用方自己降级）。"""
+        """把图片逐个转述成文字。失败或未配置时返回空串（调用方自己降级）。
+
+        分两步：**看图**（多模态，多张图合并成一次，按图片指纹缓存）
+        → **关系**（纯文本、不带图、每次现算）。最终拼成
+        `画面描述｜类型｜文字｜与话题的关系：…`，对下游完全兼容。
+        """
 
         scene = self._scene_text(question=question, quoted=quoted, context_lines=context_lines)
-        results: list[str] = []
-        for source in image_sources:
-            # 同一张图在不同话题下要说的话不一样，所以缓存键带上当时的对话背景
-            cache_key = f"{source}|{scene}"
-            if cache_key in self._cache:
-                results.append(self._cache[cache_key])
+        looks = await self._look_many(image_sources, scene)
+        if self._relation_enabled() and any(item for item in looks):
+            relations = await self._relate(looks, scene)
+        else:
+            relations = ["" for _ in looks]
+        return [
+            self._combine(look, relation)
+            for look, relation in zip(looks, relations)
+        ]
+
+    @staticmethod
+    def _combine(look: str, relation: str) -> str:
+        """把「画面｜类型｜文字」和「与话题的关系：…」拼成一条。"""
+
+        text = " ".join(str(look or "").split())
+        extra = " ".join(str(relation or "").split())
+        if not text:
+            return ""
+        if not extra:
+            return text
+        if extra.startswith("与话题的关系"):
+            return f"{text}｜{extra}"
+        return f"{text}｜与话题的关系：{extra}"
+
+    async def _look_many(self, image_sources: list[str], scene: str) -> list[str]:
+        """看图：命中的走缓存，未命中的合并成一次调用（失败退回逐张）。"""
+
+        results: list[str] = ["" for _ in image_sources]
+        pending: list[int] = []
+        for index, source in enumerate(image_sources):
+            if not source:
                 continue
-            caption = ""
-            if self.enabled and source:
-                caption = await self._describe_one(source, scene)
-            self._cache[cache_key] = caption
-            if len(self._cache) > 200:
-                self._cache.clear()
-            results.append(caption)
+            cached = await self._cached_look(source)
+            if cached:
+                results[index] = cached
+                continue
+            pending.append(index)
+        if not pending:
+            return results
+        if not self.enabled:
+            return results
+        if len(pending) == 1:
+            index = pending[0]
+            results[index] = await self._describe_cached(image_sources[index], scene)
+            return results
+        # 多张一起看：一次多模态调用
+        sources = [image_sources[index] for index in pending]
+        merged = await self._describe_batch(sources, scene)
+        for slot, index in enumerate(pending):
+            caption = merged[slot] if slot < len(merged) else ""
+            if not caption:
+                # 合并解析失败：这张退回逐张调用，稳妥优先
+                caption = await self._describe_cached(image_sources[index], scene)
+            else:
+                await self._store_look(image_sources[index], caption)
+            results[index] = caption
         return results
+
+    async def describe_to_text(self, image_sources: list[str], prompt: str = "") -> str:
+        """给引擎用的看图入口（天气工具返回的图要读出来）：带缓存、多图合并成一次调用。"""
+
+        sources = [str(item) for item in (image_sources or []) if str(item).strip()]
+        if not sources or not self.enabled:
+            return ""
+        looks = await self._look_many(sources, str(prompt or "").strip())
+        return "\n".join(text for text in looks if text).strip()
+
+    async def _cached_look(self, source: str) -> str:
+        """命中缓存就返回"看图结果"（不含关系）。"""
+
+        fingerprint = _image_fingerprint(source)
+        cache = self._cache_config()
+        if not fingerprint or not bool(cache.get("enabled")):
+            return ""
+        entry = await self._cache_get(fingerprint, float(cache.get("max_age") or 0))
+        if entry is None:
+            return ""
+        self.hits += 1
+        await self._cache_touch(fingerprint)
+        caption = str(entry.get("caption") or "")
+        prefix = str(entry.get("prefix") or "")
+        # 老行存的是含关系段的旧格式：只取"关系之前"的部分
+        if "与话题的关系" in caption:
+            return prefix or _caption_prefix(caption)
+        return caption
+
+    async def _store_look(self, source: str, caption: str) -> None:
+        fingerprint = _image_fingerprint(source)
+        cache = self._cache_config()
+        if not fingerprint or not bool(cache.get("enabled")) or not caption:
+            return
+        await self._cache_put(fingerprint, caption=caption, prefix=caption)
+
+    async def _describe_batch(self, sources: list[str], scene: str) -> list[str]:
+        """一次看多张图：要求逐行输出，解析不出来返回空列表。"""
+
+        if len(sources) < 2:
+            return []
+        prompt = (scene + "\n\n" if scene else "") + _MULTI_IMAGE_RULE.format(
+            count=len(sources)
+        ).strip()
+        try:
+            response = await self.plugin.context.llm_generate(
+                chat_provider_id=self.provider_id,
+                system_prompt=self._system_prompt(),
+                prompt=prompt,
+                image_urls=list(sources),
+            )
+        except Exception as exc:
+            self.plugin.logger.debug(f"[virtual_world] 多图转述失败：{exc}")
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            return []
+        text = str(getattr(response, "completion_text", "") or "").strip()
+        if not text:
+            self.last_error = "转述模型没有返回文字（可能不支持图片输入）"
+            return []
+        return _split_multi_caption(text, len(sources))
+
+    async def _relate(self, looks: list[str], scene: str) -> list[str]:
+        """关系分析：纯文本、不带图；失败就返回空串（另一半照样能用）。"""
+
+        lines = [f"图{index}：{text}" for index, text in enumerate(looks, start=1) if text]
+        if not lines:
+            return ["" for _ in looks]
+        provider = self._relation_provider()
+        prompt = (scene + "\n\n" if scene else "") + "图片转述：\n" + "\n".join(lines)
+        try:
+            response = await self.plugin.context.llm_generate(
+                chat_provider_id=provider,
+                system_prompt=self._relation_prompt(),
+                prompt=prompt,
+            )
+        except Exception as exc:
+            self.plugin.logger.debug(f"[virtual_world] 图片关系分析失败：{exc}")
+            return ["" for _ in looks]
+        text = str(getattr(response, "completion_text", "") or "").strip()
+        if not text:
+            return ["" for _ in looks]
+        if len(lines) == 1:
+            return [text if len(looks) == 1 else "" for _ in looks]
+        parts = _split_multi_caption(text, len(looks))
+        if not parts:
+            return ["" for _ in looks]
+        return parts
+
+    def _relation_provider(self) -> str:
+        """关系分析用哪个模型：打杂模型（纯文本）；没配就跟随看图模型。"""
+
+        configured = str(getattr(self.plugin, "utility_provider_id", "") or "").strip()
+        return configured or self.provider_id
+
+    async def _describe_cached(self, source: str, scene: str) -> str:
+        """看单张图（缓存由调用方先查过）：带并发去重、失败不落盘。"""
+
+        if not source:
+            return ""
+        fingerprint = _image_fingerprint(source)
+        if not self.enabled:
+            return ""
+        # 同一张图正在识别：等它，别再调一次模型
+        pending = self._inflight.get(fingerprint) if fingerprint else None
+        if pending is not None:
+            try:
+                return str(await asyncio.shield(pending))
+            except Exception:
+                return ""
+        failed_at = float(self._negative.get(fingerprint) or 0.0)
+        if failed_at and time.time() - failed_at < 60:
+            return ""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        if fingerprint:
+            self._inflight[fingerprint] = future
+        try:
+            caption = await self._describe_one(source, scene)
+        finally:
+            if fingerprint:
+                self._inflight.pop(fingerprint, None)
+        if not caption:
+            # 失败不写持久缓存：偶发超时不该被永久记成"看不出"
+            if fingerprint:
+                self._negative[fingerprint] = time.time()
+            if not future.done():
+                future.set_result("")
+            return ""
+        await self._store_look(source, caption)
+        if not future.done():
+            future.set_result(caption)
+        return caption
+
+    def _cache_config(self) -> dict[str, Any]:
+        try:
+            vision = self.plugin.engine.world.vision
+            days = max(0, int(getattr(vision, "cache_days", 30) or 0))
+            return {
+                "enabled": bool(getattr(vision, "cache_enabled", True)),
+                "max": max(1, int(getattr(vision, "cache_max", 500) or 500)),
+                "max_age": days * 86400 if days else 0,
+            }
+        except Exception:
+            return {"enabled": True, "max": 500, "max_age": 30 * 86400}
+
+    async def _cache_get(self, fingerprint: str, max_age: float) -> dict[str, Any] | None:
+        try:
+            return await self.plugin.db.call(
+                "get_image_caption", fingerprint=fingerprint, max_age_seconds=max_age
+            )
+        except Exception:
+            return None
+
+    async def _cache_touch(self, fingerprint: str) -> None:
+        try:
+            await self.plugin.db.call("touch_image_caption", fingerprint=fingerprint)
+        except Exception:
+            pass
+
+    async def _cache_put(self, fingerprint: str, *, caption: str, prefix: str) -> None:
+        cache = self._cache_config()
+        try:
+            await self.plugin.db.call(
+                "put_image_caption",
+                fingerprint=fingerprint,
+                caption=caption,
+                prefix=prefix,
+                model=self.provider_id,
+            )
+            await self.plugin.db.call(
+                "trim_image_cache",
+                keep=int(cache.get("max") or 500),
+                max_age_seconds=float(cache.get("max_age") or 0),
+            )
+        except Exception as exc:
+            self.plugin.logger.debug(f"[virtual_world] 写图片缓存失败：{exc}")
 
     @staticmethod
     def _scene_text(
@@ -854,6 +1179,11 @@ class AstrBotTools:
 
     def __init__(self, plugin: "VirtualWorldPlugin") -> None:
         self.plugin = plugin
+
+    def has_context(self) -> bool:
+        """手上有没有一条真实消息事件：工具调用要拿它当上下文，没有就只能等。"""
+
+        return self.plugin.last_event_any() is not None
 
     def list_tools(self) -> list[ToolInfo]:
         manager = self._manager()
@@ -1365,7 +1695,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "exneverbur",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v1.4.1",
+    "v1.4.2",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -1375,9 +1705,15 @@ class VirtualWorldPlugin(Star):
         self.enabled = _cfg_bool(config.get("enabled"), True)
         self.web_enabled = _cfg_bool(config.get("web_enabled"), True)
         self.llm_provider_id = str(config.get("llm_provider_id") or "").strip()
-        self.helper_provider_id = str(config.get("helper_provider_id") or "").strip()
+        # 打杂模型（文本、便宜）：补工具参数、压上下文、判断图和话题的关系
         self.vision_provider_id = str(config.get("vision_provider_id") or "").strip()
-        self.context_provider_id = str(config.get("context_provider_id") or "").strip()
+        self.helper_provider_id = (
+            str(config.get("helper_provider_id") or "").strip()
+            # 老配置里"上下文压缩"和"关系分析"是两个独立模型：并进打杂模型，
+            # 让用户只需要理解两个便宜档（看图 / 文本）
+            or str(config.get("context_provider_id") or "").strip()
+        )
+        self.utility_provider_id = self.helper_provider_id
         # 内容生成模型：只在编辑器里"批量生成动作 / 地点"时用，留空回落到主模型
         self.creator_provider_id = str(config.get("creator_provider_id") or "").strip()
         self.tick_interval = max(5, _cfg_int(config.get("tick_interval"), 60))
@@ -1400,16 +1736,24 @@ class VirtualWorldPlugin(Star):
         """最近一次主模型调用的原始响应（按会话存，供回复钩子使用）。"""
         self._tick_task: asyncio.Task | None = None
         self._self_initiated_depth = 0
+        self._self_initiated_tasks: set[asyncio.Task] = set()
+        """正在调模型的那几条协程（我们自己的调用）。"""
+        self._self_initiated_untracked = 0
+        self._reply_locks: dict[str, asyncio.Lock] = {}
+        """每个会话一条：同一条会话的接管排队执行，避免两条回复互相不知道对方。"""
         # 发送方持有「失败冷却」，所以自己留一份（回退响应路径也要用它判断）
         self.messenger = AstrBotMessenger(self)
+        # 看图（多模态）：图片转述、天气工具返回的图都走它
+        self.vision = AstrBotVision(self, self.vision_provider_id)
 
         self.engine = VirtualWorldEngine(
             store=self.store,
             db=self.db,
             llm=AstrBotLLM(self),
             helper_llm=AstrBotLLM(self, self.helper_provider_id),
-            context_llm=AstrBotLLM(self, self.context_provider_id),
+            context_llm=AstrBotLLM(self, self.utility_provider_id),
             creator_llm=AstrBotLLM(self, self.creator_provider_id),
+            describer=self.vision,
             messenger=self.messenger,
             tools=AstrBotTools(self),
             commands=AstrBotCommands(self),
@@ -1420,7 +1764,6 @@ class VirtualWorldPlugin(Star):
             debug=self.debug,
             logger=self.logger,
         )
-        self.vision = AstrBotVision(self, self.vision_provider_id)
 
         self._register_web_apis()
 
@@ -1692,11 +2035,87 @@ class VirtualWorldPlugin(Star):
         return lines
 
     def set_self_initiated(self) -> int:
+        """标记"接下来这段是我们自己发起的调用"。"""
+
         self._self_initiated_depth += 1
+        task = self._current_task()
+        if task is None:
+            # 不在任务里跑（极少见）：退化成全量拦截，宁可自己漏一会儿也不自环
+            self._self_initiated_untracked += 1
+        else:
+            self._self_initiated_tasks.add(task)
         return self._self_initiated_depth
 
     def reset_self_initiated(self, _token: int = 0) -> None:
         self._self_initiated_depth = max(0, self._self_initiated_depth - 1)
+        task = self._current_task()
+        if task is None:
+            self._self_initiated_untracked = max(0, self._self_initiated_untracked - 1)
+        else:
+            self._self_initiated_tasks.discard(task)
+
+    @staticmethod
+    def _current_task() -> asyncio.Task | None:
+        try:
+            return asyncio.current_task()
+        except RuntimeError:
+            # 没有正在跑的事件循环（同步收尾之类），当作"不在任务里"
+            return None
+
+    def in_self_initiated_call(self) -> bool:
+        """当前这条协程是不是"我们自己正在调模型"的那一条。
+
+        按协程判断（而不是"只要有调用在跑"）：我们自己的请求依旧不会被自己注入 / 接管，
+        但同一时间到达的真人消息走的是另一条协程，照常处理。
+        """
+
+        task = self._current_task()
+        if task is None:
+            return self._self_initiated_depth > 0
+        if task in self._self_initiated_tasks:
+            return True
+        return self._self_initiated_untracked > 0
+
+    def _reply_lock(self, session_id: str) -> asyncio.Lock:
+        lock = self._reply_locks.get(session_id)
+        if lock is not None:
+            return lock
+        if len(self._reply_locks) > 128:
+            # 会话多起来以后顺手回收没在用的那些，别一直攒着
+            for key in [
+                key
+                for key, value in self._reply_locks.items()
+                if not value.locked()
+            ]:
+                self._reply_locks.pop(key, None)
+        lock = asyncio.Lock()
+        self._reply_locks[session_id] = lock
+        return lock
+
+    @contextlib.asynccontextmanager
+    async def _reply_turn(self, session_id: str):
+        """同一会话里，接管按到达顺序排队执行。
+
+        前一条还在等她开口时，后一条先等着——不然两条回复都是照着"回复前"的状态写出来的，
+        会互相不知道对方说了什么、重复回应同一件事。等太久（前一条卡住了）就不再等，
+        宁可多说一句，也别一直不说话。
+        """
+
+        lock = self._reply_lock(session_id)
+        acquired = False
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=REPLY_TURN_WAIT_SECONDS)
+            acquired = True
+        except asyncio.TimeoutError:
+            if self.debug:
+                self.logger.info(
+                    f"[virtual_world] 上一条回复还没结束，这条不再排队 session={session_id}"
+                )
+        try:
+            yield
+        finally:
+            if acquired:
+                lock.release()
 
     # ================= 回复路径（接管 / 注入） =================
 
@@ -1712,9 +2131,7 @@ class VirtualWorldPlugin(Star):
 
         if not self.enabled:
             return
-        if self._self_initiated_depth > 0:
-            return
-        if event.get_extra(SELF_INITIATED_FLAG):
+        if self.in_self_initiated_call():
             return
         if event.is_stopped():
             return
@@ -1789,36 +2206,39 @@ class VirtualWorldPlugin(Star):
             if await self._fire_hook(event, "OnWaitingLLMRequestEvent"):
                 event.stop_event()
                 return
-            outcome = await self.engine.handle_reply(
-                ctx, history=list(getattr(req, "contexts", None) or [])
-            )
-            echo = list(getattr(outcome, "debug_messages", []) or [])
-            if outcome.ok and outcome.messages:
-                # 先让别的插件的回复钩子过一遍（它们可能在回复里读写标记）
-                bridged = await self._bridge_reply_hooks(
-                    event,
-                    list(outcome.messages),
-                    str(getattr(outcome, "tail", "") or ""),
+            # 同一条会话同一时间只跑一条接管：连发的第二条会排队，
+            # 等前一条说完再开口，这样它能看到对方刚说过什么
+            async with self._reply_turn(session_id):
+                outcome = await self.engine.handle_reply(
+                    ctx, history=list(getattr(req, "contexts", None) or [])
                 )
-                # 再按换行拆段：一段一条消息，别把好几句挤成一坨；
-                # 调试回显按它实际发生的位置插进去（先调工具、再说话，群里也是这个顺序）
-                await self._send_reply(
-                    event, self._merge_with_echo(bridged, outcome, echo)
-                )
-                # 「发完了」也要补一遍：靠它摘掉"处理中"标记的插件才不会一直挂着
-                await self._fire_hook(event, "OnAfterMessageSentEvent")
-                if self.debug:
-                    self.logger.info(
-                        f"[virtual_world] 接管回复 {session_id}："
-                        f"reasoning={outcome.reasoning} messages={outcome.messages}"
+                echo = list(getattr(outcome, "debug_messages", []) or [])
+                if outcome.ok and outcome.messages:
+                    # 先让别的插件的回复钩子过一遍（它们可能在回复里读写标记）
+                    bridged = await self._bridge_reply_hooks(
+                        event,
+                        list(outcome.messages),
+                        str(getattr(outcome, "tail", "") or ""),
                     )
-                event.stop_event()
-                return
-            # 接管没成功、会交回主人格：调试信息照样发出去，不然就看不到了
-            if echo:
-                await self._send_reply(event, echo)
-                await self._fire_hook(event, "OnAfterMessageSentEvent")
-            self._log_takeover_fallback(session_id, outcome)
+                    # 再按换行拆段：一段一条消息，别把好几句挤成一坨；
+                    # 调试回显按它实际发生的位置插进去（先调工具、再说话，群里也是这个顺序）
+                    await self._send_reply(
+                        event, self._merge_with_echo(bridged, outcome, echo)
+                    )
+                    # 「发完了」也要补一遍：靠它摘掉"处理中"标记的插件才不会一直挂着
+                    await self._fire_hook(event, "OnAfterMessageSentEvent")
+                    if self.debug:
+                        self.logger.info(
+                            f"[virtual_world] 接管回复 {session_id}："
+                            f"reasoning={outcome.reasoning} messages={outcome.messages}"
+                        )
+                    event.stop_event()
+                    return
+                # 接管没成功、会交回主人格：调试信息照样发出去，不然就看不到了
+                if echo:
+                    await self._send_reply(event, echo)
+                    await self._fire_hook(event, "OnAfterMessageSentEvent")
+                self._log_takeover_fallback(session_id, outcome)
 
         # ---- 注入模式（也是接管失败后的兜底）----
         try:
@@ -2090,7 +2510,7 @@ class VirtualWorldPlugin(Star):
 
         if not self.enabled:
             return
-        if self._self_initiated_depth > 0:
+        if self.in_self_initiated_call():
             return
         if self.retired:
             return
@@ -2618,6 +3038,7 @@ class VirtualWorldPlugin(Star):
         register(f"/{p}/memories/import", self.api_memory_import, ["POST"], "导入记忆")
         register(f"/{p}/prompt", self.api_prompt, ["GET"], "预览提示词")
         register(f"/{p}/history", self.api_history, ["GET"], "数值历史")
+        register(f"/{p}/defaults", self.api_defaults, ["GET"], "内置默认文案")
         register(f"/{p}/backup", self.api_backup, ["POST"], "备份配置")
         register(f"/{p}/presets", self.api_presets, ["GET"], "预设列表")
         register(f"/{p}/presets/save", self.api_preset_save, ["POST"], "把当前配置存成预设")
@@ -2712,8 +3133,21 @@ class VirtualWorldPlugin(Star):
                 "schedules": schedules,
                 "sessions": sessions,
                 "warnings": self.engine.load_warnings,
+                # 图片转述缓存的使用情况（编辑器里显示"省了多少次识别"）
+                "vision_cache": await self._vision_cache_stats(),
+                # 当前天气：地图页顶部横幅直接用它
+                "weather": await self.engine.weather_payload(),
             }
         )
+
+    async def _vision_cache_stats(self) -> dict[str, Any]:
+        try:
+            stats = await self.db.call("image_cache_stats")
+        except Exception:
+            stats = {"entries": 0, "hits": 0}
+        vision = getattr(self, "vision", None)
+        stats["session_hits"] = int(getattr(vision, "hits", 0) or 0)
+        return stats
 
     async def api_put_world(self):
         payload = await request.json(default={}) or {}
@@ -2862,6 +3296,17 @@ class VirtualWorldPlugin(Star):
         if action == "interrupt":
             done = await self.engine.interrupt(session_id, force=True)
             return json_response({"ok": True, "interrupted": done})
+        if action == "reset_tools":
+            # 手动解除工具熔断（状态页上的「立即重试」）
+            name = str(payload.get("tool") or "").strip()
+            cleared = self.engine.reset_tool_breakers(name)
+            return json_response({"ok": True, "cleared": cleared})
+        if action == "refresh_weather":
+            # 地图页横幅上的「立即刷新」：查一次并记下来（不发消息）
+            await self.engine.maybe_refresh_weather(force=True)
+            return json_response(
+                {"ok": True, "weather": await self.engine.weather_payload()}
+            )
         if action == "tick":
             outcomes = await self.engine.tick()
             return json_response(
@@ -3205,6 +3650,35 @@ class VirtualWorldPlugin(Star):
         except (TypeError, ValueError):
             hours = 24
         return json_response(await self.engine.state_history(session_id, hours=hours))
+
+    async def api_defaults(self):
+        """内置默认文案：内置动作的说明/名片文案，以及两段图片转述提示词。
+
+        编辑器里的「恢复默认」图标都从这里取值——默认文案只有 core/defaults.py 一份。
+        """
+
+        guard = self._guard()
+        if guard is not None:
+            return guard
+        actions: dict[str, dict[str, str]] = {}
+        for item in DEFAULT_WORLD.get("actions") or []:
+            action_id = str(item.get("id") or "")
+            if not action_id:
+                continue
+            actions[action_id] = {
+                "name": str(item.get("name") or ""),
+                "description": str(item.get("description") or ""),
+                "nickname_text": str(item.get("nickname_text") or ""),
+            }
+        return json_response(
+            {
+                "actions": actions,
+                "captions": {
+                    "look": DEFAULT_CAPTION_PROMPT,
+                    "relation": DEFAULT_CAPTION_RELATION_PROMPT,
+                },
+            }
+        )
 
     async def api_presets(self):
         guard = self._guard()

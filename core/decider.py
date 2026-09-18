@@ -40,6 +40,10 @@ SELF_CARE_VALENCE = 0.4
 SELF_CARE_BOREDOM = 0.55
 SELF_CARE_IDLE = 0.3
 
+# 好奇心触发的"去查点东西"两次之间至少隔这么久：查一次只降一点点好奇心，
+# 不设冷却的话她会每隔几分钟就查同一件事，群里看到的就是她在刷新闻。
+SEARCH_COOLDOWN_MINUTES = 45
+
 
 def reply_willingness(state: WorldState, weights: dict[str, float] | None = None) -> float:
     """她对「现在开口说话」的整体意愿（0~1），供本插件的决策与外部联动共用。"""
@@ -70,10 +74,12 @@ class Decider:
         rng: random.Random | None = None,
         *,
         now_provider: Any = None,
+        tick_seconds: float = 60.0,
     ) -> None:
         self.world = world
         self.rng = rng or random.Random()
         self._now_provider = now_provider
+        self.tick_seconds = max(1.0, float(tick_seconds))
 
     def _now(self) -> float:
         if self._now_provider is None:
@@ -181,9 +187,20 @@ class Decider:
             )
 
         # 3) 好奇心高且在书房 -> 上网搜索并分享
-        if state.curiosity > 0.7 and node_id == "study" and self.action_usable("search_web"):
+        if (
+            state.curiosity > 0.7
+            and node_id == "study"
+            and self.action_usable("search_web")
+            and not self.searched_recently(state)
+        ):
+            step: dict[str, Any] = {"action": "search_web", "params": {}}
+            topic = self._search_topic()
+            if topic:
+                # 规则触发也要说清"查什么"：用户给动作配过主题就直接用，
+                # 没配就留空，交给引擎用查询模板 / 中性兜底主题
+                step["intent"] = topic
             return create_plan(
-                steps=[{"action": "search_web", "params": {}}],
+                steps=[step],
                 world_time=state.world_time,
                 valid_for=self._plan_valid(),
                 reason="好奇心高，想查点东西",
@@ -319,6 +336,31 @@ class Decider:
         if action.llm_level == "tool":
             return bool(action.tool_list())
         return True
+
+    def _search_topic(self, action_id: str = "search_web") -> str:
+        """这个检索动作配好的固定主题（没配就返回空串，由引擎那边兜底）。"""
+
+        action = self.world.action_map().get(action_id)
+        return str(getattr(action, "search_topic", "") or "").strip() if action else ""
+
+    def searched_recently(self, state: WorldState, action_id: str = "search_web") -> bool:
+        """她刚查过没有：查一次只降一点点好奇心，不拦一下会变成每隔几分钟查同一件事。"""
+
+        cooldown = SEARCH_COOLDOWN_MINUTES * 60.0 / max(1.0, self.tick_seconds)
+        if cooldown <= 0:
+            return False
+        now = int(state.world_time or 0)
+        for item in reversed(list(getattr(state, "recent_events", []) or [])):
+            detail = item.get("detail") if isinstance(item, dict) else None
+            if not isinstance(detail, dict):
+                continue
+            name = str(detail.get("action") or detail.get("type") or "")
+            if name != action_id:
+                continue
+            when = int(item.get("world_time") or 0)
+            if now - when <= cooldown:
+                return True
+        return False
 
     # ---------------- 插话 ----------------
 

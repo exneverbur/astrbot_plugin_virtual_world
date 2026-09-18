@@ -10,7 +10,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.decider import Decider  # noqa: E402
+from core.decider import SEARCH_COOLDOWN_MINUTES, Decider  # noqa: E402
 from core.defaults import default_world  # noqa: E402
 from core.engagement import EngagementTracker  # noqa: E402
 from core.json_actions import (  # noqa: E402
@@ -22,6 +22,19 @@ from core.json_actions import (  # noqa: E402
 )
 from core.memory import emotional_weight  # noqa: E402
 from core.mood import cell_for, mood_label, style_block  # noqa: E402
+from core.search import (  # noqa: E402
+    merge_evidence,
+    parse_search_results,
+    render_evidence,
+    sources_of,
+)
+from core.weather import (  # noqa: E402
+    WeatherRecord,
+    age_text,
+    format_parts,
+    parse_parts,
+    prompt_block as weather_prompt_block,
+)
 from core.models import (  # noqa: E402
     DEFAULT_ECHO_TYPES,
     ECHO_EVENT_TYPES,
@@ -42,6 +55,158 @@ def make_world():
     world, warnings = parse_world(default_world())
     assert warnings == [], warnings
     return world
+
+
+class TestSearchEvidence(unittest.TestCase):
+    """搜索返回怎么变成证据：解析、去重、限量、渲染。"""
+
+    def test_parses_json_results(self):
+        raw = (
+            '{"results": ['
+            '{"title": "第一条", "url": "https://a.example/news", "snippet": "内容一",'
+            ' "published_at": "2026-09-17"},'
+            '{"title": "第二条", "url": "https://b.example/x", "content": "内容二"}'
+            "]}"
+        )
+        items = parse_search_results(raw, source="今日新闻")
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0].title, "第一条")
+        self.assertEqual(items[0].published_at, "2026-09-17")
+        self.assertEqual(items[0].source, "今日新闻")
+        self.assertEqual(sources_of(items), ["https://a.example/news", "https://b.example/x"])
+
+    def test_parses_lines_with_urls(self):
+        raw = (
+            "今日热点 - 今日热榜\nhttps://rebang.today/ 汇聚全网热搜\n"
+            "百度热搜\nhttps://top.baidu.com/board?platform=pc 热搜指数"
+        )
+        items = parse_search_results(raw)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0].url, "https://rebang.today/")
+        self.assertIn("百度热搜", items[1].title)
+
+    def test_dedupes_the_same_url_with_different_tokens(self):
+        raw = (
+            "标题 A\nhttps://news.example/a?token=1\n"
+            "标题 A 复制\nhttps://news.example/a?token=2"
+        )
+        items = parse_search_results(raw)
+        self.assertEqual(len(items), 1)
+
+    def test_unstructured_text_is_kept_as_one_item(self):
+        items = parse_search_results("今天没什么特别的，就是一段散文")
+        self.assertEqual(len(items), 1)
+        self.assertIn("散文", items[0].snippet)
+
+    def test_render_is_numbered_and_limited(self):
+        items = parse_search_results(
+            "\n".join(f"标题{i}\nhttps://x.example/{i}" for i in range(10))
+        )
+        items = merge_evidence(items, limit=3)
+        text = render_evidence(items)
+        self.assertIn("1. ", text)
+        self.assertIn("https://x.example/0", text)
+        self.assertNotIn("https://x.example/9", text)
+
+    def test_rendering_keeps_the_passage_when_present(self):
+        items = parse_search_results("标题\nhttps://x.example/a")
+        items[0].snippet = "摘要片段"
+        items[0].passage = "正文片段"
+        text = render_evidence(items)
+        self.assertIn("正文片段", text)
+        # 有正文时正文优先，摘要不再出现在证据块里
+        self.assertNotIn("摘要片段", text)
+        self.assertIn("来源：https://x.example/a", text)
+
+
+class TestWeather(unittest.TestCase):
+    """天气：多久之前的说法、字段拆分、以及写进提示词的那一段。"""
+
+    NOW = 1_789_000_000.0  # 2026-09-13 前后，随便一个固定时刻
+
+    def test_age_says_hours_for_today(self):
+        self.assertEqual(age_text(self.NOW - 600, self.NOW), "刚刚")
+        self.assertEqual(age_text(self.NOW - 3 * 3600, self.NOW), "3 小时前")
+
+    def test_age_says_yesterday_and_beyond(self):
+        self.assertEqual(age_text(self.NOW - 26 * 3600, self.NOW), "昨天")
+        self.assertEqual(age_text(self.NOW - 50 * 3600, self.NOW), "前天")
+        self.assertEqual(age_text(self.NOW - 5 * 86400, self.NOW), "5 天前")
+
+    def test_age_is_empty_without_a_timestamp(self):
+        self.assertEqual(age_text(0, self.NOW), "")
+        self.assertEqual(age_text(self.NOW, 0), "")
+
+    def test_parts_round_trip(self):
+        line = "武汉｜26℃｜多云｜湿度68%｜东南风3级｜夜里转小雨"
+        parts = parse_parts(line)
+        self.assertEqual(parts["city"], "武汉")
+        self.assertEqual(parts["temp"], "26℃")
+        self.assertEqual(parts["forecast"], "夜里转小雨")
+        self.assertEqual(format_parts(parts), line)
+
+    def test_parts_accept_partial_input(self):
+        parts = parse_parts("武汉｜26℃")
+        self.assertEqual(parts, {"city": "武汉", "temp": "26℃"})
+        self.assertEqual(format_parts(parts), "武汉｜26℃")
+        self.assertEqual(parse_parts("今天多云"), {})
+
+    def test_prompt_block_keeps_the_age(self):
+        record = WeatherRecord(text="武汉｜26℃", at=self.NOW - 2 * 3600)
+        block = weather_prompt_block(record, self.NOW)
+        self.assertIn("# 外面的天气", block)
+        self.assertIn("2 小时前", block)
+        self.assertIn("武汉｜26℃", block)
+
+    def test_prompt_block_drops_stale_weather(self):
+        record = WeatherRecord(text="武汉｜26℃", at=self.NOW - 30 * 3600)
+        self.assertEqual(weather_prompt_block(record, self.NOW, stale_hours=24), "")
+
+    def test_prompt_block_is_empty_without_a_record(self):
+        self.assertEqual(weather_prompt_block(WeatherRecord(), self.NOW), "")
+
+    def test_broken_payload_is_ignored(self):
+        self.assertTrue(WeatherRecord.from_payload(None).empty)
+        self.assertTrue(WeatherRecord.from_payload({"at": "不是数字"}).empty)
+        record = WeatherRecord.from_payload(
+            {"text": "武汉｜26℃", "at": 123.0, "parts": {"city": "武汉"}}
+        )
+        self.assertEqual(record.line(), "武汉｜26℃")
+        self.assertEqual(record.at, 123.0)
+
+
+class TestActionQueries(unittest.TestCase):
+    """检索型动作自己给的查询词：接受几种写法，清洗后限量。"""
+
+    def test_parses_a_list(self):
+        result = parse_action_payload(
+            '{"actions":[{"type":"search_web","intent":"查新闻",'
+            '"queries":["今日热点","AI 行业"]}]}',
+            available_actions={"search_web"},
+        )
+        self.assertEqual(result.actions[0].queries, ["今日热点", "AI 行业"])
+
+    def test_parses_a_multi_line_string(self):
+        result = parse_action_payload(
+            '{"actions":[{"type":"search_web","queries":"今日热点\\nAI 行业"}]}',
+            available_actions={"search_web"},
+        )
+        self.assertEqual(result.actions[0].queries, ["今日热点", "AI 行业"])
+
+    def test_dedupes_and_limits(self):
+        result = parse_action_payload(
+            '{"actions":[{"type":"search_web","queries":'
+            '["a","A","b","c","d","e","f","g"]}]}',
+            available_actions={"search_web"},
+        )
+        self.assertEqual(result.actions[0].queries, ["a", "b", "c", "d", "e"])
+
+    def test_missing_queries_is_an_empty_list(self):
+        result = parse_action_payload(
+            '{"actions":[{"type":"search_web","intent":"查新闻"}]}',
+            available_actions={"search_web"},
+        )
+        self.assertEqual(result.actions[0].queries, [])
 
 
 class TestMoodGrid(unittest.TestCase):
@@ -727,12 +892,60 @@ class TestDecider(unittest.TestCase):
         self.assertEqual(plan["steps"][0]["target_node"], "lobby")
 
     def test_curious_in_study_searches(self):
+        """好奇心高 + 在书房 + 真的配了搜索工具 → 安排上网搜索。"""
+
         state = WorldState(
             session_id="s1", node_id="study", curiosity=0.9, boredom=0.1, world_time=10
         )
-        plan = self.decider.rule_plan(state)
+        # 没给她配搜索工具时不安排：安排了也跑不起来（内置动作不再带默认工具）
+        self.assertIsNone(self.decider.rule_plan(state))
+        data = default_world()
+        for action in data["actions"]:
+            if action["id"] == "search_web":
+                action["tool_names"] = ["anysearch_search"]
+        world, _warnings = parse_world(data)
+        plan = Decider(world).rule_plan(state)
         self.assertIsNotNone(plan)
         self.assertEqual(plan["steps"][0]["action"], "search_web")
+
+    def test_curious_search_is_not_repeated_every_cycle(self):
+        """刚查过就别再查：否则好奇心一直高于阈值时，她会每隔几分钟刷一次新闻。"""
+
+        data = default_world()
+        for action in data["actions"]:
+            if action["id"] == "search_web":
+                action["tool_names"] = ["anysearch_search"]
+        world, _warnings = parse_world(data)
+        decider = Decider(world, tick_seconds=60.0)
+        state = WorldState(
+            session_id="s1", node_id="study", curiosity=0.9, boredom=0.1, world_time=100
+        )
+        state.add_event("tool_result", {"action": "search_web", "ok": True})
+
+        self.assertIsNone(decider.rule_plan(state))
+
+        # 过了冷却时间就又可以查
+        state.world_time = 100 + int(SEARCH_COOLDOWN_MINUTES * 60 / 60) + 1
+        plan = decider.rule_plan(state)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan["steps"][0]["action"], "search_web")
+
+    def test_curious_search_uses_the_configured_topic(self):
+        """动作里配过「搜索主题」时，规则触发也要带上它，而不是留一句空意图。"""
+
+        data = default_world()
+        for action in data["actions"]:
+            if action["id"] == "search_web":
+                action["tool_names"] = ["anysearch_search"]
+                action["search_topic"] = "今日新闻热点"
+        world, _warnings = parse_world(data)
+        state = WorldState(
+            session_id="s1", node_id="study", curiosity=0.9, boredom=0.1, world_time=10
+        )
+
+        plan = Decider(world).rule_plan(state)
+
+        self.assertEqual(plan["steps"][0]["intent"], "今日新闻热点")
 
     def test_bored_wanders(self):
         state = WorldState(
@@ -1065,22 +1278,21 @@ class TestToolScopeFromActions(unittest.TestCase):
 
     def test_tools_are_derived_from_node_actions(self):
         world, _warnings = parse_world(default_world())
-        # 内置搜索 / 查天气还带一串备选工具（本机装了哪个就用哪个），都算这个地点能用的
-        self.assertEqual(
-            node_tool_names(world, "study"),
-            {
-                "web_search",
-                "anysearch_search",
-                "search",
-                "tavily_search",
-                "get_weather",
-                "get_current_weather",
-                "weather",
-            },
-        )
+        # 内置搜索 / 查天气**不带默认工具**（用户自己挑），所以默认学不到任何工具
+        self.assertEqual(node_tool_names(world, "study"), set())
         self.assertEqual(node_tool_names(world, "bedroom"), set())
         bedroom = world.node_map()["bedroom"]
         self.assertEqual(allowed_tools(world, bedroom), set())
+
+    def test_configured_tools_show_up_for_the_node(self):
+        """用户给动作挑了工具之后，才算这个地点能用的工具。"""
+
+        data = default_world()
+        for action in data["actions"]:
+            if action["id"] == "search_web":
+                action["tool_names"] = ["anysearch_search"]
+        world, _warnings = parse_world(data)
+        self.assertEqual(node_tool_names(world, "study"), {"anysearch_search"})
 
     def test_global_tools_apply_everywhere(self):
         data = default_world()
@@ -1106,11 +1318,25 @@ class TestToolScopeFromActions(unittest.TestCase):
         world, _warnings = parse_world(default_world())
         search = world.action_map()["search_web"]
         weather = world.action_map()["check_weather"]
-        # 主选工具没装时才会轮到备选，用户自己挑的名字始终排在最前
-        self.assertEqual(search.tool_name, "web_search")
-        self.assertIn("anysearch_search", search.tool_fallbacks)
-        self.assertEqual(weather.tool_name, "get_weather")
-        self.assertIn("get_current_weather", weather.tool_fallbacks)
+        # 不给默认工具：本机装了哪个搜索 / 天气工具由用户自己挑
+        self.assertEqual(search.tool_list(), [])
+        self.assertEqual(weather.tool_list(), [])
+        self.assertEqual(search.tool_fallbacks, [])
+        # 内置搜索默认走检索流水线
+        self.assertEqual(search.tool_flow, "search")
+
+    def test_old_search_action_is_upgraded_to_the_search_flow(self):
+        """老配置里没有「调用形态」这个字段：升级成联网检索；用户改过的就保留。"""
+
+        data = default_world()
+        target = [item for item in data["actions"] if item["id"] == "search_web"][0]
+        target.pop("tool_flow", None)
+        world, _warnings = parse_world(data)
+        self.assertEqual(world.action_map()["search_web"].tool_flow, "search")
+
+        target["tool_flow"] = "simple"
+        world, _warnings = parse_world(data)
+        self.assertEqual(world.action_map()["search_web"].tool_flow, "simple")
 
 
 class TestToolNameMatching(unittest.TestCase):

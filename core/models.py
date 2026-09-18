@@ -10,7 +10,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .defaults import DEFAULT_CAPTION_PROMPT, DEFAULT_WAKE_WORDS
+from .defaults import (
+    DEFAULT_CAPTION_PROMPT,
+    DEFAULT_CAPTION_RELATION_PROMPT,
+    DEFAULT_WAKE_WORDS,
+)
 
 
 def _rename_keys(data: Any, mapping: dict[str, str]) -> Any:
@@ -309,11 +313,60 @@ class ActionDef(Permissive):
     """工具型动作要用到的工具，可以配多个，执行时按顺序调用并汇总结果。"""
 
     tool_fallbacks: list[str] = Field(default_factory=list)
-    """``tool_names`` 一个都没装时按顺序顶上的备选工具。
+    """**已废弃**：备选工具现在直接并进 ``tool_names``（顺序即优先级）。
 
-    内置的「上网搜索 / 查天气」用它做到"本机装了哪个就用哪个"：用户自己挑的工具名
-    始终排在前面，不会被悄悄改掉。
+    解析老配置时会自动合并并清空，保留字段只是为了迁移时看得见原来的值。
     """
+
+    tool_mode: Literal["sequence", "fallback", "smart"] = "sequence"
+    """多个工具怎么用：
+
+    - ``sequence``（默认）：装了的都调，按顺序，结果合并；
+    - ``fallback``：只用一个——按顺序挑第一个能用的，失败就换下一个；
+    - ``smart``：让辅助模型按她的意图挑一个（选择与补参数合并成一次调用），
+      失败先补参数重试，仍失败就把那个工具从本轮候选里摘掉再问一次。
+    """
+
+    tool_flow: Literal["simple", "search"] = "simple"
+    """工具动作的编排形态。
+
+    - ``simple``（默认）：调用工具 → 把结果交回给她说一句；
+    - ``search``：联网检索流水线——多查询、结果归一化成"证据"、可选读正文，
+      再按证据讲给她听（「上网搜索」默认就是这个形态）。
+    """
+
+    reader_tool_names: list[str] = Field(default_factory=list)
+    """联网检索形态下，用来读网页正文的工具（可以传 URL、返回 markdown 的那种）。
+
+    留空就只用搜索结果的摘要，不抓正文。
+    """
+
+    search_depth: Literal["quick", "standard", "deep"] = "standard"
+    """检索深度：quick 只查一次不读正文，standard 读前两篇、最多补查一轮，
+    deep 读前三篇、最多补查两轮。"""
+
+    search_max_queries: int = 3
+    """一次动作最多发几条查询（她可以在动作里直接给多条 query）。"""
+
+    search_max_reads: int = 2
+    """最多读几篇正文。"""
+
+    search_rounds: int = 1
+    """证据不够时最多补查几轮。"""
+
+    search_topic: str = ""
+    """这个检索动作的固定主题（例如「今日新闻热点」）。
+
+    自定义动作（比如「搜索新闻」）在日程里被调用、又没写意图时，就用它当搜索主题；
+    优先级：日程里的意图 > 这里 > 查询模板 > 动作说明。
+    """
+
+    search_query_template: str = ""
+    """查询模板：用 ``{topic}`` / ``{date}`` 占位，例如 ``{date} 新闻热点``。"""
+
+    search_cite: bool = False
+    """讲结果时是否允许带一句来源（默认不带，来源只进日志与调试输出）。"""
+
 
     trigger_command: str = ""
     """「指令触发」型动作要触发的 AstrBot 指令，例如 ``情感分析`` 或 ``/天气``。"""
@@ -487,6 +540,8 @@ ECHO_EVENT_TYPES: dict[str, str] = {
     "sleep_skip": "🤐",
     "mood_reset": "🌤️",
     "poke": "👉",
+    "search_sources": "🔗",
+    "weather": "🌤️",
 }
 # 「常用」那一档：决定、动作、工具、跳过——排查她"为什么这么做"最需要的几类
 DEFAULT_ECHO_TYPES: tuple[str, ...] = (
@@ -641,7 +696,47 @@ class VisionCaption(Permissive):
     """图片转述（把图变成文字再给主模型看）用的提示词。"""
 
     prompt: str = DEFAULT_CAPTION_PROMPT
-    """转述模型的系统提示词。默认那段会顺带认出「这是不是表情包 / 什么梗」。"""
+    """**看图**提示词：只描述画面/类型/文字，不写与话题的关系。
+
+    这段输出的内容与话题无关，所以可以按图片指纹缓存、跨话题复用。
+    """
+
+    relation_prompt: str = DEFAULT_CAPTION_RELATION_PROMPT
+    """**关系**提示词：拿上一步的转述 + 当前消息 + 最近群聊，写一句「与话题的关系」。
+
+    这一步不带图（纯文本），每次现算、不缓存。
+    """
+
+    relation_enabled: bool = True
+    """是否补一次关系分析。关掉就只把画面/类型/文字交给主模型，让它自己判断关系。"""
+
+    cache_enabled: bool = True
+    """同一张图只转述一次：按图片指纹缓存，重启后仍然有效（表情包重复率极高）。"""
+
+    cache_max: int = 500
+    """最多记住多少张图。"""
+
+    cache_days: int = 30
+    """一张图的转述最多用这么久，过期后重新识别一次。"""
+
+
+class WeatherConfig(Permissive):
+    """天气：全局共享一份，按需静默刷新，写进提示词也画在编辑器地图页顶部。"""
+
+    enabled: bool = True
+    """总开关：关掉就不再静默查天气，也不写进提示词（手动查天气照常可用）。"""
+
+    city: str = ""
+    """所属城市。填了它，后台查天气就直接按这个城市查，不用模型猜。"""
+
+    refresh_hours: float = 2.0
+    """每隔几小时静默查一次。她主动查过之后，这个倒计时从头算。"""
+
+    stale_hours: float = 24.0
+    """超过这么久就不再把这份天气写进提示词（默认 1 天）。"""
+
+    normalize: bool = True
+    """查到之后先交给小模型压成「城市｜温度｜…」再存，横幅和提示词都用得着。"""
 
 
 class ReplyStyle(Permissive):
@@ -754,6 +849,7 @@ class WorldConfig(Permissive):
     context: ContextConfig = Field(default_factory=ContextConfig)
     reply_style: ReplyStyle = Field(default_factory=ReplyStyle)
     vision: VisionCaption = Field(default_factory=VisionCaption)
+    weather: WeatherConfig = Field(default_factory=WeatherConfig)
     content_safety: ContentSafety = Field(default_factory=ContentSafety)
     zones: list[ZoneDef] = Field(default_factory=list)
     zone_edges: list[ZoneEdgeDef] = Field(default_factory=list)
@@ -837,6 +933,9 @@ class ChainStep(Permissive):
     params: dict[str, Any] = Field(default_factory=dict)
     intent: str = ""
     """这一步"想干什么"。工具型 / 指令型动作靠它补参数，空了会被跳过。"""
+
+    queries: list[str] = Field(default_factory=list)
+    """检索型步骤可以直接写几条查询词；留空就按 intent 让辅助模型翻。"""
 
 
 class ScheduleConditions(Permissive):
@@ -1037,20 +1136,30 @@ def _upgrade_builtin_tool_action(action: dict[str, Any]) -> dict[str, Any]:
                 "duration_max": 0,
             }
         )
-    # 备选工具：只有在还写着旧默认工具名时才补，用户挑过的工具名一律不动
-    legacy = {
-        "search_web": ("web_search", ["anysearch_search", "search", "tavily_search"]),
-        "check_weather": ("get_weather", ["get_current_weather", "weather"]),
-    }[action_id]
+    # 工具名字：老配置只写了 tool_name 时同步进 tool_names 就行。
+    # 内置动作现在**不带默认工具**（用户自己挑），所以这里不再自动补备选。
     names = [str(item) for item in (changed.get("tool_names") or []) if str(item).strip()]
     if not names:
         single = str(changed.get("tool_name") or "").strip()
         if single:
-            names = [single]
-            changed["tool_names"] = list(names)
+            changed["tool_names"] = [single]
             changed["tool_name"] = single
-    if names == [legacy[0]] and not (changed.get("tool_fallbacks") or []):
-        changed["tool_fallbacks"] = list(legacy[1])
+    # 备选工具并进候选列表：以前"没装就换一个"和"装了都调"是两套字段，
+    # 现在统一成"候选 + 用法"，合并后默认按"依次尝试"（正是原来备选的语义）。
+    fallbacks = [
+        str(item) for item in (changed.get("tool_fallbacks") or []) if str(item).strip()
+    ]
+    if fallbacks:
+        merged = list(dict.fromkeys([*(changed.get("tool_names") or []), *fallbacks]))
+        changed["tool_names"] = merged
+        changed["tool_name"] = merged[0] if merged else ""
+        changed["tool_fallbacks"] = []
+        if str(changed.get("tool_mode") or "sequence") == "sequence" and len(merged) > 1:
+            changed["tool_mode"] = "fallback"
+    if action_id == "search_web" and "tool_flow" not in action:
+        # 老配置的内置搜索还没有"调用形态"这个字段：默认升级成联网检索。
+        # 之后用户在编辑器里改成"直接调用"时字段就写进去了，不会再被改回来。
+        changed["tool_flow"] = "search"
     return changed
 
 

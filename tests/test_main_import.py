@@ -669,6 +669,171 @@ class TestMainImport(unittest.TestCase):
         self.assertEqual(event.sent, [])
         plugin.db.raw.close()
 
+    # ---------------- 「我们自己的模型调用」不该吞掉别人的消息 ----------------
+
+    @staticmethod
+    def _stub_say_reply(context, text: str = "来了") -> None:
+        """让桩模型回一条 say，好断言"这一次真的被接管了"。"""
+
+        async def llm_generate(**_kwargs):
+            class _Response:
+                completion_text = (
+                    '{"actions":[{"type":"say","messages":["' + text + '"]}]}'
+                )
+
+            return _Response()
+
+        context.llm_generate = llm_generate
+
+    def _plugin_with_session(self, **config):
+        """建一个只属于这个用例的会话：本文件的用例共用一个数据目录。"""
+
+        session = config.pop("session", "aiocqhttp:GroupMessage:1")
+        context = self.module.Context()
+        plugin = self.module.VirtualWorldPlugin(
+            context,
+            self.module.AstrBotConfig(
+                {"enabled": True, "tick_interval": 60, **config}
+            ),
+        )
+        plugin.store.add_session(session, session_type="group", platform="aiocqhttp")
+        plugin.engine.reload_config()
+
+        async def reset_state():
+            async with plugin.engine.session_state(session) as state:
+                state.state = "idle"
+                state.current_action = None
+                state.current_plan = None
+
+        asyncio.run(reset_state())
+        return plugin, context, session
+
+    def test_message_arriving_during_our_own_model_call_is_still_taken_over(self):
+        """后台正在调模型时进来的 @ 也要接管，不能漏给主人格。"""
+
+        plugin, context, session = self._plugin_with_session(
+            session="aiocqhttp:GroupMessage:probe-takeover"
+        )
+        self._stub_say_reply(context)
+
+        async def drive():
+            async def background_call():
+                token = plugin.set_self_initiated()
+                try:
+                    await asyncio.sleep(0.2)  # 正在等模型返回
+                finally:
+                    plugin.reset_self_initiated(token)
+
+            task = asyncio.create_task(background_call())
+            await asyncio.sleep(0)  # 让后台那次调用先拿到标记
+            event = _GateEvent("在吗", session=session)
+            await plugin.on_llm_request(event, _GateRequest("在吗"))
+            await task
+            return event
+
+        event = asyncio.run(drive())
+        self.assertTrue(event.is_stopped())
+        self.assertEqual(len(event.sent), 1)
+        plugin.db.raw.close()
+
+    def test_sleep_gate_blocks_even_while_our_own_call_is_in_flight(self):
+        """睡觉门禁不能被"我们自己的调用"窗口绕过。"""
+
+        plugin, _context, session = self._plugin_with_session(
+            session="aiocqhttp:GroupMessage:probe-sleep"
+        )
+
+        async def put_her_to_sleep():
+            async with plugin.engine.session_state(session) as state:
+                state.state = "sleeping"
+                state.current_action = {"type": "sleep", "duration_ticks": 480}
+
+        asyncio.run(put_her_to_sleep())
+
+        async def drive():
+            async def background_call():
+                token = plugin.set_self_initiated()
+                try:
+                    await asyncio.sleep(0.2)
+                finally:
+                    plugin.reset_self_initiated(token)
+
+            task = asyncio.create_task(background_call())
+            await asyncio.sleep(0)
+            event = _GateEvent(
+                "今天好热啊", wake=False, mention=False, session=session
+            )
+            await plugin.on_sleep_guard(event)
+            await task
+            return event
+
+        event = asyncio.run(drive())
+        self.assertTrue(event.is_stopped())
+        plugin.db.raw.close()
+
+    def test_our_own_call_is_still_never_taken_over_by_itself(self):
+        """我们自己的调用带着标记：同一条协程里不再注入，也不接管自己。"""
+
+        plugin, context, session = self._plugin_with_session(
+            session="aiocqhttp:GroupMessage:probe-inner"
+        )
+        self._stub_say_reply(context)
+
+        async def drive():
+            token = plugin.set_self_initiated()
+            try:
+                event = _GateEvent("内部调用", session=session)
+                req = _GateRequest("内部调用")
+                await plugin.on_llm_request(event, req)
+                return event, req
+            finally:
+                plugin.reset_self_initiated(token)
+
+        event, req = asyncio.run(drive())
+        self.assertFalse(event.is_stopped())
+        self.assertEqual(event.sent, [])
+        self.assertEqual(req.system_prompt, "")
+        plugin.db.raw.close()
+
+    def test_two_messages_in_one_session_never_run_takeover_at_the_same_time(self):
+        """同一会话里两条消息的接管要排队：第二条等第一条说完再开口。"""
+
+        plugin, context, session = self._plugin_with_session(
+            session="aiocqhttp:GroupMessage:probe-serial"
+        )
+        busy = {"now": 0, "peak": 0}
+
+        async def llm_generate(**_kwargs):
+            busy["now"] += 1
+            busy["peak"] = max(busy["peak"], busy["now"])
+            try:
+                await asyncio.sleep(0.1)
+            finally:
+                busy["now"] -= 1
+
+            class _Response:
+                completion_text = '{"actions":[{"type":"say","messages":["来了"]}]}'
+
+            return _Response()
+
+        context.llm_generate = llm_generate
+
+        async def drive():
+            first = _GateEvent("在吗", session=session)
+            second = _GateEvent("还在吗", session=session)
+            await asyncio.gather(
+                plugin.on_llm_request(first, _GateRequest("在吗")),
+                plugin.on_llm_request(second, _GateRequest("还在吗")),
+            )
+            return first, second
+
+        first, second = asyncio.run(drive())
+
+        self.assertEqual(busy["peak"], 1)
+        self.assertEqual(len(first.sent), 1)
+        self.assertEqual(len(second.sent), 1)
+        plugin.db.raw.close()
+
 
 class _FakeEvent:
     """只实现 _command_args 需要的方法。"""
@@ -683,10 +848,19 @@ class _FakeEvent:
 class _GateEvent(fake_astrbot._AstrMessageEvent):
     """驱动 on_llm_request 的最小事件桩。"""
 
-    def __init__(self, text: str, *, wake: bool = True, mention: bool = True) -> None:
+    def __init__(
+        self,
+        text: str,
+        *,
+        wake: bool = True,
+        mention: bool = True,
+        session: str = "",
+    ) -> None:
         super().__init__()
         self._text = text
         self._wake = wake
+        if session:
+            self.unified_msg_origin = session
         self.message_obj = types.SimpleNamespace(
             message=[At("1")] if mention else []
         )
@@ -1065,12 +1239,16 @@ class TestCaptionPrompt(unittest.TestCase):
         cls.module = load_plugin_module()
 
     def test_default_prompt_asks_for_meme_detection(self):
-        from core.defaults import DEFAULT_CAPTION_PROMPT
+        from core.defaults import DEFAULT_CAPTION_PROMPT, DEFAULT_CAPTION_RELATION_PROMPT
 
         self.assertIn("表情包", DEFAULT_CAPTION_PROMPT)
         self.assertIn("梗", DEFAULT_CAPTION_PROMPT)
-        # 不能把原来那两段要求弄丢
-        self.assertIn("与话题的关系", DEFAULT_CAPTION_PROMPT)
+        # 图里的文字要写细一点，这是这次特意放宽的
+        self.assertIn("文字", DEFAULT_CAPTION_PROMPT)
+        self.assertIn("60~80", DEFAULT_CAPTION_PROMPT)
+        # 看图这段**不写**关系：关系由另一段纯文本提示词负责
+        self.assertIn("不要写这张图和话题的关系", DEFAULT_CAPTION_PROMPT)
+        self.assertIn("与话题的关系", DEFAULT_CAPTION_RELATION_PROMPT)
 
     def test_custom_prompt_wins(self):
         plugin = TestMainImport._plugin(self)
@@ -1088,6 +1266,200 @@ class TestCaptionPrompt(unittest.TestCase):
             self.assertIn("表情包", plugin.vision._system_prompt())
         finally:
             plugin.db.raw.close()
+
+    # ---------------- 图片转述缓存 ----------------
+
+    def _vision_plugin(
+        self,
+        look: str = "熊猫头，摆烂、无语｜表情包｜文字：「今天也想躺平」",
+        relation: str = "与话题的关系：在附和想躺平",
+        batch: str = "",
+    ):
+        """带计数的假转述模型：带图调用返回"看图"结果，纯文本调用返回"关系"。"""
+
+        # 图片缓存是跨会话共享的，所以这里给每个用例一个独立的数据目录，
+        # 免得用例之间互相捡到对方留下的缓存行。
+        previous = os.environ.get("VIRTUAL_WORLD_DATA_DIR")
+        os.environ["VIRTUAL_WORLD_DATA_DIR"] = tempfile.mkdtemp(prefix="vw-vision-")
+        try:
+            plugin = TestMainImport._plugin(self)
+        finally:
+            if previous is None:
+                os.environ.pop("VIRTUAL_WORLD_DATA_DIR", None)
+            else:
+                os.environ["VIRTUAL_WORLD_DATA_DIR"] = previous
+        plugin.vision.provider_id = "vision-model"
+        calls: list[dict] = []
+
+        class _Response:
+            def __init__(self, text: str) -> None:
+                self.completion_text = text
+
+        async def fake_generate(**kwargs):
+            calls.append(kwargs)
+            images = [item for item in (kwargs.get("image_urls") or []) if item]
+            if not images:
+                return _Response(relation)
+            if len(images) > 1 and batch:
+                return _Response(batch)
+            return _Response(look)
+
+        plugin.context.llm_generate = fake_generate
+        return plugin, calls
+
+    @staticmethod
+    def _image_calls(calls: list[dict]) -> list[dict]:
+        return [item for item in calls if item.get("image_urls")]
+
+    def test_same_image_is_described_only_once(self):
+        """同一个表情包第二次出现：不再调多模态，只补一次关系分析。"""
+
+        plugin, calls = self._vision_plugin()
+        source = "base64://c2FtZS1zdGlja2Vy"
+        try:
+            first = asyncio.run(
+                plugin.vision.describe([source], question="你看这个", context_lines=["在聊加班"])
+            )
+            second = asyncio.run(
+                plugin.vision.describe([source], question="换个话题", context_lines=["在聊晚饭"])
+            )
+            # 只有一次带图的调用；第二次走缓存，但关系照旧现算
+            self.assertEqual(len(self._image_calls(calls)), 1)
+            self.assertIn("与话题的关系", first[0])
+            self.assertIn("熊猫头", second[0])
+            self.assertIn("与话题的关系", second[0])
+            self.assertEqual(plugin.vision.hits, 1)
+            stats = asyncio.run(plugin._vision_cache_stats())
+            self.assertEqual(stats["entries"], 1)
+            self.assertEqual(stats["hits"], 1)
+        finally:
+            plugin.db.raw.close()
+
+    def test_multi_images_are_looked_at_in_one_call(self):
+        """一条消息里的多张图合并成一次多模态调用。"""
+
+        plugin, calls = self._vision_plugin(
+            batch="图1：一只猫在键盘上｜照片｜文字：无\n图2：熊猫头｜表情包｜文字：「躺平」"
+        )
+        first = "base64://aW1nLTE"
+        second = "base64://aW1nLTI"
+        try:
+            captions = asyncio.run(plugin.vision.describe([first, second], question="看这两张"))
+            self.assertEqual(len(self._image_calls(calls)), 1)
+            self.assertEqual(len(self._image_calls(calls)[0]["image_urls"]), 2)
+            self.assertIn("一只猫在键盘上", captions[0])
+            self.assertIn("熊猫头", captions[1])
+            # 两张都各自缓存了
+            stats = asyncio.run(plugin._vision_cache_stats())
+            self.assertEqual(stats["entries"], 2)
+        finally:
+            plugin.db.raw.close()
+
+    def test_multi_image_parse_failure_falls_back_to_one_by_one(self):
+        """模型没按「图1：」格式输出时，退回逐张调用（稳优先）。"""
+
+        plugin, calls = self._vision_plugin(batch="两张图我一起说了：一只猫和一个熊猫头")
+        first = "base64://aW1nLTE"
+        second = "base64://aW1nLTI"
+        try:
+            captions = asyncio.run(plugin.vision.describe([first, second]))
+            # 一次失败的批量 + 两次逐张
+            self.assertEqual(len(self._image_calls(calls)), 3)
+            self.assertTrue(all(captions))
+        finally:
+            plugin.db.raw.close()
+
+    def test_relation_can_be_turned_off(self):
+        """关掉关系分析：只给画面/类型/文字，关系交给主模型。"""
+
+        plugin, calls = self._vision_plugin()
+        raw = plugin.store.raw_world()
+        raw.setdefault("vision", {})["relation_enabled"] = False
+        plugin.store.save_world(raw)
+        plugin.engine.reload_config()
+        source = "base64://bm8tcmVsYXRpb24"
+        try:
+            captions = asyncio.run(plugin.vision.describe([source]))
+            self.assertIn("熊猫头", captions[0])
+            self.assertNotIn("与话题的关系", captions[0])
+            self.assertEqual(len(self._image_calls(calls)), 1)
+            self.assertEqual(len(calls), 1)
+        finally:
+            plugin.db.raw.close()
+
+    def test_cache_survives_a_restart(self):
+        """缓存是持久的：插件重载后同一张图仍然不用重新识别。"""
+
+        plugin, calls = self._vision_plugin()
+        # 每个用例用各自的图，避免互相捡到对方留下的缓存行
+        source = "base64://cmVzdGFydC1zdGlja2Vy"
+        try:
+            asyncio.run(plugin.vision.describe([source]))
+            plugin.vision._negative.clear()
+            fresh = plugin.vision
+            fresh.hits = 0
+            again = asyncio.run(fresh.describe([source]))
+            self.assertEqual(len(self._image_calls(calls)), 1)
+            self.assertIn("熊猫头", again[0])
+        finally:
+            plugin.db.raw.close()
+
+    def test_failed_description_is_not_cached(self):
+        """偶发失败不该被永久记成"看不出"：第二次要重新识别。"""
+
+        plugin, calls = self._vision_plugin(look="", relation="")
+        source = "base64://ZmFpbGVkLXN0aWNrZXI"
+        try:
+            self.assertEqual(asyncio.run(plugin.vision.describe([source])), [""])
+            plugin.vision._negative.clear()  # 模拟过了一阵子
+            asyncio.run(plugin.vision.describe([source]))
+            self.assertEqual(len(self._image_calls(calls)), 2)
+            self.assertEqual(
+                asyncio.run(plugin.db.call("image_cache_stats"))["entries"], 0
+            )
+        finally:
+            plugin.db.raw.close()
+
+    def test_cache_can_be_turned_off(self):
+        plugin, calls = self._vision_plugin()
+        raw = plugin.store.raw_world()
+        raw.setdefault("vision", {})["cache_enabled"] = False
+        plugin.store.save_world(raw)
+        plugin.engine.reload_config()
+        source = "base64://b2ZmLXN0aWNrZXI"
+        try:
+            asyncio.run(plugin.vision.describe([source]))
+            asyncio.run(plugin.vision.describe([source]))
+            self.assertEqual(len(self._image_calls(calls)), 2)
+        finally:
+            # 配置是模块级共享的：改完要放回去，别影响别的用例
+            raw.setdefault("vision", {})["cache_enabled"] = True
+            plugin.store.save_world(raw)
+            plugin.engine.reload_config()
+            plugin.db.raw.close()
+
+    def test_fingerprint_ignores_temporary_tokens(self):
+        """同一张图换个临时链接（带 token）也要认成同一张。"""
+
+        fingerprint = self.module._image_fingerprint
+        self.assertEqual(
+            fingerprint("https://cdn.example/a.jpg?token=1&t=2"),
+            fingerprint("https://cdn.example/a.jpg?token=9"),
+        )
+        self.assertNotEqual(
+            fingerprint("https://cdn.example/a.jpg"), fingerprint("https://cdn.example/b.jpg")
+        )
+        self.assertEqual(
+            fingerprint("base64://abc"), fingerprint("base64://abc")
+        )
+        self.assertNotEqual(fingerprint("base64://abc"), fingerprint("base64://abd"))
+
+    def test_caption_prefix_drops_the_relation_part(self):
+        prefix = self.module._caption_prefix("一只猫在键盘上｜照片｜与话题的关系：在吐槽加班")
+        self.assertIn("一只猫在键盘上", prefix)
+        self.assertNotIn("与话题的关系", prefix)
+        # 切不出来就整条返回，别把描述弄丢
+        self.assertEqual(self.module._caption_prefix("什么都没写的描述"), "什么都没写的描述")
 
 
 class TestReplyHookResponse(unittest.TestCase):

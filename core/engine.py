@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 from .config_store import ConfigStore
 from .db import AsyncDatabase
+from .defaults import DEFAULT_WEATHER_PROMPT
 from .decider import Decider, reply_willingness
 from .engagement import EngagementTracker
 from .json_actions import (
@@ -55,6 +56,15 @@ from .state import (
     chat_item_is_fresh,
 )
 from .state_dynamics import StateDynamics
+from .search import Evidence, merge_evidence, parse_search_results, render_evidence, sources_of
+from .weather import (
+    WEATHER_KEY,
+    WEATHER_TRY_KEY,
+    WeatherRecord,
+    banner as weather_banner,
+    parse_parts,
+    prompt_block as weather_prompt_block,
+)
 from .tool_policy import allowed_tools, is_self_send_tool
 from .mood import (
     SELF_CARE_NOTE,
@@ -75,6 +85,34 @@ from .generator import (
 
 DEFAULT_TICK_SECONDS = 60.0
 
+# 检索流水线：整条动作（多条查询 + 读正文 + 补查）一共最多花这么多秒
+SEARCH_BUDGET_SECONDS = 20.0
+# 读回来的正文按链接缓存这么久，避免同一篇被反复抓
+READ_CACHE_SECONDS = 6 * 3600
+# 一篇正文最多留多少字给模型看
+READ_PASSAGE_CHARS = 1200
+# 没写意图、也没配主题/模板时的兜底搜索主题（见 PromptBuilder 里那段说明）
+DEFAULT_SEARCH_TOPIC = "今天有什么新鲜事"
+# 生成搜索关键词时的额外要求：不写清楚，模型会给你一个"什么都要"的万能查询
+SEARCH_QUERY_RULES = (
+    "这次要填的是**搜索关键词**：写成能直接丢进搜索框的词（谁 / 什么时候 / 哪方面），"
+    "20 字以内；只查一件事，不要罗列多个主题，"
+    "不要写成「获取……的最新信息/实时更新」这种句子；"
+    "最近聊天里提到过的话题优先。"
+)
+
+
+def _clean_search_topic(reply: Any) -> str:
+    """把"想查什么"的那句回答洗干净；看起来不像话题（JSON、代码、空话）就用空串。"""
+
+    text = " ".join(str(reply or "").split()).strip().strip("「」\"'。!！?？")
+    if not text or len(text) > 40:
+        return ""
+    banned = ("{", "}", "query", "参数", "JSON", "json")
+    if any(item in text for item in banned):
+        return ""
+    return text
+
 
 def _echo_payload(
     event_type: str, detail: dict[str, Any], enabled: set[str]
@@ -91,8 +129,6 @@ def _echo_payload(
     if event_type == "action":
         return not (bool(detail.get("visible")) and bool(detail.get("messages")))
     return True
-SELF_INITIATED_FLAG = "virtual_world_self_initiated"
-
 # 写记忆时模型偶尔会"反过来问人名"。出现这些字样就不是记忆，改用兜底文案。
 MEMORY_REFUSAL_HINTS = (
     "捏造",
@@ -137,6 +173,9 @@ class TickOutcome:
     发送时按这个下标把两类消息重新插回真实顺序——她先调了工具、拿到结果才说话，
     群里也该是这个次序，而不是"话发完再补一句我刚查了天气"。
     """
+
+    echoed_event_ids: set[int] = field(default_factory=set)
+    """已经在发生的当下插好位置的事件 id：收尾那次批量回显要跳过它们，不然会重复发。"""
 
     def add_debug(self, line: str) -> None:
         """记一条调试回显，并记住它落在哪两条正式回复之间。"""
@@ -260,6 +299,7 @@ class VirtualWorldEngine:
         helper_llm=None,
         context_llm=None,
         creator_llm=None,
+        describer=None,
         messenger=None,
         tools=None,
         commands=None,
@@ -279,6 +319,8 @@ class VirtualWorldEngine:
         self.context_llm = context_llm or self.helper_llm
         # 内容生成模型：只在编辑器里"批量生成动作 / 地点"时用，运行时不参与
         self.creator_llm = creator_llm or self.llm
+        # 看图：天气工具返回的图也要读出来（插件那边传 AstrBotVision；没有就跳过图片）
+        self.describer = describer
         self.messenger = messenger
         self.tools = tools
         # 指令通道：把别家插件的指令转发出去（「指令触发」型动作用）
@@ -305,13 +347,16 @@ class VirtualWorldEngine:
         self._pending_echo: dict[str, list[str]] = {}
         """回复路径之外产生的调试回显，等下一次发送时带出去。"""
         self._filled_params: dict[tuple[str, str], dict[str, Any]] = {}
+        self._read_cache: dict[str, tuple[float, str]] = {}
+        """URL -> (写入时刻, 正文)，抓过的网页短期内不再重复抓。"""
+
+        self._tool_failures: dict[str, dict[str, Any]] = {}
+        """工具的连续失败次数与退避到期时间（熔断用，只在内存里）。"""
         self._last_llm: dict[str, dict[str, Any]] = {}
         """每个会话最近一次主模型调用的结果（编辑器「模型通道」那行要看）。"""
         self._schedule_signature: list[tuple[Any, ...]] | None = None
         self._schedule_reset_pending = False
         self._last_tick_at: float = 0.0
-        self._self_initiated = asyncio.Event()
-        self._self_initiated_tasks: set[asyncio.Task] = set()
 
         self.reload_config()
 
@@ -342,6 +387,9 @@ class VirtualWorldEngine:
         self.sessions = sessions
         self._sessions_index = {item.session_id: item for item in sessions.sessions}
         self.load_warnings = warnings
+        # 配置一改就清掉工具熔断：最常见的"工具坏了"其实是刚装好 / 刚补上 key，
+        # 用户保存之后应该立刻能再试，而不是等退避结束。
+        self._tool_failures.clear()
 
         # 情绪两轴需要"现在是几点"和"现实时间"：交给演化器自己取，
         # 免得每个调用点都要把 now / hour 传一遍。
@@ -351,7 +399,9 @@ class VirtualWorldEngine:
             hour_provider=lambda: self.local_now().hour,
         )
         self.memory = MemoryEngine(self.db.raw, world)
-        self.decider = Decider(world, now_provider=self._now)
+        self.decider = Decider(
+            world, now_provider=self._now, tick_seconds=self.tick_seconds
+        )
         self.engagement = EngagementTracker(world)
         self.prompts = PromptBuilder(
             world, tick_seconds=self.tick_seconds, now_provider=self.local_now
@@ -725,6 +775,7 @@ class VirtualWorldEngine:
                 extra_notes=extra_notes,
                 focus_user=ctx.user_name or ctx.user_id,
                 recent_chat=self.chat_window(state),
+                weather=await self.weather_line(),
             )
             if ctx.other_context:
                 injection += f"\n\n# 其他插件提供的上下文\n{ctx.other_context}"
@@ -1188,6 +1239,7 @@ class VirtualWorldEngine:
                 max_messages=say_limit,
                 reasoning=bool(self.world.reasoning_enabled),
                 style_block=style_text,
+                weather=await self.weather_line(),
             )
             user_prompt = self.prompts.build_reply_user_prompt(
                 user_name=ctx.user_name,
@@ -2086,10 +2138,249 @@ class VirtualWorldEngine:
 
     # ================= Tick =================
 
+    # ================= 天气 =================
+
+    async def weather_record(self) -> WeatherRecord:
+        """当前那份天气（全局共享，重启后仍在）。"""
+
+        try:
+            payload = await self.db.call("kv_get", WEATHER_KEY)
+        except Exception:
+            return WeatherRecord()
+        return WeatherRecord.from_payload(payload)
+
+    async def weather_line(self) -> str:
+        """写进提示词的那一段；关掉、没记录、或者旧到不值得提都返回空串。"""
+
+        config = self.world.weather
+        if not bool(getattr(config, "enabled", True)):
+            return ""
+        record = await self.weather_record()
+        if record.empty:
+            return ""
+        return weather_prompt_block(
+            record,
+            self._now(),
+            stale_hours=float(getattr(config, "stale_hours", 24.0) or 0.0),
+            tz=self._resolve_tz(),
+        )
+
+    async def weather_payload(self) -> dict[str, Any]:
+        """编辑器横幅要的数据。"""
+
+        record = await self.weather_record()
+        return weather_banner(record, self._now(), tz=self._resolve_tz())
+
+    async def weather_next_at(self) -> float:
+        """下一次静默刷新大约在什么时候（0 = 不会再刷新）。"""
+
+        config = self.world.weather
+        if not bool(getattr(config, "enabled", True)):
+            return 0.0
+        hours = max(0.0, float(getattr(config, "refresh_hours", 2.0) or 0.0))
+        if hours <= 0:
+            return 0.0
+        try:
+            last = float(await self.db.call("kv_get", WEATHER_TRY_KEY) or 0.0)
+        except Exception:
+            last = 0.0
+        if last <= 0:
+            return self._now()
+        return last + hours * 3600.0
+
+    async def maybe_refresh_weather(self, *, force: bool = False) -> None:
+        """到点了就静默查一次天气：不说话、不发群，只更新那份记录。
+
+        ``force=True`` 用于编辑器上的「立即刷新」：跳过倒计时，其余条件照旧。
+        """
+
+        config = self.world.weather
+        if not bool(getattr(config, "enabled", True)):
+            return
+        hours = max(0.0, float(getattr(config, "refresh_hours", 2.0) or 0.0))
+        if hours <= 0 or self.tools is None:
+            return
+        now = self._now()
+        try:
+            last_try = float(await self.db.call("kv_get", WEATHER_TRY_KEY) or 0.0)
+        except Exception:
+            last_try = 0.0
+        if not force and last_try > 0 and (now - last_try) < hours * 3600:
+            return
+        # 工具需要一条真实消息当上下文：群里还没人说过话就先不查，等下一轮
+        has_context = getattr(self.tools, "has_context", None)
+        if callable(has_context) and not bool(has_context()):
+            return
+        sessions = self.enabled_session_ids()
+        if not sessions:
+            return
+        # 先记"试过了"：失败也要等下一个周期，不要每个 tick 都去撞
+        try:
+            await self.db.call("kv_set", WEATHER_TRY_KEY, float(now))
+        except Exception:
+            pass
+        await self.refresh_weather(sessions[0])
+
+    async def refresh_weather(self, session_id: str) -> WeatherRecord:
+        """查一次天气并记下来（静默：不触发续说，也不回显到群里）。"""
+
+        definition = self.world.action_map().get("check_weather")
+        if definition is None or self.tools is None:
+            return WeatherRecord()
+        try:
+            state = await self.load_state(session_id, cold_start=False)
+        except Exception:
+            return WeatherRecord()
+        outcome = TickOutcome(session_id=session_id)
+        action = PlannedAction(type=definition.id, intent="现在外面的天气")
+        city = str(getattr(self.world.weather, "city", "") or "").strip()
+        if city:
+            action.params = self._city_params(definition, state, city)
+        if not await self._prepare_tool_action(state, definition, action, outcome):
+            return WeatherRecord()
+        payload: dict[str, Any] = {
+            "type": definition.id,
+            "params": dict(action.params),
+            "tool_params": dict(getattr(action, "tool_params", {}) or {}),
+            "intent": action.intent,
+            "queries": [],
+        }
+        # 这里刻意不传 outcome：静默刷新不该出现在群里（调试回显也不该）
+        await self._run_tool_calls(state, definition, payload)
+        return await self._store_weather(state, definition, payload, source="auto")
+
+    async def _store_weather(
+        self,
+        state: WorldState,
+        definition: ActionDef,
+        action: dict[str, Any],
+        *,
+        source: str,
+    ) -> WeatherRecord:
+        """把这次查到的天气写进全局记录；什么都没拿到就什么都不改。"""
+
+        raw = str(action.get("tool_result") or "").strip()
+        images = [str(item) for item in (action.get("tool_images") or []) if str(item)]
+        if not raw and not images:
+            return WeatherRecord()
+        text = await self._normalize_weather(state, raw, images)
+        if not text:
+            return WeatherRecord()
+        record = WeatherRecord(
+            text=text,
+            parts=parse_parts(text),
+            at=self._now(),
+            source=source,
+            raw=_clip_text(raw, 2000),
+            images=images,
+        )
+        try:
+            await self.db.call("kv_set", WEATHER_KEY, record.to_payload())
+        except Exception as exc:
+            self._log("warning", f"天气记录写不进去：{exc}")
+            return WeatherRecord()
+        # 静默刷新也算"刚查过"：下一次静默刷新从头计时
+        try:
+            await self.db.call("kv_set", WEATHER_TRY_KEY, float(self._now()))
+        except Exception:
+            pass
+        await self._log_event(
+            state,
+            "weather",
+            {
+                "action": definition.id,
+                "source": source,
+                "text": record.line(),
+                "images": len(images),
+                "raw": _clip_text(raw, 300),
+            },
+        )
+        return record
+
+    async def _normalize_weather(
+        self, state: WorldState, raw: str, images: list[str]
+    ) -> str:
+        """把天气结果压成「城市｜温度｜天气｜湿度｜风力｜预报」。
+
+        返回图片先交给多模态模型读出来，再把文字交给小模型归一化；
+        哪一步没配、或者读不出来，就退回原文，绝不编。
+        """
+
+        text = str(raw or "").strip()
+        if images and self.describer is not None:
+            described = ""
+            try:
+                described = await self.describer.describe_to_text(
+                    images, DEFAULT_WEATHER_PROMPT
+                )
+            except Exception as exc:
+                self._log("debug", f"天气图读不出来：{exc}")
+            if described:
+                text = f"{described}\n{text}".strip()
+        if not text:
+            return ""
+        if parse_parts(text):
+            return " ".join(text.split())[:200]
+        if not bool(getattr(self.world.weather, "normalize", True)):
+            return text
+        if self.helper_llm is None or not self._tool_param_allowed(state):
+            return text
+        reply = await self._ask_helper(
+            state.session_id,
+            DEFAULT_WEATHER_PROMPT,
+            f"天气内容：\n{_clip_text(text, 1200)}",
+        )
+        self._count_tool_param(state)
+        cleaned = " ".join(str(reply or "").split())
+        if not cleaned or "读不出" in cleaned:
+            return "" if images else text
+        # 模型没按格式给（拆不出字段）时保留原文：宁可她讲得啰嗦，也别丢信息
+        return cleaned[:200] if parse_parts(cleaned) else text
+
+    def _city_params(
+        self, definition: ActionDef, state: WorldState, city: str
+    ) -> dict[str, Any]:
+        """把「全局设置里的城市」填进天气工具的城市参数（认得出参数名才填）。"""
+
+        names = self.resolve_tools(definition, state.node_id)
+        if not names:
+            return {}
+        key = self._city_param_name(names[0])
+        return {key: city} if key else {}
+
+    def _city_param_name(self, tool: str) -> str:
+        """天气工具里"城市"该填哪个参数。"""
+
+        schema = normalize_param_schema(self.tool_schemas().get(tool) or {})
+        properties = [str(name) for name in (schema.get("properties") or {})]
+        required = [str(name) for name in (schema.get("required") or [])]
+        exact = {
+            "city",
+            "location",
+            "place",
+            "region",
+            "area",
+            "district",
+            "城市",
+            "地点",
+        }
+        for pool in (required, properties):
+            for name in pool:
+                low = name.lower()
+                if low in exact or "city" in low or "location" in low:
+                    return name
+        return required[0] if required else ""
+
     async def tick(self) -> list[TickOutcome]:
         """推进所有启用会话的世界时钟。返回需要发送的消息。"""
 
         self._last_tick_at = self._now()
+        try:
+            # 天气是全局的：整轮只查一次，放在会话循环之前，
+            # 这样它写的事件也已经越过各会话的回显游标（静默刷新不快发到群里）
+            await self.maybe_refresh_weather()
+        except Exception as exc:
+            self._log("debug", f"静默刷新天气失败：{exc}")
         outcomes: list[TickOutcome] = []
         for session_id in self.enabled_session_ids():
             try:
@@ -2276,7 +2567,10 @@ class VirtualWorldEngine:
         elif definition is not None and definition.llm_level == "tool":
             # 工具型动作：配了几个工具就按顺序调几个，成功失败都记账，
             # 日志页要能看出"她到底查到了什么 / 为什么没查到"
-            await self._run_tool_calls(state, definition, action)
+            await self._run_tool_calls(state, definition, action, outcome=outcome)
+            if definition.id == "check_weather":
+                # 查到的天气顺带进全局记录：提示词、编辑器横幅、静默刷新都读它
+                await self._store_weather(state, definition, action, source="manual")
         elif definition is not None and definition.llm_level == "command":
             # 持续型的指令动作：和工具型动作一样，到点才把指令发出去。
             # 以前这里没有这一支，"查天气"这种配成持续动作的指令永远不执行、也一条日志都没有。
@@ -2327,14 +2621,30 @@ class VirtualWorldEngine:
                 "elapsed_ticks": int(action.get("elapsed_ticks", 0)),
                 "tool_result": _clip_text(action.get("tool_result"), 200),
             },
+            outcome=outcome,
         )
 
         trigger = definition.on_complete.trigger if definition else "none"
         detail = str(action.get("tool_result", "") or "")
+        evidence_text = self._search_evidence_text(definition, action)
+        if evidence_text:
+            # 检索型动作：给模型的是编号证据块，不是被截断的一坨原文
+            detail = evidence_text
         images = list(action.get("tool_images") or [])
         if not detail and images:
             detail = "工具返回了一张图片，图片一起发给你了。"
         hint = definition.on_complete.prompt_hint if definition else ""
+        if evidence_text and not str(hint or "").strip():
+            hint = (
+                "把查到的内容讲给群里听：只能依据上面这些证据，"
+                "不要用印象补充、不要编数字或时间；证据里没有就直说没查到。"
+                "别照抄原文、别念网址，用你自己的口吻挑最有用的两三点。"
+            )
+        if evidence_text and bool(getattr(definition, "search_cite", False)):
+            hint = (
+                str(hint or "").rstrip()
+                + " 讲完可以在末尾用括号补一条你参考的来源链接。"
+            )
         want_followup = trigger == "llm_followup"
         is_tool_action = bool(definition is not None and definition.llm_level == "tool")
         tool_failed = is_tool_action and not bool(action.get("tool_ok", True))
@@ -2459,6 +2769,7 @@ class VirtualWorldEngine:
             recent_chat=self.chat_window(state),
             reasoning=bool(self.world.reasoning_enabled),
             style_block=style_text,
+            weather=await self.weather_line(),
         )
         prompt = self.prompts.build_reply_followup_prompt(hint, tool_result)
         reply = await self._ask_llm(
@@ -2613,6 +2924,7 @@ class VirtualWorldEngine:
                 "steps": plan.get("steps"),
                 "raw": _clip_text(plan.get("raw"), 200),
             },
+            outcome=outcome,
         )
 
     async def decide_after_arrival(
@@ -2697,6 +3009,7 @@ class VirtualWorldEngine:
             mode="plan",
             reasoning=bool(self.world.reasoning_enabled),
             style_block=style_text,
+            weather=await self.weather_line(),
         )
         prompt = (
             (f"{hint}\n\n" if hint else "")
@@ -2776,6 +3089,7 @@ class VirtualWorldEngine:
             intent=str(step.get("intent", "") or ""),
             params=dict(step.get("params") or {}),
             duration=int(step.get("duration", 0) or 0),
+            queries=[str(item) for item in (step.get("queries") or []) if str(item)],
             raw=step,
         )
 
@@ -2797,6 +3111,7 @@ class VirtualWorldEngine:
             "content": item.content,
             "intent": item.intent,
             "params": dict(item.params or {}),
+            "queries": list(item.queries or []),
             "status": "pending",
         }
 
@@ -2867,6 +3182,7 @@ class VirtualWorldEngine:
                         "action": action.type,
                         "note": f"「{definition.name or action.type}」已停用",
                     },
+                    outcome=outcome,
                 )
                 continue
             if not definition.available_in(state.node_id):
@@ -2891,6 +3207,7 @@ class VirtualWorldEngine:
                     state,
                     "skip",
                     {"action": action.type, "note": f"「{action.type}」在 {state.node_id} 不可用"},
+                    outcome=outcome,
                 )
                 continue
             ok, reason = self._check_preconditions(state, definition)
@@ -2900,6 +3217,7 @@ class VirtualWorldEngine:
                     state,
                     "skip",
                     {"action": action.type, "note": f"「{action.type}」前置条件不满足：{reason}"},
+                    outcome=outcome,
                 )
                 continue
             if definition.llm_level == "tool":
@@ -2993,6 +3311,7 @@ class VirtualWorldEngine:
                 "source": "auto_travel",
                 "steps": [{"action": item.type} for item in pending],
             },
+            outcome=outcome,
         )
         walk = PlannedAction(type="walk_to", target_node=target_node)
         await self._start_action(
@@ -3026,6 +3345,84 @@ class VirtualWorldEngine:
     def _tool_exists(self, name: str) -> bool:
         return name in self.available_tools()
 
+    # ---------------- 工具熔断 ----------------
+    #
+    # 连续两次"工具本身不可用"（没注册 handler / 抛异常 / 超时）就临时不用它，
+    # 退避 30 秒起、逐次翻倍、上限 30 分钟。参数缺失或返回空结果**不算**失败。
+
+    TOOL_BREAK_AFTER = 2
+    TOOL_BREAK_BASE_SECONDS = 30.0
+    TOOL_BREAK_MAX_SECONDS = 1800.0
+
+    def _tool_breaker(self, name: str) -> dict[str, Any]:
+        return self._tool_failures.setdefault(
+            str(name or ""), {"count": 0, "until": 0.0, "reason": ""}
+        )
+
+    def tool_unavailable_reason(self, name: str) -> str:
+        """这个工具现在是不是被熔断了；返回剩余秒数的说明，空串表示可用。"""
+
+        record = self._tool_failures.get(str(name or ""))
+        if not record:
+            return ""
+        until = float(record.get("until") or 0.0)
+        if until <= 0:
+            return ""
+        left = until - self._now()
+        if left <= 0:
+            # 退避到期：放一次试探（half-open），成功就会清零
+            record["until"] = 0.0
+            return ""
+        return f"刚失败过，{int(left)} 秒后再试（{_clip_text(record.get('reason'), 60)}）"
+
+    def tool_breaker_state(self) -> list[dict[str, Any]]:
+        """当前被熔断的工具（编辑器里显示 + 手动解除用）。"""
+
+        now = self._now()
+        items: list[dict[str, Any]] = []
+        for name, record in self._tool_failures.items():
+            until = float(record.get("until") or 0.0)
+            if until <= now:
+                continue
+            items.append(
+                {
+                    "tool": name,
+                    "seconds_left": int(until - now),
+                    "fails": int(record.get("count") or 0),
+                    "reason": _clip_text(record.get("reason"), 80),
+                }
+            )
+        return sorted(items, key=lambda item: item["seconds_left"], reverse=True)
+
+    def reset_tool_breakers(self, name: str = "") -> int:
+        """解除熔断：给名字就清这一个，留空清全部（配置一改就全清）。"""
+
+        if name:
+            record = self._tool_failures.pop(str(name), None)
+            return 1 if record else 0
+        count = len(self._tool_failures)
+        self._tool_failures.clear()
+        return count
+
+    def note_tool_result(self, name: str, *, ok: bool, error: str = "") -> None:
+        """记一次工具调用的结果，决定要不要熔断。"""
+
+        key = str(name or "")
+        if not key:
+            return
+        if ok:
+            # 成功即清零：这也是"暂不可用"最主要的自动解除方式
+            self._tool_failures.pop(key, None)
+            return
+        if not _looks_like_tool_broken(error):
+            return
+        record = self._tool_breaker(key)
+        record["count"] = int(record.get("count") or 0) + 1
+        record["reason"] = str(error or "")
+        if record["count"] >= self.TOOL_BREAK_AFTER:
+            backoff = self.TOOL_BREAK_BASE_SECONDS * (2 ** (record["count"] - self.TOOL_BREAK_AFTER))
+            record["until"] = self._now() + min(self.TOOL_BREAK_MAX_SECONDS, backoff)
+
     def _tool_hint(self, limit: int = 8) -> str:
         """给「缺少工具」的报错补上"现在到底有哪些工具"，方便用户自己改配置。"""
 
@@ -3047,6 +3444,9 @@ class VirtualWorldEngine:
         if not name:
             return ""
         if not self._tool_exists(name) or is_self_send_tool(name):
+            return ""
+        if self.tool_unavailable_reason(name):
+            # 刚连续失败过：退避期内不再用它（到点会自动放行试探）
             return ""
         return name
 
@@ -3107,6 +3507,7 @@ class VirtualWorldEngine:
         params: dict[str, Any] | None = None,
         previous_results: str = "",
         error_hint: str = "",
+        extra_rules: str = "",
     ) -> tuple[dict[str, Any], str]:
         """把「她想干什么」翻译成工具需要的参数字典。
 
@@ -3157,6 +3558,7 @@ class VirtualWorldEngine:
             recent_chat=self.chat_window(state),
             previous_results=previous_results,
             error_hint=error_hint,
+            extra_rules=extra_rules,
         )
         reply = await self._ask_helper(
             state.session_id, system_prompt, prompt
@@ -3262,17 +3664,20 @@ class VirtualWorldEngine:
                     "action": definition.id,
                     "note": f"工具动作「{definition.name or definition.id}」找不到可用工具：{reason}",
                 },
+                outcome=outcome,
             )
             return False
 
         # 用户在动作里配好的固定参数（例如查天气固定 city=武汉）先铺底，
         # 大模型这一轮写出来的参数覆盖在它上面。
-        fixed: dict[str, str] = {}
-        for key, spec in (definition.params or {}).items():
-            value = getattr(spec, "value", "")
-            if isinstance(value, str) and value.strip():
-                fixed[str(key)] = value.strip()
-        base = {**fixed, **dict(self._act_get(action, "params", {}) or {})}
+        base = self._action_base_params(definition, action)
+        if str(getattr(definition, "tool_flow", "simple")) == "search":
+            # 检索型动作不在这一步补参数：查询词和参数在真正调用时按查询逐条生成
+            # （见 ``_run_search_flow``），这里只把这一轮要查什么定下来。
+            self._act_set(action, "queries", self._explicit_queries(definition, action))
+            self._act_set(action, "tool_params", {})
+            self._act_set(action, "params", dict(base))
+            return True
         stored: dict[str, dict[str, Any]] = {}
         for index, name in enumerate(names):
             # 大模型写出来的参数只当第一个工具的，其余工具由辅助模型按各自定义补
@@ -3302,6 +3707,7 @@ class VirtualWorldEngine:
                             + (f"：{note}" if note else "")
                         ),
                     },
+                    outcome=outcome,
                 )
                 return False
             stored[name] = params
@@ -3334,6 +3740,7 @@ class VirtualWorldEngine:
                 state,
                 "skip",
                 {"action": definition.id, "note": "指令型动作没有配置要触发的指令"},
+                outcome=outcome,
             )
             return
         intent = (action.intent or action.content or "").strip()
@@ -3788,128 +4195,70 @@ class VirtualWorldEngine:
         state: WorldState,
         definition: ActionDef,
         action: dict[str, Any],
+        *,
+        outcome: TickOutcome | None = None,
     ) -> None:
         """按配置顺序调用动作挂着的工具，把结果汇总进 ``action``。"""
 
         names = self.resolve_tools(definition, state.node_id)
+        if str(getattr(definition, "tool_flow", "simple")) == "search":
+            # 联网检索形态走自己的流水线（多查询 / 证据 / 读正文 / 补查）
+            await self._run_search_flow(
+                state, definition, action, names, outcome=outcome
+            )
+            return
+        mode = str(getattr(definition, "tool_mode", "sequence") or "sequence")
         stored = dict(action.get("tool_params") or {})
         texts: list[str] = []
         failed: list[str] = []
         images: list[str] = []
         last_params: dict[str, Any] = {}
-        for index, name in enumerate(names):
-            params = dict(stored.get(name) or action.get("params") or {})
-            if index > 0 and texts:
-                # 后面的工具拿前面的结果再补一次参数：需要网址/编号这类信息时不该靠猜
-                merged, note = await self.fill_tool_params(
+        used: list[str] = []
+        if mode == "smart" and len(names) > 1:
+            await self._run_tools_smart(
+                state,
+                definition,
+                action,
+                names,
+                outcome=outcome,
+                texts=texts,
+                failed=failed,
+                images=images,
+                used=used,
+            )
+        else:
+            for index, name in enumerate(names):
+                entry = await self._call_one_tool(
                     state,
                     definition,
-                    PlannedAction(
-                        type=definition.id,
-                        intent=str(action.get("intent") or action.get("content") or ""),
-                    ),
-                    tool_name=name,
-                    params=params,
-                    previous_results="\n\n".join(texts),
+                    action,
+                    name,
+                    params=dict(stored.get(name) or action.get("params") or {}),
+                    previous_results="\n\n".join(texts) if index > 0 else "",
+                    outcome=outcome,
                 )
-                if merged:
-                    params = {**params, **merged}
-                missing = self.missing_params_for(name, params)
-                if missing:
-                    failed.append(f"{name}：缺少参数 {missing}" + (f"（{note}）" if note else ""))
-                    await self._log_event(
-                        state,
-                        "skip",
-                        {
-                            "action": definition.id,
-                            "note": f"工具「{name}」缺少必填参数 {missing}，这次只调了前面的工具",
-                        },
-                    )
+                if entry is None:
+                    failed.append(f"{name}：缺少参数")
                     continue
-            call = await self._call_tool(definition.id, params, state, tool_name=name)
-            if not call.ok and _looks_like_argument_error(call.error):
-                # 工具作者把参数写成"可选"、实现里却必须要：拿报错再补一次，只重试一次
-                retried, note = await self.fill_tool_params(
-                    state,
-                    definition,
-                    PlannedAction(
-                        type=definition.id,
-                        intent=str(action.get("intent") or action.get("content") or ""),
-                    ),
-                    tool_name=name,
-                    params=params,
-                    error_hint=str(call.error or ""),
+                call, sent = entry
+                used.append(call.tool or name)
+                if not last_params:
+                    last_params = sent
+                if call.ok and call.text:
+                    texts.append(str(call.text))
+                elif not call.ok:
+                    failed.append(f"{call.tool or name}：{call.error or '没有返回结果'}")
+                images.extend(getattr(call, "image_urls", None) or [])
+                await self._log_tool_outcome(
+                    state, definition, name, call, outcome=outcome
                 )
-                if retried:
-                    retry_params = {**params, **retried}
-                    await self._log_event(
-                        state,
-                        "tool_call",
-                        {
-                            "action": definition.id,
-                            "tool": name,
-                            "params": dict(retry_params),
-                            "note": "按报错补了一次参数" + (f"：{note}" if note else ""),
-                        },
-                    )
-                    again = await self._call_tool(
-                        definition.id, retry_params, state, tool_name=name
-                    )
-                    await self._log_event(
-                        state,
-                        "tool_result",
-                        {
-                            "action": definition.id,
-                            "tool": again.tool or name,
-                            "ok": bool(again.ok),
-                            "result": _clip_text(again.text, 400),
-                            "error": again.error,
-                        },
-                    )
-                    if again.ok or again.text:
-                        call = again
-                        params = retry_params
-            await self._log_event(
-                state,
-                "tool_call",
-                {
-                    "action": definition.id,
-                    "tool": name,
-                    "params": dict(params),
-                },
-            )
-            sent = dict(call.params or params)
-            if not last_params:
-                last_params = sent
-            if call.ok and call.text:
-                texts.append(str(call.text))
-            elif not call.ok:
-                failed.append(f"{call.tool or name}：{call.error or '没有返回结果'}")
-                # 工具没跑成 = 挫败感：这条线上一眼看不见，但确实影响她的心情
-                self.dynamics.apply_event(state, "tool_failed", now=self._now())
-            images.extend(getattr(call, "image_urls", None) or [])
-            state.add_event(
-                "tool_result",
-                {
-                    "action": definition.id,
-                    "tool": call.tool or name,
-                    "ok": bool(call.ok),
-                },
-            )
-            await self._log_event(
-                state,
-                "tool_result",
-                {
-                    "action": definition.id,
-                    "tool": call.tool or name,
-                    "ok": bool(call.ok),
-                    "result": _clip_text(call.text, 400),
-                    "error": call.error,
-                },
-            )
+                if mode == "fallback" and call.ok and (call.text or images):
+                    # 依次尝试：这一个跑通了就不再碰后面的
+                    break
 
         action["tool_names"] = list(names)
         action["tool_name"] = names[-1] if names else ""
+        action["tool_used"] = used
         # 只有图片也算拿到结果：不然"生成一张图"这类工具会被当成失败
         action["tool_ok"] = bool(texts or images)
         action["tool_error"] = "；".join(failed)
@@ -3919,6 +4268,726 @@ class VirtualWorldEngine:
             action["tool_result"] = "\n\n".join(texts)
         elif last_params:
             action.setdefault("params", last_params)
+    def _action_base_params(self, definition: ActionDef, action: Any) -> dict[str, Any]:
+        """动作上配的固定参数打底，这一轮模型给的参数覆盖在它上面。"""
+
+        fixed: dict[str, Any] = {}
+        for key, spec in (definition.params or {}).items():
+            value = getattr(spec, "value", "")
+            if isinstance(value, str) and value.strip():
+                fixed[str(key)] = value.strip()
+        return {**fixed, **dict(self._act_get(action, "params", {}) or {})}
+
+    def _explicit_queries(
+        self, definition: ActionDef, action: Any, *, limit: int = 0
+    ) -> list[str]:
+        """她自己写进动作里的查询词（没写就是空列表，交给调用方兜底）。"""
+
+        cap = int(limit or getattr(definition, "search_max_queries", 3) or 1)
+        cap = max(1, min(cap, 5))
+        result: list[str] = []
+        for item in self._act_get(action, "queries", []) or []:
+            text = " ".join(str(item).split())[:120]
+            if text and text not in result:
+                result.append(text)
+            if len(result) >= cap:
+                break
+        return result
+
+    def _search_intent(self, action: Any) -> str:
+        """她自己写明的"想查什么"。"""
+
+        return str(
+            self._act_get(action, "intent", "")
+            or self._act_get(action, "content", "")
+            or ""
+        ).strip()
+
+    def _search_topic(self, definition: ActionDef, action: Any) -> str:
+        """她已经写明的意图 / 动作里配好的主题 / 查询模板；都没有就返回空串。
+
+        注意别拿动作说明兜底：那写的是"这个动作怎么用"，不是"要查什么"。
+        真正的兜底（让大模型自己想一句、或者中性主题）在 ``_search_intent_for`` 里。
+        """
+
+        intent = self._search_intent(action)
+        if intent:
+            return intent
+        topic = str(getattr(definition, "search_topic", "") or "").strip()
+        template = str(getattr(definition, "search_query_template", "") or "").strip()
+        if template:
+            date_text = self.local_now().strftime("%Y-%m-%d")
+            text = " ".join(template.replace("{topic}", topic).replace("{date}", date_text).split())
+            if text:
+                return text[:120]
+        if topic:
+            return topic
+        return ""
+
+    async def _search_intent_for(
+        self, state: WorldState, definition: ActionDef, action: Any
+    ) -> str:
+        """这一轮"想查什么"：她写的 > 配置的主题/模板 > 让她自己想 > 中性兜底。"""
+
+        given = self._search_topic(definition, action)
+        if given:
+            return given
+        generated = await self._ask_search_topic(state)
+        return generated or DEFAULT_SEARCH_TOPIC
+
+    async def _ask_search_topic(self, state: WorldState) -> str:
+        """规则触发、她自己又没写意图时，问一句"你现在想查什么"。
+
+        问出来的话题贴着她此刻的处境和群里正在聊的事，比固定主题自然；
+        没模型 / 额度用完 / 回答不可用时返回空串，由调用方兜底。
+        """
+
+        if self.llm is None or not self._llm_text_allowed(state):
+            return ""
+        node = self.node(state.node_id)
+        chat_lines = [
+            f"{item.get('name') or item.get('user_id')}：{_clip_text(item.get('text'), 40)}"
+            for item in self.chat_window(state)[-6:]
+        ]
+        system_prompt, prompt = self.prompts.build_search_topic_prompt(
+            where=(node.name or node.id) if node else "",
+            state_hint=(
+                f"心情 {state.mood}，无聊 {state.boredom:.2f}，好奇心 {state.curiosity:.2f}"
+            ),
+            chat_lines=chat_lines,
+            persona_text=_clip_text(await self._persona_text(state.session_id), 400),
+        )
+        reply = await self._ask_llm(state.session_id, system_prompt, prompt)
+        self._count_llm_text(state)
+        return _clean_search_topic(reply)
+
+    def _query_param_name(self, tool: str) -> str:
+        """工具里"查询词"该填哪个参数：按名字猜，认不出来就取第一个参数。"""
+
+        schema = normalize_param_schema(self.tool_schemas().get(tool) or {})
+        properties = [str(name) for name in (schema.get("properties") or {})]
+        required = [str(name) for name in (schema.get("required") or [])]
+        exact = {
+            "q",
+            "query",
+            "queries",
+            "keyword",
+            "keywords",
+            "wd",
+            "text",
+            "prompt",
+            "words",
+            "search_query",
+            "search_keyword",
+        }
+        for pool in (required, properties):
+            for name in pool:
+                low = name.lower()
+                if low in exact or "query" in low or "keyword" in low:
+                    return name
+        return required[0] if required else (properties[0] if properties else "")
+
+    def _url_param_name(self, tool: str) -> str:
+        """阅读工具里"网址"该填哪个参数。"""
+
+        schema = normalize_param_schema(self.tool_schemas().get(tool) or {})
+        properties = [str(name) for name in (schema.get("properties") or {})]
+        required = [str(name) for name in (schema.get("required") or [])]
+        for pool in (required, properties):
+            for name in pool:
+                low = name.lower()
+                if low in ("url", "uri", "link", "href", "address", "webpage", "page"):
+                    return name
+                if "url" in low or "link" in low:
+                    return name
+        return required[0] if required else (properties[0] if properties else "")
+
+    def _reader_tools(self, definition: ActionDef, state: WorldState) -> list[str]:
+        """这个检索动作配了哪些可用的阅读网页工具。"""
+
+        result: list[str] = []
+        for name in definition.reader_tool_names or []:
+            chosen = self.resolve_tool(definition.id, state.node_id, name) or (
+                self.resolve_tool_prefix(name)
+            )
+            if chosen and chosen not in result:
+                result.append(chosen)
+        return result
+
+    @staticmethod
+    def _search_budget(definition: ActionDef) -> tuple[int, int]:
+        """``(最多读几篇正文, 最多补查几轮)``；``quick`` 档查一轮就收工。"""
+
+        depth = str(getattr(definition, "search_depth", "standard") or "standard")
+        reads = max(0, int(getattr(definition, "search_max_reads", 2) or 0))
+        rounds = max(0, int(getattr(definition, "search_rounds", 1) or 0))
+        if depth == "quick":
+            return 0, 0
+        if depth == "deep":
+            return max(reads, 3), max(rounds, 2)
+        return reads, rounds
+
+    @staticmethod
+    def _search_needs_more(items: list[Evidence]) -> bool:
+        """证据是不是太薄：条数太少、或者全是短摘要没有正文。"""
+
+        if len(items) < 2:
+            return True
+        return not any(
+            len((item.passage or item.snippet or "").strip()) >= 40 for item in items
+        )
+
+    async def _search_once(
+        self,
+        state: WorldState,
+        definition: ActionDef,
+        action: dict[str, Any],
+        tool: str,
+        query: str,
+        base: dict[str, Any],
+        query_key: str,
+        *,
+        outcome: TickOutcome | None = None,
+        texts: list[str],
+        items: list[Evidence],
+        failed: list[str],
+        images: list[str],
+        used: list[str],
+    ) -> None:
+        """按一条查询词调一次搜索工具，结果直接并进证据。"""
+
+        params = dict(base)
+        if query_key:
+            params[query_key] = query
+        entry = await self._call_one_tool(
+            state, definition, action, tool, params=params, outcome=outcome
+        )
+        if entry is None:
+            failed.append(f"{tool}：缺少参数")
+            return
+        call, _sent = entry
+        used.append(call.tool or tool)
+        if call.ok and call.text:
+            texts.append(str(call.text))
+            items.extend(parse_search_results(str(call.text), source=query))
+        elif not call.ok:
+            failed.append(f"{call.tool or tool}：{call.error or '没有返回结果'}")
+        images.extend(getattr(call, "image_urls", None) or [])
+        await self._log_tool_outcome(state, definition, tool, call, outcome=outcome)
+
+    async def _search_gap_queries(
+        self,
+        state: WorldState,
+        definition: ActionDef,
+        action: dict[str, Any],
+        items: list[Evidence],
+        *,
+        topic: str = "",
+    ) -> list[str]:
+        """证据不够时让辅助模型补几个查询角度（最多两条）。"""
+
+        if self.helper_llm is None or not self._tool_param_allowed(state):
+            return []
+        topic = topic or self._search_intent(action) or self._search_topic(definition, action)
+        system_prompt, prompt = self.prompts.build_search_gap_prompt(
+            topic=topic,
+            known=[item.title or item.snippet for item in items],
+            date_text=self.local_now().strftime("%Y-%m-%d"),
+            limit=2,
+        )
+        reply = await self._ask_helper(state.session_id, system_prompt, prompt)
+        self._count_tool_param(state)
+        payload = extract_json_object(reply) if reply else None
+        if not isinstance(payload, dict):
+            return []
+        raw = payload.get("queries")
+        if isinstance(raw, str):
+            raw = [line for line in raw.splitlines() if line.strip()]
+        if not isinstance(raw, list):
+            return []
+        result: list[str] = []
+        for entry in raw:
+            text = " ".join(str(entry).split())[:60]
+            if text and text not in result:
+                result.append(text)
+        return result[:2]
+
+    async def _read_passage(
+        self,
+        state: WorldState,
+        definition: ActionDef,
+        readers: list[str],
+        url: str,
+        *,
+        outcome: TickOutcome | None = None,
+    ) -> str:
+        """用阅读工具抓一篇正文（带缓存），失败返回空串。"""
+
+        key = str(url or "").split("?")[0].split("#")[0].rstrip("/").lower()
+        cached = self._read_cache.get(key) if key else None
+        if cached and (time.monotonic() - cached[0]) < READ_CACHE_SECONDS:
+            return cached[1]
+        for tool in readers:
+            param = self._url_param_name(tool)
+            if not param:
+                continue
+            params = {param: url}
+            await self._log_event(
+                state,
+                "tool_call",
+                {
+                    "action": definition.id,
+                    "tool": tool,
+                    "params": dict(params),
+                    "note": "读正文",
+                },
+                outcome=outcome,
+            )
+            call = await self._call_tool(definition.id, params, state, tool_name=tool)
+            await self._log_tool_outcome(
+                state, definition, tool, call, outcome=outcome
+            )
+            if call.ok and call.text:
+                text = _clip_text(call.text, READ_PASSAGE_CHARS)
+                if text:
+                    if key:
+                        self._read_cache[key] = (time.monotonic(), text)
+                        if len(self._read_cache) > 200:
+                            self._read_cache.clear()
+                    return text
+        return ""
+
+    async def _run_search_flow(
+        self,
+        state: WorldState,
+        definition: ActionDef,
+        action: dict[str, Any],
+        names: list[str],
+        *,
+        outcome: TickOutcome | None = None,
+    ) -> None:
+        """联网检索形态的动作：多条查询 → 证据 →（可选）读正文 →（可选）补查。"""
+
+        tool = names[0] if names else ""
+        deadline = time.monotonic() + SEARCH_BUDGET_SECONDS
+        base = self._action_base_params(definition, action)
+        queries = self._explicit_queries(definition, action)
+        texts: list[str] = []
+        failed: list[str] = []
+        images: list[str] = []
+        used: list[str] = []
+        items: list[Evidence] = []
+        asked: list[str] = []
+
+        action["tool_names"] = list(names)
+        action["tool_used"] = []
+        if not tool:
+            action["tool_name"] = ""
+            action["tool_ok"] = False
+            action["tool_error"] = "这个动作还没选好可用的搜索工具"
+            return
+
+        query_key = self._query_param_name(tool)
+        intent = ""
+        if query_key and not queries:
+            # 她自己没写查询词，但参数里已经带了：就用那一条
+            given = str(base.get(query_key) or "").strip()
+            if given:
+                queries = [given]
+        if not queries:
+            # 还是没写：先定"要查什么"（她写的 / 配好的 / 让她自己想），
+            # 再让辅助模型把这句意图翻成查询词
+            intent = await self._search_intent_for(state, definition, action)
+            filled, _note = await self.fill_tool_params(
+                state,
+                definition,
+                PlannedAction(type=definition.id, intent=intent),
+                tool_name=tool,
+                params=base,
+                extra_rules=SEARCH_QUERY_RULES,
+            )
+            if filled:
+                base = {**base, **filled}
+            generated = str(base.get(query_key) or "").strip() if query_key else ""
+            if not generated:
+                generated = intent
+                if query_key:
+                    base[query_key] = generated
+            queries = [generated] if generated else []
+        elif query_key:
+            missing = [
+                name for name in self.missing_params_for(tool, base) if name != query_key
+            ]
+            if missing:
+                filled, _note = await self.fill_tool_params(
+                    state,
+                    definition,
+                    PlannedAction(type=definition.id, intent=queries[0]),
+                    tool_name=tool,
+                    params=base,
+                )
+                if filled:
+                    base = {**base, **filled}
+
+        for query in queries:
+            await self._search_once(
+                state,
+                definition,
+                action,
+                tool,
+                query,
+                base,
+                query_key,
+                outcome=outcome,
+                texts=texts,
+                items=items,
+                failed=failed,
+                images=images,
+                used=used,
+            )
+            asked.append(query)
+            if time.monotonic() > deadline:
+                break
+
+        read_budget, rounds = self._search_budget(definition)
+        for _ in range(rounds):
+            if time.monotonic() > deadline or not self._search_needs_more(items):
+                break
+            gaps = await self._search_gap_queries(
+                state, definition, action, items, topic=intent
+            )
+            fresh = [entry for entry in gaps if entry not in asked]
+            if not fresh:
+                break
+            for query in fresh:
+                await self._search_once(
+                    state,
+                    definition,
+                    action,
+                    tool,
+                    query,
+                    base,
+                    query_key,
+                    outcome=outcome,
+                    texts=texts,
+                    items=items,
+                    failed=failed,
+                    images=images,
+                    used=used,
+                )
+                asked.append(query)
+                if time.monotonic() > deadline:
+                    break
+
+        if read_budget > 0:
+            readers = self._reader_tools(definition, state)
+            if readers:
+                readable = [item for item in items if item.url and not item.passage]
+                for item in readable[:read_budget]:
+                    if time.monotonic() > deadline:
+                        break
+                    item.passage = await self._read_passage(
+                        state, definition, readers, item.url, outcome=outcome
+                    )
+
+        items = merge_evidence(items, limit=8)
+        action["tool_name"] = tool
+        action["tool_used"] = used
+        action["tool_ok"] = bool(texts or images)
+        action["tool_error"] = "；".join(failed)
+        action["tool_queries"] = list(asked)
+        if images:
+            action["tool_images"] = images
+        if texts:
+            action["tool_result"] = "\n\n".join(texts)
+        elif base:
+            action.setdefault("params", dict(base))
+        if items:
+            await self._store_search_evidence(
+                state, definition, action, items, asked, outcome=outcome
+            )
+
+    async def _store_search_evidence(
+        self,
+        state: WorldState,
+        definition: ActionDef,
+        action: dict[str, Any],
+        items: list[Evidence],
+        queries: list[str],
+        *,
+        outcome: TickOutcome | None = None,
+    ) -> None:
+        """证据写进 ``action``：编号块给模型看，原文完整留在日志里。"""
+
+        action["tool_evidence"] = [
+            {
+                "title": item.title,
+                "url": item.url,
+                "snippet": item.snippet,
+                "published_at": item.published_at,
+                "passage": item.passage,
+            }
+            for item in items
+        ]
+        action["tool_evidence_text"] = render_evidence(items)
+        sources = sources_of(items)
+        action["tool_sources"] = sources
+        await self._log_event(
+            state,
+            "search_sources",
+            {
+                "action": definition.id,
+                "count": len(items),
+                "sources": sources,
+                "queries": list(queries or []),
+            },
+            outcome=outcome,
+        )
+
+    @staticmethod
+    def _search_evidence_text(
+        definition: ActionDef | None, action: dict[str, Any]
+    ) -> str:
+        """检索型动作交给模型的证据块；其它动作返回空串。"""
+
+        if definition is None:
+            return ""
+        if str(getattr(definition, "tool_flow", "simple")) != "search":
+            return ""
+        return str(action.get("tool_evidence_text") or "")
+
+    async def _call_one_tool(
+        self,
+        state: WorldState,
+        definition: ActionDef,
+        action: dict[str, Any],
+        name: str,
+        *,
+        params: dict[str, Any],
+        previous_results: str = "",
+        outcome: TickOutcome | None = None,
+    ) -> tuple[ToolCallResult, dict[str, Any]] | None:
+        """准备参数 → 调工具 → 参数报错时再补一次。
+
+        返回 ``(调用结果, 实际参数)``；连必填参数都补不出来时返回 ``None``（跳过这个工具）。
+        ``previous_results`` 用于一个动作挂多个工具的场景：把前一个工具的结果给补参模型，
+        它才能填出网址、编号这类只有前面才知道的参数。
+        """
+
+        intent = str(action.get("intent") or action.get("content") or "")
+        if previous_results:
+            merged, note = await self.fill_tool_params(
+                state,
+                definition,
+                PlannedAction(type=definition.id, intent=intent),
+                tool_name=name,
+                params=params,
+                previous_results=previous_results,
+            )
+            if merged:
+                params = {**params, **merged}
+            missing = self.missing_params_for(name, params)
+            if missing:
+                await self._log_event(
+                    state,
+                    "skip",
+                    {
+                        "action": definition.id,
+                        "note": f"工具「{name}」缺少必填参数 {missing}，这次只调了前面的工具"
+                        + (f"（{note}）" if note else ""),
+                    },
+                    outcome=outcome,
+                )
+                return None
+        call = await self._call_tool(definition.id, params, state, tool_name=name)
+        if not call.ok and _looks_like_argument_error(call.error):
+            # 工具作者把参数写成"可选"、实现里却必须要：拿报错再补一次，只重试一次
+            retried, note = await self.fill_tool_params(
+                state,
+                definition,
+                PlannedAction(type=definition.id, intent=intent),
+                tool_name=name,
+                params=params,
+                error_hint=str(call.error or ""),
+            )
+            if retried:
+                retry_params = {**params, **retried}
+                await self._log_event(
+                    state,
+                    "tool_call",
+                    {
+                        "action": definition.id,
+                        "tool": name,
+                        "params": dict(retry_params),
+                        "note": "按报错补了一次参数" + (f"：{note}" if note else ""),
+                    },
+                    outcome=outcome,
+                )
+                again = await self._call_tool(
+                    definition.id, retry_params, state, tool_name=name
+                )
+                await self._log_event(
+                    state,
+                    "tool_result",
+                    {
+                        "action": definition.id,
+                        "tool": again.tool or name,
+                        "ok": bool(again.ok),
+                        "result": _clip_text(again.text, 400),
+                        "error": again.error,
+                    },
+                    outcome=outcome,
+                )
+                if again.ok or again.text:
+                    call = again
+                    params = retry_params
+        await self._log_event(
+            state,
+            "tool_call",
+            {"action": definition.id, "tool": name, "params": dict(params)},
+            outcome=outcome,
+        )
+        return call, dict(call.params or params)
+
+    async def _log_tool_outcome(
+        self,
+        state: WorldState,
+        definition: ActionDef,
+        name: str,
+        call: ToolCallResult,
+        *,
+        outcome: TickOutcome | None = None,
+    ) -> None:
+        """工具返回（或失败）写进日志，失败还会记一笔挫败感。"""
+
+        if not call.ok:
+            # 工具没跑成 = 挫败感：这条线上一眼看不见，但确实影响她的心情
+            self.dynamics.apply_event(state, "tool_failed", now=self._now())
+        state.add_event(
+            "tool_result",
+            {"action": definition.id, "tool": call.tool or name, "ok": bool(call.ok)},
+        )
+        await self._log_event(
+            state,
+            "tool_result",
+            {
+                "action": definition.id,
+                "tool": call.tool or name,
+                "ok": bool(call.ok),
+                "result": _clip_text(call.text, 400),
+                "error": call.error,
+            },
+            outcome=outcome,
+        )
+
+    async def _run_tools_smart(
+        self,
+        state: WorldState,
+        definition: ActionDef,
+        action: dict[str, Any],
+        names: list[str],
+        *,
+        outcome: TickOutcome | None = None,
+        texts: list[str],
+        failed: list[str],
+        images: list[str],
+        used: list[str],
+    ) -> None:
+        """智能选择：让辅助模型按意图挑一个工具，失败先补参、再换下一个。
+
+        每次重问都会把"刚失败的那个"从候选里摘掉，这样它不会反复选中同一个坏工具。
+        """
+
+        remaining = list(names)
+        while remaining:
+            picked, params = await self._pick_tool_for_action(
+                state, definition, action, remaining
+            )
+            if picked not in remaining:
+                picked, params = remaining[0], {}
+            entry = await self._call_one_tool(
+                state,
+                definition,
+                action,
+                picked,
+                params=dict(params or {}),
+                outcome=outcome,
+            )
+            if entry is None:
+                failed.append(f"{picked}：缺少参数")
+                remaining = [item for item in remaining if item != picked]
+                continue
+            call, sent = entry
+            used.append(call.tool or picked)
+            if call.ok and call.text:
+                texts.append(str(call.text))
+            elif not call.ok:
+                failed.append(f"{call.tool or picked}：{call.error or '没有返回结果'}")
+            images.extend(getattr(call, "image_urls", None) or [])
+            await self._log_tool_outcome(
+                state, definition, picked, call, outcome=outcome
+            )
+            if call.ok and (call.text or images):
+                return
+            if len(remaining) <= 1:
+                return
+            # 工具本身不可用才换：参数问题的重试已经在 _call_one_tool 里做过了
+            remaining = [item for item in remaining if item != picked]
+
+    async def _pick_tool_for_action(
+        self,
+        state: WorldState,
+        definition: ActionDef,
+        action: dict[str, Any],
+        names: list[str],
+    ) -> tuple[str, dict[str, Any]]:
+        """智能选择：一次调用同时挑工具和补参数；挑不出来返回 ("", {})。"""
+
+        if self.helper_llm is None or not names:
+            return "", {}
+        if not self._tool_param_allowed(state):
+            return "", {}
+        intent = str(action.get("intent") or action.get("content") or "")
+        if not intent:
+            intent = self.fallback_intent(definition)
+        schemas = self.tool_schemas()
+        descriptions = self.available_tools()
+        tools = [
+            {
+                "name": name,
+                "description": descriptions.get(name, ""),
+                "param_text": render_param_text(schemas.get(name) or {}),
+            }
+            for name in names
+        ]
+        system_prompt, prompt = self.prompts.build_tool_choice_prompt(
+            tools=tools,
+            intent=intent,
+            recent_chat=self.chat_context(state),
+        )
+        reply = await self._ask_helper(state.session_id, system_prompt, prompt)
+        self._count_tool_param(state)
+        payload = extract_json_object(reply) if reply else None
+        if not isinstance(payload, dict):
+            return "", {}
+        picked = str(payload.get("tool") or "").strip()
+        if picked not in names:
+            return "", {}
+        params = payload.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        await self._log_event(
+            state,
+            "tool_call",
+            {
+                "action": definition.id,
+                "tool": picked,
+                "note": f"智能选择：从 {'、'.join(names)} 里挑了这个",
+            },
+        )
+        return picked, {
+            str(key): value for key, value in params.items() if not str(key).startswith("_")
+        }
 
     async def _start_action(
         self,
@@ -3942,6 +5011,7 @@ class VirtualWorldEngine:
                 state,
                 "skip",
                 {"action": definition.id, "note": f"「{definition.id}」在 {state.node_id} 不可用"},
+                outcome=outcome,
             )
             return
         ok, reason = self._check_preconditions(state, definition)
@@ -3954,6 +5024,7 @@ class VirtualWorldEngine:
                     "action": definition.id,
                     "note": f"「{definition.id}」前置条件不满足：{reason}",
                 },
+                outcome=outcome,
             )
             return
         if definition.llm_level == "tool":
@@ -3965,6 +5036,7 @@ class VirtualWorldEngine:
                 state,
                 "skip",
                 {"action": definition.id, "note": "超过每小时分享上限"},
+                outcome=outcome,
             )
             return
 
@@ -4018,6 +5090,7 @@ class VirtualWorldEngine:
                         "note": f"她正在做「{previous.get('desc') or previous.get('type')}」，"
                         f"这一步把它顶掉了",
                     },
+                    outcome=outcome,
                 )
             state.current_action = payload
             state.add_event("action_start", {"type": definition.id})
@@ -4030,6 +5103,7 @@ class VirtualWorldEngine:
                     "target_node": payload.get("target_node") or "",
                     "params": dict(action.params or {}),
                 },
+                outcome=outcome,
             )
             if (
                 definition.llm_level == "template"
@@ -4082,6 +5156,7 @@ class VirtualWorldEngine:
                 "intent": action.intent,
                 "target": action.target,
                 "content": action.content,
+                "queries": list(getattr(action, "queries", []) or []),
                 "elapsed_ticks": 0,
                 "duration_ticks": 0,
                 "from_plan": False,
@@ -4375,8 +5450,14 @@ class VirtualWorldEngine:
                 target=str(getattr(step, "target", "") or ""),
                 target_node=str(getattr(step, "target_node", "") or ""),
                 content=str(getattr(step, "content", "") or ""),
+                # 这一步"想干什么"必须带过去：工具型动作的参数就是照它补的，
+                # 丢了它就只能拿动作说明兜底（以前日程里写的意图等于白写）
+                intent=str(getattr(step, "intent", "") or ""),
                 params=dict(getattr(step, "params", {}) or {}),
                 duration=int(getattr(step, "duration", 0) or 0),
+                queries=[
+                    str(item) for item in (getattr(step, "queries", []) or []) if str(item)
+                ],
             )
             definition = self.world.action_map().get(action.type)
             if definition is None:
@@ -4485,6 +5566,7 @@ class VirtualWorldEngine:
             recent_chat=self.chat_window(state),
             reasoning=bool(self.world.reasoning_enabled),
             style_block=style_text,
+            weather=await self.weather_line(),
         )
         prompt = instruction + '\n只输出 JSON：{"actions":[{"type":"say","messages":["..."]}]}'
         reply = await self._ask_llm(state.session_id, system_prompt, prompt)
@@ -4544,19 +5626,26 @@ class VirtualWorldEngine:
             )
         except Exception as exc:
             self._log("warning", f"工具 {chosen} 调用失败: {exc}")
+            self.note_tool_result(chosen, ok=False, error=str(exc))
             return ToolCallResult(ok=False, error=str(exc), tool=chosen)
         if isinstance(result, ToolCallResult):
             if not result.tool:
                 result.tool = chosen
             if not result.params:
                 result.params = dict(params or {})
+            # 成功就清掉失败计数；"工具坏了"的失败才计入熔断
+            self.note_tool_result(
+                chosen, ok=bool(result.ok), error=str(result.error or "")
+            )
             return result
         # 兼容返回纯字符串的实现
         text = str(result or "").strip()
         if not text:
+            self.note_tool_result(chosen, ok=False, error="工具返回了空结果")
             return ToolCallResult(
                 ok=False, error="工具返回了空结果", tool=chosen, params=dict(params or {})
             )
+        self.note_tool_result(chosen, ok=True)
         return ToolCallResult(ok=True, text=text, tool=chosen, params=dict(params or {}))
 
     async def _ask_llm(
@@ -5588,6 +6677,7 @@ class VirtualWorldEngine:
                 "say_limit": int(state.last_say_limit or 0),
             },
             "interject": dict(state.interject_stats or {}),
+            "tool_breakers": self.tool_breaker_state(),
             "current_action": state.current_action,
             "current_plan": state.current_plan,
             "last_reasoning": state.last_reasoning,
@@ -5655,6 +6745,7 @@ class VirtualWorldEngine:
             memories=memories,
             engagement_hint=self.engagement.hint(state),
             recent_chat=self.chat_window(state),
+            weather=await self.weather_line(),
         )
 
     async def overview(self) -> list[dict[str, Any]]:
@@ -5701,6 +6792,7 @@ class VirtualWorldEngine:
             recent_chat=self.chat_window(state),
             reasoning=bool(self.world.reasoning_enabled),
             style_block=style_text,
+            weather=await self.weather_line(),
         )
 
     async def _event_marker(self, state: WorldState) -> int:
@@ -5783,7 +6875,12 @@ class VirtualWorldEngine:
         # query_events 是新到旧；一次 tick 里最多回显最新的这么多条，
         # 再按时间正序发出去（连锁动作多的时候不要把群刷了）
         compact = self.echo_compact()
+        # 有些事件在发生的当下就已经插好位置了（见 ``_log_event`` 的 ``outcome`` 参数），
+        # 这里再发一遍就会重复——跳过它们，剩下的才补在这一轮末尾。
+        already = set(getattr(outcome, "echoed_event_ids", ()) or ())
         for item in reversed(fresh[:12]):
+            if int(item.get("id") or 0) in already:
+                continue
             kind = str(item.get("event_type") or "")
             detail = item.get("detail")
             if not isinstance(detail, dict):
@@ -5822,6 +6919,7 @@ class VirtualWorldEngine:
 
         payload = detail or {}
         enabled = self.echo_types()
+        line_added = False
         if (
             outcome is not None
             and enabled
@@ -5841,6 +6939,7 @@ class VirtualWorldEngine:
                 line = ""
             if line:
                 outcome.add_debug(f"{ECHO_EVENT_TYPES.get(event_type, '•')} {line}")
+                line_added = True
 
         try:
             new_id = await self.db.call(
@@ -5853,6 +6952,9 @@ class VirtualWorldEngine:
             )
             if new_id:
                 self._event_ids[state.session_id] = int(new_id)
+                if outcome is not None and line_added:
+                    # 这一行已经在发生的当下插好了位置：收尾那次批量回显要跳过它
+                    outcome.echoed_event_ids.add(int(new_id))
         except Exception as exc:  # 日志写失败不能影响主流程
             self._log("debug", f"写事件日志失败：{exc}")
             return
@@ -5891,6 +6993,45 @@ def _looks_like_argument_error(error: Any) -> bool:
     if not text:
         return False
     return any(marker in text for marker in _ARGUMENT_ERROR_MARKERS)
+
+
+# 「工具自己坏了」的迹象：只有这些才计入熔断——参数写错是补参的问题，不算工具坏。
+_BROKEN_TOOL_MARKERS = (
+    "没有可调用的 handler",
+    "没有可调用",
+    "not callable",
+    "no such tool",
+    "tool not found",
+    "找不到工具",
+    "无法调用",
+    "timeout",
+    "timed out",
+    "超时",
+    "connection",
+    "connect",
+    "refused",
+    "gateway",
+    "502",
+    "503",
+    "500",
+    "rate limit",
+    "quota",
+    "unauthorized",
+    "401",
+    "403",
+)
+
+
+def _looks_like_tool_broken(error: Any) -> bool:
+    """这次失败像不像"工具本身不可用"（而不是参数/意图的问题）。"""
+
+    text = str(error or "").lower()
+    if not text:
+        # 没有报错信息、也没返回内容：当成工具没给出结果，不计入熔断
+        return False
+    if _looks_like_argument_error(text):
+        return False
+    return any(marker in text for marker in _BROKEN_TOOL_MARKERS)
 
 
 _SCHEMA_RESERVED_KEYS = {

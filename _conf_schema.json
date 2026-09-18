@@ -22,24 +22,16 @@
     "default": ""
   },
   "helper_provider_id": {
-    "description": "辅助模型（补工具参数）",
-    "hint": "把「她想干什么」翻译成工具参数用。选便宜、快、能稳定输出 JSON 的。留空跟随上面那个。",
+    "description": "打杂模型（文本）",
+    "hint": "专门干零碎活：把「她想干什么」翻译成工具参数、把过长的群聊压成摘要、判断图和话题的关系、把天气结果整理成一行。选便宜、快、能稳定输出 JSON 的文本模型。留空跟随上面的看图模型。",
     "_special": "select_provider",
     "obvious_hint": false,
     "type": "string",
     "default": ""
   },
   "vision_provider_id": {
-    "description": "图片转述模型（多模态）",
-    "hint": "群友发图时，先把图转成一句文字描述再进上下文，适合主模型看不了图的情况。必须选支持图片输入的。留空＝不转述，改为把图片直接交给主模型（主模型本身得是多模态的，一次最多几张见「全局设置 → 上下文 → 图片上限」）。",
-    "_special": "select_provider",
-    "obvious_hint": false,
-    "type": "string",
-    "default": ""
-  },
-  "context_provider_id": {
-    "description": "上下文压缩模型",
-    "hint": "群聊留档太长时压成摘要用，只在「全局设置 → 上下文 → 超出后怎么办」选「压成摘要」时才调用。留空跟随第一个。",
+    "description": "看图模型（多模态）",
+    "hint": "所有「把图变成文字」的活都归它：群友发来的图片转述、天气工具返回的天气图。必须选支持图片输入的，选便宜的就够。留空＝不转述，改为把图片直接交给主模型（主模型本身得是多模态的，一次最多几张见「全局设置 → 上下文 → 图片上限」）。",
     "_special": "select_provider",
     "obvious_hint": false,
     "type": "string",
@@ -47,7 +39,7 @@
   },
   "creator_provider_id": {
     "description": "内容生成模型（生成动作 / 地点）",
-    "hint": "只在编辑器里点「生成动作 / 生成地点」时调用，平时完全不占 token。留空跟随第一个。",
+    "hint": "只在编辑器里点「生成动作 / 生成地点」时调用，平时完全不占 token。它要写的是文案，不建议用打杂模型顶掉；留空跟随插件用模型。",
     "_special": "select_provider",
     "obvious_hint": false,
     "type": "string",

@@ -84,6 +84,16 @@ CREATE TABLE IF NOT EXISTS state_history (
 );
 CREATE INDEX IF NOT EXISTS idx_state_history ON state_history (session_id, at);
 
+CREATE TABLE IF NOT EXISTS image_cache (
+    fingerprint TEXT PRIMARY KEY,
+    caption TEXT NOT NULL DEFAULT '',
+    prefix TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    hits INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    last_used_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS schedule_fire (
     session_id TEXT NOT NULL,
     schedule_id TEXT NOT NULL,
@@ -570,6 +580,82 @@ class Database:
         return int(cursor.lastrowid or 0)
 
     # ---------------- 数值历史（给编辑器画曲线） ----------------
+
+    # ---------------- 图片转述缓存 ----------------
+    #
+    # 同一个表情包会在群里反复出现，看图（多模态）是这里最贵的一次调用。
+    # 按"图片指纹"而不是地址缓存：同一个文件换个临时链接也能命中。
+
+    def get_image_caption(
+        self, *, fingerprint: str, max_age_seconds: float = 0.0
+    ) -> dict[str, Any] | None:
+        rows = self._query(
+            "SELECT caption, prefix, model, hits, created_at, last_used_at"
+            " FROM image_cache WHERE fingerprint = ?",
+            (str(fingerprint or ""),),
+        )
+        if not rows:
+            return None
+        row = dict(rows[0])
+        if max_age_seconds > 0 and time.time() - float(row.get("created_at") or 0) > float(
+            max_age_seconds
+        ):
+            return None
+        return row
+
+    def put_image_caption(
+        self,
+        *,
+        fingerprint: str,
+        caption: str,
+        prefix: str = "",
+        model: str = "",
+    ) -> None:
+        now = time.time()
+        self._execute(
+            "INSERT INTO image_cache (fingerprint, caption, prefix, model, hits, created_at,"
+            " last_used_at) VALUES (?, ?, ?, ?, 0, ?, ?)"
+            " ON CONFLICT(fingerprint) DO UPDATE SET caption = excluded.caption,"
+            " prefix = excluded.prefix, model = excluded.model, created_at = excluded.created_at",
+            (
+                str(fingerprint or ""),
+                str(caption or ""),
+                str(prefix or ""),
+                str(model or ""),
+                now,
+                now,
+            ),
+        )
+
+    def touch_image_caption(self, *, fingerprint: str) -> None:
+        """命中一次：计数 +1，并刷新使用时间（用来做 LRU 与"省了多少次"）。"""
+
+        self._execute(
+            "UPDATE image_cache SET hits = hits + 1, last_used_at = ? WHERE fingerprint = ?",
+            (time.time(), str(fingerprint or "")),
+        )
+
+    def trim_image_cache(self, *, keep: int, max_age_seconds: float = 0.0) -> int:
+        limit = max(1, int(keep))
+        if max_age_seconds > 0:
+            self._execute(
+                "DELETE FROM image_cache WHERE created_at < ?",
+                (time.time() - float(max_age_seconds),),
+            )
+        cursor = self._execute(
+            "DELETE FROM image_cache WHERE fingerprint NOT IN ("
+            " SELECT fingerprint FROM image_cache ORDER BY last_used_at DESC LIMIT ?)",
+            (limit,),
+        )
+        return int(cursor.rowcount or 0)
+
+    def image_cache_stats(self) -> dict[str, Any]:
+        rows = self._query(
+            "SELECT COUNT(*) AS entries, COALESCE(SUM(hits), 0) AS hits FROM image_cache"
+        )
+        if not rows:
+            return {"entries": 0, "hits": 0}
+        return {"entries": int(rows[0]["entries"] or 0), "hits": int(rows[0]["hits"] or 0)}
 
     def add_state_history(
         self,

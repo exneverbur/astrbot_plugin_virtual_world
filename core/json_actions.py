@@ -104,6 +104,9 @@ class PlannedAction:
 
     params: dict[str, Any] = field(default_factory=dict)
     duration: int = 0
+    queries: list[str] = field(default_factory=list)
+    """检索型动作这一轮要查的几条查询词（可以只给一条；留空由引擎按意图兜）。"""
+
     raw: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -122,6 +125,8 @@ class PlannedAction:
             data["params"] = dict(self.params)
         if self.duration:
             data["duration"] = self.duration
+        if self.queries:
+            data["queries"] = list(self.queries)
         return data
 
 
@@ -338,6 +343,7 @@ def parse_action_payload(
             action.params = params
         # 工具型动作只给 intent、不给 params 是正常的：参数由辅助模型在调用前按工具 schema 补全。
         # 真正补不出来时，引擎会写一条带原因的 skip 事件——这里不需要再猜。
+        action.queries = _parse_queries(item.get("queries"))
 
         try:
             action.duration = max(0, int(item.get("duration", 0) or 0))
@@ -379,6 +385,42 @@ def _parse_valence_delta(value: Any) -> float:
     if number != number:  # NaN
         return 0.0
     return max(-1.0, min(1.0, number))
+
+
+MAX_QUERIES = 5
+
+
+def _parse_queries(payload: Any) -> list[str]:
+    """检索型动作给的查询词：接受列表或一行一条的字符串，去重并限量。
+
+    这里是纯清洗，真正的条数上限（按动作配置）由引擎那一步再截一次。
+    """
+
+    raw: list[Any] = []
+    if isinstance(payload, str):
+        raw = [line for line in payload.splitlines() if line.strip()]
+    elif isinstance(payload, (list, tuple)):
+        for entry in payload:
+            if isinstance(entry, str) and "\n" in entry:
+                raw.extend(line for line in entry.splitlines() if line.strip())
+            else:
+                raw.append(entry)
+    result: list[str] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, (str, int, float)) or isinstance(entry, bool):
+            continue
+        text = " ".join(str(entry).split())[:120]
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+        if len(result) >= MAX_QUERIES:
+            break
+    return result
 
 
 def _json_tail(text: str, limit: int = 60) -> str:
@@ -502,6 +544,7 @@ def parse_plan_payload(
                 ).strip()[:200],
                 "messages": step.get("messages") if isinstance(step.get("messages"), list) else [],
                 "params": step.get("params") if isinstance(step.get("params"), dict) else {},
+                "queries": _parse_queries(step.get("queries")),
                 "status": "pending",
             }
         )

@@ -28,6 +28,7 @@ const ui = {
   statusTimer: null,
   historyHours: 24,
   historyBusy: false,
+  defaults: { actions: {}, captions: {} },
 };
 
 /* ================================================================== */
@@ -251,6 +252,20 @@ const ECHO_TYPE_CHOICES = [
     hint: "她戳某个群友的结果；没戳成时会写明原因（协议端不支持 / 冷却中…）。",
     group: "tool",
   },
+  {
+    key: "search_sources",
+    icon: "🔗",
+    label: "检索来源",
+    hint: "这一轮联网查到了哪几条、来自哪些链接（默认不在群里发，只在日志里）。",
+    group: "tool",
+  },
+  {
+    key: "weather",
+    icon: "🌤️",
+    label: "天气",
+    hint: "她查到 / 后台静默查到的天气写成了什么（也会写进提示词当背景）。",
+    group: "misc",
+  },
 ];
 
 /** 调试输出的分组：类型多了以后按用途分块，找起来快。 */
@@ -294,6 +309,8 @@ const LOG_TYPES = {
   mood_reset: { icon: "🌤️", label: "心情缓过来" },
   storm: { icon: "🌩️", label: "情绪上头 / 平复" },
   poke: { icon: "👉", label: "戳一戳" },
+  search_sources: { icon: "🔗", label: "检索来源" },
+  weather: { icon: "🌤️", label: "天气" },
   chain: { icon: "🔗", label: "动作链" },
   cold_start: { icon: "🌅", label: "冷启动" },
   bot_spoke: { icon: "🗣️", label: "发言等待回应" },
@@ -387,22 +404,47 @@ const TRIGGERS = [
   },
 ];
 
-/** 图片转述提示词的内置默认值（与后端 core/defaults.py 里那段保持一致）。 */
+/** 图片转述提示词的占位文字：真正的默认值从后端 `/defaults` 取（core/defaults.py 一份）。 */
 const DEFAULT_CAPTION_PROMPT =
-  "你要帮一个群聊机器人看懂图片。只看图片本身是不够的——还要说清这张图和当前话题的关系，" +
-  "这样机器人才知道该怎么接话。\n" +
-  "先判断它是不是表情包 / 梗图：是的话要说清是什么梗、在表达什么情绪" +
-  "（例如「熊猫头，摆烂、无语」），因为接一张梗图和接一张照片的方式完全不同。\n" +
-  "输出一行中文，格式固定为：画面描述｜类型｜与话题的关系：…\n" +
-  "画面描述：画面里有什么、在做什么、有没有值得注意的文字或表情，40 字以内。\n" +
-  "类型：表情包 / 梗图（写明是什么梗、什么情绪）、照片、截图，或者其它。\n" +
-  "与话题的关系：这张图在回应什么、和正在聊的事有什么关联；确实看不出关系就写「看不出直接关系」。\n" +
-  "不要客套、不要分点、不要写「这张图片」、不要编造看不到的内容。";
+  "你是群聊图片转述器……（留空即用内置默认，点标题右侧的 ↺ 可以看默认内容）";
+
+const DEFAULT_CAPTION_RELATION_PROMPT =
+  "你会拿到图片的文字转述和当前对话……（留空即用内置默认）";
 
 const TARGET_TYPES = [
   { key: "none", label: "自己 / 空间", hint: "动作只作用于她自己或环境，默认不发到群里" },
   { key: "user", label: "某个群友", hint: "动作的目标是人（例如抱抱、挥手）" },
   { key: "group", label: "整个群", hint: "动作面向所有人（例如说话、分享）" },
+];
+
+/** 一个动作挂了多个工具时的用法。 */
+const TOOL_MODES = [
+  { key: "sequence", label: "按顺序都调", hint: "装了的都调一遍，按顺序，结果合并（例如先搜索、再抓正文）" },
+  { key: "fallback", label: "依次尝试", hint: "只用一个：按顺序挑第一个能用的，失败了换下一个" },
+  { key: "smart", label: "智能选择", hint: "让辅助模型按她的意图挑一个（选择与补参数一次完成），失败就换下一个" },
+];
+
+/** 工具型动作的编排形态。 */
+const TOOL_FLOWS = [
+  {
+    key: "simple",
+    label: "直接调用",
+    hint: "调完把结果交回给她说一句；多个工具按上面的「工具用法」执行。",
+  },
+  {
+    key: "search",
+    label: "联网检索",
+    hint:
+      "查东西专用：她可以一次给几条查询词 → 结果整理成带编号的证据 →（可选）用阅读工具抓正文 →" +
+      "证据不够时再补查一轮 → 她照着证据讲，不许编。适合「上网搜索」这类动作。",
+  },
+];
+
+/** 检索深度。 */
+const SEARCH_DEPTHS = [
+  { key: "quick", label: "快查", hint: "只查一轮，不读正文、不补查。问一句立刻要答案时用。" },
+  { key: "standard", label: "标准", hint: "查一轮 + 读前两篇正文 + 不够时补查一轮（默认）。" },
+  { key: "deep", label: "深挖", hint: "至少读三篇、最多补查两轮，适合让她把一件事讲透。" },
 ];
 
 const SCOPE_MODES = [
@@ -548,11 +590,22 @@ function tipBox(text) {
   return span;
 }
 
-function fieldHead(label, hint) {
+function fieldHead(label, hint, onRestore) {
   const head = el("div", "field-head");
   head.appendChild(el("span", "", label));
   const tip = tipBox(hint);
   if (tip) head.appendChild(tip);
+  if (onRestore) {
+    // 「恢复默认」：默认文案来自后端（core/defaults.py），前端不复制一份
+    const button = el("button", "icon-btn restore-btn", "↺");
+    button.type = "button";
+    button.title = "恢复成内置默认";
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      onRestore();
+    });
+    head.appendChild(button);
+  }
   return head;
 }
 
@@ -664,7 +717,16 @@ function comboField(label, value, options, onChange, opts = {}) {
 
 function inputField(label, value, onChange, opts = {}) {
   const wrapper = el("label");
-  wrapper.appendChild(fieldHead(label, opts.hint));
+  wrapper.appendChild(
+    fieldHead(label, opts.hint, opts.onRestore
+      ? () => {
+          const text = String(opts.onRestore() ?? "");
+          input.value = text;
+          onChange(text);
+          markDirty();
+        }
+      : null),
+  );
   const input = document.createElement("input");
   input.type = opts.type || "text";
   if (opts.min !== undefined) input.min = opts.min;
@@ -688,7 +750,16 @@ function inputField(label, value, onChange, opts = {}) {
 
 function textareaField(label, value, onChange, opts = {}) {
   const wrapper = el("label");
-  wrapper.appendChild(fieldHead(label, opts.hint));
+  wrapper.appendChild(
+    fieldHead(label, opts.hint, opts.onRestore
+      ? () => {
+          const text = String(opts.onRestore() ?? "");
+          input.value = text;
+          onChange(text);
+          markDirty();
+        }
+      : null),
+  );
   const input = document.createElement("textarea");
   input.value = value ?? "";
   if (opts.placeholder) input.placeholder = opts.placeholder;
@@ -2001,9 +2072,14 @@ async function startApp() {
 async function loadAll() {
   setSaveState("加载中…");
   try {
-    const [config, tools] = await Promise.all([apiGet("config"), apiGet("tools")]);
+    const [config, tools, defaults] = await Promise.all([
+      apiGet("config"),
+      apiGet("tools"),
+      apiGet("defaults"),
+    ]);
     ui.config = config;
     ui.tools = tools.tools || [];
+    ui.defaults = defaults || { actions: {}, captions: {} };
     ui.sessions = (config.sessions && config.sessions.sessions) || [];
     if (config.warnings && config.warnings.length) {
       toast(`配置提醒：${config.warnings.join("；")}`);
@@ -2079,6 +2155,8 @@ function bindButtons() {
   $("status-nickname-reset").addEventListener("click", () => nicknameAction("reset_nickname"));
 
   $("map-back").addEventListener("click", backToWorldMap);
+  const weatherRefresh = $("map-weather-refresh");
+  if (weatherRefresh) weatherRefresh.addEventListener("click", refreshWeatherNow);
   $("zone-add").addEventListener("click", addZone);
   $("zone-delete").addEventListener("click", deleteZone);
   $("zone-edge-add").addEventListener("click", addPortal);
@@ -2779,6 +2857,37 @@ function renderStatusSections(data, stateLabel) {
       `想插话时被拦住：${interjectParts.join(" · ")}`,
     );
   }
+  // 工具被熔断时摆出来，并给一个"立即重试"，不用等退避结束
+  const breakers = data.tool_breakers || [];
+  if (breakers.length) {
+    const box = el("div", "status-line");
+    box.appendChild(el("span", "status-key", "暂不可用"));
+    const body = el("span", "status-val");
+    breakers.forEach((item, index) => {
+      if (index) body.appendChild(el("span", "", "　"));
+      const text = `${item.tool}（剩 ${item.seconds_left} 秒）`;
+      body.appendChild(el("span", "", text));
+      const retry = el("button", "ghost small", "重试");
+      retry.type = "button";
+      retry.title = item.reason || "立即解除这个工具的熔断";
+      retry.addEventListener("click", async () => {
+        try {
+          await apiPost("state/action", {
+            session: data.session_id,
+            action: "reset_tools",
+            tool: item.tool,
+          });
+          toast(`${item.tool} 已解除，可以再试`);
+          refreshStatus();
+        } catch (error) {
+          toast(error.message || "解除失败");
+        }
+      });
+      body.appendChild(retry);
+    });
+    box.appendChild(body);
+    runtimeBox.appendChild(box);
+  }
   const budget = data.budget || {};
   const budgetParts = [
     ["计划", "plan"],
@@ -3239,7 +3348,88 @@ function describeAction(action) {
 
 function renderMap() {
   updateMapToolbar();
+  renderWeatherBanner();
   return ui.mapLevel === "world" ? renderWorldMap() : renderZoneMap();
+}
+
+/** 天气图标：按描述里的关键词猜一个，猜不到就用通用的。 */
+function weatherIcon(desc) {
+  const text = String(desc || "");
+  if (/雷/.test(text)) return "⛈";
+  if (/雪|冰/.test(text)) return "❄️";
+  if (/雨/.test(text)) return "🌧";
+  if (/雾|霾/.test(text)) return "🌫";
+  if (/阴/.test(text)) return "☁️";
+  if (/云/.test(text)) return "⛅";
+  if (/晴/.test(text)) return "☀️";
+  return "🌤";
+}
+
+/** "多久之前"由前端算：她那边是按自然日算的（今天说小时、昨天前天直说）。 */
+function weatherAge(at) {
+  const stamp = Number(at);
+  if (!Number.isFinite(stamp) || stamp <= 0) return "";
+  const now = new Date();
+  const then = new Date(stamp * 1000);
+  const hours = (now.getTime() - then.getTime()) / 3600000;
+  if (hours < 1) return "刚刚查的";
+  const startOfDay = (date) => new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const days = Math.round((startOfDay(now) - startOfDay(then)) / 86400000);
+  if (days <= 0) return `${Math.floor(hours)} 小时前查的`;
+  if (days === 1) return "昨天查的";
+  if (days === 2) return "前天查的";
+  return `${days} 天前查的`;
+}
+
+/** 地图页顶部的天气条：数据来自 /config 的 weather 字段。 */
+function renderWeatherBanner() {
+  const box = $("map-weather");
+  if (!box) return;
+  const weather = (ui.config && ui.config.weather) || {};
+  const text = String(weather.text || "").trim();
+  const main = $("map-weather-main");
+  const age = $("map-weather-age");
+  if (!text) {
+    box.classList.remove("hidden");
+    $("map-weather-icon").textContent = "🌤";
+    main.textContent = "还没有天气记录";
+    main.className = "weather-main muted";
+    age.textContent = "";
+    return;
+  }
+  box.classList.remove("hidden");
+  box.setAttribute("title", text);
+  $("map-weather-icon").textContent = weatherIcon(weather.desc);
+  main.className = "weather-main";
+  const head = [weather.city, weather.desc, weather.temp].filter(Boolean).join(" ");
+  main.textContent = head || text;
+  const rest = head && text !== head ? text : "";
+  age.innerHTML = "";
+  if (rest) {
+    age.appendChild(el("span", "weather-line", rest));
+    age.appendChild(el("span", "", " · "));
+  }
+  age.appendChild(el("span", "", weatherAge(weather.at)));
+  if (!head) main.textContent = text;
+}
+
+async function refreshWeatherNow() {
+  const button = $("map-weather-refresh");
+  if (!button) return;
+  button.disabled = true;
+  button.textContent = "查询中…";
+  try {
+    const data = await apiPost("state/action", { action: "refresh_weather" });
+    if (data && data.weather) {
+      ui.config.weather = data.weather;
+    }
+    renderWeatherBanner();
+  } catch (error) {
+    window.alert(`查天气失败：${error.message || error}`);
+  } finally {
+    button.disabled = false;
+    button.textContent = "刷新";
+  }
 }
 
 /** 世界地图：只画区域节点和区域之间的连线。 */
@@ -5047,6 +5237,10 @@ function renderActionForm() {
   form.appendChild(
     textareaField("说明", action.description || "", (value) => (action.description = value), {
       hint: "一句话说明这个动作是干什么的。这段文字会直接给大模型看，写得越清楚她越不容易用错。",
+      // 内置动作有出厂说明：改乱了可以一键还原（只还原这一栏，不动其它配置）
+      onRestore: action.builtin
+        ? () => ((ui.defaults.actions || {})[action.id] || {}).description || ""
+        : null,
     }),
   );
   const knownGroups = Array.from(
@@ -5214,6 +5408,22 @@ function renderActionForm() {
       ),
     );
     toolBox.appendChild(toolTitle);
+    toolBox.appendChild(
+      pillsField(
+        "调用形态",
+        action.tool_flow || "simple",
+        TOOL_FLOWS,
+        (value) => {
+          action.tool_flow = value;
+          renderActionForm();
+        },
+        {
+          hint:
+            "直接调用 = 把工具结果交回给她说一句。\n" +
+            "联网检索 = 查东西专用的流水线：多条查询词 → 结果整理成证据 → 可选读正文 → 不够就补查。",
+        },
+      ),
+    );
     const currentTools = Array.isArray(action.tool_names) && action.tool_names.length
       ? action.tool_names.slice()
       : action.tool_name
@@ -5232,11 +5442,31 @@ function renderActionForm() {
         {
           hint:
             "工具型动作至少要选一个工具，而且是 AstrBot 里真实注册的那个。\n" +
+            "**没选工具 = 这个动作会被跳过**（例如「上网搜索」「查天气」现在都不带默认工具，要先在这里挑一个能用的）。\n" +
             "选了多个就按顺序依次调用（比如先搜索、再把搜到的页面抓下来），结果一起交回给她。\n" +
             "运行时她只要说明「想干什么」，具体参数由辅助模型按每个工具自己的定义补全，" +
             "所以不用在这里配置默认参数。",
           empty: "点击选择工具…",
           renderChips: true,
+        },
+      ),
+    );
+    toolBox.appendChild(
+      pillsField(
+        "工具用法",
+        action.tool_mode || "sequence",
+        TOOL_MODES,
+        (value) => {
+          action.tool_mode = value;
+          renderActionForm();
+        },
+        {
+          hint:
+            "选了多个工具时怎么用：\n" +
+            "按顺序都调 = 每个都调一遍，结果合并（例如先搜索、再抓正文）。\n" +
+            "依次尝试 = 只用一个，按顺序挑第一个能用的；失败了换下一个。\n" +
+            "智能选择 = 让辅助模型按她的意图挑一个（挑工具和补参数一次完成），" +
+            "失败先补参数重试，仍失败就换下一个。",
         },
       ),
     );
@@ -5277,6 +5507,131 @@ function renderActionForm() {
           `⚠ AstrBot 里现在没有这些工具：${missingTools.join("、")}。这一步会被跳过，请重新选。`,
         ),
       );
+    }
+
+    if ((action.tool_flow || "simple") === "search") {
+      const searchBox = el("div", "subsection");
+      const searchTitle = el("div", "sub-title");
+      searchTitle.appendChild(el("span", "", "联网检索设置"));
+      searchTitle.appendChild(
+        tipBox(
+          "她把要查的写进 intent，也可以一次给几条 queries 分角度查。\n" +
+            "插件把搜索工具返回的内容整理成带编号的证据交给她，证据里没有的她会直说没查到。",
+        ),
+      );
+      searchBox.appendChild(searchTitle);
+      searchBox.appendChild(
+        pickerField(
+          "阅读网页工具（可选）",
+          action.reader_tool_names || [],
+          toolItems(),
+          (chosen) => {
+            action.reader_tool_names = chosen;
+          },
+          {
+            hint:
+              "能传网址、返回正文的工具（例如把网页转成 markdown 的那种）。\n" +
+              "配了它，插件会挑搜索结果里最靠前的几篇抓正文再交给她；留空就只用搜索摘要。\n" +
+              "同一篇网页 6 小时内不会重复抓。",
+            empty: "点击选择工具…",
+            renderChips: true,
+          },
+        ),
+      );
+      searchBox.appendChild(
+        pillsField(
+          "检索深度",
+          action.search_depth || "standard",
+          SEARCH_DEPTHS,
+          (value) => {
+            action.search_depth = value;
+            renderActionForm();
+          },
+          {
+            hint:
+              "决定这一趟查多远。快查只查一轮不读正文；标准会读前两篇、不够再补查一轮；深挖至少读三篇、最多补查两轮。",
+          },
+        ),
+      );
+      searchBox.appendChild(
+        inputField(
+          "最多查询条数",
+          action.search_max_queries ?? 3,
+          (value) => (action.search_max_queries = Math.min(5, Math.max(1, num(value, 3)))),
+          {
+            hint:
+              "她自己一次最多能给几条查询词；没写查询词时，插件会让辅助模型按她的意图翻出一条。",
+            type: "number",
+            min: 1,
+            max: 5,
+          },
+        ),
+      );
+      searchBox.appendChild(
+        inputField(
+          "最多读几篇正文",
+          action.search_max_reads ?? 2,
+          (value) => (action.search_max_reads = Math.max(0, num(value, 2))),
+          { hint: "配了阅读工具才生效；读得越多越慢，也越费工具额度。", type: "number", min: 0, max: 5 },
+        ),
+      );
+      searchBox.appendChild(
+        inputField(
+          "最多补查几轮",
+          action.search_rounds ?? 1,
+          (value) => (action.search_rounds = Math.max(0, num(value, 1))),
+          {
+            hint: "查到的东西太少时，让辅助模型换个角度再查一轮；0 = 不补查。",
+            type: "number",
+            min: 0,
+            max: 3,
+          },
+        ),
+      );
+      searchBox.appendChild(
+        inputField(
+          "搜索主题",
+          action.search_topic || "",
+          (value) => (action.search_topic = value.trim()),
+          {
+            hint:
+              "这个动作「固定查什么」。日程里调用它、又没写意图时就用它当查询词" +
+              "（例如动作叫「搜索新闻」，主题写「今日新闻热点」）。\n" +
+              "优先级：她自己写的意图 > 这里 > 查询模板 > 让她按当时的处境和群里的话题自己说一句 > " +
+              "中性兜底（「今天有什么新鲜事」）。\n" +
+              "留空也能跑：规则触发（好奇心、日程）时她会自己想一句；配了主题则更稳定、也省一次调用。",
+            placeholder: "例如 今日新闻热点",
+          },
+        ),
+      );
+      searchBox.appendChild(
+        inputField(
+          "查询模板（可选）",
+          action.search_query_template || "",
+          (value) => (action.search_query_template = value.trim()),
+          {
+            hint:
+              "把主题套成固定格式，可用占位符 {topic} 和 {date}。\n" +
+              "例如 {date} 新闻热点 → 2026-09-17 新闻热点。",
+            placeholder: "例如 {date} 新闻热点",
+          },
+        ),
+      );
+      searchBox.appendChild(
+        pillsField(
+          "讲结果时带来源",
+          action.search_cite ? "yes" : "no",
+          [
+            { key: "no", label: "不带", hint: "来源只写进日志与调试输出，群里不出现网址（默认）" },
+            { key: "yes", label: "带一条", hint: "允许她在末尾用括号补一条参考链接" },
+          ],
+          (value) => {
+            action.search_cite = value === "yes";
+          },
+          { hint: "群里通常不想看到一串网址；要核对来源时再打开。" },
+        ),
+      );
+      toolBox.appendChild(searchBox);
     }
     form.appendChild(toolBox);
   }
@@ -7370,26 +7725,163 @@ function renderSettings() {
   /* --- 图片转述 --- */
   const visionSection = settingsSection(
     "图片转述",
-    "配了「图片转述模型」（插件配置里那个）之后，群里发的图会先用这段提示词转成一句文字，再进上下文。",
-    "转述模型看不到群聊，只知道你在这里写的要求——所以要在这里交代清楚「描述里必须包含什么」。" +
-      "默认那段会额外认出「这是不是表情包 / 什么梗」，因为接梗图和接照片的方式不一样。",
+    "配了「图片转述模型」（插件配置里那个）之后，群里发的图会先转成文字再进上下文。",
+    "分两步：先「看图」写成画面描述，再用纯文本补一句「和话题的关系」。" +
+      "看图这步与话题无关，所以能按图片缓存、同一张表情包只识别一次。",
   );
   const visionFull = el("div", "full");
   visionFull.appendChild(
     textareaField(
-      "转述提示词",
+      "看图提示词",
       world.vision.prompt || "",
       (value) => (world.vision.prompt = value),
       {
         hint:
-          "留空就用内置默认（推荐）。默认要求输出「画面描述｜类型｜与话题的关系」，并写明是不是表情包、什么梗、什么情绪。",
+          "留空就用内置默认（推荐）。默认要求输出「画面描述｜类型｜文字」，" +
+          "并写明是不是表情包、什么梗、什么情绪；图里的文字会照抄关键句。\n" +
+          "**不要在这里要求它写与话题的关系**——那部分由下面的提示词单独生成，写在这里就不能跨话题缓存了。",
         rows: 8,
         placeholder: DEFAULT_CAPTION_PROMPT,
+        onRestore: () => (ui.defaults.captions || {}).look || DEFAULT_CAPTION_PROMPT,
+      },
+    ),
+  );
+  visionFull.appendChild(
+    textareaField(
+      "关系提示词",
+      world.vision.relation_prompt || "",
+      (value) => (world.vision.relation_prompt = value),
+      {
+        hint:
+          "第二步用：拿上一步的转述 + 当前消息 + 最近群聊，写一句「与话题的关系」。\n" +
+          "这一步**不带图**，所以很便宜（可以配一个便宜的文本模型来跑，见插件配置）。留空用内置默认。",
+        rows: 4,
+        placeholder: DEFAULT_CAPTION_RELATION_PROMPT,
+        onRestore: () =>
+          (ui.defaults.captions || {}).relation || DEFAULT_CAPTION_RELATION_PROMPT,
       },
     ),
   );
   visionSection._fields.appendChild(visionFull);
+  visionSection._fields.appendChild(
+    checkboxField(
+      "补一句「与话题的关系」",
+      world.vision.relation_enabled !== false,
+      (value) => (world.vision.relation_enabled = value),
+      {
+        hint:
+          "开启后多一次纯文本调用，她会知道这张图和正在聊的事有什么关系。\n" +
+          "关掉就只把画面/类型/文字交给主模型，由它自己判断关系（省一次调用）。",
+      },
+    ),
+  );
+  visionSection._fields.appendChild(
+    checkboxField(
+      "同一张图只识别一次（推荐）",
+      world.vision.cache_enabled !== false,
+      (value) => (world.vision.cache_enabled = value),
+      {
+        hint:
+          "按图片内容缓存转述结果：表情包、梗图会反复出现，第二次起不再调用多模态模型。\n" +
+          "缓存是持久的，重启插件后仍然有效；换话题重发同一张图时会复用它" +
+          "「画面 / 类型 / 文字」，只重算「与话题的关系」。\n" +
+          "多张图会合并成一次调用；模型没按格式输出时自动退回逐张。",
+      },
+    ),
+  );
+  visionSection._fields.appendChild(
+    inputField(
+      "最多记住多少张图",
+      num(world.vision.cache_max, 500),
+      (value) => (world.vision.cache_max = num(value, 500)),
+      { hint: "超出后按最近使用时间淘汰。", type: "number", min: 20 },
+    ),
+  );
+  visionSection._fields.appendChild(
+    inputField(
+      "缓存保留多少天",
+      num(world.vision.cache_days, 30),
+      (value) => (world.vision.cache_days = num(value, 30)),
+      { hint: "过期后重新识别一次。填 0 表示不过期。", type: "number", min: 0 },
+    ),
+  );
+  const cacheStats = (ui.config && ui.config.vision_cache) || {};
+  visionSection._fields.appendChild(
+    el(
+      "p",
+      "muted full",
+      `已记住 ${num(cacheStats.entries, 0)} 张图，累计省下 ${num(
+        cacheStats.hits,
+        0,
+      )} 次识别（本次运行 ${num(cacheStats.session_hits, 0)} 次）。`,
+    ),
+  );
   form.appendChild(visionSection);
+
+  /* --- 天气 --- */
+  world.weather = world.weather || {};
+  const weather = settingsSection(
+    "天气",
+    "她所在城市的天气：后台每隔几小时静默查一次，查到的结果会当背景写进提示词。",
+    "填了城市就按它查，不用模型猜；超过「多旧就不再提」的时间后，提示词里不再带这份天气。" +
+      "当前天气也会显示在地图页顶部。",
+  );
+  weather._fields.appendChild(
+    checkboxField(
+      "启用天气",
+      world.weather.enabled !== false,
+      (value) => (world.weather.enabled = value),
+      { hint: "关掉之后不再后台查天气、也不写进提示词（她主动查天气照常可用）。" },
+    ),
+  );
+  weather._fields.appendChild(
+    inputField(
+      "所属城市",
+      world.weather.city || "",
+      (value) => (world.weather.city = value.trim()),
+      {
+        hint: "例如「武汉」。留空就让辅助模型按聊天内容推断，容易猜偏，建议填上。",
+        placeholder: "例如 武汉",
+      },
+    ),
+  );
+  weather._fields.appendChild(
+    inputField(
+      "每隔几小时查一次",
+      num(world.weather.refresh_hours, 2),
+      (value) => (world.weather.refresh_hours = Math.max(0, num(value, 2))),
+      {
+        hint: "默认 2 小时。她主动查过天气后，这个倒计时从头算。填 0 = 不在后台查。",
+        type: "number",
+        min: 0,
+      },
+    ),
+  );
+  weather._fields.appendChild(
+    inputField(
+      "多旧就不再提",
+      num(world.weather.stale_hours, 24),
+      (value) => (world.weather.stale_hours = Math.max(0, num(value, 24))),
+      {
+        hint: "默认 24 小时（超过一天就当过时了，不再写进提示词）。地图页横幅仍会显示，只是标着「很久以前」。",
+        type: "number",
+        min: 0,
+      },
+    ),
+  );
+  weather._fields.appendChild(
+    checkboxField(
+      "把结果整理成一行",
+      world.weather.normalize !== false,
+      (value) => (world.weather.normalize = value),
+      {
+        hint:
+          "查询结果先交给小模型压成「城市｜温度｜天气｜湿度｜风力｜预报」，横幅和提示词都用这一行；" +
+          "工具返回图片时会先调图片转述模型把图读成文字。关掉就直接存原文。",
+      },
+    ),
+  );
+  form.appendChild(weather);
 
   /* --- 群名片 --- */
   const nickname = settingsSection(

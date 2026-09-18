@@ -388,12 +388,17 @@ class PromptBuilder:
             "你不熟悉的人或事，先用上面能查的动作查一遍再回答；不要凭印象编，也不要含糊带过。\n"
             "查的时候把「查什么」写清楚（谁、什么时候、哪方面）；查到了用你自己的话讲重点，"
             "别照抄原文、别念网址；查不到或结果不相关，就照实说没查到，别拿旧印象凑。\n"
+            "一个话题要分几个角度查时，可以在动作里一次写 2~3 条 queries"
+            "（例如「今天的热点新闻」和「某某事件 最新进展」），系统会逐条查完再汇总；"
+            "只查一件事就写 intent，不用勉强凑多条。\n"
             "已经查过、结果里已经有的，不要重复再查。\n\n"
         )
 
     def _action_line(self, action: Any) -> str:
         text = f"- {action.id}：{action.description or action.name}"
-        if action.llm_level == "tool":
+        if str(getattr(action, "tool_flow", "simple")) == "search":
+            text += "（联网检索型：把要查的写进 intent，也可以给 1~3 条 queries 分角度查）"
+        elif action.llm_level == "tool":
             text += "（工具型：只填 intent，说明你想做什么；参数会自动补全）"
         if action.llm_level == "command":
             text += "（指令型：只填 intent 说清想让它干什么，参数由系统按指令说明补全）"
@@ -432,6 +437,7 @@ class PromptBuilder:
         focus_user: str = "",
         recent_chat: list[dict[str, Any]] | None = None,
         style_block: str = "",
+        weather: str = "",
     ) -> str:
         now = self._now()
         # 记忆按时间从早到晚排，越靠下越新——模型读提示词时最后的更"近"。
@@ -484,6 +490,9 @@ class PromptBuilder:
             # 这几行在相邻两次调用之间通常是稳定的，放在最前面才能让前缀缓存尽量长；
             # 时钟每分钟都变，它后面的内容（记忆、群聊…）本来就每轮都变，放这里不浪费。
             blocks.append(self._clock_line(now))
+        if weather:
+            # 天气跟着时钟走（都是"此刻外面什么样"），同样属于每轮都可能变的内容
+            blocks.append(weather)
         if node is not None:
             # 可达表只跟"她在哪"有关，比状态稳、比记忆易变得多，放时钟后面
             blocks.append(self.reach_table(node.id))
@@ -834,7 +843,8 @@ class PromptBuilder:
             '    { "type": "say", "messages": ["消息1", "消息2"] },\n'
             '    { "type": "walk_to", "target_node": "window" },\n'
             '    { "type": "think", "content": "内心活动" },\n'
-            '    { "type": "search_web", "intent": "查一下今天有什么科技新闻" }\n'
+            '    { "type": "search_web", "intent": "查一下今天有什么科技新闻",\n'
+            '      "queries": ["今日科技新闻", "AI 行业 最新进展"] }\n'
             "  ],\n"
             '  "cancel": "只有对方明确要求你停下 / 别做了 / 改主意时才写，写了就会立刻生效：'
             'now = 立刻停手并放弃剩下的安排，queue = 手上这件做完但不要再按原计划走；'
@@ -847,6 +857,9 @@ class PromptBuilder:
             "- think：只填 content，是内心活动，不会发到群里。\n"
             "- 工具型动作：只填 intent，用一句自然语言说清你想做什么；"
             "不要自己编参数，系统会按工具定义自动补全。\n\n"
+            "- 标着「联网检索型」的动作：intent 写清楚查什么就够了；"
+            "要分几个角度查时可以再加一条 queries，每条一个关键词句，最多 3 条，"
+            "系统会逐条查完再汇总。\n\n"
             "规则：\n"
             "1. 只能从「当前场景」那一层列出的动作里选 type，写别的会被丢弃。\n"
             "2. 工具型动作必须填 intent（想做什么），不要填 params。\n"
@@ -901,6 +914,7 @@ class PromptBuilder:
         focus_user: str = "",
         recent_chat: list[dict[str, Any]] | None = None,
         style_block: str = "",
+        weather: str = "",
     ) -> str:
         """注入模式：给主人格的一层「世界认知」。"""
 
@@ -914,6 +928,7 @@ class PromptBuilder:
             focus_user=focus_user,
             recent_chat=recent_chat,
             style_block=style_block,
+            weather=weather,
         )
         return (
             "\n\n# ===== 虚拟世界状态（这是你此刻真实的处境）=====\n"
@@ -951,6 +966,7 @@ class PromptBuilder:
         reasoning: bool = True,
         mode: str = "actions",
         style_block: str = "",
+        weather: str = "",
     ) -> str:
         """接管模式：完整五层，含 JSON 输出约束。
 
@@ -984,6 +1000,7 @@ class PromptBuilder:
                 recent_chat=recent_chat,
                 other_context=other_context,
                 style_block=style_block,
+                weather=weather,
             )
         )
         layers.append(self.reminder_layer(mode))
@@ -1360,6 +1377,7 @@ class PromptBuilder:
         recent_chat: list[dict[str, Any]] | None = None,
         previous_results: str = "",
         error_hint: str = "",
+        extra_rules: str = "",
     ) -> tuple[str, str]:
         """把「她想干什么」翻译成工具参数时用的提示词（返回 system, user）。"""
 
@@ -1399,7 +1417,108 @@ class PromptBuilder:
                 if error_hint
                 else ""
             )
+            + (f"\n\n{extra_rules.strip()}" if extra_rules.strip() else "")
             + "\n\n请输出参数字典（JSON）。"
+        )
+        return system, prompt
+
+    def build_tool_choice_prompt(
+        self,
+        *,
+        tools: list[dict[str, str]],
+        intent: str,
+        recent_chat: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, str]:
+        """一个动作挂了多个工具、且用法是「智能选择」时用（返回 system, user）。
+
+        选择与补参数合并成一次调用：模型同时给出用哪个工具、以及它的参数。
+        """
+
+        system = (
+            "你是一个工具选择器。用户会给你几个候选工具的定义和一句意图，"
+            "你要挑出**最合适的那一个**，并给出调用它需要的参数。"
+            "只输出一个 JSON 对象，格式：{\"tool\": \"工具名\", \"params\": {...}}；"
+            "不要解释、不要 Markdown；参数无法判断就省略，不要编造。"
+            "候选里没有合适的也要挑一个最接近的，不要自己发明工具名。"
+        )
+        blocks = []
+        for item in tools:
+            blocks.append(
+                f"### {item.get('name')}\n"
+                f"说明：{item.get('description') or '（无）'}\n"
+                f"参数定义：\n{item.get('param_text') or '（无参数）'}"
+            )
+        chat_lines = [
+            f"- {item.get('name') or item.get('user_id')}: {_one_line(item.get('text'), 60)}"
+            for item in list(recent_chat or [])[-6:]
+        ]
+        prompt = (
+            "候选工具：\n\n"
+            + "\n\n".join(blocks)
+            + f"\n\n她的意图：{intent}\n"
+            + ("\n最近聊天（仅供参考）：\n" + "\n".join(chat_lines) if chat_lines else "")
+            + "\n\n请输出 {\"tool\": ..., \"params\": {...}}。"
+        )
+        return system, prompt
+
+    def build_search_gap_prompt(
+        self,
+        *,
+        topic: str,
+        known: list[str],
+        date_text: str = "",
+        limit: int = 2,
+    ) -> tuple[str, str]:
+        """这一轮查回来的东西不够时，让辅助模型再想几个该补查的角度（返回 system, user）。"""
+
+        system = (
+            "你在帮一个角色补全联网检索的查询词。她刚才按一个主题查过一轮，"
+            "现在需要你判断还缺什么，并给出一两条新的查询词。"
+            "只输出一个 JSON 对象，格式：{\"queries\": [\"查询词1\", \"查询词2\"]}；"
+            "不要解释、不要 Markdown；如果已经够了就输出 {\"queries\": []}。"
+        )
+        known_lines = "\n".join(f"- {_one_line(item, 80)}" for item in known[:8])
+        prompt = (
+            f"她要查的主题：{topic or '（没有写明）'}\n"
+            + (f"今天的日期：{date_text}\n" if date_text else "")
+            + "# 刚才查到的结果标题\n"
+            + (known_lines or "（什么都没查到）")
+            + "\n\n# 要求\n"
+            f"1. 最多给 {max(1, int(limit))} 条查询词，每条不超过 30 字，要能当搜索框里的关键词用；\n"
+            "2. 换角度、换关键词，不要和刚才查到的内容重复；\n"
+            "3. 只需要补充关键信息（时间、地点、具体对象、官方来源）时给查询词；\n"
+            "4. 已经够回答主题了就输出空列表。\n\n"
+            "请输出 {\"queries\": [...]}。"
+        )
+        return system, prompt
+
+    def build_search_topic_prompt(
+        self,
+        *,
+        where: str,
+        state_hint: str,
+        chat_lines: list[str] | None = None,
+        persona_text: str = "",
+    ) -> tuple[str, str]:
+        """规则触发检索、她自己又没写想查什么时，让她自己想一句（返回 system, user）。
+
+        比固定主题好在她会跟着此刻的处境和群里的话题走，而不是每次都搜同一个"今日热点"。
+        """
+
+        system = (
+            "你是这个角色本人。用第一人称、一句话说清你现在想上网查什么。"
+            "只输出这一句话，不要解释、不要加引号、不要罗列多个主题。"
+        )
+        lines = [f"- {item}" for item in (chat_lines or []) if str(item).strip()]
+        prompt = (
+            (f"# 你是谁\n{_one_line(persona_text, 400)}\n\n" if persona_text else "")
+            + f"# 你此刻\n你在 {where or '某个地方'}；{state_hint}\n\n"
+            + ("# 群里最近在聊\n" + "\n".join(lines) + "\n\n" if lines else "")
+            + "# 要求\n"
+            "1. 一句话，20 字以内，具体到能当搜索话题用（例如「今天有什么有意思的科技新闻」）；\n"
+            "2. 只查一件事，不要写成「新闻、天气、比分」这种罗列；\n"
+            "3. 群里正在聊的话题优先，没有就按你自己的兴趣来；\n"
+            "4. 只输出这句话。"
         )
         return system, prompt
 

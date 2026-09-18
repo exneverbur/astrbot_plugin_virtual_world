@@ -69,6 +69,18 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.engine.load_warnings, [])
 
+        # 内置的搜索 / 查天气动作不再自带默认工具（现在由用户自己挑）。
+        # 测试里显式配一个，等同于"真实用户已经配好"的状态；
+        # 专门测"没配工具会被跳过"的用例会自己把它清掉。
+        raw = self.store.raw_world()
+        for action in raw["actions"]:
+            if action["id"] == "search_web":
+                action["tool_names"] = ["web_search"]
+            elif action["id"] == "check_weather":
+                action["tool_names"] = ["get_current_weather", "get_weather", "weather"]
+        self.store.save_world(raw)
+        self.engine.reload_config()
+
     # ---------------- 工具 ----------------
 
     def ctx(self, **overrides) -> MessageContext:
@@ -1129,6 +1141,151 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(filled.get("get_current_weather", {}).get("city"), "武汉")
         self.assertEqual(self.llm.calls, [])  # 固定参数齐了，不需要再问辅助模型
 
+    # ---------------- 工具用法：按顺序都调 / 依次尝试 / 智能选择 ----------------
+
+    def bind_tool_action(
+        self,
+        tool_names: list[str],
+        *,
+        mode: str = "sequence",
+        flow: str = "simple",
+        action_id: str = "search_web",
+        offset: int = 0,
+    ) -> ActionDef:
+        """给内置搜索动作换一组工具和用法（真实用户就是这么配的）。"""
+
+        raw = self.store.raw_world()
+        for action in raw["actions"]:
+            if action["id"] == action_id:
+                action["tool_names"] = list(tool_names)
+                action["tool_name"] = tool_names[0] if tool_names else ""
+                action["tool_fallbacks"] = []
+                action["tool_mode"] = mode
+                # 这里测的是「多个工具怎么用」，与检索流水线无关，走最朴素的调用形态
+                action["tool_flow"] = flow
+        self.store.save_world(raw)
+        self.engine.reload_config()
+        return self.engine.world.action_map()[action_id]
+
+    async def test_fallback_mode_uses_the_next_tool_when_one_fails(self):
+        """依次尝试：第一个工具坏了就用第二个，不再往下试。"""
+
+        self.tools._tools = {"first_tool": "先试这个", "second_tool": "坏了再试这个"}
+        self.tools.failures["first_tool"] = "工具「first_tool」没有可调用的 handler"
+        self.tools.results = {"second_tool": "第二个工具的结果"}
+        definition = self.bind_tool_action(["first_tool", "second_tool"], mode="fallback")
+        await self.set_state(node_id="study")
+
+        payload = {"type": "search_web", "intent": "查今天的新闻", "params": {}}
+        await self.engine._run_tool_calls(await self.get_state(), definition, payload)
+
+        self.assertEqual([name for name, _params in self.tools.calls], ["first_tool", "second_tool"])
+        self.assertIn("第二个工具的结果", payload["tool_result"])
+        self.assertTrue(payload["tool_ok"])
+
+    # ---------------- 工具熔断 ----------------
+
+    async def test_broken_tool_is_skipped_after_two_failures(self):
+        """连续两次"工具坏了"就临时不用它；退避期过后自动放行试探。"""
+
+        self.tools.failures["web_search"] = "工具「web_search」没有可调用的 handler"
+        state = await self.set_state(node_id="study")
+        for _ in range(2):
+            call = await self.engine._call_tool("search_web", {"query": "x"}, state, tool_name="web_search")
+            self.assertFalse(call.ok)
+        # 第三次：解析阶段就跳过它了
+        call = await self.engine._call_tool("search_web", {"query": "x"}, state, tool_name="web_search")
+        self.assertFalse(call.ok)
+        self.assertEqual(self.engine.resolve_tool("search_web", "study", "web_search"), "")
+        breakers = self.engine.tool_breaker_state()
+        self.assertEqual(len(breakers), 1)
+        self.assertEqual(breakers[0]["tool"], "web_search")
+        self.assertGreater(breakers[0]["seconds_left"], 0)
+
+        # 成功一次就清零
+        self.tools.failures.clear()
+        self.engine.reset_tool_breakers("web_search")
+        ok_call = await self.engine._call_tool("search_web", {"query": "x"}, state, tool_name="web_search")
+        self.assertTrue(ok_call.ok)
+        self.assertEqual(self.engine.tool_breaker_state(), [])
+
+    async def test_argument_errors_do_not_break_the_tool(self):
+        """参数写错是补参的问题，不该把工具拉黑。"""
+
+        self.tools.failures["web_search"] = "missing 1 required positional argument: 'query'"
+        state = await self.set_state(node_id="study")
+        for _ in range(3):
+            await self.engine._call_tool("search_web", {}, state, tool_name="web_search")
+        self.assertEqual(self.engine.tool_breaker_state(), [])
+        self.assertEqual(self.engine.resolve_tool("search_web", "study", "web_search"), "web_search")
+
+    async def test_breaker_clears_when_config_changes(self):
+        """配置一改就全清：最常见的"工具坏了"其实是刚装好、刚补了 key。"""
+
+        self.tools.failures["web_search"] = "工具「web_search」没有可调用的 handler"
+        state = await self.set_state(node_id="study")
+        for _ in range(2):
+            await self.engine._call_tool("search_web", {"query": "x"}, state, tool_name="web_search")
+        self.assertTrue(self.engine.tool_breaker_state())
+
+        self.engine.reload_config()
+        self.assertEqual(self.engine.tool_breaker_state(), [])
+
+    async def test_smart_mode_lets_the_helper_pick_one_tool(self):
+        """智能选择：辅助模型按意图挑一个，挑工具和补参数一次完成。"""
+
+        self.tools._tools = {"news_search": "搜新闻", "code_search": "搜代码"}
+        self.tools.results = {"news_search": "今天的新闻", "code_search": "代码片段"}
+        self.tools.schemas["news_search"] = {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        }
+        self.tools.schemas["code_search"] = {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        }
+        definition = self.bind_tool_action(["news_search", "code_search"], mode="smart")
+        await self.set_state(node_id="study")
+        self.llm.replies = ['{"tool": "news_search", "params": {"query": "今天的新闻"}}']
+
+        payload = {"type": "search_web", "intent": "查今天的新闻", "params": {}}
+        await self.engine._run_tool_calls(await self.get_state(), definition, payload)
+
+        # 只调了模型挑中的那个，而且参数也是它一起给出来的
+        self.assertEqual([name for name, _params in self.tools.calls], ["news_search"])
+        self.assertEqual(self.tools.calls[0][1]["query"], "今天的新闻")
+        self.assertTrue(payload["tool_ok"])
+
+    async def test_smart_mode_switches_tool_after_a_broken_one(self):
+        """智能选择：挑中的工具坏了，就把它摘掉再问一次。"""
+
+        self.tools._tools = {"broken_one": "坏的", "good_one": "好的"}
+        self.tools.failures["broken_one"] = "工具「broken_one」没有可调用的 handler"
+        self.tools.results = {"good_one": "好的结果"}
+        for name in ("broken_one", "good_one"):
+            self.tools.schemas[name] = {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            }
+        definition = self.bind_tool_action(["broken_one", "good_one"], mode="smart")
+        await self.set_state(node_id="study")
+        self.llm.replies = [
+            '{"tool": "broken_one", "params": {"query": "新闻"}}',
+            '{"tool": "good_one", "params": {"query": "新闻"}}',
+        ]
+
+        payload = {"type": "search_web", "intent": "查今天的新闻", "params": {}}
+        await self.engine._run_tool_calls(await self.get_state(), definition, payload)
+
+        self.assertEqual(
+            [name for name, _params in self.tools.calls], ["broken_one", "good_one"]
+        )
+        self.assertIn("好的结果", payload["tool_result"])
+        # 第二次问的时候，坏工具已经从候选里摘掉了
+        self.assertNotIn("broken_one", self.llm.calls[-1]["prompt"])
+
     async def test_action_with_two_tools_calls_both_in_order(self):
         """一个动作挂两个工具时，按配置顺序都调用，并把结果合并起来。"""
 
@@ -1148,6 +1305,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         for action in raw["actions"]:
             if action["id"] == "search_web":
                 action["tool_names"] = ["web_search", "web_fetch"]
+                action["tool_flow"] = "simple"
         self.store.save_world(raw)
         self.engine.reload_config()
 
@@ -1182,6 +1340,236 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("正文内容", payload["tool_result"])
         self.assertTrue(payload["tool_ok"])
 
+    # ---------------- 联网检索：多查询 / 读正文 / 补查 ----------------
+
+    def bind_search_flow(
+        self,
+        search_tools: list[str],
+        *,
+        readers: list[str] | None = None,
+        depth: str = "standard",
+        reads: int = 2,
+        rounds: int = 1,
+        max_queries: int = 3,
+    ) -> ActionDef:
+        """把内置搜索动作配成检索流水线形态。"""
+
+        raw = self.store.raw_world()
+        for action in raw["actions"]:
+            if action["id"] == "search_web":
+                action["tool_names"] = list(search_tools)
+                action["tool_name"] = search_tools[0] if search_tools else ""
+                action["tool_flow"] = "search"
+                action["reader_tool_names"] = list(readers or [])
+                action["search_depth"] = depth
+                action["search_max_reads"] = reads
+                action["search_rounds"] = rounds
+                action["search_max_queries"] = max_queries
+        self.store.save_world(raw)
+        self.engine.reload_config()
+        return self.engine.world.action_map()["search_web"]
+
+    def use_search_tool(self, name: str = "news_search", result: str = "") -> None:
+        self.tools._tools = {name: "搜新闻"}
+        self.tools.schemas[name] = {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        }
+        self.tools.results = {name: result or "今日热点\nhttps://news.example/a 第一条"}
+
+    async def test_search_flow_runs_every_query_and_keeps_sources(self):
+        """她写了几条 queries 就查几次，来源进日志。"""
+
+        self.use_search_tool(
+            result=(
+                "今日热点\nhttps://news.example/a 第一条\n"
+                "行业动态\nhttps://news.example/b 第二条"
+            )
+        )
+        definition = self.bind_search_flow(["news_search"], depth="quick")
+        state = await self.set_state(node_id="study")
+        payload = {
+            "type": "search_web",
+            "intent": "查今天的新闻",
+            "queries": ["今日科技新闻", "AI 行业 最新进展"],
+        }
+
+        await self.engine._run_tool_calls(state, definition, payload)
+
+        self.assertEqual(
+            [params.get("query") for _name, params in self.tools.calls],
+            ["今日科技新闻", "AI 行业 最新进展"],
+        )
+        self.assertIn("1. ", payload["tool_evidence_text"])
+        events = await self.db.call("query_events", session_id=SESSION, limit=30)
+        sources = [item for item in events if item["event_type"] == "search_sources"]
+        self.assertTrue(sources)
+        self.assertEqual(
+            sources[0]["detail"]["queries"], ["今日科技新闻", "AI 行业 最新进展"]
+        )
+        self.assertEqual(len(sources[0]["detail"]["sources"]), 2)
+
+    async def test_search_flow_asks_the_helper_when_no_queries_given(self):
+        """她只写了意图：让辅助模型翻成一条查询词，而不是把意图原样丢给搜索。"""
+
+        self.use_search_tool()
+        definition = self.bind_search_flow(["news_search"], depth="quick")
+        await self.set_state(node_id="study")
+        self.llm.replies = ['{"query": "今天的新闻"}']
+        payload = {"type": "search_web", "intent": "查一下今天的新闻"}
+
+        await self.engine._run_tool_calls(await self.get_state(), definition, payload)
+
+        self.assertEqual(self.tools.calls[0][1]["query"], "今天的新闻")
+
+    async def test_rule_triggered_search_gets_a_real_topic(self):
+        """规则触发的检索（没有大模型给的意图）：让她自己说想查什么，别再拿动作说明顶。"""
+
+        self.tools._tools = {"web_search": "搜索网页"}
+        self.tools.schemas["web_search"] = {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        }
+        self.tools.results = {"web_search": "今天有三条科技新闻。"}
+        definition = self.bind_search_flow(["web_search"], depth="quick")
+        await self.set_state(node_id="study")
+        self.llm.replies = ["今天有什么有意思的科技新闻", '{"query": "今日科技新闻"}']
+        # 好奇心规则就是这么建动作的：只有动作名，没有意图
+        payload = {"type": "search_web", "intent": "", "params": {}}
+
+        await self.engine._run_tool_calls(await self.get_state(), definition, payload)
+
+        # 第一次调用是"你自己想查什么"，第二次才是翻成查询词
+        self.assertIn("想上网查什么", self.llm.calls[0]["system_prompt"])
+        self.assertIn("只输出这句话", self.llm.calls[0]["prompt"])
+        asked = self.llm.calls[1]["prompt"]
+        self.assertNotIn("书房用电脑", asked)
+        self.assertIn("今天有什么有意思的科技新闻", asked)
+        self.assertEqual(self.tools.calls[0][1]["query"], "今日科技新闻")
+
+    async def test_rule_triggered_search_uses_the_configured_topic_first(self):
+        """动作里配过「搜索主题」：直接用，不再多问一次大模型。"""
+
+        self.tools._tools = {"web_search": "搜索网页"}
+        self.tools.schemas["web_search"] = {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        }
+        self.tools.results = {"web_search": "今天有三条科技新闻。"}
+        self.bind_search_flow(["web_search"], depth="quick")
+        self.set_search_topic("今日新闻热点")
+        definition = self.engine.world.action_map()["search_web"]
+        await self.set_state(node_id="study")
+        self.llm.replies = ['{"query": "今日热点新闻"}']
+        payload = {"type": "search_web", "intent": "", "params": {}}
+
+        await self.engine._run_tool_calls(await self.get_state(), definition, payload)
+
+        self.assertEqual(len(self.llm.calls), 1)  # 只调了补参那一次
+        self.assertIn("今日新闻热点", self.llm.calls[0]["prompt"])
+        self.assertEqual(self.tools.calls[0][1]["query"], "今日热点新闻")
+
+    async def test_rule_triggered_search_falls_back_without_a_model(self):
+        """没有可用的主模型时退回中性主题，而不是动作说明。"""
+
+        self.tools._tools = {"web_search": "搜索网页"}
+        self.tools.schemas["web_search"] = {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        }
+        self.tools.results = {"web_search": "今天有三条科技新闻。"}
+        definition = self.bind_search_flow(["web_search"], depth="quick")
+        await self.set_state(node_id="study")
+        self.engine.llm = None  # 主模型不可用；补参还有 helper
+        self.llm.replies = ['{"query": "今日热点新闻"}']
+        payload = {"type": "search_web", "intent": "", "params": {}}
+
+        await self.engine._run_tool_calls(await self.get_state(), definition, payload)
+
+        asked = self.llm.calls[0]["prompt"]
+        self.assertNotIn("书房用电脑", asked)
+        self.assertIn("今天有什么新鲜事", asked)
+
+    async def test_search_flow_reads_the_top_pages(self):
+        """配了阅读工具就去读正文，正文进证据块。"""
+
+        self.use_search_tool(result="标题\nhttps://news.example/a 摘要")
+        self.tools._tools["page_reader"] = "读网页"
+        self.tools.schemas["page_reader"] = {
+            "type": "object",
+            "properties": {"url": {"type": "string"}},
+            "required": ["url"],
+        }
+        self.tools.results["page_reader"] = "正文片段" * 60
+        definition = self.bind_search_flow(["news_search"], readers=["page_reader"])
+        await self.set_state(node_id="study")
+        payload = {"type": "search_web", "intent": "查新闻", "queries": ["今天的新闻"]}
+
+        await self.engine._run_tool_calls(await self.get_state(), definition, payload)
+
+        self.assertEqual(
+            [name for name, _params in self.tools.calls], ["news_search", "page_reader"]
+        )
+        self.assertEqual(self.tools.calls[1][1]["url"], "https://news.example/a")
+        self.assertIn("正文片段", payload["tool_evidence"][0]["passage"])
+        self.assertIn("正文片段", payload["tool_evidence_text"])
+
+    async def test_search_flow_asks_for_more_angles_when_evidence_is_thin(self):
+        """只搜到一条时，让辅助模型补一个角度再查一次。"""
+
+        self.use_search_tool(result="只有一条\nhttps://news.example/only 很短")
+        definition = self.bind_search_flow(["news_search"])
+        await self.set_state(node_id="study")
+        self.llm.replies = ['{"queries": ["换个角度"]}']
+        payload = {"type": "search_web", "intent": "查新闻", "queries": ["今天的新闻"]}
+
+        await self.engine._run_tool_calls(await self.get_state(), definition, payload)
+
+        self.assertEqual(
+            [params.get("query") for _name, params in self.tools.calls],
+            ["今天的新闻", "换个角度"],
+        )
+
+    async def test_quick_depth_stops_after_one_search(self):
+        """quick 档位：只查一轮，不读正文也不补查。"""
+
+        self.use_search_tool(result="只有一条\nhttps://news.example/only 很短")
+        self.tools._tools["page_reader"] = "读网页"
+        self.tools.schemas["page_reader"] = {
+            "type": "object",
+            "properties": {"url": {"type": "string"}},
+        }
+        definition = self.bind_search_flow(
+            ["news_search"], readers=["page_reader"], depth="quick"
+        )
+        await self.set_state(node_id="study")
+        self.llm.replies = ['{"queries": ["不该被问到"]}']
+        payload = {"type": "search_web", "intent": "查新闻", "queries": ["今天的新闻"]}
+
+        await self.engine._run_tool_calls(await self.get_state(), definition, payload)
+
+        self.assertEqual([name for name, _params in self.tools.calls], ["news_search"])
+        self.assertEqual(self.llm.calls, [])
+
+    async def test_search_flow_reports_when_nothing_is_usable(self):
+        """什么都没搜到：结果为空，不写证据块，也不编。"""
+
+        self.use_search_tool()
+        self.tools.failures["news_search"] = "工具「news_search」没有可调用的 handler"
+        definition = self.bind_search_flow(["news_search"], depth="quick")
+        await self.set_state(node_id="study")
+        payload = {"type": "search_web", "intent": "查新闻", "queries": ["今天的新闻"]}
+
+        await self.engine._run_tool_calls(await self.get_state(), definition, payload)
+
+        self.assertFalse(payload["tool_ok"])
+        self.assertNotIn("tool_evidence_text", payload)
+        self.assertTrue(payload["tool_error"])
+
     async def test_queued_step_keeps_intent(self):
         """被排队的工具动作必须留住 intent，否则到点只会说"没有给出想做什么"。"""
 
@@ -1202,6 +1590,30 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         queued = [step for step in plan.get("steps", []) if step.get("action") == "search_web"]
         self.assertTrue(queued, plan)
         self.assertEqual(queued[0]["intent"], "搜今天的新闻")
+
+    async def test_queued_step_keeps_queries(self):
+        """排队时也要留住她自己写的查询词，否则到点会退化成按主题兜一条。"""
+
+        await self.set_state(node_id="bedroom")
+        actions = [
+            PlannedAction(type="sleep", duration=600),
+            PlannedAction(
+                type="search_web",
+                intent="查今天的新闻",
+                queries=["今日热点", "行业动态"],
+            ),
+        ]
+        outcome = TickOutcome(session_id=SESSION)
+        async with self.engine.session_state(SESSION) as state:
+            await self.engine._execute_actions(
+                state, self.engine.node("bedroom"), outcome, actions, depth=0, autonomous=False
+            )
+        state = await self.engine.load_state(SESSION, cold_start=False)
+
+        plan = state.current_plan or {}
+        queued = [step for step in plan.get("steps", []) if step.get("action") == "search_web"]
+        self.assertTrue(queued, plan)
+        self.assertEqual(queued[0]["queries"], ["今日热点", "行业动态"])
 
     async def test_new_actions_are_appended_after_existing_plan(self):
         """这一轮剩下的动作排在她原来的安排前面，原计划不丢。"""
@@ -1872,6 +2284,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         for action in raw["actions"]:
             if action["id"] == "search_web":
                 action["tool_names"] = ["web_search", "web_fetch"]
+                action["tool_flow"] = "simple"
         self.store.save_world(raw)
         self.engine.reload_config()
 
@@ -2682,10 +3095,11 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_tool_action_needs_its_own_required_params(self):
         """工具参数由工具 schema 决定：缺必填就跳过，给全了就调用。"""
 
-        self.engine.tools.schemas["web_search"] = {
+        self.tools._tools = {"get_current_weather": "查天气"}
+        self.engine.tools.schemas["get_current_weather"] = {
             "type": "object",
-            "properties": {"query": {"type": "string", "description": "搜索关键词"}},
-            "required": ["query"],
+            "properties": {"city": {"type": "string", "description": "城市"}},
+            "required": ["city"],
         }
         self.set_schedules(
             [
@@ -2694,7 +3108,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
                     "enabled": True,
                     "time": "16:00",
                     "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
-                    "action_chain": [{"type": "search_web"}],
+                    "action_chain": [{"type": "check_weather"}],
                     "conditions": {},
                     "priority": 9,
                 }
@@ -2713,7 +3127,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
                     "time": "16:00",
                     "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
                     "action_chain": [
-                        {"type": "search_web", "params": {"query": "今天的新闻"}}
+                        {"type": "check_weather", "params": {"city": "武汉"}}
                     ],
                     "conditions": {},
                     "priority": 9,
@@ -2724,7 +3138,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         await self.engine.tick()  # 启动动作
         await self.engine.tick()  # 动作完成 -> 调工具
         self.assertEqual(len(self.tools.calls), 1)
-        self.assertEqual(self.tools.calls[0][1]["query"], "今天的新闻")
+        self.assertEqual(self.tools.calls[0][1]["city"], "武汉")
 
     def set_schedules(self, schedules: list[dict]) -> None:
         self.store.save_schedules({"schedules": schedules})
@@ -3064,6 +3478,130 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
 
     # ---------------- 事件日志（日志页的数据来源） ----------------
 
+    # ---------------- 天气 ----------------
+
+    def use_weather_tool(self, result: str = "武汉 26℃ 多云") -> None:
+        self.tools._tools = {"get_current_weather": "查天气"}
+        self.tools.schemas["get_current_weather"] = {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        }
+        self.tools.results = {"get_current_weather": result}
+
+    def set_weather_city(self, city: str = "武汉") -> None:
+        raw = self.store.raw_world()
+        raw["weather"] = {**(raw.get("weather") or {}), "city": city}
+        self.store.save_world(raw)
+        self.engine.reload_config()
+
+    def set_search_topic(self, topic: str, action_id: str = "search_web") -> None:
+        raw = self.store.raw_world()
+        for action in raw["actions"]:
+            if action["id"] == action_id:
+                action["search_topic"] = topic
+        self.store.save_world(raw)
+        self.engine.reload_config()
+
+    async def test_manual_weather_query_is_kept_as_context(self):
+        """她主动查了天气：结果进全局记录，下一轮提示词里就有这一段。"""
+
+        self.use_weather_tool()
+        self.set_weather_city()
+        await self.set_state(node_id="study")
+        self.llm.replies = ["武汉｜26℃｜多云｜湿度68%｜东南风3级｜夜里转小雨"]
+
+        await self.engine.refresh_weather(SESSION)
+
+        record = await self.engine.weather_record()
+        self.assertEqual(record.text, "武汉｜26℃｜多云｜湿度68%｜东南风3级｜夜里转小雨")
+        self.assertEqual(record.parts.get("city"), "武汉")
+
+        self.llm.replies = [SAY_REPLY]
+        await self.engine.handle_reply(self.ctx())
+        prompt = self.llm.calls[-1]["system_prompt"]
+        self.assertIn("# 外面的天气", prompt)
+        self.assertIn("武汉｜26℃", prompt)
+
+    async def test_weather_refresh_follows_the_interval(self):
+        """后台静默刷新按间隔来：没到点不查，到点查一次。"""
+
+        self.use_weather_tool()
+        self.set_weather_city()
+        await self.set_state(node_id="study")
+
+        await self.engine.maybe_refresh_weather()
+        self.assertEqual(len(self.tools.calls), 1)
+        # 间隔没到：再调也不查
+        await self.engine.maybe_refresh_weather()
+        self.assertEqual(len(self.tools.calls), 1)
+
+        self.clock.advance(3 * 3600)
+        await self.engine.maybe_refresh_weather()
+        self.assertEqual(len(self.tools.calls), 2)
+
+    async def test_manual_query_pushes_the_refresh_back(self):
+        """她主动查过之后，后台刷新的倒计时从头算。"""
+
+        self.use_weather_tool()
+        self.set_weather_city()
+        await self.set_state(node_id="study")
+
+        await self.engine.refresh_weather(SESSION)
+        self.assertEqual(len(self.tools.calls), 1)
+        await self.engine.maybe_refresh_weather()
+        self.assertEqual(len(self.tools.calls), 1)
+
+        self.clock.advance(3 * 3600)
+        await self.engine.maybe_refresh_weather()
+        self.assertEqual(len(self.tools.calls), 2)
+
+    async def test_weather_image_is_read_by_the_describer(self):
+        """天气工具返回图片时，先用看图模型读成文字再存。"""
+
+        class _Describer:
+            def __init__(self) -> None:
+                self.calls: list[list[str]] = []
+
+            async def describe_to_text(self, images, prompt=""):
+                self.calls.append(list(images))
+                return "武汉｜26℃｜多云｜湿度68%｜东南风3级"
+
+        describer = _Describer()
+        self.engine.describer = describer
+        state = await self.set_state(node_id="study")
+        definition = self.engine.world.action_map()["check_weather"]
+
+        record = await self.engine._store_weather(
+            state,
+            definition,
+            {"tool_images": ["http://example.com/weather.png"]},
+            source="auto",
+        )
+
+        self.assertEqual(describer.calls, [["http://example.com/weather.png"]])
+        self.assertEqual(record.parts.get("city"), "武汉")
+        self.assertEqual((await self.engine.weather_record()).text, record.text)
+
+    async def test_stale_weather_is_not_written_into_the_prompt(self):
+        """超过「多旧就不再提」的时间：提示词里不再带这份天气。"""
+
+        await self.engine.db.call(
+            "kv_set",
+            "weather",
+            {
+                "text": "武汉｜26℃",
+                "parts": {"city": "武汉", "temp": "26℃"},
+                "at": self.clock.now() - 5 * 86400,
+            },
+        )
+        self.assertEqual(await self.engine.weather_line(), "")
+
+        # 横幅仍然看得到，只是标着"多久之前"
+        payload = await self.engine.weather_payload()
+        self.assertEqual(payload["temp"], "26℃")
+        self.assertIn("天前", payload["age"])
+
     async def test_echo_actions_sends_them_as_messages(self):
         """开「把动作发到群里」后，动作与工具调用会作为普通消息发出来。"""
 
@@ -3094,6 +3632,32 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
             [item for item in state.recent_chat if "🔧" in str(item.get("text", ""))],
             state.recent_chat,
         )
+
+    async def test_tool_echo_is_sent_before_the_followup_say(self):
+        """先调工具、结果回来才说话：回显也要按这个顺序排（工具在前）。"""
+
+        raw = self.store.raw_world()
+        raw["echo_types"] = ["tool_call", "tool_result"]
+        self.store.save_world(raw)
+        self.engine.reload_config()
+        self.bind_search_flow(["web_search"], depth="quick")
+        await self.set_state(node_id="study")
+        self.tools.results["web_search"] = "今天有三条科技新闻。"
+        self.llm.replies = [
+            '{"actions":[{"type":"search_web","intent":"查今天的新闻",'
+            '"queries":["今天的新闻"]}]}',
+            '{"actions":[{"type":"say","messages":["查到了三条"]}]}',
+        ]
+
+        outcome = await self.engine.handle_reply(self.ctx())
+        ordered = outcome.ordered_messages()
+
+        self.assertIn("查到了三条", ordered)
+        tool_at = next(
+            index for index, line in enumerate(ordered) if line.startswith("🔧")
+        )
+        say_at = ordered.index("查到了三条")
+        self.assertLess(tool_at, say_at, ordered)
 
     async def test_echo_actions_off_by_default(self):
         self.add_schedule(
@@ -3305,10 +3869,18 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("抱了你一下", " ".join(actions[0]["detail"]["messages"]))
 
     async def test_skipped_action_is_logged(self):
+        """工具型动作缺必填参数就跳过，跳过原因要写进日志。"""
+
+        self.tools._tools = {"get_current_weather": "查天气"}
         self.engine.tools.schemas["web_search"] = {
             "type": "object",
             "properties": {"query": {"type": "string"}},
             "required": ["query"],
+        }
+        self.engine.tools.schemas["get_current_weather"] = {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
         }
         self.set_schedules(
             [
@@ -3317,7 +3889,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
                     "enabled": True,
                     "time": "19:00",
                     "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
-                    "action_chain": [{"type": "search_web"}],
+                    "action_chain": [{"type": "check_weather"}],
                     "conditions": {},
                     "priority": 9,
                 }
