@@ -2246,38 +2246,44 @@ class VirtualWorldEngine:
             return self._now()
         return last + hours * 3600.0
 
-    async def maybe_refresh_weather(self, *, force: bool = False) -> None:
+    async def maybe_refresh_weather(self, *, force: bool = False) -> str:
         """到点了就静默查一次天气：不说话、不发群，只更新那份记录。
 
         ``force=True`` 用于编辑器上的「立即刷新」：跳过倒计时，其余条件照旧。
+        返回一句说明（编辑器直接弹给用户看，免得"点了没反应"）；空串表示成功。
         """
 
         config = self.world.weather
         if not bool(getattr(config, "enabled", True)):
-            return
+            return "天气功能在全局设置里关着"
         hours = max(0.0, float(getattr(config, "refresh_hours", 2.0) or 0.0))
-        if hours <= 0 or self.tools is None:
-            return
+        if self.tools is None:
+            return "拿不到 AstrBot 的工具通道"
+        if hours <= 0:
+            return "后台刷新间隔是 0（只在手动点的时候查）"
         now = self._now()
         try:
             last_try = float(await self.db.call("kv_get", WEATHER_TRY_KEY) or 0.0)
         except Exception:
             last_try = 0.0
         if not force and last_try > 0 and (now - last_try) < hours * 3600:
-            return
+            return "还没到下一次刷新的时间"
         # 工具需要一条真实消息当上下文：群里还没人说过话就先不查，等下一轮
         has_context = getattr(self.tools, "has_context", None)
         if callable(has_context) and not bool(has_context()):
-            return
+            return "群里还没人说过话，工具拿不到消息当上下文——先让群里说一句再试"
         sessions = self.enabled_session_ids()
         if not sessions:
-            return
+            return "没有启用的会话（先在会话白名单里加一个群）"
         # 先记"试过了"：失败也要等下一个周期，不要每个 tick 都去撞
         try:
             await self.db.call("kv_set", WEATHER_TRY_KEY, float(now))
         except Exception:
             pass
-        await self.refresh_weather(sessions[0])
+        record = await self.refresh_weather(sessions[0])
+        if record.empty:
+            return "这次没查到：检查「查天气」动作里选没选天气工具（日志里有原因）"
+        return ""
 
     async def refresh_weather(self, session_id: str) -> WeatherRecord:
         """查一次天气并记下来（静默：不触发续说，也不回显到群里）。"""
@@ -2289,6 +2295,27 @@ class VirtualWorldEngine:
             state = await self.load_state(session_id, cold_start=False)
         except Exception:
             return WeatherRecord()
+        if str(getattr(definition, "llm_level", "")) == "command":
+            # 查天气配成「指令型」时就走指令通道——以前这里写死走工具，配了也没用
+            command = str(getattr(definition, "trigger_command", "") or "").strip()
+            if not command or self.commands is None:
+                return WeatherRecord()
+            intent = self._search_intent({}) or self._search_topic(
+                definition, {}
+            ) or "现在外面的天气"
+            line = await self._compose_command(state, definition, command, intent)
+            call = await self.commands.trigger(session_id, line)
+            if not call.ok or not str(call.text or "").strip():
+                return WeatherRecord()
+            return await self._store_weather(
+                state,
+                definition,
+                {
+                    "tool_result": call.text,
+                    "tool_images": list(getattr(call, "image_urls", None) or []),
+                },
+                source="auto",
+            )
         outcome = TickOutcome(session_id=session_id)
         action = PlannedAction(type=definition.id, intent="现在外面的天气")
         city = str(getattr(self.world.weather, "city", "") or "").strip()
@@ -3908,6 +3935,14 @@ class VirtualWorldEngine:
         outcome.notes.append(
             f"触发指令「{line}」：" + ("成功" if call.ok else f"失败（{call.error}）")
         )
+        if definition.id == "check_weather" and call.ok and str(call.text or "").strip():
+            # 查天气配成「指令型」时，结果同样要进全局天气记录
+            await self._store_weather(
+                state,
+                definition,
+                {"tool_result": call.text, "tool_images": images},
+                source="manual",
+            )
         detail = call.text if call.ok else f"（这条指令没跑成：{call.error}）"
         detail = self._clip_followup(detail)
         if not detail and images:
@@ -6297,12 +6332,23 @@ class VirtualWorldEngine:
         return note
 
     async def interrupt(self, session_id: str, *, force: bool = False) -> bool:
-        """用户消息打断当前持续动作。返回是否真的打断了。"""
+        """打断当前持续动作。返回是否真的打断了。
+
+        **打断睡觉 = 叫醒**：只把动作停掉是不够的——计划里那一步还在，下一个 tick
+        又会把她放倒（看起来就是"打断了却马上又睡了，@ 她也没反应"）。
+        所以这里走和「叫醒」同一套：停动作、清掉排队的计划、给一段不会再睡的保护期。
+        """
 
         if not self.is_enabled(session_id):
             return False
         async with self.session_state(session_id) as state:
             action = state.current_action
+            asleep = self._is_asleep(state)
+            if asleep:
+                self._wake_up_state(
+                    state, MessageContext(session_id=session_id, user_name="你", text="")
+                )
+                return True
             if not isinstance(action, dict):
                 return False
             if not force and not action.get("interruptible", True):
@@ -6380,14 +6426,20 @@ class VirtualWorldEngine:
             return []
 
     async def wake_up(self, session_id: str) -> bool:
+        """手动叫醒（编辑器按钮 / `/vw 叫醒`）。
+
+        走的是和「@ 她 + 唤醒词」完全一样的那套：停下动作、**清掉排队的计划**
+        （否则计划里那一步「睡觉」下一个 tick 又把她放倒）、给一段不会再睡的保护期、
+        顺手把群名片从「睡觉中」改回来。
+        """
+
         if not self.is_enabled(session_id):
             return False
         async with self.session_state(session_id) as state:
             was_sleeping = state.is_sleeping
-            state.current_action = None
-            state.state = STATE_IDLE
-            if state.world_time < state.mood_override_until:
-                state.mood_override_until = 0
+            self._wake_up_state(
+                state, MessageContext(session_id=session_id, user_name="你", text="")
+            )
             return was_sleeping
 
     # ================= 限额 =================

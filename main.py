@@ -2039,19 +2039,19 @@ class VirtualWorldPlugin(Star):
 
         self._self_initiated_depth += 1
         task = self._current_task()
-        if task is None:
-            # 不在任务里跑（极少见）：退化成全量拦截，宁可自己漏一会儿也不自环
-            self._self_initiated_untracked += 1
-        else:
+        if task is not None:
             self._self_initiated_tasks.add(task)
+            # 防御：万一某次调用没走到 reset（异常被吞、任务被取消……），
+            # 集合里堆着死任务会让后面的钩子判断出现意外，定期清一次只留当前任务。
+            if len(self._self_initiated_tasks) > 8:
+                self._self_initiated_tasks.clear()
+                self._self_initiated_tasks.add(task)
         return self._self_initiated_depth
 
     def reset_self_initiated(self, _token: int = 0) -> None:
         self._self_initiated_depth = max(0, self._self_initiated_depth - 1)
         task = self._current_task()
-        if task is None:
-            self._self_initiated_untracked = max(0, self._self_initiated_untracked - 1)
-        else:
+        if task is not None:
             self._self_initiated_tasks.discard(task)
 
     @staticmethod
@@ -2071,10 +2071,9 @@ class VirtualWorldPlugin(Star):
 
         task = self._current_task()
         if task is None:
+            # 没有正在跑的事件循环（同步收尾之类）：只能按"有没有调用在飞"粗判
             return self._self_initiated_depth > 0
-        if task in self._self_initiated_tasks:
-            return True
-        return self._self_initiated_untracked > 0
+        return task in self._self_initiated_tasks
 
     def _reply_lock(self, session_id: str) -> asyncio.Lock:
         lock = self._reply_locks.get(session_id)
@@ -2132,6 +2131,14 @@ class VirtualWorldPlugin(Star):
         if not self.enabled:
             return
         if self.in_self_initiated_call():
+            # 正常情况下这里只该拦下"我们自己发起的请求"。
+            # 真有人 @ 她却被拦在这里，说明那道标记泄漏了——留一条日志，好排查。
+            if event.get_sender_id() and event.get_sender_id() != event.get_self_id():
+                self.logger.warning(
+                    f"[virtual_world] 这条消息被「插件自己在调模型」的标记拦下了"
+                    f"（depth={self._self_initiated_depth}）："
+                    f"{str(event.get_message_str() or '')[:30]}"
+                )
             return
         if event.is_stopped():
             return
@@ -3286,10 +3293,22 @@ class VirtualWorldPlugin(Star):
         guard = self._guard(payload)
         if guard is not None:
             return guard
-        session_id = str(payload.get("session", "") or "")
         action = str(payload.get("action", "") or "")
-        if not session_id or not action:
-            return error_response("缺少 session 或 action")
+        if not action:
+            return error_response("缺少 action")
+        if action == "refresh_weather":
+            # 这条是全局动作（天气不分会话），不要求前端带 session
+            note = await self.engine.maybe_refresh_weather(force=True)
+            return json_response(
+                {
+                    "ok": True,
+                    "note": note,
+                    "weather": await self.engine.weather_payload(),
+                }
+            )
+        session_id = str(payload.get("session", "") or "")
+        if not session_id:
+            return error_response("缺少 session")
         if action == "wake":
             was = await self.engine.wake_up(session_id)
             return json_response({"ok": True, "was_sleeping": was})
@@ -3301,12 +3320,6 @@ class VirtualWorldPlugin(Star):
             name = str(payload.get("tool") or "").strip()
             cleared = self.engine.reset_tool_breakers(name)
             return json_response({"ok": True, "cleared": cleared})
-        if action == "refresh_weather":
-            # 地图页横幅上的「立即刷新」：查一次并记下来（不发消息）
-            await self.engine.maybe_refresh_weather(force=True)
-            return json_response(
-                {"ok": True, "weather": await self.engine.weather_payload()}
-            )
         if action == "tick":
             outcomes = await self.engine.tick()
             return json_response(

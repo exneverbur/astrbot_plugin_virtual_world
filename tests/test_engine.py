@@ -1691,6 +1691,69 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("# 最近查过", prompt)
         self.assertIn("今日科技新闻", prompt)
 
+    async def test_waking_from_the_editor_drops_the_sleep_plan(self):
+        """网页上叫醒之后，计划里那一步「睡觉」不能再把她放倒。"""
+
+        from core import planner as planner_module
+
+        await self.set_state(node_id="bedroom")
+        async with self.engine.session_state(SESSION) as state:
+            state.state = "sleeping"
+            state.current_action = {
+                "type": "sleep",
+                "elapsed_ticks": 1,
+                "duration_ticks": 480,
+            }
+            state.current_plan = planner_module.create_plan(
+                steps=[{"action": "sleep", "duration": 480}],
+                world_time=state.world_time,
+            )
+
+        woken = await self.engine.wake_up(SESSION)
+
+        self.assertTrue(woken)
+        state = await self.get_state()
+        self.assertIsNone(state.current_action)
+        self.assertIsNone(state.current_plan)
+        self.assertFalse(state.is_sleeping)
+        # 保护期：刚被叫醒这段时间里规则不再安排她回去睡
+        self.assertGreater(int(state.no_sleep_until), int(state.world_time))
+
+    async def test_weather_refresh_explains_why_it_did_nothing(self):
+        """点「刷新」没反应时，要能告诉她为什么（这里没给动作配天气工具）。"""
+
+        note = await self.engine.maybe_refresh_weather(force=True)
+
+        self.assertTrue(note)
+        self.assertIn("天气工具", note)
+
+    async def test_interrupting_her_sleep_counts_as_waking_up(self):
+        """网页上「打断」睡觉 = 叫醒：计划要一起清掉，不然下一个 tick 又睡回去。"""
+
+        from core import planner as planner_module
+
+        await self.set_state(node_id="bedroom")
+        async with self.engine.session_state(SESSION) as state:
+            state.state = "sleeping"
+            state.current_action = {
+                "type": "sleep",
+                "elapsed_ticks": 1,
+                "duration_ticks": 480,
+            }
+            state.current_plan = planner_module.create_plan(
+                steps=[{"action": "sleep", "duration": 480}],
+                world_time=state.world_time,
+            )
+
+        done = await self.engine.interrupt(SESSION, force=True)
+
+        self.assertTrue(done)
+        state = await self.get_state()
+        self.assertFalse(state.is_sleeping)
+        self.assertIsNone(state.current_action)
+        self.assertIsNone(state.current_plan)
+        self.assertGreater(int(state.no_sleep_until), int(state.world_time))
+
     async def test_queued_step_keeps_intent(self):
         """被排队的工具动作必须留住 intent，否则到点只会说"没有给出想做什么"。"""
 

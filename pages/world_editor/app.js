@@ -3419,13 +3419,27 @@ async function refreshWeatherNow() {
   button.disabled = true;
   button.textContent = "查询中…";
   try {
-    const data = await apiPost("state/action", { action: "refresh_weather" });
+    // 天气是全局的（后端不要求 session），但顺手把当前选中的会话带上，便于排查
+    const session =
+      ($("map-session") && $("map-session").value) ||
+      ($("status-session") && $("status-session").value) ||
+      "";
+    const data = await apiPost("state/action", {
+      action: "refresh_weather",
+      ...(session ? { session } : {}),
+    });
     if (data && data.weather) {
       ui.config.weather = data.weather;
     }
     renderWeatherBanner();
+    // 插件页在 sandbox iframe 里，window.alert 会被拦掉；统一用页面内的 toast
+    if (data && data.note) {
+      toast(data.note);
+    } else {
+      toast("天气已更新");
+    }
   } catch (error) {
-    window.alert(`查天气失败：${error.message || error}`);
+    toast(`查天气失败：${error.message || error}`);
   } finally {
     button.disabled = false;
     button.textContent = "刷新";
