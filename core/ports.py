@@ -117,6 +117,11 @@ class CommandPort(Protocol):
         self, session_id: str, command: str, *, event: Any = None
     ) -> ToolCallResult: ...
 
+    def session_with_context(self, candidates: list[str] | None = None) -> str:
+        """最近收到过消息的那条会话：指令要借它的消息当上下文（拿不到返回空串）。"""
+
+        ...
+
 
 @runtime_checkable
 class ToolPort(Protocol):

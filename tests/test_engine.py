@@ -308,6 +308,45 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("科技新闻", results[0]["detail"]["result"])
         self.assertEqual(results[0]["detail"]["tool"], "web_search")
 
+    async def test_long_tool_result_is_kept_long_in_the_log(self):
+        """工具返回一长段时，日志里要留得下大半，别只剩开头一小截。"""
+
+        self.add_schedule(
+            id="search_log",
+            time="12:00",
+            action_chain=[{"type": "search_web", "intent": "今天有什么新闻"}],
+        )
+        await self.set_state(node_id="study")
+        body = "".join(f"第{index:03d}条结果。" for index in range(100))
+        self.tools.results["web_search"] = body
+        self.clock.set_struct(datetime(2026, 9, 10, 12, 0))
+        await self.engine.run_schedules()
+        events = await self.db.call("query_events", session_id=SESSION, limit=30)
+        results = [item for item in events if item["event_type"] == "tool_result"]
+        self.assertTrue(results, events)
+        logged = results[0]["detail"]["result"]
+        self.assertEqual(logged, body)
+        self.assertIn("第099条结果", logged)
+
+    async def test_over_long_tool_result_says_how_much_was_cut(self):
+        """真的超长时也要标明截断，免得以为工具只返回了这么点。"""
+
+        self.add_schedule(
+            id="search_log",
+            time="12:00",
+            action_chain=[{"type": "search_web", "intent": "今天有什么新闻"}],
+        )
+        await self.set_state(node_id="study")
+        self.tools.results["web_search"] = "长" * 3000
+        self.clock.set_struct(datetime(2026, 9, 10, 12, 0))
+        await self.engine.run_schedules()
+        events = await self.db.call("query_events", session_id=SESSION, limit=30)
+        results = [item for item in events if item["event_type"] == "tool_result"]
+        self.assertTrue(results, events)
+        logged = results[0]["detail"]["result"]
+        self.assertIn("完整 3000 字", logged)
+        self.assertLess(len(logged), 1300)
+
     async def test_failed_tool_is_logged_and_does_not_make_her_talk(self):
         """工具失败时：日志里记下原因，并且不要让她就着空气编一段。"""
 
@@ -1597,12 +1636,41 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         search_lines = [line for line in lines if line.startswith("🌐")]
         self.assertEqual(len(search_lines), 1, lines)
         self.assertIn("正在联网搜索", search_lines[0])
+        # 查询词是她正在查什么，精简模式下也不能省
+        self.assertIn("今日科技新闻", search_lines[0])
         # 逐条的工具调用仍然完整写进日志页
         events = await self.db.call("query_events", session_id=SESSION, limit=40)
         kinds = [item["event_type"] for item in events]
         self.assertIn("tool_call", kinds)
         self.assertIn("tool_result", kinds)
         self.assertIn("search", kinds)
+
+    async def test_search_line_keeps_queries_in_compact_mode(self):
+        """精简模式省的是参数和结果，不是「正在查什么」。"""
+
+        raw = self.store.raw_world()
+        raw["echo_types"] = ["search"]
+        raw["echo_compact"] = True
+        self.store.save_world(raw)
+        self.engine.reload_config()
+        self.use_search_tool()
+        definition = self.bind_search_flow(["news_search"], depth="quick")
+        await self.set_state(node_id="study")
+        payload = {
+            "type": "search_web",
+            "intent": "看看今天的科技新闻",
+            "queries": ["今日科技新闻", "芯片 动态"],
+        }
+        outcome = TickOutcome(session_id=SESSION)
+
+        await self.engine._run_tool_calls(
+            await self.get_state(), definition, payload, outcome=outcome
+        )
+
+        search_lines = [line for line in outcome.debug_messages if line.startswith("🌐")]
+        self.assertEqual(len(search_lines), 1, outcome.debug_messages)
+        self.assertIn("今日科技新闻", search_lines[0])
+        self.assertIn("芯片 动态", search_lines[0])
 
     async def test_search_line_is_sent_live_and_not_duplicated(self):
         """有实时通道时：「正在联网搜索」在检索开始时立刻发出，收尾不再重复发。"""
@@ -2225,6 +2293,20 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         await self.run_command_action()
         self.assertLess(len(self.llm.calls[-1]["prompt"]), 3000)
         self.assertIn("已截断", self.llm.calls[-1]["prompt"])
+
+    async def test_long_command_result_is_kept_long_in_the_log(self):
+        """指令返回一长段时，提示词可以压，但日志里要留全一点。"""
+
+        from core.ports import ToolCallResult
+
+        body = "".join(f"第{index:03d}行。" for index in range(120))
+        self.stub_commands(ToolCallResult(ok=True, text=body, tool="天气"))
+        self.add_command_action()
+        await self.run_command_action()
+        events = await self.db.call("query_events", session_id=SESSION, limit=20)
+        results = [item for item in events if item["event_type"] == "command_result"]
+        self.assertTrue(results, events)
+        self.assertEqual(results[0]["detail"]["result"], body)
 
     async def test_preset_round_trip_and_state_clear(self):
         """预设：存下来、改坏再应用能复原；切预设只清状态，不动记忆与日志。"""
@@ -3814,6 +3896,31 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.store.save_world(raw)
         self.engine.reload_config()
 
+    def set_weather_command(self, command: str = "天气") -> None:
+        """把内置「查天气」改成指令型：不选工具，改成触发一条指令。"""
+
+        raw = self.store.raw_world()
+        for action in raw["actions"]:
+            if action["id"] == "check_weather":
+                action["llm_level"] = "command"
+                action["trigger_command"] = command
+                action["tool_names"] = []
+        self.store.save_world(raw)
+        self.engine.reload_config()
+
+    def stub_command_channel(self, result) -> list[str]:
+        """记录触发过的指令；返回那个列表，方便断言她到底发了什么。"""
+
+        lines: list[str] = []
+
+        class _Commands:
+            async def trigger(self, session_id, command, *, event=None):
+                lines.append(command)
+                return result
+
+        self.engine.commands = _Commands()
+        return lines
+
     def set_search_topic(self, topic: str, action_id: str = "search_web") -> None:
         raw = self.store.raw_world()
         for action in raw["actions"]:
@@ -3874,6 +3981,59 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.clock.advance(3 * 3600)
         await self.engine.maybe_refresh_weather()
         self.assertEqual(len(self.tools.calls), 2)
+
+    async def test_weather_refresh_works_when_the_action_is_a_command(self):
+        """「查天气」配成指令型时，地图上的刷新也要走得通（不用再选天气工具）。"""
+
+        from core.ports import ToolCallResult
+
+        self.set_weather_command("天气")
+        self.set_weather_city("武汉")
+        await self.set_state(node_id="study")
+        lines = self.stub_command_channel(
+            ToolCallResult(ok=True, text="武汉｜26℃｜多云｜湿度68%", tool="天气")
+        )
+        self.llm.replies = ["/天气 武汉"]
+
+        note = await self.engine.maybe_refresh_weather(force=True, session_id=SESSION)
+
+        self.assertEqual(note, "")
+        self.assertEqual(lines, ["/天气 武汉"])
+        record = await self.engine.weather_record()
+        self.assertEqual(record.text, "武汉｜26℃｜多云｜湿度68%")
+
+    async def test_command_weather_failure_is_explained_honestly(self):
+        """指令型没跑成时要说清是指令的事，别再让人去配工具。"""
+
+        from core.ports import ToolCallResult
+
+        self.set_weather_command("天气")
+        self.set_weather_city("武汉")
+        await self.set_state(node_id="study")
+        self.stub_command_channel(
+            ToolCallResult(ok=False, error="没找到指令「天气」", tool="天气")
+        )
+
+        note = await self.engine.maybe_refresh_weather(force=True, session_id=SESSION)
+
+        self.assertIn("没找到指令", note)
+        self.assertNotIn("天气工具", note)
+
+    async def test_manual_weather_query_ignores_the_background_interval(self):
+        """后台刷新间隔填 0（只在手动点的时候查）时，点「刷新」仍然要真的去查。"""
+
+        self.use_weather_tool()
+        self.set_weather_city()
+        raw = self.store.raw_world()
+        raw["weather"] = {**(raw.get("weather") or {}), "refresh_hours": 0}
+        self.store.save_world(raw)
+        self.engine.reload_config()
+        await self.set_state(node_id="study")
+
+        note = await self.engine.maybe_refresh_weather(force=True, session_id=SESSION)
+
+        self.assertEqual(note, "")
+        self.assertEqual(len(self.tools.calls), 1)
 
     async def test_weather_image_is_read_by_the_describer(self):
         """天气工具返回图片时，先用看图模型读成文字再存。"""

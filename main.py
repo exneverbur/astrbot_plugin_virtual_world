@@ -834,6 +834,20 @@ class AstrBotCommands:
     def __init__(self, plugin: "VirtualWorldPlugin") -> None:
         self.plugin = plugin
 
+    def session_with_context(self, candidates: list[str] | None = None) -> str:
+        """最近收到过消息的那条会话（在 ``candidates`` 里挑，没给就全局挑）。"""
+
+        events = getattr(self.plugin, "_last_events", None) or {}
+        if not events:
+            return ""
+        if candidates is None:
+            return next(reversed(events), "")
+        wanted = {str(item) for item in candidates}
+        for session_id in reversed(events):
+            if session_id in wanted:
+                return session_id
+        return ""
+
     async def trigger(
         self, session_id: str, command: str, *, event: Any = None
     ) -> ToolCallResult:
@@ -3312,8 +3326,11 @@ class VirtualWorldPlugin(Star):
         if not action:
             return error_response("缺少 action")
         if action == "refresh_weather":
-            # 这条是全局动作（天气不分会话），不要求前端带 session
-            note = await self.engine.maybe_refresh_weather(force=True)
+            # 天气本身不分会话，但「查天气」配成指令型时要借一条真实消息当上下文，
+            # 所以前端选中的那条会话优先，没带就按白名单第一条
+            note = await self.engine.maybe_refresh_weather(
+                force=True, session_id=str(payload.get("session") or "")
+            )
             return json_response(
                 {
                     "ok": True,

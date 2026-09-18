@@ -278,11 +278,12 @@ def render_event(
     if kind == "search":
         queries = [str(item) for item in (detail.get("queries") or []) if str(item)]
         head = "正在联网搜索"
-        if queries and not compact:
-            head += f"「{'、'.join(_clip(item, 20) for item in queries[:3])}」"
-            if len(queries) > 3:
+        # 这一行就靠查询词说明她在查什么，精简模式下也留着
+        if queries:
+            head += f"「{'、'.join(_clip(item, 20) for item in queries[:4])}」"
+            if len(queries) > 4:
                 head += " 等"
-        return head + "…（期间的工具调用只写进日志）"
+        return head
 
     if kind == "search_sources":
         count = int(detail.get("count") or 0)

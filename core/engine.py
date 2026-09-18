@@ -2311,10 +2311,23 @@ class VirtualWorldEngine:
             return self._now()
         return last + hours * 3600.0
 
-    async def maybe_refresh_weather(self, *, force: bool = False) -> str:
+    def _weather_channel(self, definition: ActionDef | None) -> str:
+        """「查天气」这次走哪条路：``command`` 指令型 / ``tool`` 工具型 / ``""`` 两者都不是。"""
+
+        if definition is None:
+            return ""
+        level = str(getattr(definition, "llm_level", "") or "")
+        if level == "command":
+            return "command"
+        return "tool" if level == "tool" else ""
+
+    async def maybe_refresh_weather(
+        self, *, force: bool = False, session_id: str = ""
+    ) -> str:
         """到点了就静默查一次天气：不说话、不发群，只更新那份记录。
 
         ``force=True`` 用于编辑器上的「立即刷新」：跳过倒计时，其余条件照旧。
+        ``session_id`` 是编辑器里选中的那条会话：指令型动作要借它的消息当上下文。
         返回一句说明（编辑器直接弹给用户看，免得"点了没反应"）；空串表示成功。
         """
 
@@ -2322,9 +2335,20 @@ class VirtualWorldEngine:
         if not bool(getattr(config, "enabled", True)):
             return "天气功能在全局设置里关着"
         hours = max(0.0, float(getattr(config, "refresh_hours", 2.0) or 0.0))
-        if self.tools is None:
+        definition = self.world.action_map().get("check_weather")
+        channel = self._weather_channel(definition)
+        if not channel:
+            # 「查天气」可以是工具型，也可以是指令型；两者都没配就没法查
+            return "「查天气」动作得配成工具型（选一个天气工具）或指令型（填要触发的指令）"
+        if channel == "command":
+            if self.commands is None:
+                return "拿不到 AstrBot 的指令通道"
+            if not str(getattr(definition, "trigger_command", "") or "").strip():
+                return "「查天气」是指令型，但没填要触发的指令名"
+        elif self.tools is None:
             return "拿不到 AstrBot 的工具通道"
-        if hours <= 0:
+        if hours <= 0 and not force:
+            # 间隔 0 = 不在后台查；手动点「刷新」照样要查
             return "后台刷新间隔是 0（只在手动点的时候查）"
         now = self._now()
         try:
@@ -2333,46 +2357,80 @@ class VirtualWorldEngine:
             last_try = 0.0
         if not force and last_try > 0 and (now - last_try) < hours * 3600:
             return "还没到下一次刷新的时间"
-        # 工具需要一条真实消息当上下文：群里还没人说过话就先不查，等下一轮
-        has_context = getattr(self.tools, "has_context", None)
-        if callable(has_context) and not bool(has_context()):
-            return "群里还没人说过话，工具拿不到消息当上下文——先让群里说一句再试"
+        if channel == "tool":
+            # 工具需要一条真实消息当上下文：群里还没人说过话就先不查，等下一轮
+            has_context = getattr(self.tools, "has_context", None)
+            if callable(has_context) and not bool(has_context()):
+                return "群里还没人说过话，工具拿不到消息当上下文——先让群里说一句再试"
         sessions = self.enabled_session_ids()
-        if not sessions:
+        wanted = str(session_id or "").strip()
+        target = wanted if wanted and wanted in sessions else ""
+        if not target and channel == "command":
+            # 指令要借一条真实消息当上下文：优先白名单里最近说过话的那个会话
+            picker = getattr(self.commands, "session_with_context", None)
+            if callable(picker):
+                try:
+                    target = str(picker(sessions) or "")
+                except Exception:
+                    target = ""
+        target = target or (sessions[0] if sessions else "")
+        if not target:
             return "没有启用的会话（先在会话白名单里加一个群）"
         # 先记"试过了"：失败也要等下一个周期，不要每个 tick 都去撞
         try:
             await self.db.call("kv_set", WEATHER_TRY_KEY, float(now))
         except Exception:
             pass
-        record = await self.refresh_weather(sessions[0])
-        if record.empty:
-            return "这次没查到：检查「查天气」动作里选没选天气工具（日志里有原因）"
-        return ""
+        record, note = await self._weather_once(target)
+        if not record.empty:
+            return ""
+        return note or "这次没查到（日志里有原因）"
 
     async def refresh_weather(self, session_id: str) -> WeatherRecord:
         """查一次天气并记下来（静默：不触发续说，也不回显到群里）。"""
 
+        record, _note = await self._weather_once(session_id)
+        return record
+
+    async def _weather_once(self, session_id: str) -> tuple[WeatherRecord, str]:
+        """查一次天气：返回 ``(记录, 没查到的原因)``；查到了就写进全局天气记录。"""
+
         definition = self.world.action_map().get("check_weather")
-        if definition is None or self.tools is None:
-            return WeatherRecord()
+        channel = self._weather_channel(definition)
+        if definition is None or not channel:
+            return WeatherRecord(), "「查天气」动作没配成工具型或指令型"
         try:
             state = await self.load_state(session_id, cold_start=False)
         except Exception:
-            return WeatherRecord()
-        if str(getattr(definition, "llm_level", "")) == "command":
-            # 查天气配成「指令型」时就走指令通道——以前这里写死走工具，配了也没用
+            return WeatherRecord(), "读不到她在那个会话里的状态，先让她在群里说一句话"
+        if channel == "command":
+            # 查天气配成「指令型」时就走指令通道
             command = str(getattr(definition, "trigger_command", "") or "").strip()
-            if not command or self.commands is None:
-                return WeatherRecord()
-            intent = self._search_intent({}) or self._search_topic(
-                definition, {}
-            ) or "现在外面的天气"
+            if not command:
+                return WeatherRecord(), "「查天气」是指令型，但没填要触发的指令名"
+            if self.commands is None:
+                return WeatherRecord(), "拿不到 AstrBot 的指令通道"
+            city = str(getattr(self.world.weather, "city", "") or "").strip()
+            intent = f"查一下{city}现在的天气" if city else "现在外面的天气"
             line = await self._compose_command(state, definition, command, intent)
             call = await self.commands.trigger(session_id, line)
-            if not call.ok or not str(call.text or "").strip():
-                return WeatherRecord()
-            return await self._store_weather(
+            if not call.ok:
+                await self._log_event(
+                    state,
+                    "skip",
+                    {
+                        "action": definition.id,
+                        "note": f"查天气的指令「{line}」没跑成：{call.error or '没有返回内容'}",
+                    },
+                )
+                return WeatherRecord(), (
+                    f"指令「{line}」没跑成：{call.error or '没有返回内容'}"
+                )
+            if not str(call.text or "").strip() and not list(
+                getattr(call, "image_urls", None) or []
+            ):
+                return WeatherRecord(), f"指令「{line}」跑完了，但没返回天气内容"
+            record = await self._store_weather(
                 state,
                 definition,
                 {
@@ -2381,13 +2439,21 @@ class VirtualWorldEngine:
                 },
                 source="auto",
             )
+            if record.empty:
+                return record, "指令返回了内容，但没能整理成天气（日志里有原因）"
+            return record, ""
+        if self.tools is None:
+            return WeatherRecord(), "拿不到 AstrBot 的工具通道"
         outcome = TickOutcome(session_id=session_id)
         action = PlannedAction(type=definition.id, intent="现在外面的天气")
         city = str(getattr(self.world.weather, "city", "") or "").strip()
         if city:
             action.params = self._city_params(definition, state, city)
         if not await self._prepare_tool_action(state, definition, action, outcome):
-            return WeatherRecord()
+            return WeatherRecord(), (
+                "「查天气」选的天气工具在 AstrBot 里没注册或没选："
+                "先确认工具装好了，或者把它改成指令型动作"
+            )
         payload: dict[str, Any] = {
             "type": definition.id,
             "params": dict(action.params),
@@ -2397,7 +2463,10 @@ class VirtualWorldEngine:
         }
         # 这里刻意不传 outcome：静默刷新不该出现在群里（调试回显也不该）
         await self._run_tool_calls(state, definition, payload)
-        return await self._store_weather(state, definition, payload, source="auto")
+        record = await self._store_weather(state, definition, payload, source="auto")
+        if record.empty:
+            return record, "天气工具没返回可用的内容（日志里有原因）"
+        return record, ""
 
     async def _store_weather(
         self,
@@ -3991,7 +4060,7 @@ class VirtualWorldEngine:
                 "action": definition.id,
                 "command": line,
                 "ok": bool(call.ok),
-                "result": _clip_text(call.text, 400),
+                "result": _clip_log(call.text),
                 "images": len(images),
                 "error": call.error,
             },
@@ -5358,7 +5427,7 @@ class VirtualWorldEngine:
                         "action": definition.id,
                         "tool": again.tool or name,
                         "ok": bool(again.ok),
-                        "result": _clip_text(again.text, 400),
+                        "result": _clip_log(again.text),
                         "error": again.error,
                     },
                     outcome=outcome,
@@ -5402,7 +5471,7 @@ class VirtualWorldEngine:
                 "action": definition.id,
                 "tool": call.tool or name,
                 "ok": bool(call.ok),
-                "result": _clip_text(call.text, 400),
+                "result": _clip_log(call.text),
                 "error": call.error,
             },
             outcome=outcome,
@@ -7763,6 +7832,17 @@ def _clip_text(value: Any, limit: int = 200) -> str:
         return ""
     text = str(value).strip().replace("\n", " ")
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _clip_log(value: Any, limit: int = 1200) -> str:
+    """写进日志页的正文：留长一些，并且**标明是被截断的**（免得以为工具只返回了这么点）。"""
+
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"…（完整 {len(text)} 字，日志里只留存前 {limit} 字）"
 
 
 def _to_int_or_default(value: Any, default: int = 0) -> int:
