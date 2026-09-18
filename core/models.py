@@ -348,10 +348,10 @@ class ActionDef(Permissive):
     search_max_queries: int = 3
     """一次动作最多发几条查询（她可以在动作里直接给多条 query）。"""
 
-    search_max_reads: int = 2
+    search_max_reads: int = 3
     """最多读几篇正文。"""
 
-    search_rounds: int = 1
+    search_rounds: int = 2
     """证据不够时最多补查几轮。"""
 
     search_topic: str = ""
@@ -1166,6 +1166,13 @@ def _upgrade_builtin_tool_action(action: dict[str, Any]) -> dict[str, Any]:
         # 老配置的内置搜索还没有"调用形态"这个字段：默认升级成联网检索。
         # 之后用户在编辑器里改成"直接调用"时字段就写进去了，不会再被改回来。
         changed["tool_flow"] = "search"
+    if action_id == "search_web":
+        # 读几篇 / 补查几轮的旧默认值（2 / 1）偏保守，实际用起来经常"只拿到首页就收工"。
+        # 只在还是旧默认值时上调一次，用户自己改过的值不动。
+        if int(changed.get("search_max_reads") or 0) == 2:
+            changed["search_max_reads"] = 3
+        if int(changed.get("search_rounds") or 0) == 1:
+            changed["search_rounds"] = 2
     return changed
 
 

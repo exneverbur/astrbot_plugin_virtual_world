@@ -119,6 +119,51 @@ class TestSearchEvidence(unittest.TestCase):
         self.assertIn("来源：https://x.example/a", text)
 
 
+class TestSearchSourcePicking(unittest.TestCase):
+    """搜索结果的"选页"判断：首页 / 栏目页不算正文，读了也是白读。"""
+
+    def test_homepages_are_recognised(self):
+        from core.engine import _looks_like_homepage
+
+        for url in (
+            "https://news.google.com/home?hl=zh-CN&gl=CN&ceid=CN%3Azh-Hans",
+            "https://www.bbc.com/zhongwen/simp",
+            "https://m.cn.nytimes.com/",
+            "https://cn.wsj.com/",
+            "https://example.com",
+        ):
+            self.assertTrue(_looks_like_homepage(url), url)
+
+    def test_article_urls_are_not_homepages(self):
+        from core.engine import _looks_like_homepage
+
+        for url in (
+            "https://nte.perfectworld.com/cn/article/news/gamebroad/20260602/262481.html",
+            "https://zh.wikipedia.org/wiki/%E4%B9%9D%E4%B8%80%E5%85%AB%E4%BA%8B%E8%AE%8A",
+            "https://www.ithome.com/0/790/123.htm",
+        ):
+            self.assertFalse(_looks_like_homepage(url), url)
+
+    def test_old_search_defaults_are_raised_once(self):
+        """读几篇 / 补查几轮还是旧默认值（2 / 1）时上调一次；用户改过的值不动。"""
+
+        data = default_world()
+        target = [item for item in data["actions"] if item["id"] == "search_web"][0]
+        target["search_max_reads"] = 2
+        target["search_rounds"] = 1
+        world, _warnings = parse_world(data)
+        search = world.action_map()["search_web"]
+        self.assertEqual(search.search_max_reads, 3)
+        self.assertEqual(search.search_rounds, 2)
+
+        target["search_max_reads"] = 1
+        target["search_rounds"] = 0
+        world, _warnings = parse_world(data)
+        search = world.action_map()["search_web"]
+        self.assertEqual(search.search_max_reads, 1)
+        self.assertEqual(search.search_rounds, 0)
+
+
 class TestWeather(unittest.TestCase):
     """天气：多久之前的说法、字段拆分、以及写进提示词的那一段。"""
 

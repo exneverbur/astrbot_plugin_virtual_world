@@ -1695,6 +1695,44 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         await task
         self.assertFalse(self.engine.is_busy(SESSION))
 
+    async def test_multiple_queries_are_issued_in_parallel(self):
+        """一次检索的多条查询要并发发出去：串行时每条都要等上一条搜完（又慢、回显还散）。"""
+
+        import asyncio
+
+        self.tools._tools = {"news_search": "搜新闻"}
+        self.tools.schemas["news_search"] = {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        }
+        self.tools.results = {"news_search": "标题\nhttps://news.example/a 内容"}
+        inflight = {"now": 0, "peak": 0}
+        original = self.tools.call_tool
+
+        async def slow_call(name, params, session_id=""):
+            inflight["now"] += 1
+            inflight["peak"] = max(inflight["peak"], inflight["now"])
+            try:
+                await asyncio.sleep(0.15)
+                return await original(name, params, session_id)
+            finally:
+                inflight["now"] -= 1
+
+        self.tools.call_tool = slow_call
+        definition = self.bind_search_flow(["news_search"], depth="quick")
+        await self.set_state(node_id="study")
+        payload = {
+            "type": "search_web",
+            "intent": "查新闻",
+            "queries": ["今日新闻", "国际要闻", "科技动态"],
+        }
+
+        await self.engine._run_tool_calls(await self.get_state(), definition, payload)
+
+        self.assertEqual(inflight["peak"], 3, (self.tools.calls, payload))
+        self.assertEqual(len(self.tools.calls), 3)
+
     async def test_followup_round_cannot_search_again(self):
         """刚查完那一轮：她想再写一次检索会被拦下，只让她说话。"""
 

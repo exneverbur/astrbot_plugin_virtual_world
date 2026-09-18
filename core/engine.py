@@ -109,6 +109,45 @@ SEARCH_QUERY_RULES = (
 )
 
 
+# 单独一段路径就到底的，基本都是栏目入口
+_HOMEPAGE_SEGMENTS = (
+    "home",
+    "index",
+    "index.html",
+    "zh",
+    "cn",
+    "en",
+    "zhongwen",
+    "simp",
+    "news",
+    "hot",
+    "top",
+)
+# 两段路径、且就是栏目首页的
+_HOMEPAGE_PATHS = ("/zhongwen/simp", "/cn/index", "/zh/index")
+
+
+def _looks_like_homepage(url: str) -> bool:
+    """这个链接像不像"首页 / 导航页"——搜索经常先给你一堆这种，读了也没有正文。
+
+    ``https://news.google.com/home``、``https://www.bbc.com/zhongwen/simp``、
+    ``https://m.cn.nytimes.com/`` 这类都是：路径为空或者是栏目入口，没有具体内容。
+    """
+
+    text = str(url or "").strip().lower()
+    if not text:
+        return False
+    body = text.split("://", 1)[-1]
+    path = "/" + body.split("/", 1)[1] if "/" in body else ""
+    path = path.split("?", 1)[0].split("#", 1)[0]
+    segments = [item for item in path.split("/") if item]
+    if not segments:
+        return True  # 只有域名：就是首页
+    if len(segments) == 1:
+        return segments[0] in _HOMEPAGE_SEGMENTS
+    return f"/{segments[0]}/{segments[1]}" in _HOMEPAGE_PATHS
+
+
 def _clean_search_topic(reply: Any) -> str:
     """把"想查什么"的那句回答洗干净；看起来不像话题（JSON、代码、空话）就用空串。"""
 
@@ -4723,12 +4762,21 @@ class VirtualWorldEngine:
         )
         return call
 
-    async def _run_one_query(
+    @staticmethod
+    def _next_search_tool(tool: str, candidates: list[str]) -> str:
+        """下一个候选搜索工具（没有就返回空串）。"""
+
+        if tool not in candidates:
+            return ""
+        index = candidates.index(tool)
+        return candidates[index + 1] if index + 1 < len(candidates) else ""
+
+    async def _search_batch(
         self,
         state: WorldState,
         definition: ActionDef,
         action: dict[str, Any],
-        query: str,
+        queries: list[str],
         base: dict[str, Any],
         query_key: str,
         tool: str,
@@ -4742,62 +4790,66 @@ class VirtualWorldEngine:
         used: list[str],
         asked: list[str],
     ) -> str:
-        """查一条查询词；搜索工具本身坏了就换下一个候选，把这一条重试一遍。"""
+        """并发查一批查询词；整批都因为"工具本身坏了"失败时，换下一个候选重试一遍。
 
-        asked.append(query)
-        for _ in range(len(candidates) + 1):
-            call = await self._search_once(
-                state,
-                definition,
-                action,
-                tool,
-                query,
-                base,
-                query_key,
-                outcome=outcome,
-                texts=texts,
-                items=items,
-                failed=failed,
-                images=images,
-                used=used,
-            )
-            nxt = await self._switch_search_tool(
-                state, definition, tool, call, candidates, failed
-            )
-            if nxt == tool:
-                return tool
-            tool = nxt
-        return tool
-
-    async def _switch_search_tool(
-        self,
-        state: WorldState,
-        definition: ActionDef,
-        tool: str,
-        call: ToolCallResult | None,
-        candidates: list[str],
-        failed: list[str],
-    ) -> str:
-        """搜索工具本身坏了就换下一个候选（动作上挂多个搜索工具时才有意义）。
-
-        参数写错不算坏——那种在 ``_call_one_tool`` 里已经带着报错补过一次了。
+        并发是刻意的：串行时每条要等上一条搜完（一次 3~4 秒），既慢、回显也会散成好几行。
         """
 
-        if call is None or call.ok or not candidates:
+        if not queries:
             return tool
-        if _looks_like_argument_error(str(call.error or "")):
-            return tool
-        if tool not in candidates or candidates.index(tool) >= len(candidates) - 1:
-            return tool
-        index = candidates.index(tool)
-        nxt = candidates[index + 1]
-        failed.append(f"{tool} 换成了 {nxt}")
-        await self._log_event(
-            state,
-            "skip",
-            {"action": definition.id, "note": f"搜索工具「{tool}」用不了，改用「{nxt}」"},
-        )
-        return nxt
+        asked.extend(queries)
+        for _ in range(len(candidates) + 1):
+            results = await asyncio.gather(
+                *(
+                    self._search_once(
+                        state,
+                        definition,
+                        action,
+                        tool,
+                        query,
+                        base,
+                        query_key,
+                        outcome=outcome,
+                        texts=texts,
+                        items=items,
+                        failed=failed,
+                        images=images,
+                        used=used,
+                    )
+                    for query in queries
+                ),
+                return_exceptions=True,
+            )
+            usable = 0
+            broken = 0
+            for entry in results:
+                if isinstance(entry, Exception):
+                    broken += 1
+                    failed.append(f"{tool}：{entry}")
+                    continue
+                if entry is None:
+                    broken += 1
+                    continue
+                if entry.ok or _looks_like_argument_error(str(entry.error or "")):
+                    # 跑通了、或者只是参数写错（工具本身没坏）都不算"工具坏了"
+                    usable += 1
+                else:
+                    broken += 1
+            if usable or broken < len(queries):
+                return tool
+            nxt = self._next_search_tool(tool, candidates)
+            if not nxt:
+                return tool
+            await self._log_event(
+                state,
+                "skip",
+                {
+                    "action": definition.id,
+                    "note": f"搜索工具「{tool}」用不了，改用「{nxt}」",
+                },
+            )
+            tool = nxt
+        return tool
 
     async def _search_continue(
         self,
@@ -4817,14 +4869,20 @@ class VirtualWorldEngine:
 
         if self.llm is None:
             return True, []
-        points = [
-            "｜".join(
+        points = []
+        for item in items:
+            text = "｜".join(
                 part
-                for part in (item.title, item.published_at, (item.passage or item.snippet or "")[:120])
+                for part in (
+                    item.title,
+                    item.published_at,
+                    (item.passage or item.snippet or "")[:120],
+                )
                 if part
             )
-            for item in items
-        ]
+            if _looks_like_homepage(item.url):
+                text += "（这条像首页/栏目页，没有正文）"
+            points.append(text)
         system_prompt, prompt = self.prompts.build_search_continue_prompt(
             topic=topic,
             asked=asked,
@@ -5016,26 +5074,25 @@ class VirtualWorldEngine:
                 if filled:
                     base = {**base, **filled}
 
-        for query in queries:
-            tool = await self._run_one_query(
-                state,
-                definition,
-                action,
-                query,
-                base,
-                query_key,
-                tool,
-                candidates,
-                outcome=outcome,
-                texts=texts,
-                items=items,
-                failed=failed,
-                images=images,
-                used=used,
-                asked=asked,
-            )
-            if time.monotonic() > deadline:
-                break
+        # 多条查询**并发**发出去：串行的话每条要等上一条搜完（一次 3~4 秒），
+        # 既慢又让回显分散成好几行；并发之后它们几乎同时发生，防抖自然合成一行
+        tool = await self._search_batch(
+            state,
+            definition,
+            action,
+            queries,
+            base,
+            query_key,
+            tool,
+            candidates,
+            outcome=outcome,
+            texts=texts,
+            items=items,
+            failed=failed,
+            images=images,
+            used=used,
+            asked=asked,
+        )
 
         read_budget, rounds = self._search_budget(definition, action)
         for _ in range(rounds):
@@ -5055,26 +5112,23 @@ class VirtualWorldEngine:
             fresh = [entry for entry in gaps if entry not in asked]
             if not fresh:
                 break
-            for query in fresh:
-                tool = await self._run_one_query(
-                    state,
-                    definition,
-                    action,
-                    query,
-                    base,
-                    query_key,
-                    tool,
-                    candidates,
-                    outcome=outcome,
-                    texts=texts,
-                    items=items,
-                    failed=failed,
-                    images=images,
-                    used=used,
-                    asked=asked,
-                )
-                if time.monotonic() > deadline:
-                    break
+            tool = await self._search_batch(
+                state,
+                definition,
+                action,
+                fresh,
+                base,
+                query_key,
+                tool,
+                candidates,
+                outcome=outcome,
+                texts=texts,
+                items=items,
+                failed=failed,
+                images=images,
+                used=used,
+                asked=asked,
+            )
             if len(items) <= before:
                 # 补了一轮什么都没新拿到：别再往下问了，直接用现有的说
                 break
@@ -5083,14 +5137,25 @@ class VirtualWorldEngine:
             readers = self._reader_tools(definition, state)
             if readers:
                 readable = [item for item in items if item.url and not item.passage]
-                for item in readable[:read_budget]:
-                    if time.monotonic() > deadline:
-                        break
-                    item.passage = await self._read_passage(
-                        state, definition, readers, item.url, outcome=outcome
-                    )
-                    if item.passage:
-                        reads += 1
+                # 优先读"看着像正文"的：搜索经常先给一堆首页/导航页，
+                # 读了它们只会浪费一次调用（返回的还是栏目导航，没有内容）
+                concrete = [item for item in readable if not _looks_like_homepage(item.url)]
+                picked = (concrete or readable)[:read_budget]
+                # 读正文同样并发：几篇一起抓，比一篇篇等快得多
+                passages = await asyncio.gather(
+                    *(
+                        self._read_passage(
+                            state, definition, readers, item.url, outcome=outcome
+                        )
+                        for item in picked
+                    ),
+                    return_exceptions=True,
+                )
+                for item, passage in zip(picked, passages):
+                    if isinstance(passage, Exception) or not passage:
+                        continue
+                    item.passage = str(passage)
+                    reads += 1
 
         items = merge_evidence(items, limit=8)
         digest = await self._digest_evidence(
