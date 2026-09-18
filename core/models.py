@@ -937,6 +937,12 @@ class ChainStep(Permissive):
     queries: list[str] = Field(default_factory=list)
     """检索型步骤可以直接写几条查询词；留空就按 intent 让辅助模型翻。"""
 
+    search_depth: str = ""
+    """这一步想要的检索深度（quick / standard / deep）；留空按动作配置。"""
+
+    read_pages: int = -1
+    """这一步想读几篇正文；-1 表示没写。"""
+
 
 class ScheduleConditions(Permissive):
     not_state: list[str] = Field(default_factory=list)
@@ -1450,6 +1456,10 @@ def parse_world(data: dict[str, Any]) -> tuple[WorldConfig, list[str]]:
     for action in actions:
         if action.id in REQUIRED_BUILTIN_ACTIONS:
             action.builtin = True
+        elif action.builtin:
+            # 「内置」只属于上面那批动作。复制内置动作、手改 JSON、导入别人的预设都可能
+            # 把这个标记带过来，留着它副本在编辑器里就删不掉了——这里直接清掉。
+            action.builtin = False
     world.actions = actions
 
     # 跨区连线（门户对）：两端的区域与房间都必须存在，且房间确实属于那一端区域

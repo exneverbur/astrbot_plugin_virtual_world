@@ -9,6 +9,18 @@ from __future__ import annotations
 from typing import Any
 
 
+def _read_pages(value: Any) -> int:
+    """她写的"读几篇"：没写或写坏都当 -1（按动作配置来），0 也是有效值。"""
+
+    if value is None or value == "":
+        return -1
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return -1
+    return number if number >= 0 else -1
+
+
 def create_plan(
     *,
     steps: list[dict[str, Any]],
@@ -35,6 +47,8 @@ def create_plan(
                 "intent": str(step.get("intent", "") or ""),
                 # 检索型动作自己写的查询词同理：丢了会退化成按主题兜一条
                 "queries": [str(item) for item in (step.get("queries") or []) if str(item)],
+                "search_depth": str(step.get("search_depth", "") or ""),
+                "read_pages": _read_pages(step.get("read_pages")),
                 "messages": list(step.get("messages") or []),
                 "params": dict(step.get("params") or {}),
                 "interject": bool(step.get("interject", False)),

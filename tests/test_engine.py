@@ -1570,6 +1570,127 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tool_evidence_text", payload)
         self.assertTrue(payload["tool_error"])
 
+    async def test_one_search_action_echoes_a_single_line(self):
+        """一次检索查了三条：群里只出现一行「🔧 搜索 ×3」，不是三条调用。"""
+
+        raw = self.store.raw_world()
+        raw["echo_types"] = ["tool_call", "tool_result"]
+        self.store.save_world(raw)
+        self.engine.reload_config()
+        self.use_search_tool()
+        definition = self.bind_search_flow(["news_search"], depth="quick")
+        await self.set_state(node_id="study")
+        payload = {
+            "type": "search_web",
+            "intent": "看看今天的科技新闻",
+            "queries": ["今日科技新闻", "AI 行业 最新进展", "芯片 动态"],
+        }
+        outcome = TickOutcome(session_id=SESSION)
+
+        await self.engine._run_tool_calls(
+            await self.get_state(), definition, payload, outcome=outcome
+        )
+
+        tool_lines = [line for line in outcome.debug_messages if line.startswith("🔧")]
+        self.assertEqual(len(tool_lines), 1, outcome.debug_messages)
+        self.assertIn("×3", tool_lines[0])
+        self.assertIn("今日科技新闻", tool_lines[0])
+        # 每条查询单独一行的老格式不该再出现
+        self.assertFalse(
+            [line for line in outcome.debug_messages if "调用「news_search」" in line]
+        )
+        self.assertTrue(
+            [line for line in outcome.debug_messages if line.startswith("📥")]
+        )
+
+    async def test_followup_round_cannot_search_again(self):
+        """刚查完那一轮：她想再写一次检索会被拦下，只让她说话。"""
+
+        self.use_search_tool()
+        self.bind_search_flow(["news_search"], depth="quick")
+        await self.set_state(node_id="study")
+        self.tools.results["news_search"] = (
+            "新闻一\nhttps://news.example/a " + "有一条芯片行业的消息。" * 8 + "\n"
+            "新闻二\nhttps://news.example/b " + "另外还有一条 AI 模型的进展。" * 8
+        )
+        self.llm.replies = [
+            '{"actions":[{"type":"search_web","intent":"查新闻",'
+            '"queries":["今天的新闻"]}]}',
+            "结论：查到了三条\n1. 有一条值得讲（1）",
+            '{"actions":[{"type":"search_web","intent":"再查一次",'
+            '"queries":["别的话题"]},{"type":"say","messages":["查到了三条"]}]}',
+        ]
+
+        outcome = await self.engine.handle_reply(self.ctx())
+
+        # 只搜了一次（第二轮那次被拦）
+        self.assertEqual(len(self.tools.calls), 1)
+        self.assertIn("查到了三条", " ".join(outcome.messages))
+        # 拦下来这件事要能在日志里看到，提示词里也明确不让她再查
+        events = await self.db.call("query_events", session_id=SESSION, limit=40)
+        notes = [item["detail"].get("note", "") for item in events if item["event_type"] == "skip"]
+        self.assertTrue(any("续说这一轮不再接" in note for note in notes), notes)
+        self.assertIn("不要再调检索", self.llm.calls[-1]["prompt"])
+
+    async def test_she_can_ask_for_a_shallower_search(self):
+        """她自己写 search_depth=quick：就不读正文了（配置是上限）。"""
+
+        self.use_search_tool(result="标题\nhttps://news.example/a 摘要内容够长" * 3)
+        self.tools._tools["page_reader"] = "读网页"
+        self.tools.schemas["page_reader"] = {
+            "type": "object",
+            "properties": {"url": {"type": "string"}},
+            "required": ["url"],
+        }
+        definition = self.bind_search_flow(["news_search"], readers=["page_reader"])
+        await self.set_state(node_id="study")
+        payload = {
+            "type": "search_web",
+            "intent": "查新闻",
+            "queries": ["今天的新闻"],
+            "search_depth": "quick",
+        }
+
+        await self.engine._run_tool_calls(await self.get_state(), definition, payload)
+
+        # 快查档：读了 0 篇
+        self.assertEqual([name for name, _params in self.tools.calls], ["news_search"])
+
+    async def test_second_search_tool_takes_over_when_the_first_is_broken(self):
+        """动作上挂了两个搜索工具：第一个用不了就换第二个（不是白挂）。"""
+
+        self.tools._tools = {"first_search": "第一个", "second_search": "第二个"}
+        for name in ("first_search", "second_search"):
+            self.tools.schemas[name] = {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            }
+        self.tools.results = {"second_search": "第二条搜索返回的内容"}
+        definition = self.bind_search_flow(["first_search", "second_search"], depth="quick")
+        await self.set_state(node_id="study")
+        self.tools.failures["first_search"] = "工具「first_search」没有可调用的 handler"
+        payload = {"type": "search_web", "intent": "查新闻", "queries": ["今天的新闻"]}
+
+        await self.engine._run_tool_calls(await self.get_state(), definition, payload)
+
+        self.assertIn(
+            ("second_search", {"query": "今天的新闻"}),
+            self.tools.calls,
+        )
+
+    async def test_recent_search_is_written_into_the_prompt(self):
+        """上一轮查过什么要带进下一轮提示词，免得她拿同样的词再查一遍。"""
+
+        await self.engine._remember_search(SESSION, ["今日科技新闻"], 3)
+        self.llm.replies = [SAY_REPLY]
+
+        await self.engine.handle_reply(self.ctx())
+
+        prompt = self.llm.calls[-1]["system_prompt"]
+        self.assertIn("# 最近查过", prompt)
+        self.assertIn("今日科技新闻", prompt)
+
     async def test_queued_step_keeps_intent(self):
         """被排队的工具动作必须留住 intent，否则到点只会说"没有给出想做什么"。"""
 
@@ -3625,7 +3746,9 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertTrue(echoed, outcomes[0].debug_messages)
         self.assertTrue(any("🔧" in text and "今天的新闻" in text for text in echoed), echoed)
-        self.assertTrue(any("📥" in text and "科技新闻" in text for text in echoed), echoed)
+        # 一次检索里的多次调用合并成一行：🔧 搜索 ×N：查询词…
+        self.assertTrue(any("🔧 搜索" in text for text in echoed), echoed)
+        self.assertTrue(any("📥" in text and "可用结果" in text for text in echoed), echoed)
         # 回显不算"她说过的话"：不进聊天上下文（她自己真正说的那句才算）
         state = await self.get_state()
         self.assertFalse(
@@ -3642,10 +3765,15 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.engine.reload_config()
         self.bind_search_flow(["web_search"], depth="quick")
         await self.set_state(node_id="study")
-        self.tools.results["web_search"] = "今天有三条科技新闻。"
+        # 材料够多才值得压成要点：一两条短摘要直接用证据块，不会多花一次调用
+        self.tools.results["web_search"] = (
+            "科技新闻一\nhttps://news.example/a " + "今天有一条芯片行业的消息。" * 8 + "\n"
+            "科技新闻二\nhttps://news.example/b " + "另外还有一条 AI 模型的进展。" * 8
+        )
         self.llm.replies = [
             '{"actions":[{"type":"search_web","intent":"查今天的新闻",'
             '"queries":["今天的新闻"]}]}',
+            "结论：今天有三条科技新闻\n1. 芯片行业有新动态（1）",
             '{"actions":[{"type":"say","messages":["查到了三条"]}]}',
         ]
 
@@ -3658,6 +3786,8 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         )
         say_at = ordered.index("查到了三条")
         self.assertLess(tool_at, say_at, ordered)
+        # 交给主模型的是"要点+编号"，不是原始证据块
+        self.assertIn("芯片行业有新动态", self.llm.calls[-1]["prompt"])
 
     async def test_echo_actions_off_by_default(self):
         self.add_schedule(

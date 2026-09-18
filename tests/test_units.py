@@ -1325,6 +1325,23 @@ class TestToolScopeFromActions(unittest.TestCase):
         # 内置搜索默认走检索流水线
         self.assertEqual(search.tool_flow, "search")
 
+    def test_only_real_builtins_keep_the_flag(self):
+        """复制内置动作带过来的 builtin 标记要被清掉，否则副本在编辑器里删不掉。"""
+
+        data = default_world()
+        source = [item for item in data["actions"] if item["id"] == "search_web"][0]
+        clone = dict(source)
+        clone["id"] = "search_web_copy"
+        clone["name"] = "上网搜索（副本）"
+        data["actions"].append(clone)
+
+        world, _warnings = parse_world(data)
+
+        self.assertFalse(world.action_map()["search_web_copy"].builtin)
+        # 真内置动作的标记不受影响
+        self.assertTrue(world.action_map()["search_web"].builtin)
+        self.assertTrue(world.action_map()["say"].builtin)
+
     def test_old_search_action_is_upgraded_to_the_search_flow(self):
         """老配置里没有「调用形态」这个字段：升级成联网检索；用户改过的就保留。"""
 
@@ -1808,6 +1825,64 @@ class TestPromptBuilder(unittest.TestCase):
         joined = "\n".join(blocks)
         self.assertIn("你最近说过的话", joined)
         self.assertIn("都下午三点了呀主人！", joined)
+
+    def test_chat_blocks_say_whose_conversation_it_is(self):
+        """别人在互相说话时要写明"没点名找你"，还要点破「你」不是指她。"""
+
+        others = self.builder.chat_blocks(
+            [
+                {"user_id": "1", "name": "不相疑", "text": "放太多天了", "is_self": False},
+                {"user_id": "2", "name": "大狗", "text": "又不是上班", "is_self": False},
+                {"user_id": "1", "name": "不相疑", "text": "草饲你", "is_self": False},
+            ],
+            mine_names=["凶猛蓝色虎鲸"],
+        )
+        joined = "\n".join(others)
+        self.assertIn("他们是在互相说话", joined)
+        self.assertIn("不是指你", joined)
+
+        # 她刚说过话、别人接着往下说：不能一律说成"没找你"
+        with_self = self.builder.chat_blocks(
+            [
+                {"user_id": "__self__", "name": "她", "text": "在书房翻配置", "is_self": True},
+                {"user_id": "1", "name": "不相疑", "text": "那你继续", "is_self": False},
+            ],
+            mine_names=["凶猛蓝色虎鲸"],
+        )
+        self.assertIn("你刚说过话", "\n".join(with_self))
+
+        # 有人 @ 她（插件在记录里写的就是这个措辞）时反过来
+        mine = self.builder.chat_blocks(
+            [
+                {
+                    "user_id": "1",
+                    "name": "不相疑",
+                    "text": "在吗\n［这条消息 @ 了：你（凶猛蓝色虎鲸💢(9)）］",
+                    "is_self": False,
+                }
+            ],
+            mine_names=["凶猛蓝色鲸鱼"],
+        )
+        self.assertIn("是对你说的", "\n".join(mine))
+
+    def test_bot_name_list_covers_nickname_variants(self):
+        """昵称带表情/后缀时也要认得出来（「凶猛蓝色虎鲸💢」→「凶猛蓝色虎鲸」）。"""
+
+        state = WorldState(session_id="s1", node_id="study")
+        state.bot_current_nickname = "凶猛蓝色虎鲸💢"
+        state.bot_base_nickname = "小鲸鱼"
+        names = self.builder.bot_name_list(state)
+        self.assertIn("小鲸鱼", names)
+        self.assertIn("凶猛蓝色虎鲸", names)
+
+    def test_interject_prompt_warns_about_the_second_person_you(self):
+        """插话模式的用户消息要提醒她：别人话里的「你」不是她。"""
+
+        text = self.builder.build_reply_user_prompt(
+            user_name="不相疑", text="草饲你", addressing="interject"
+        )
+        self.assertIn("不是指你", text)
+        self.assertIn("别用「主人」", text)
 
     def test_inner_voice_prefers_reasoning(self):
         state = WorldState(

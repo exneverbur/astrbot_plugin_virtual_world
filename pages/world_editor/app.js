@@ -5444,6 +5444,8 @@ function renderActionForm() {
             "工具型动作至少要选一个工具，而且是 AstrBot 里真实注册的那个。\n" +
             "**没选工具 = 这个动作会被跳过**（例如「上网搜索」「查天气」现在都不带默认工具，要先在这里挑一个能用的）。\n" +
             "选了多个就按顺序依次调用（比如先搜索、再把搜到的页面抓下来），结果一起交回给她。\n" +
+            "**联网检索形态下只有第一个能用的搜索工具会被当作搜索入口**，它坏了会自动换下一个；" +
+            "要抓网页正文请在下面的「阅读网页工具」里单独选。\n" +
             "运行时她只要说明「想干什么」，具体参数由辅助模型按每个工具自己的定义补全，" +
             "所以不用在这里配置默认参数。",
           empty: "点击选择工具…",
@@ -5527,11 +5529,15 @@ function renderActionForm() {
           toolItems(),
           (chosen) => {
             action.reader_tool_names = chosen;
+            // 选完要立刻重画：不然按钮上还是"点击选择工具…"，
+            // 再点开时上次选的也没勾上（看起来就像这个字段配不了）
+            renderActionForm();
           },
           {
             hint:
               "能传网址、返回正文的工具（例如把网页转成 markdown 的那种）。\n" +
               "配了它，插件会挑搜索结果里最靠前的几篇抓正文再交给她；留空就只用搜索摘要。\n" +
+              "注意「检索深度」要选「标准」或「深挖」才会读正文——「快查」档只看摘要。\n" +
               "同一篇网页 6 小时内不会重复抓。",
             empty: "点击选择工具…",
             renderChips: true,
@@ -5547,10 +5553,12 @@ function renderActionForm() {
             action.search_depth = value;
             renderActionForm();
           },
-          {
-            hint:
-              "决定这一趟查多远。快查只查一轮不读正文；标准会读前两篇、不够再补查一轮；深挖至少读三篇、最多补查两轮。",
-          },
+        {
+          hint:
+            "决定这一趟查多远，**配的是上限**：快查只查一轮不读正文；标准读前两篇、不够补查一轮；" +
+              "深挖至少读三篇、最多补查两轮。她可以在动作里写更浅的档位（例如简单问题自己选快查），" +
+              "但不能超过这里。",
+        },
         ),
       );
       searchBox.appendChild(
@@ -5627,6 +5635,7 @@ function renderActionForm() {
           ],
           (value) => {
             action.search_cite = value === "yes";
+            renderActionForm();
           },
           { hint: "群里通常不想看到一串网址；要核对来源时再打开。" },
         ),
@@ -6023,6 +6032,8 @@ function copyAction(actionId) {
   const clone = JSON.parse(JSON.stringify(source));
   clone.id = id;
   clone.name = `${source.name || source.id}（副本）`;
+  // 复制出来的是她自己的动作：把「内置」标记摘掉，否则副本会被当成内置动作（删不掉）
+  clone.builtin = false;
   clone.created_at = Date.now();
   actions().push(clone);
   markDirty();

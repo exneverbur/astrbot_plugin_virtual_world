@@ -110,6 +110,20 @@ _REASONING_LABELS = {
 }
 
 
+def _mentions_me(text: str, names: list[str]) -> bool:
+    """这条群聊记录里有没有点名找她：@ 了她，或者叫了她的名字/名片。
+
+    别人消息里的「你」不算——中文里那个「你」几乎总是指群里另一个人。
+    """
+
+    body = str(text or "")
+    if not body:
+        return False
+    if "@ 了：你" in body or "你（" in body:
+        return True
+    return any(name and name in body for name in names)
+
+
 def _one_line(value: Any, limit: int = 140) -> str:
     """把任意内容压成一行：转发、引用、多段文本在提示词里都会把排版撑乱。"""
 
@@ -438,6 +452,7 @@ class PromptBuilder:
         recent_chat: list[dict[str, Any]] | None = None,
         style_block: str = "",
         weather: str = "",
+        recent_search: str = "",
     ) -> str:
         now = self._now()
         # 记忆按时间从早到晚排，越靠下越新——模型读提示词时最后的更"近"。
@@ -493,6 +508,9 @@ class PromptBuilder:
         if weather:
             # 天气跟着时钟走（都是"此刻外面什么样"），同样属于每轮都可能变的内容
             blocks.append(weather)
+        if recent_search:
+            # 「最近查过什么」也贴在这附近：省得她隔一轮又用同样的词查一遍
+            blocks.append(recent_search)
         if node is not None:
             # 可达表只跟"她在哪"有关，比状态稳、比记忆易变得多，放时钟后面
             blocks.append(self.reach_table(node.id))
@@ -523,6 +541,7 @@ class PromptBuilder:
                 replied_until=float(getattr(state, "chat_replied_until", 0.0) or 0.0),
                 replied_seq=int(getattr(state, "chat_replied_seq", 0) or 0),
                 recent_replies=list(getattr(state, "recent_replies", []) or []),
+                mine_names=self.bot_name_list(state),
             )
         )
         # 其他插件注入的内容跟着这条消息走，每轮都不一样，放到靠后的位置
@@ -664,6 +683,7 @@ class PromptBuilder:
         replied_until: float = 0.0,
         replied_seq: int = 0,
         recent_replies: list[str] | None = None,
+        mine_names: list[str] | None = None,
     ) -> list[str]:
         """把群聊背景拆成三块：之前聊过的概览、现在在聊什么、她刚说过的话。
 
@@ -731,9 +751,32 @@ class PromptBuilder:
             last_who = who
             last_at = at
         if lines:
+            # 她自己不在这些消息里出现时，明确告诉她"这几条不是对你说的"：
+            # 中文字面的「你」经常指群里另一个人，模型很容易当成有人在跟自己说话。
+            names = [str(item).strip() for item in (mine_names or []) if str(item).strip()]
+            mentioned = any(
+                _mentions_me(str(item.get("text") or ""), names) for item in fresh
+            )
+            spoke = any(item.get("is_self") for item in fresh)
+            if mentioned:
+                address_line = "这几条里有人 @ 你 / 叫了你的名字：其中有话是对你说的。\n"
+            elif spoke:
+                address_line = (
+                    "这几条里你刚说过话：接着你往下说的多半是对你说的；"
+                    "但他们俩之间互相说的那部分别揽到自己身上，\n"
+                    "不确定是在问谁时，别用「主人」这类专属称呼。\n"
+                )
+            else:
+                address_line = (
+                    "这几条里没有人 @ 你、也没有叫你的名字：他们是在互相说话。\n"
+                    "别人句子里的「你」指的是群里另一个人，**不是指你**——"
+                    "没点名找你时你只是在旁边看着，\n"
+                    "想接话就自然接一句，但别写成「他们在跟你说话」。\n"
+                )
             blocks.append(
                 "# 最近在聊什么（按时间顺序，最后一条最新；带「你:」的是你自己说的）\n"
-                "这一串是原样的聊天记录：谁在跟谁说话、话题怎么接的，都看这里。\n"
+                + address_line
+                + "这一串是原样的聊天记录：谁在跟谁说话、话题怎么接的，都看这里。\n"
                 "不要逐条复述、不要总结成列表。\n"
                 + "\n".join(lines)
             )
@@ -747,8 +790,31 @@ class PromptBuilder:
             )
         return blocks
 
+    def bot_name_list(self, state: Any) -> list[str]:
+        """她可能被叫到的名字：配置里的 bot 名字 + 群名片（原名/当前名）。
+
+        用来判断"这几条群聊里有没有点名找她"。
+        """
+
+        names = [
+            str(getattr(self.world, "bot_name", "") or "").strip(),
+            str(getattr(state, "bot_current_nickname", "") or "").strip(),
+            str(getattr(state, "bot_base_nickname", "") or "").strip(),
+        ]
+        # 昵称里常带表情/后缀（「凶猛蓝色虎鲸💢」），去掉非中文数字字母后再比一次
+        extra: list[str] = []
+        for name in names:
+            cleaned = "".join(ch for ch in name if ch.isalnum())
+            if cleaned and cleaned != name and len(cleaned) >= 2:
+                extra.append(cleaned)
+        result: list[str] = []
+        for name in [*names, *extra]:
+            if name and name not in result:
+                result.append(name)
+        return result
+
     def _chat_time(self, at: float, now: datetime | None) -> str:
-        """群聊记录里的时间戳：几点几分。"""
+        """群聊记录的时间戳：几点几分。"""
 
         if not at:
             return "--:--"
@@ -859,7 +925,11 @@ class PromptBuilder:
             "不要自己编参数，系统会按工具定义自动补全。\n\n"
             "- 标着「联网检索型」的动作：intent 写清楚查什么就够了；"
             "要分几个角度查时可以再加一条 queries，每条一个关键词句，最多 3 条，"
-            "系统会逐条查完再汇总。\n\n"
+            "系统会逐条查完再汇总。\n"
+            "  同一个动作还可以写 search_depth（quick 只查摘要 / standard 读正文 / deep 多读几篇）"
+            "和 read_pages（最多读几篇）——简单问题用 quick，要读长文才说得清的才用 deep；"
+            "写法不能超过动作自己配的上限。查完就把结果整理好交给你，"
+            "**同一轮里不要再重复查同一件事**：没查到的就直说没查到。\n\n"
             "规则：\n"
             "1. 只能从「当前场景」那一层列出的动作里选 type，写别的会被丢弃。\n"
             "2. 工具型动作必须填 intent（想做什么），不要填 params。\n"
@@ -915,6 +985,7 @@ class PromptBuilder:
         recent_chat: list[dict[str, Any]] | None = None,
         style_block: str = "",
         weather: str = "",
+        recent_search: str = "",
     ) -> str:
         """注入模式：给主人格的一层「世界认知」。"""
 
@@ -929,6 +1000,7 @@ class PromptBuilder:
             recent_chat=recent_chat,
             style_block=style_block,
             weather=weather,
+            recent_search=recent_search,
         )
         return (
             "\n\n# ===== 虚拟世界状态（这是你此刻真实的处境）=====\n"
@@ -967,6 +1039,7 @@ class PromptBuilder:
         mode: str = "actions",
         style_block: str = "",
         weather: str = "",
+        recent_search: str = "",
     ) -> str:
         """接管模式：完整五层，含 JSON 输出约束。
 
@@ -1001,6 +1074,7 @@ class PromptBuilder:
                 other_context=other_context,
                 style_block=style_block,
                 weather=weather,
+                recent_search=recent_search,
             )
         )
         layers.append(self.reminder_layer(mode))
@@ -1029,7 +1103,9 @@ class PromptBuilder:
                 text,
                 "",
                 "没有人点名找你。你可以顺着接一句，也可以觉得没必要说就只做自己的事；"
-                "不要把这句话当成别人对你的请求或指令。",
+                "不要把这句话当成别人对你的请求或指令；"
+                "别人话里的「你」指的是群里另一个人，不是指你——"
+                "不确定是谁在跟谁说话时，别用「主人」这类专属称呼，也别写成在回应他。",
             ]
         else:
             parts = [f"{who} 对你说：", text]
@@ -1048,12 +1124,23 @@ class PromptBuilder:
         parts.append("只输出 JSON。")
         return "\n".join(parts)
 
-    def build_reply_followup_prompt(self, hint: str, tool_result: str) -> str:
+    def build_reply_followup_prompt(
+        self, hint: str, tool_result: str, *, no_search: bool = False
+    ) -> str:
+        """续说提示词。``no_search=True`` 时会明确禁止这一轮再查（刚查完就别反复查）。"""
+
+        no_search_rule = (
+            "- 东西已经查完了：这一轮**不要再调检索/搜索类动作**，用手上的结果说话；"
+            "确实没查到就直说没查到，不要换个词再查一遍。\n"
+            if no_search
+            else ""
+        )
         return (
             "你刚才做了一件事，这是结果：\n"
             f"{tool_result}\n\n"
             f"{hint or '用你自己的话简短地说说这件事。'}\n\n"
             "说话时的分寸：\n"
+            f"{no_search_rule}"
             "- 如果刚才没有人在跟你说话，就当成随口一句自言自语，别写成在招呼全场；\n"
             "- 不要吆喝、不要招揽、不要推销（例如「想吃吗」「吱一声」「要的扣 1」），"
             "也不要用「我给你留了一份」这类讨好句式；\n"
@@ -1519,6 +1606,41 @@ class PromptBuilder:
             "2. 只查一件事，不要写成「新闻、天气、比分」这种罗列；\n"
             "3. 群里正在聊的话题优先，没有就按你自己的兴趣来；\n"
             "4. 只输出这句话。"
+        )
+        return system, prompt
+
+    def build_search_digest_prompt(
+        self,
+        *,
+        topic: str,
+        materials: list[str],
+        limit: int = 6,
+        date_text: str = "",
+    ) -> tuple[str, str]:
+        """把检索回来的材料压成"要点 + 编号"（返回 system, user）。
+
+        给主模型的是要点而不是整篇原料：省 token，也让她不容易"没看清就再查一遍"。
+        """
+
+        system = (
+            "你在整理检索到的资料。把材料压成几条要点，供另一个模型直接引用。\n"
+            "只输出整理结果，不要解释、不要客套、不要 Markdown 标题。\n"
+            "格式：\n"
+            "结论：<一句话回答主题；材料里答不上来就写「材料里没有直接答案」>\n"
+            "1. <要点，40 字以内>\n"
+            "2. <要点>\n"
+            "…最多 "
+            f"{max(1, int(limit))} 条。要点末尾用（N）标出它来自第几条材料。\n"
+            "规则：只写材料里出现过的事实，不要用常识补、不要编数字和时间；"
+            "重复的合并成一条；和主题无关的不要写。"
+        )
+        blocks = "\n".join(
+            f"{index}. {_one_line(item, 400)}" for index, item in enumerate(materials, 1)
+        )
+        prompt = (
+            f"要回答的主题：{topic or '（没写明）'}\n"
+            + (f"今天的日期：{date_text}\n" if date_text else "")
+            + f"\n# 材料\n{blocks}\n\n请按格式输出。"
         )
         return system, prompt
 

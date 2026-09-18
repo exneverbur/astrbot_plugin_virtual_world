@@ -107,6 +107,15 @@ class PlannedAction:
     queries: list[str] = field(default_factory=list)
     """检索型动作这一轮要查的几条查询词（可以只给一条；留空由引擎按意图兜）。"""
 
+    search_depth: str = ""
+    """她自己想要的检索深度（``quick`` / ``standard`` / ``deep``）。留空＝按动作配置。
+
+    她只能往浅里调（配置是上限），免得每次都开深挖。
+    """
+
+    read_pages: int = -1
+    """她想要读几篇正文；-1 表示没写，按动作配置来。"""
+
     raw: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -127,6 +136,10 @@ class PlannedAction:
             data["duration"] = self.duration
         if self.queries:
             data["queries"] = list(self.queries)
+        if self.search_depth:
+            data["search_depth"] = self.search_depth
+        if self.read_pages >= 0:
+            data["read_pages"] = self.read_pages
         return data
 
 
@@ -344,6 +357,13 @@ def parse_action_payload(
         # 工具型动作只给 intent、不给 params 是正常的：参数由辅助模型在调用前按工具 schema 补全。
         # 真正补不出来时，引擎会写一条带原因的 skip 事件——这里不需要再猜。
         action.queries = _parse_queries(item.get("queries"))
+        depth = str(item.get("search_depth", "") or "").strip().lower()
+        action.search_depth = depth if depth in ("quick", "standard", "deep") else ""
+        try:
+            wanted_reads = int(item.get("read_pages", -1))
+        except (TypeError, ValueError):
+            wanted_reads = -1
+        action.read_pages = wanted_reads if wanted_reads >= 0 else -1
 
         try:
             action.duration = max(0, int(item.get("duration", 0) or 0))

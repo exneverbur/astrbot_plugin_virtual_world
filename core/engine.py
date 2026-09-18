@@ -93,6 +93,9 @@ READ_CACHE_SECONDS = 6 * 3600
 READ_PASSAGE_CHARS = 1200
 # 没写意图、也没配主题/模板时的兜底搜索主题（见 PromptBuilder 里那段说明）
 DEFAULT_SEARCH_TOPIC = "今天有什么新鲜事"
+# 最近一次检索记在 kv 里的键前缀与有效期（提示词里提醒她"刚查过什么"）
+SEARCH_LOG_KEY = "search.last"
+SEARCH_LOG_MINUTES = 60
 # 生成搜索关键词时的额外要求：不写清楚，模型会给你一个"什么都要"的万能查询
 SEARCH_QUERY_RULES = (
     "这次要填的是**搜索关键词**：写成能直接丢进搜索框的词（谁 / 什么时候 / 哪方面），"
@@ -775,7 +778,7 @@ class VirtualWorldEngine:
                 extra_notes=extra_notes,
                 focus_user=ctx.user_name or ctx.user_id,
                 recent_chat=self.chat_window(state),
-                weather=await self.weather_line(),
+                **await self.runtime_notes(state.session_id),
             )
             if ctx.other_context:
                 injection += f"\n\n# 其他插件提供的上下文\n{ctx.other_context}"
@@ -1239,7 +1242,7 @@ class VirtualWorldEngine:
                 max_messages=say_limit,
                 reasoning=bool(self.world.reasoning_enabled),
                 style_block=style_text,
-                weather=await self.weather_line(),
+                **await self.runtime_notes(state.session_id),
             )
             user_prompt = self.prompts.build_reply_user_prompt(
                 user_name=ctx.user_name,
@@ -2171,6 +2174,61 @@ class VirtualWorldEngine:
         record = await self.weather_record()
         return weather_banner(record, self._now(), tz=self._resolve_tz())
 
+    async def runtime_notes(self, session_id: str) -> dict[str, str]:
+        """提示词里那几段"此刻的事实"：天气 + 最近查过什么。"""
+
+        return {
+            "weather": await self.weather_line(),
+            "recent_search": await self._recent_search_line(session_id),
+        }
+
+    async def _recent_search_line(self, session_id: str) -> str:
+        """最近一次检索的摘要（一小时内才写进提示词）：省得她拿同样的词再查一遍。"""
+
+        if not session_id:
+            return ""
+        try:
+            payload = await self.db.call("kv_get", f"{SEARCH_LOG_KEY}.{session_id}")
+        except Exception:
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        try:
+            at = float(payload.get("at") or 0.0)
+        except (TypeError, ValueError):
+            return ""
+        age = self._now() - at
+        if at <= 0 or age < 0 or age > SEARCH_LOG_MINUTES * 60:
+            return ""
+        queries = [str(item) for item in (payload.get("queries") or []) if str(item)][:3]
+        if not queries:
+            return ""
+        minutes = max(1, int(round(age / 60)))
+        found = int(payload.get("found") or 0)
+        return (
+            "# 最近查过\n"
+            f"{minutes} 分钟前你查过「{'」「'.join(queries)}」，拿到 {found} 条材料。"
+            "同一件事不要马上再查一遍；要接着查就换个更具体的角度。"
+        )
+
+    async def _remember_search(
+        self, session_id: str, queries: list[str], found: int
+    ) -> None:
+        if not session_id or not queries:
+            return
+        try:
+            await self.db.call(
+                "kv_set",
+                f"{SEARCH_LOG_KEY}.{session_id}",
+                {
+                    "at": float(self._now()),
+                    "queries": [str(item) for item in queries[:5]],
+                    "found": int(found),
+                },
+            )
+        except Exception:
+            pass
+
     async def weather_next_at(self) -> float:
         """下一次静默刷新大约在什么时候（0 = 不会再刷新）。"""
 
@@ -2540,7 +2598,9 @@ class VirtualWorldEngine:
         action["elapsed_ticks"] = int(action.get("elapsed_ticks", 0)) + 1
         if int(action.get("elapsed_ticks", 0)) < int(action.get("duration_ticks", 0) or 0):
             return
-        await self._finish_action(state, node, outcome, action)
+        await self._finish_action(
+            state, node, outcome, action, depth=int(action.get("depth") or 0)
+        )
 
     async def _finish_action(
         self,
@@ -2548,6 +2608,8 @@ class VirtualWorldEngine:
         node: NodeDef | None,
         outcome: TickOutcome,
         action: dict[str, Any],
+        *,
+        depth: int = 0,
     ) -> None:
         action_id = str(action.get("type", ""))
         definition = self.world.action_map().get(action_id)
@@ -2627,20 +2689,24 @@ class VirtualWorldEngine:
         trigger = definition.on_complete.trigger if definition else "none"
         detail = str(action.get("tool_result", "") or "")
         evidence_text = self._search_evidence_text(definition, action)
-        if evidence_text:
-            # 检索型动作：给模型的是编号证据块，不是被截断的一坨原文
+        digest = str(action.get("tool_digest") or "").strip()
+        if digest:
+            # 检索型动作交回主模型的是"要点+编号"，不是一堆原文
+            detail = digest
+        elif evidence_text:
+            # 没压出要点时退回编号证据块，也不是被截断的一坨原文
             detail = evidence_text
         images = list(action.get("tool_images") or [])
         if not detail and images:
             detail = "工具返回了一张图片，图片一起发给你了。"
         hint = definition.on_complete.prompt_hint if definition else ""
-        if evidence_text and not str(hint or "").strip():
+        if (digest or evidence_text) and not str(hint or "").strip():
             hint = (
-                "把查到的内容讲给群里听：只能依据上面这些证据，"
-                "不要用印象补充、不要编数字或时间；证据里没有就直说没查到。"
+                "把查到的内容讲给群里听：只能依据上面这些材料，"
+                "不要用印象补充、不要编数字或时间；材料里没有就直说没查到。"
                 "别照抄原文、别念网址，用你自己的口吻挑最有用的两三点。"
             )
-        if evidence_text and bool(getattr(definition, "search_cite", False)):
+        if (digest or evidence_text) and bool(getattr(definition, "search_cite", False)):
             hint = (
                 str(hint or "").rstrip()
                 + " 讲完可以在末尾用括号补一条你参考的来源链接。"
@@ -2679,7 +2745,17 @@ class VirtualWorldEngine:
                 detail = f"你刚刚做完了「{label}」，用了大约 {minutes} 分钟。"
             detail = self._clip_followup(detail)
             await self._llm_followup(
-                state, node, outcome, hint, detail, image_urls=images
+                state,
+                node,
+                outcome,
+                hint,
+                detail,
+                image_urls=images,
+                depth=depth + 1,
+                after_search=bool(
+                    definition is not None
+                    and str(getattr(definition, "tool_flow", "simple")) == "search"
+                ),
             )
         elif trigger == "schedule":
             await self._run_linked_schedule(state, node, outcome, definition, depth=1)
@@ -2750,6 +2826,9 @@ class VirtualWorldEngine:
         hint: str,
         tool_result: str,
         image_urls: list[str] | None = None,
+        *,
+        depth: int = 1,
+        after_search: bool = False,
     ) -> None:
         persona_text = await self._persona_text(state.session_id)
         _cell, say_limit, style_text = self.style_for(state, state.session_id)
@@ -2769,9 +2848,11 @@ class VirtualWorldEngine:
             recent_chat=self.chat_window(state),
             reasoning=bool(self.world.reasoning_enabled),
             style_block=style_text,
-            weather=await self.weather_line(),
+            **await self.runtime_notes(state.session_id),
         )
-        prompt = self.prompts.build_reply_followup_prompt(hint, tool_result)
+        prompt = self.prompts.build_reply_followup_prompt(
+            hint, tool_result, no_search=after_search
+        )
         reply = await self._ask_llm(
             state.session_id,
             system_prompt,
@@ -2788,7 +2869,54 @@ class VirtualWorldEngine:
             max_actions=self.world.limits.max_actions_per_message,
             max_messages=say_limit,
         )
-        await self._execute_actions(state, node, outcome, result.actions, depth=1, autonomous=True)
+        actions, blocked = self._followup_actions(
+            result.actions, depth=depth, after_search=after_search
+        )
+        if blocked:
+            await self._log_event(
+                state,
+                "skip",
+                {
+                    "action": "、".join(blocked),
+                    "note": "续说这一轮不再接新的检索 / 工具动作（刚查完或链条太深），只让她说话",
+                },
+                outcome=outcome,
+            )
+        await self._execute_actions(
+            state, node, outcome, actions, depth=depth, autonomous=True
+        )
+
+    def _followup_actions(
+        self, actions: list[Any], *, depth: int, after_search: bool
+    ) -> tuple[list[Any], list[str]]:
+        """续说那一轮能用哪些动作。
+
+        两条闸门：
+        - **刚查完就别再查**：不然她会"查一段、说一段、再查一段"，一路查下去；
+        - **链条太深就只让她说话**：以前每轮都从 depth=1 重新起链，等于没有上限。
+        """
+
+        limit = int(self.world.limits.max_action_chain_depth)
+        too_deep = depth > limit
+        kept: list[Any] = []
+        blocked: list[str] = []
+        for item in actions:
+            definition = self.world.action_map().get(str(getattr(item, "type", "")))
+            is_search = (
+                definition is not None
+                and str(getattr(definition, "tool_flow", "simple")) == "search"
+            )
+            is_tool = definition is not None and definition.llm_level in ("tool", "command")
+            if (after_search and is_search) or (too_deep and is_tool):
+                blocked.append(str(getattr(item, "type", "")))
+                continue
+            kept.append(item)
+        if blocked:
+            self._log(
+                "debug",
+                f"续说这一轮不接新的检索/工具动作：{'、'.join(blocked)}",
+            )
+        return kept, blocked
 
     async def _tick_plan(
         self,
@@ -3009,7 +3137,7 @@ class VirtualWorldEngine:
             mode="plan",
             reasoning=bool(self.world.reasoning_enabled),
             style_block=style_text,
-            weather=await self.weather_line(),
+            **await self.runtime_notes(state.session_id),
         )
         prompt = (
             (f"{hint}\n\n" if hint else "")
@@ -3090,6 +3218,8 @@ class VirtualWorldEngine:
             params=dict(step.get("params") or {}),
             duration=int(step.get("duration", 0) or 0),
             queries=[str(item) for item in (step.get("queries") or []) if str(item)],
+            search_depth=str(step.get("search_depth", "") or ""),
+            read_pages=_to_int_or_default(step.get("read_pages"), -1),
             raw=step,
         )
 
@@ -3112,6 +3242,8 @@ class VirtualWorldEngine:
             "intent": item.intent,
             "params": dict(item.params or {}),
             "queries": list(item.queries or []),
+            "search_depth": str(item.search_depth or ""),
+            "read_pages": int(item.read_pages),
             "status": "pending",
         }
 
@@ -4387,6 +4519,28 @@ class VirtualWorldEngine:
                     return name
         return required[0] if required else (properties[0] if properties else "")
 
+    @staticmethod
+    def _query_from_params(params: dict[str, Any]) -> str:
+        """工具 schema 认不出来时，从这一轮已经带上的参数里找一个像查询词的值。
+
+        日程 / 计划里常常直接写了 ``params: {query: ...}``，别让它白写。
+        """
+
+        values = [
+            str(value).strip()
+            for value in (params or {}).values()
+            if isinstance(value, str) and str(value).strip()
+        ]
+        if len(values) == 1:
+            return values[0]
+        for key, value in (params or {}).items():
+            low = str(key).lower()
+            if any(token in low for token in ("query", "keyword", "wd")) and str(
+                value
+            ).strip():
+                return str(value).strip()
+        return ""
+
     def _url_param_name(self, tool: str) -> str:
         """阅读工具里"网址"该填哪个参数。"""
 
@@ -4415,12 +4569,29 @@ class VirtualWorldEngine:
         return result
 
     @staticmethod
-    def _search_budget(definition: ActionDef) -> tuple[int, int]:
-        """``(最多读几篇正文, 最多补查几轮)``；``quick`` 档查一轮就收工。"""
+    def _search_budget(
+        definition: ActionDef, action: dict[str, Any] | None = None
+    ) -> tuple[int, int]:
+        """``(最多读几篇正文, 最多补查几轮)``；``quick`` 档查一轮就收工。
 
-        depth = str(getattr(definition, "search_depth", "standard") or "standard")
+        动作里配的是**上限**：她自己写 ``search_depth`` / ``read_pages`` 时可以收着点用，
+        但不能超过配置（免得她每次都开深挖）。
+        """
+
+        ranks = {"quick": 0, "standard": 1, "deep": 2}
+        configured = str(getattr(definition, "search_depth", "standard") or "standard")
+        wanted = str((action or {}).get("search_depth") or "").strip().lower()
+        depth = configured
+        if wanted in ranks and ranks[wanted] < ranks.get(configured, 1):
+            depth = wanted
         reads = max(0, int(getattr(definition, "search_max_reads", 2) or 0))
         rounds = max(0, int(getattr(definition, "search_rounds", 1) or 0))
+        asked_reads = (action or {}).get("read_pages")
+        try:
+            if asked_reads is not None and int(asked_reads) >= 0:
+                reads = min(reads, int(asked_reads))
+        except (TypeError, ValueError):
+            pass
         if depth == "quick":
             return 0, 0
         if depth == "deep":
@@ -4431,10 +4602,16 @@ class VirtualWorldEngine:
     def _search_needs_more(items: list[Evidence]) -> bool:
         """证据是不是太薄：条数太少、或者全是短摘要没有正文。"""
 
+        return not VirtualWorldEngine._search_sufficient(items)
+
+    @staticmethod
+    def _search_sufficient(items: list[Evidence]) -> bool:
+        """证据够不够用：至少两条，而且其中一条有像样的正文或摘要。"""
+
         if len(items) < 2:
-            return True
-        return not any(
-            len((item.passage or item.snippet or "").strip()) >= 40 for item in items
+            return False
+        return any(
+            len((item.passage or item.snippet or "").strip()) >= 60 for item in items
         )
 
     async def _search_once(
@@ -4448,23 +4625,30 @@ class VirtualWorldEngine:
         query_key: str,
         *,
         outcome: TickOutcome | None = None,
+        echo: bool = False,
         texts: list[str],
         items: list[Evidence],
         failed: list[str],
         images: list[str],
         used: list[str],
-    ) -> None:
+    ) -> ToolCallResult | None:
         """按一条查询词调一次搜索工具，结果直接并进证据。"""
 
         params = dict(base)
         if query_key:
             params[query_key] = query
         entry = await self._call_one_tool(
-            state, definition, action, tool, params=params, outcome=outcome
+            state,
+            definition,
+            action,
+            tool,
+            params=params,
+            outcome=outcome,
+            echo=echo,
         )
         if entry is None:
             failed.append(f"{tool}：缺少参数")
-            return
+            return None
         call, _sent = entry
         used.append(call.tool or tool)
         if call.ok and call.text:
@@ -4473,7 +4657,86 @@ class VirtualWorldEngine:
         elif not call.ok:
             failed.append(f"{call.tool or tool}：{call.error or '没有返回结果'}")
         images.extend(getattr(call, "image_urls", None) or [])
-        await self._log_tool_outcome(state, definition, tool, call, outcome=outcome)
+        await self._log_tool_outcome(
+            state, definition, tool, call, outcome=outcome, echo=echo
+        )
+        return call
+
+    async def _run_one_query(
+        self,
+        state: WorldState,
+        definition: ActionDef,
+        action: dict[str, Any],
+        query: str,
+        base: dict[str, Any],
+        query_key: str,
+        tool: str,
+        candidates: list[str],
+        *,
+        outcome: TickOutcome | None,
+        texts: list[str],
+        items: list[Evidence],
+        failed: list[str],
+        images: list[str],
+        used: list[str],
+        asked: list[str],
+    ) -> str:
+        """查一条查询词；搜索工具本身坏了就换下一个候选，把这一条重试一遍。"""
+
+        asked.append(query)
+        for _ in range(len(candidates) + 1):
+            call = await self._search_once(
+                state,
+                definition,
+                action,
+                tool,
+                query,
+                base,
+                query_key,
+                outcome=outcome,
+                texts=texts,
+                items=items,
+                failed=failed,
+                images=images,
+                used=used,
+            )
+            nxt = await self._switch_search_tool(
+                state, definition, tool, call, candidates, failed
+            )
+            if nxt == tool:
+                return tool
+            tool = nxt
+        return tool
+
+    async def _switch_search_tool(
+        self,
+        state: WorldState,
+        definition: ActionDef,
+        tool: str,
+        call: ToolCallResult | None,
+        candidates: list[str],
+        failed: list[str],
+    ) -> str:
+        """搜索工具本身坏了就换下一个候选（动作上挂多个搜索工具时才有意义）。
+
+        参数写错不算坏——那种在 ``_call_one_tool`` 里已经带着报错补过一次了。
+        """
+
+        if call is None or call.ok or not candidates:
+            return tool
+        if _looks_like_argument_error(str(call.error or "")):
+            return tool
+        if tool not in candidates or candidates.index(tool) >= len(candidates) - 1:
+            return tool
+        index = candidates.index(tool)
+        nxt = candidates[index + 1]
+        failed.append(f"{tool} 换成了 {nxt}")
+        await self._log_event(
+            state,
+            "skip",
+            {"action": definition.id, "note": f"搜索工具「{tool}」用不了，改用「{nxt}」"},
+        )
+        return nxt
 
     async def _search_gap_queries(
         self,
@@ -4520,6 +4783,7 @@ class VirtualWorldEngine:
         url: str,
         *,
         outcome: TickOutcome | None = None,
+        echo: bool = False,
     ) -> str:
         """用阅读工具抓一篇正文（带缓存），失败返回空串。"""
 
@@ -4542,10 +4806,11 @@ class VirtualWorldEngine:
                     "note": "读正文",
                 },
                 outcome=outcome,
+                silent=not echo,
             )
             call = await self._call_tool(definition.id, params, state, tool_name=tool)
             await self._log_tool_outcome(
-                state, definition, tool, call, outcome=outcome
+                state, definition, tool, call, outcome=outcome, echo=echo
             )
             if call.ok and call.text:
                 text = _clip_text(call.text, READ_PASSAGE_CHARS)
@@ -4569,6 +4834,7 @@ class VirtualWorldEngine:
         """联网检索形态的动作：多条查询 → 证据 →（可选）读正文 →（可选）补查。"""
 
         tool = names[0] if names else ""
+        candidates = list(names)
         deadline = time.monotonic() + SEARCH_BUDGET_SECONDS
         base = self._action_base_params(definition, action)
         queries = self._explicit_queries(definition, action)
@@ -4578,6 +4844,7 @@ class VirtualWorldEngine:
         used: list[str] = []
         items: list[Evidence] = []
         asked: list[str] = []
+        reads = 0
 
         action["tool_names"] = list(names)
         action["tool_used"] = []
@@ -4589,9 +4856,13 @@ class VirtualWorldEngine:
 
         query_key = self._query_param_name(tool)
         intent = ""
-        if query_key and not queries:
+        if not queries:
             # 她自己没写查询词，但参数里已经带了：就用那一条
-            given = str(base.get(query_key) or "").strip()
+            given = (
+                str(base.get(query_key) or "").strip()
+                if query_key
+                else self._query_from_params(base)
+            )
             if given:
                 queries = [given]
         if not queries:
@@ -4630,29 +4901,31 @@ class VirtualWorldEngine:
                     base = {**base, **filled}
 
         for query in queries:
-            await self._search_once(
+            tool = await self._run_one_query(
                 state,
                 definition,
                 action,
-                tool,
                 query,
                 base,
                 query_key,
+                tool,
+                candidates,
                 outcome=outcome,
                 texts=texts,
                 items=items,
                 failed=failed,
                 images=images,
                 used=used,
+                asked=asked,
             )
-            asked.append(query)
             if time.monotonic() > deadline:
                 break
 
-        read_budget, rounds = self._search_budget(definition)
+        read_budget, rounds = self._search_budget(definition, action)
         for _ in range(rounds):
             if time.monotonic() > deadline or not self._search_needs_more(items):
                 break
+            before = len(items)
             gaps = await self._search_gap_queries(
                 state, definition, action, items, topic=intent
             )
@@ -4660,24 +4933,28 @@ class VirtualWorldEngine:
             if not fresh:
                 break
             for query in fresh:
-                await self._search_once(
+                tool = await self._run_one_query(
                     state,
                     definition,
                     action,
-                    tool,
                     query,
                     base,
                     query_key,
+                    tool,
+                    candidates,
                     outcome=outcome,
                     texts=texts,
                     items=items,
                     failed=failed,
                     images=images,
                     used=used,
+                    asked=asked,
                 )
-                asked.append(query)
                 if time.monotonic() > deadline:
                     break
+            if len(items) <= before:
+                # 补了一轮什么都没新拿到：别再往下问了，直接用现有的说
+                break
 
         if read_budget > 0:
             readers = self._reader_tools(definition, state)
@@ -4687,10 +4964,21 @@ class VirtualWorldEngine:
                     if time.monotonic() > deadline:
                         break
                     item.passage = await self._read_passage(
-                        state, definition, readers, item.url, outcome=outcome
+                        state, definition, readers, item.url, outcome=outcome, echo=False
                     )
+                    if item.passage:
+                        reads += 1
 
         items = merge_evidence(items, limit=8)
+        self._echo_search_summary(
+            outcome,
+            queries=asked,
+            reads=reads,
+            found=len(items),
+            failures=len(failed),
+            first_title=(items[0].title or items[0].snippet) if items else "",
+        )
+        digest = await self._digest_evidence(state, items, topic=intent or (asked[0] if asked else ""))
         action["tool_name"] = tool
         action["tool_used"] = used
         action["tool_ok"] = bool(texts or images)
@@ -4702,10 +4990,85 @@ class VirtualWorldEngine:
             action["tool_result"] = "\n\n".join(texts)
         elif base:
             action.setdefault("params", dict(base))
+        if digest:
+            # 交给主模型的是"要点+编号"，不是一堆原文；材料本身仍然留在日志里
+            action["tool_digest"] = digest
         if items:
             await self._store_search_evidence(
                 state, definition, action, items, asked, outcome=outcome
             )
+        await self._remember_search(state.session_id, asked, len(items))
+
+    async def _digest_evidence(
+        self, state: WorldState, items: list[Evidence], *, topic: str
+    ) -> str:
+        """把证据压成"要点 + 编号"；没模型/没额度时返回空串（调用方用原始证据）。"""
+
+        if not items or self.helper_llm is None or not self._tool_param_allowed(state):
+            return ""
+        # 材料本来就很少很短时不值得再花一次调用：直接用证据块
+        texts = [item.passage or item.snippet or "" for item in items]
+        if len(items) < 2 or sum(len(text) for text in texts) < 160:
+            return ""
+        materials = [
+            "｜".join(
+                part
+                for part in (
+                    item.title,
+                    item.published_at,
+                    (item.passage or item.snippet or "")[:400],
+                )
+                if part
+            )
+            for item in items[:8]
+        ]
+        system_prompt, prompt = self.prompts.build_search_digest_prompt(
+            topic=topic,
+            materials=materials,
+            date_text=self.local_now().strftime("%Y-%m-%d"),
+        )
+        reply = await self._ask_helper(state.session_id, system_prompt, prompt)
+        self._count_tool_param(state)
+        text = str(reply or "").strip()
+        if not text or "材料里没有" in text and len(text) < 30:
+            return ""
+        return _clip_text(text, 1200)
+
+    def _echo_search_summary(
+        self,
+        outcome: TickOutcome | None,
+        *,
+        queries: list[str],
+        reads: int,
+        found: int,
+        failures: int,
+        first_title: str = "",
+    ) -> None:
+        """把一次检索里的多次调用合并成两三行回显。
+
+        一次检索本来就可能有 3 条查询 + 2 篇正文，逐条发就是五条消息、群里像刷屏；
+        这里只报"搜了几次、读了什么、拿到几条"，细节仍然完整留在日志页。
+        """
+
+        if outcome is None or not queries:
+            return
+        enabled = self.echo_types()
+        compact = self.echo_compact()
+        if "tool_call" in enabled:
+            head = f"🔧 搜索 ×{len(queries)}"
+            if not compact:
+                shown = " / ".join(_clip_text(item, 24) for item in queries[:3])
+                head += f"：{shown}" + (" …" if len(queries) > 3 else "")
+            if failures:
+                head += f"（{failures} 次没成功）"
+            outcome.add_debug(head)
+            if reads:
+                outcome.add_debug(f"📖 读正文 ×{reads}")
+        if "tool_result" in enabled:
+            line = f"📥 共 {found} 条可用结果"
+            if not compact and first_title:
+                line += f"：{_clip_text(first_title, 30)}"
+            outcome.add_debug(line)
 
     async def _store_search_evidence(
         self,
@@ -4766,6 +5129,7 @@ class VirtualWorldEngine:
         params: dict[str, Any],
         previous_results: str = "",
         outcome: TickOutcome | None = None,
+        echo: bool = True,
     ) -> tuple[ToolCallResult, dict[str, Any]] | None:
         """准备参数 → 调工具 → 参数报错时再补一次。
 
@@ -4797,6 +5161,7 @@ class VirtualWorldEngine:
                         + (f"（{note}）" if note else ""),
                     },
                     outcome=outcome,
+                    silent=not echo,
                 )
                 return None
         call = await self._call_tool(definition.id, params, state, tool_name=name)
@@ -4822,6 +5187,7 @@ class VirtualWorldEngine:
                         "note": "按报错补了一次参数" + (f"：{note}" if note else ""),
                     },
                     outcome=outcome,
+                    silent=not echo,
                 )
                 again = await self._call_tool(
                     definition.id, retry_params, state, tool_name=name
@@ -4837,6 +5203,7 @@ class VirtualWorldEngine:
                         "error": again.error,
                     },
                     outcome=outcome,
+                    silent=not echo,
                 )
                 if again.ok or again.text:
                     call = again
@@ -4846,6 +5213,7 @@ class VirtualWorldEngine:
             "tool_call",
             {"action": definition.id, "tool": name, "params": dict(params)},
             outcome=outcome,
+            silent=not echo,
         )
         return call, dict(call.params or params)
 
@@ -4857,6 +5225,7 @@ class VirtualWorldEngine:
         call: ToolCallResult,
         *,
         outcome: TickOutcome | None = None,
+        echo: bool = True,
     ) -> None:
         """工具返回（或失败）写进日志，失败还会记一笔挫败感。"""
 
@@ -4878,6 +5247,7 @@ class VirtualWorldEngine:
                 "error": call.error,
             },
             outcome=outcome,
+            silent=not echo,
         )
 
     async def _run_tools_smart(
@@ -5157,6 +5527,7 @@ class VirtualWorldEngine:
                 "target": action.target,
                 "content": action.content,
                 "queries": list(getattr(action, "queries", []) or []),
+                "depth": depth,
                 "elapsed_ticks": 0,
                 "duration_ticks": 0,
                 "from_plan": False,
@@ -5255,6 +5626,8 @@ class VirtualWorldEngine:
                     node,
                     "群里正在聊上面「最近群里在聊」那些内容。"
                     "如果你确实有话想接，就自然地接一句（不要逐条复述、不要总结、不要点名批评）；"
+                    "先看清那几句是谁在对谁说：没点名找你的话，就当他们在互相聊，"
+                    "别把别人话里的「你」当成你自己，也别用「主人」这类专属称呼去接；"
                     "如果说不出什么，就返回空的动作列表，保持安静。",
                     allow_fallback=False,
                 )
@@ -5458,6 +5831,8 @@ class VirtualWorldEngine:
                 queries=[
                     str(item) for item in (getattr(step, "queries", []) or []) if str(item)
                 ],
+                search_depth=str(getattr(step, "search_depth", "") or ""),
+                read_pages=_to_int_or_default(getattr(step, "read_pages", None), -1),
             )
             definition = self.world.action_map().get(action.type)
             if definition is None:
@@ -5566,7 +5941,7 @@ class VirtualWorldEngine:
             recent_chat=self.chat_window(state),
             reasoning=bool(self.world.reasoning_enabled),
             style_block=style_text,
-            weather=await self.weather_line(),
+            **await self.runtime_notes(state.session_id),
         )
         prompt = instruction + '\n只输出 JSON：{"actions":[{"type":"say","messages":["..."]}]}'
         reply = await self._ask_llm(state.session_id, system_prompt, prompt)
@@ -6745,7 +7120,7 @@ class VirtualWorldEngine:
             memories=memories,
             engagement_hint=self.engagement.hint(state),
             recent_chat=self.chat_window(state),
-            weather=await self.weather_line(),
+            **await self.runtime_notes(state.session_id),
         )
 
     async def overview(self) -> list[dict[str, Any]]:
@@ -6792,7 +7167,7 @@ class VirtualWorldEngine:
             recent_chat=self.chat_window(state),
             reasoning=bool(self.world.reasoning_enabled),
             style_block=style_text,
-            weather=await self.weather_line(),
+            **await self.runtime_notes(session_id),
         )
 
     async def _event_marker(self, state: WorldState) -> int:
@@ -6911,10 +7286,12 @@ class VirtualWorldEngine:
         *,
         persona_id: str = "",
         outcome: TickOutcome | None = None,
+        silent: bool = False,
     ) -> None:
         """写一条事件日志（编辑器的「日志」页会渲染成人话），并顺手做数量裁剪。
 
         传入 ``outcome`` 且开启了「把动作发到群里」时，同一行文本也会作为消息发出去。
+        ``silent=True`` 表示"这条已经并进别的行里了"：不发，但要让收尾那次批量回显跳过它。
         """
 
         payload = detail or {}
@@ -6922,6 +7299,7 @@ class VirtualWorldEngine:
         line_added = False
         if (
             outcome is not None
+            and not silent
             and enabled
             and _echo_payload(event_type, payload, enabled)
         ):
@@ -6952,7 +7330,7 @@ class VirtualWorldEngine:
             )
             if new_id:
                 self._event_ids[state.session_id] = int(new_id)
-                if outcome is not None and line_added:
+                if outcome is not None and (line_added or silent):
                     # 这一行已经在发生的当下插好了位置：收尾那次批量回显要跳过它
                     outcome.echoed_event_ids.add(int(new_id))
         except Exception as exc:  # 日志写失败不能影响主流程
@@ -7170,6 +7548,17 @@ def _clip_text(value: Any, limit: int = 200) -> str:
         return ""
     text = str(value).strip().replace("\n", " ")
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _to_int_or_default(value: Any, default: int = 0) -> int:
+    """能转成整数就用它（0 也算有效值），转不出来才用默认值。"""
+
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _same_text(left: str, right: str) -> bool:
