@@ -266,6 +266,15 @@ const ECHO_TYPE_CHOICES = [
     hint: "她查到 / 后台静默查到的天气写成了什么（也会写进提示词当背景）。",
     group: "misc",
   },
+  {
+    key: "search",
+    icon: "🌐",
+    label: "联网搜索",
+    hint:
+      "她开始联网检索时发一条。**检索期间的工具调用不会逐条发到群里**" +
+      "（只在「日志」页里逐条保留），免得一次检索刷出十几行。",
+    group: "tool",
+  },
 ];
 
 /** 调试输出的分组：类型多了以后按用途分块，找起来快。 */
@@ -311,6 +320,7 @@ const LOG_TYPES = {
   poke: { icon: "👉", label: "戳一戳" },
   search_sources: { icon: "🔗", label: "检索来源" },
   weather: { icon: "🌤️", label: "天气" },
+  search: { icon: "🌐", label: "联网搜索" },
   chain: { icon: "🔗", label: "动作链" },
   cold_start: { icon: "🌅", label: "冷启动" },
   bot_spoke: { icon: "🗣️", label: "发言等待回应" },
@@ -847,7 +857,7 @@ function echoTypesField(world) {
       "常用",
       () =>
         ECHO_TYPE_CHOICES.filter((item) =>
-          ["plan", "action_start", "action_done", "action", "tool_call", "tool_result", "skip"].includes(
+          ["plan", "action_start", "action_done", "action", "search", "tool_call", "tool_result", "skip"].includes(
             item.key,
           ),
         ).map((item) => item.key),

@@ -275,6 +275,15 @@ def render_event(
             return f"想戳 {who} 但没戳成：{_clip(detail.get('note'), 90)}"
         return f"戳了 {who} 一下"
 
+    if kind == "search":
+        queries = [str(item) for item in (detail.get("queries") or []) if str(item)]
+        head = "正在联网搜索"
+        if queries and not compact:
+            head += f"「{'、'.join(_clip(item, 20) for item in queries[:3])}」"
+            if len(queries) > 3:
+                head += " 等"
+        return head + "…（期间的工具调用只写进日志）"
+
     if kind == "search_sources":
         count = int(detail.get("count") or 0)
         queries = [str(item) for item in (detail.get("queries") or []) if str(item)]

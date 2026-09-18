@@ -4798,6 +4798,13 @@ class VirtualWorldEngine:
         if not queries:
             return tool
         asked.extend(queries)
+        # 检索期间的工具调用**不进群**（只写日志）：这里只留一条「正在联网搜索」
+        await self._log_event(
+            state,
+            "search",
+            {"action": definition.id, "queries": list(queries)},
+            outcome=outcome,
+        )
         for _ in range(len(candidates) + 1):
             results = await asyncio.gather(
                 *(
@@ -4810,6 +4817,7 @@ class VirtualWorldEngine:
                         base,
                         query_key,
                         outcome=outcome,
+                        echo=False,
                         texts=texts,
                         items=items,
                         failed=failed,
@@ -5145,7 +5153,12 @@ class VirtualWorldEngine:
                 passages = await asyncio.gather(
                     *(
                         self._read_passage(
-                            state, definition, readers, item.url, outcome=outcome
+                            state,
+                            definition,
+                            readers,
+                            item.url,
+                            outcome=outcome,
+                            echo=False,
                         )
                         for item in picked
                     ),

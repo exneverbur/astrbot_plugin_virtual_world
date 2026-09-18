@@ -1570,11 +1570,11 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tool_evidence_text", payload)
         self.assertTrue(payload["tool_error"])
 
-    async def test_one_search_action_echoes_a_single_line(self):
-        """一次检索查了三条：同一工具的连续调用只发一行（防抖），不是三条。"""
+    async def test_search_hides_tool_calls_and_shows_one_line(self):
+        """检索期间的工具调用不进群（只在日志里），群里只出现一条「联网搜索」。"""
 
         raw = self.store.raw_world()
-        raw["echo_types"] = ["tool_call", "tool_result"]
+        raw["echo_types"] = ["tool_call", "tool_result", "search"]
         self.store.save_world(raw)
         self.engine.reload_config()
         self.use_search_tool()
@@ -1591,21 +1591,24 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
             await self.get_state(), definition, payload, outcome=outcome
         )
 
-        tool_lines = [line for line in outcome.debug_messages if line.startswith("🔧")]
-        self.assertEqual(len(tool_lines), 1, outcome.debug_messages)
-        # 文案就是"调用「工具」参数 …"这一种，不再有 ×N
-        self.assertIn("调用「news_search」", tool_lines[0])
-        self.assertIn("今日科技新闻", tool_lines[0])
-        self.assertNotIn("×", tool_lines[0])
-        self.assertTrue(
-            [line for line in outcome.debug_messages if line.startswith("📥")]
-        )
+        lines = list(outcome.debug_messages)
+        self.assertFalse([line for line in lines if line.startswith("🔧")], lines)
+        self.assertFalse([line for line in lines if line.startswith("📥")], lines)
+        search_lines = [line for line in lines if line.startswith("🌐")]
+        self.assertEqual(len(search_lines), 1, lines)
+        self.assertIn("正在联网搜索", search_lines[0])
+        # 逐条的工具调用仍然完整写进日志页
+        events = await self.db.call("query_events", session_id=SESSION, limit=40)
+        kinds = [item["event_type"] for item in events]
+        self.assertIn("tool_call", kinds)
+        self.assertIn("tool_result", kinds)
+        self.assertIn("search", kinds)
 
-    async def test_tool_echo_is_sent_live_and_only_once(self):
-        """有实时通道时：调用发生时立刻发一条，收尾那次批量回显不再重复发。"""
+    async def test_search_line_is_sent_live_and_not_duplicated(self):
+        """有实时通道时：「正在联网搜索」在检索开始时立刻发出，收尾不再重复发。"""
 
         raw = self.store.raw_world()
-        raw["echo_types"] = ["tool_call", "tool_result"]
+        raw["echo_types"] = ["tool_call", "tool_result", "search"]
         self.store.save_world(raw)
         self.engine.reload_config()
         self.use_search_tool()
@@ -1627,14 +1630,16 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
             await self.get_state(), definition, payload, outcome=outcome
         )
 
-        live = [text for text in self.messenger.flat_messages if text.startswith("🔧")]
-        # 三条查询同一个工具：防抖之后群里只出现一行
+        live = [text for text in self.messenger.flat_messages if text.startswith("🌐")]
+        # 一次检索只发一条；工具调用一条都不进群
         self.assertEqual(len(live), 1, self.messenger.flat_messages)
-        self.assertIn("调用「news_search」", live[0])
-        self.assertNotIn("×", live[0])
+        self.assertIn("正在联网搜索", live[0])
+        self.assertFalse(
+            [text for text in self.messenger.flat_messages if text.startswith("🔧")]
+        )
         # 已经实时发过的，不再挂进回合末的批量队列
         self.assertFalse(
-            [line for line in outcome.debug_messages if line.startswith("🔧")]
+            [line for line in outcome.debug_messages if line.startswith("🌐")]
         )
         # 收尾那次批量回显也不能再补一遍
         before = len(self.messenger.flat_messages)
@@ -3935,13 +3940,12 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         echoed = [
             text
             for text in outcomes[0].debug_messages
-            if text.startswith(("🔧", "📥", "▶️", "✅", "🎬", "⏭️", "🧠"))
+            if text.startswith(("🔧", "📥", "▶️", "✅", "🎬", "⏭️", "🧠", "🌐"))
         ]
         self.assertTrue(echoed, outcomes[0].debug_messages)
-        self.assertTrue(any("🔧" in text and "今天的新闻" in text for text in echoed), echoed)
-        # 一次检索里的多次调用合并成一行：🔧 搜索 ×N：查询词…
-        self.assertTrue(any("🔧 调用" in text for text in echoed), echoed)
-        self.assertTrue(any("📥" in text and "返回" in text for text in echoed), echoed)
+        # 联网检索期间的工具调用只在日志里；群里看到的是一条「正在联网搜索」
+        self.assertTrue(any("🌐" in text for text in echoed), echoed)
+        self.assertFalse([text for text in echoed if text.startswith("🔧")], echoed)
         # 回显不算"她说过的话"：不进聊天上下文（她自己真正说的那句才算）
         state = await self.get_state()
         self.assertFalse(
@@ -3953,7 +3957,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         """先调工具、结果回来才说话：回显也要按这个顺序排（工具在前）。"""
 
         raw = self.store.raw_world()
-        raw["echo_types"] = ["tool_call", "tool_result"]
+        raw["echo_types"] = ["tool_call", "tool_result", "search"]
         self.store.save_world(raw)
         self.engine.reload_config()
         self.bind_search_flow(["web_search"], depth="quick")
@@ -3974,8 +3978,9 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         ordered = outcome.ordered_messages()
 
         self.assertIn("查到了三条", ordered)
+        # 检索期间的工具行不再进群，群里是那条「正在联网搜索」，它要排在她说话之前
         tool_at = next(
-            index for index, line in enumerate(ordered) if line.startswith("🔧")
+            index for index, line in enumerate(ordered) if line.startswith("🌐")
         )
         say_at = ordered.index("查到了三条")
         self.assertLess(tool_at, say_at, ordered)
@@ -4000,10 +4005,10 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_echo_only_lists_the_checked_types(self):
-        """只勾了「工具调用」，群里就只出现工具那一行。"""
+        """只勾了「工具调用 + 联网搜索」时：检索期间的工具行不出现，只出现那条联网搜索。"""
 
         raw = self.store.raw_world()
-        raw["echo_types"] = ["tool_call"]
+        raw["echo_types"] = ["tool_call", "search"]
         self.store.save_world(raw)
         self.engine.reload_config()
         self.add_schedule(
@@ -4019,10 +4024,10 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         echoed = [
             text
             for text in outcomes[0].debug_messages
-            if text.startswith(("🔧", "📥", "▶️", "✅", "🎬", "⏭️", "🧠"))
+            if text.startswith(("🔧", "📥", "▶️", "✅", "🎬", "⏭️", "🧠", "🌐"))
         ]
         self.assertTrue(echoed, outcomes[0].debug_messages)
-        self.assertTrue(all(text.startswith("🔧") for text in echoed), echoed)
+        self.assertTrue(all(text.startswith("🌐") for text in echoed), echoed)
 
     async def test_legacy_echo_switch_migrates_to_the_common_set(self):
         """老配置里的 echo_actions: true 会变成「常用」那几类。"""
@@ -4038,6 +4043,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
                 "action_start",
                 "action_done",
                 "action",
+                "search",
                 "tool_call",
                 "tool_result",
                 "skip",

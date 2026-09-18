@@ -542,6 +542,7 @@ ECHO_EVENT_TYPES: dict[str, str] = {
     "poke": "👉",
     "search_sources": "🔗",
     "weather": "🌤️",
+    "search": "🌐",
 }
 # 「常用」那一档：决定、动作、工具、跳过——排查她"为什么这么做"最需要的几类
 DEFAULT_ECHO_TYPES: tuple[str, ...] = (
@@ -549,6 +550,7 @@ DEFAULT_ECHO_TYPES: tuple[str, ...] = (
     "action_start",
     "action_done",
     "action",
+    "search",
     "tool_call",
     "tool_result",
     "skip",
