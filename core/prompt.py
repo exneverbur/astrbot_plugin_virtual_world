@@ -1579,6 +1579,44 @@ class PromptBuilder:
         )
         return system, prompt
 
+    def build_search_continue_prompt(
+        self,
+        *,
+        topic: str,
+        asked: list[str],
+        points: list[str],
+        date_text: str = "",
+        limit: int = 2,
+    ) -> tuple[str, str]:
+        """检索循环里"够了吗、还缺什么"的判断（返回 system, user）。
+
+        这个判断交给**主模型**：它才知道手上这些材料够不够回答、还差哪一块。
+        只输出 JSON：``{"done": true}`` 或 ``{"done": false, "queries": ["…"]}``。
+        """
+
+        system = (
+            "你在判断「手上这些检索结果够不够回答问题」。"
+            "只输出一个 JSON 对象：够了就 {\"done\": true}；"
+            "不够就 {\"done\": false, \"queries\": [\"新的查询词\", …]}。"
+            "不要解释、不要多余字段。"
+        )
+        asked_text = "、".join(f"「{_one_line(item, 24)}」" for item in asked[:6]) or "（还没查过）"
+        point_lines = "\n".join(
+            f"{index}. {_one_line(item, 120)}" for index, item in enumerate(points[:8], 1)
+        )
+        prompt = (
+            f"要回答的主题：{topic or '（没写明）'}\n"
+            + (f"今天的日期：{date_text}\n" if date_text else "")
+            + f"\n已经查过的词：{asked_text}\n"
+            + f"\n# 现在手上的结果\n{point_lines or '（什么都没查到）'}\n\n"
+            "# 要求\n"
+            "1. 已经有能回答主题的材料，就输出 {\"done\": true}；\n"
+            "2. 明显还缺关键一块（例如只有首页、只有导航页、没有具体事件），"
+            f"才给新的查询词，最多 {max(1, int(limit))} 条，要换角度、更具体，不要重复上面查过的；\n"
+            "3. 只是结果不够完美、但已经能说清一件事，就算够了（不要没完没了地查）。"
+        )
+        return system, prompt
+
     def build_search_topic_prompt(
         self,
         *,

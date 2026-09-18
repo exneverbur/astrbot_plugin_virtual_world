@@ -3170,13 +3170,28 @@ async function clearChatContext() {
 
 async function stateAction(action, extra = {}) {
   const sessionId = $("status-session").value;
-  if (!sessionId) return;
+  if (!sessionId) {
+    // 以前这里直接 return：没选会话时点任何按钮都毫无反应，看起来像"按钮坏了"
+    toast("先在上面选一个会话；如果列表是空的，去「会话白名单」把群加回来");
+    return;
+  }
+  if (ui.stateActionPending) {
+    // 上一次请求还没回来：这次直接忽略（连着点只是浪费，等会儿会一口气生效）
+    toast("上一次还在处理，这次点击已忽略");
+    return;
+  }
+  ui.stateActionPending = true;
   try {
     const result = await apiPost("state/action", {
       session: sessionId,
       action,
       ...extra,
     });
+    if (result && result.ok === false && result.note) {
+      // 后端明确说了"她正在忙，稍等"这类原因时，优先显示它
+      toast(result.note);
+      return;
+    }
     if (result.messages && result.messages.length) {
       toast(`已发送：${result.messages.join(" / ")}`);
     } else if (result.notes && result.notes.length) {
@@ -3191,6 +3206,8 @@ async function stateAction(action, extra = {}) {
     refreshStatus();
   } catch (error) {
     toast(error.message || "执行失败");
+  } finally {
+    ui.stateActionPending = false;
   }
 }
 

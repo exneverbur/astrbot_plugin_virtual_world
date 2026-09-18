@@ -48,6 +48,9 @@ from .core.prompt import prompt_section_index
 from .core.timeline import build_timeline
 
 PLUGIN_NAME = "astrbot_plugin_virtual_world"
+# 状态页那些按钮（推进 tick / 触发决策 / 打断 / 叫醒）最多等这么久：
+# 她正在检索或调模型时可能占着会话，超时就明确回一句，别让前端"点了没反应"
+STATE_ACTION_TIMEOUT = 6.0
 # 钩子优先级：比默认 0 低，让其他插件先写完 system_prompt / 先决定要不要接管。
 # AstrBot 按 priority 从高到低执行钩子，并且一旦某个钩子 stop 了事件，后面的就不再执行。
 LLM_HOOK_PRIORITY = -100
@@ -1695,7 +1698,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "exneverbur",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v1.4.3",
+    "v1.4.4",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -1764,6 +1767,9 @@ class VirtualWorldPlugin(Star):
             debug=self.debug,
             logger=self.logger,
         )
+        # 调试回显实时发：工具/指令调用在发生的那一下就走这条通道，
+        # 不再等整轮动作跑完才一起推给群里
+        self.engine.debug_sink = self._send_debug_live
 
         self._register_web_apis()
 
@@ -2283,6 +2289,15 @@ class VirtualWorldPlugin(Star):
         if len(kept) == len(tool_set.tools):
             return
         tool_set.tools = kept
+
+    async def _send_debug_live(self, session_id: str, message: str) -> bool:
+        """把调试行立刻发到群里（引擎那边一发生就调它）。"""
+
+        try:
+            return bool(await self.messenger.send_text(session_id, [str(message)]))
+        except Exception as exc:
+            self.logger.debug(f"[virtual_world] 调试回显发送失败：{exc}")
+            return False
 
     async def _send_reply(self, event: AstrMessageEvent, messages: list[str]) -> None:
         """把接管产生的消息发回当前会话（逐条发送 = 天然分段回复）。
@@ -3310,10 +3325,25 @@ class VirtualWorldPlugin(Star):
         if not session_id:
             return error_response("缺少 session")
         if action == "wake":
-            was = await self.engine.wake_up(session_id)
+            try:
+                was = await asyncio.wait_for(
+                    self.engine.wake_up(session_id), timeout=STATE_ACTION_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                return json_response(
+                    {"ok": False, "note": "她正在忙，稍等一下再叫醒"}
+                )
             return json_response({"ok": True, "was_sleeping": was})
         if action == "interrupt":
-            done = await self.engine.interrupt(session_id, force=True)
+            try:
+                done = await asyncio.wait_for(
+                    self.engine.interrupt(session_id, force=True),
+                    timeout=STATE_ACTION_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                return json_response(
+                    {"ok": False, "note": "她正在忙，稍等一下再打断"}
+                )
             return json_response({"ok": True, "interrupted": done})
         if action == "reset_tools":
             # 手动解除工具熔断（状态页上的「立即重试」）
@@ -3321,7 +3351,23 @@ class VirtualWorldPlugin(Star):
             cleared = self.engine.reset_tool_breakers(name)
             return json_response({"ok": True, "cleared": cleared})
         if action == "tick":
-            outcomes = await self.engine.tick()
+            # 她正忙（检索/动作/模型调用占着会话）时**直接跳过这一次**：
+            # 不能排队——不然连点几下，等她忙完会一口气推进好几个 tick
+            if self.engine.is_busy(session_id):
+                return json_response(
+                    {
+                        "ok": False,
+                        "note": "她正在忙（动作或检索还没结束），这次推进已跳过",
+                    }
+                )
+            try:
+                outcomes = await asyncio.wait_for(
+                    self.engine.tick(), timeout=STATE_ACTION_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                return json_response(
+                    {"ok": False, "note": "她正在检索或调模型，稍等一下再点"}
+                )
             return json_response(
                 {
                     "ok": True,
@@ -3336,10 +3382,25 @@ class VirtualWorldPlugin(Star):
                 }
             )
         if action == "decide":
+            if self.engine.is_busy(session_id):
+                return json_response(
+                    {
+                        "ok": False,
+                        "note": "她正在忙（动作或检索还没结束），这次决策已跳过",
+                    }
+                )
             # 手动触发：绕过评估间隔，但仍然尊重"正在忙 / 在睡觉"这些硬条件
-            outcome = await self.engine.maybe_decide(
-                session_id, force=bool(payload.get("force"))
-            )
+            try:
+                outcome = await asyncio.wait_for(
+                    self.engine.maybe_decide(
+                        session_id, force=bool(payload.get("force"))
+                    ),
+                    timeout=STATE_ACTION_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                return json_response(
+                    {"ok": False, "note": "她正在忙（上一个动作还没结束），稍等一下再点"}
+                )
             return json_response(
                 {
                     "ok": True,

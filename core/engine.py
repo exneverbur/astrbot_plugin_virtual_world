@@ -91,6 +91,10 @@ SEARCH_BUDGET_SECONDS = 20.0
 READ_CACHE_SECONDS = 6 * 3600
 # 一篇正文最多留多少字给模型看
 READ_PASSAGE_CHARS = 1200
+# 调试回显的防抖窗口（秒）：同一工具的连续调用（例如一次检索并行查 4 条）
+# 只发第一条，别把群刷成一排一样的行
+DEBUG_ECHO_DEBOUNCE_SECONDS = 2.5
+_DEBUG_ECHO_TYPES = ("tool_call", "tool_result", "command_call", "command_result")
 # 没写意图、也没配主题/模板时的兜底搜索主题（见 PromptBuilder 里那段说明）
 DEFAULT_SEARCH_TOPIC = "今天有什么新鲜事"
 # 最近一次检索记在 kv 里的键前缀与有效期（提示词里提醒她"刚查过什么"）
@@ -350,6 +354,16 @@ class VirtualWorldEngine:
         self._pending_echo: dict[str, list[str]] = {}
         """回复路径之外产生的调试回显，等下一次发送时带出去。"""
         self._filled_params: dict[tuple[str, str], dict[str, Any]] = {}
+        self.debug_sink = None
+        """实时调试通道：插件层注入 ``async (session_id, message) -> bool``。
+
+        有它的时候，调试回显在**发生的事情当时**就发出去（不再是整轮跑完才一起发）；
+        测试里没有这个通道，就退回"挂到 outcome 上、收尾批量发"的老办法。
+        """
+        self._echoed_ids: dict[str, set[int]] = {}
+        """已经实时发过的事件 id：收尾那次批量回显要跳过，不然会重复。"""
+        self._echo_debounce: dict[tuple[str, str, str], float] = {}
+        """``(会话, 事件类型, 工具名) -> 上次发的时间``：同一串调用只发第一条。"""
         self._read_cache: dict[str, tuple[float, str]] = {}
         """URL -> (写入时刻, 正文)，抓过的网页短期内不再重复抓。"""
 
@@ -442,6 +456,16 @@ class VirtualWorldEngine:
             lock = asyncio.Lock()
             self._locks[session_id] = lock
         return lock
+
+    def is_busy(self, session_id: str) -> bool:
+        """她现在是不是正忙（有人在跑这个会话的动作/检索/模型调用）。
+
+        只看会话锁，**不排队**：编辑器点「推进 tick」时用它做前置判断——
+        忙着就直接跳过这一次，免得排队到动作结束后一口气推进好几个 tick。
+        """
+
+        lock = self._locks.get(session_id)
+        return bool(lock is not None and lock.locked())
 
     async def load_state(self, session_id: str, *, cold_start: bool = True) -> WorldState:
         payload = await self.db.call("get_state", session_id)
@@ -2208,7 +2232,9 @@ class VirtualWorldEngine:
         return (
             "# 最近查过\n"
             f"{minutes} 分钟前你查过「{'」「'.join(queries)}」，拿到 {found} 条材料。"
-            "同一件事不要马上再查一遍；要接着查就换个更具体的角度。"
+            "同一件事不要马上再查一遍；要接着查就换个更具体的角度。\n"
+            "如果这批材料你还没讲给群里听过，就直接讲内容——不要再回一句"
+            "「正在挑 / 马上端上来 / 等着」这类话。"
         )
 
     async def _remember_search(
@@ -4660,7 +4686,7 @@ class VirtualWorldEngine:
         query_key: str,
         *,
         outcome: TickOutcome | None = None,
-        echo: bool = False,
+        echo: bool = True,
         texts: list[str],
         items: list[Evidence],
         failed: list[str],
@@ -4773,6 +4799,61 @@ class VirtualWorldEngine:
         )
         return nxt
 
+    async def _search_continue(
+        self,
+        state: WorldState,
+        outcome: TickOutcome | None,
+        *,
+        topic: str,
+        asked: list[str],
+        items: list[Evidence],
+        limit: int = 2,
+    ) -> tuple[bool, list[str]]:
+        """问主模型：手上这些够了吗？不够就再给几条查询词。
+
+        返回 ``(是否够了, 新的查询词)``。判断不出来（没模型 / 返回不可解析）就当"够了"，
+        宁可这次少查一轮，也不要无限查下去。
+        """
+
+        if self.llm is None:
+            return True, []
+        points = [
+            "｜".join(
+                part
+                for part in (item.title, item.published_at, (item.passage or item.snippet or "")[:120])
+                if part
+            )
+            for item in items
+        ]
+        system_prompt, prompt = self.prompts.build_search_continue_prompt(
+            topic=topic,
+            asked=asked,
+            points=points,
+            date_text=self.local_now().strftime("%Y-%m-%d"),
+            limit=limit,
+        )
+        reply = await self._ask_llm(state.session_id, system_prompt, prompt)
+        if outcome is not None:
+            outcome.llm_calls += 1
+        payload = extract_json_object(reply) if reply else None
+        if not isinstance(payload, dict):
+            return True, []
+        if bool(payload.get("done")):
+            return True, []
+        raw = payload.get("queries")
+        if isinstance(raw, str):
+            raw = [line for line in raw.splitlines() if line.strip()]
+        if not isinstance(raw, list):
+            return True, []
+        result: list[str] = []
+        for entry in raw:
+            text = " ".join(str(entry).split())[:60]
+            if text and text not in result and text not in asked:
+                result.append(text)
+            if len(result) >= max(1, int(limit)):
+                break
+        return (not result), result
+
     async def _search_gap_queries(
         self,
         state: WorldState,
@@ -4818,7 +4899,7 @@ class VirtualWorldEngine:
         url: str,
         *,
         outcome: TickOutcome | None = None,
-        echo: bool = False,
+        echo: bool = True,
     ) -> str:
         """用阅读工具抓一篇正文（带缓存），失败返回空串。"""
 
@@ -4958,12 +5039,19 @@ class VirtualWorldEngine:
 
         read_budget, rounds = self._search_budget(definition, action)
         for _ in range(rounds):
-            if time.monotonic() > deadline or not self._search_needs_more(items):
+            if time.monotonic() > deadline:
+                break
+            # 够不够、还要不要再来一轮：交给主模型判断
+            done, gaps = await self._search_continue(
+                state,
+                outcome,
+                topic=intent or (asked[0] if asked else ""),
+                asked=asked,
+                items=items,
+            )
+            if done or not gaps:
                 break
             before = len(items)
-            gaps = await self._search_gap_queries(
-                state, definition, action, items, topic=intent
-            )
             fresh = [entry for entry in gaps if entry not in asked]
             if not fresh:
                 break
@@ -4999,21 +5087,15 @@ class VirtualWorldEngine:
                     if time.monotonic() > deadline:
                         break
                     item.passage = await self._read_passage(
-                        state, definition, readers, item.url, outcome=outcome, echo=False
+                        state, definition, readers, item.url, outcome=outcome
                     )
                     if item.passage:
                         reads += 1
 
         items = merge_evidence(items, limit=8)
-        self._echo_search_summary(
-            outcome,
-            queries=asked,
-            reads=reads,
-            found=len(items),
-            failures=len(failed),
-            first_title=(items[0].title or items[0].snippet) if items else "",
+        digest = await self._digest_evidence(
+            state, items, topic=intent or (asked[0] if asked else "")
         )
-        digest = await self._digest_evidence(state, items, topic=intent or (asked[0] if asked else ""))
         action["tool_name"] = tool
         action["tool_used"] = used
         action["tool_ok"] = bool(texts or images)
@@ -5068,42 +5150,6 @@ class VirtualWorldEngine:
         if not text or "材料里没有" in text and len(text) < 30:
             return ""
         return _clip_text(text, 1200)
-
-    def _echo_search_summary(
-        self,
-        outcome: TickOutcome | None,
-        *,
-        queries: list[str],
-        reads: int,
-        found: int,
-        failures: int,
-        first_title: str = "",
-    ) -> None:
-        """把一次检索里的多次调用合并成两三行回显。
-
-        一次检索本来就可能有 3 条查询 + 2 篇正文，逐条发就是五条消息、群里像刷屏；
-        这里只报"搜了几次、读了什么、拿到几条"，细节仍然完整留在日志页。
-        """
-
-        if outcome is None or not queries:
-            return
-        enabled = self.echo_types()
-        compact = self.echo_compact()
-        if "tool_call" in enabled:
-            head = f"🔧 搜索 ×{len(queries)}"
-            if not compact:
-                shown = " / ".join(_clip_text(item, 24) for item in queries[:3])
-                head += f"：{shown}" + (" …" if len(queries) > 3 else "")
-            if failures:
-                head += f"（{failures} 次没成功）"
-            outcome.add_debug(head)
-            if reads:
-                outcome.add_debug(f"📖 读正文 ×{reads}")
-        if "tool_result" in enabled:
-            line = f"📥 共 {found} 条可用结果"
-            if not compact and first_title:
-                line += f"：{_clip_text(first_title, 30)}"
-            outcome.add_debug(line)
 
     async def _store_search_evidence(
         self,
@@ -7277,6 +7323,37 @@ class VirtualWorldEngine:
 
         return self._pending_echo.pop(session_id, [])
 
+    async def _send_debug_live(self, session_id: str, message: str) -> bool:
+        """把一条调试行立刻发到群里（发送失败冷却、分段逻辑都在 messenger 里）。"""
+
+        text = str(message or "").strip()
+        if self.debug_sink is None or not text:
+            return False
+        try:
+            return bool(await self.debug_sink(session_id, text))
+        except Exception as exc:
+            self._log("debug", f"调试回显发送失败：{exc}")
+            return False
+
+    def _echo_debounced(
+        self, session_id: str, event_type: str, payload: dict[str, Any]
+    ) -> bool:
+        """同一工具的连续调用要不要吞掉：一串并行查询只留第一条。"""
+
+        if event_type not in _DEBUG_ECHO_TYPES:
+            return False
+        tool = str(payload.get("tool") or payload.get("command") or "")
+        if not tool:
+            return False
+        key = (session_id, event_type, tool)
+        now = time.monotonic()
+        last = self._echo_debounce.get(key, 0.0)
+        self._echo_debounce[key] = now
+        if len(self._echo_debounce) > 200:
+            self._echo_debounce.clear()
+            self._echo_debounce[key] = now
+        return bool(last and (now - last) < DEBUG_ECHO_DEBOUNCE_SECONDS)
+
     async def _echo_events_since(
         self, state: WorldState, outcome: TickOutcome | None, marker: int
     ) -> None:
@@ -7305,6 +7382,7 @@ class VirtualWorldEngine:
         # 有些事件在发生的当下就已经插好位置了（见 ``_log_event`` 的 ``outcome`` 参数），
         # 这里再发一遍就会重复——跳过它们，剩下的才补在这一轮末尾。
         already = set(getattr(outcome, "echoed_event_ids", ()) or ())
+        already |= set(self._echoed_ids.get(state.session_id, ()) or ())
         for item in reversed(fresh[:12]):
             if int(item.get("id") or 0) in already:
                 continue
@@ -7349,12 +7427,8 @@ class VirtualWorldEngine:
         payload = detail or {}
         enabled = self.echo_types()
         line_added = False
-        if (
-            outcome is not None
-            and not silent
-            and enabled
-            and _echo_payload(event_type, payload, enabled)
-        ):
+        line = ""
+        if not silent and enabled and _echo_payload(event_type, payload, enabled):
             try:
                 line = render_event(
                     {
@@ -7367,8 +7441,17 @@ class VirtualWorldEngine:
                 )
             except Exception:
                 line = ""
-            if line:
-                outcome.add_debug(f"{ECHO_EVENT_TYPES.get(event_type, '•')} {line}")
+        consumed = False
+        live = False
+        if line:
+            rendered = f"{ECHO_EVENT_TYPES.get(event_type, '•')} {line}"
+            if self._echo_debounced(state.session_id, event_type, payload):
+                # 同一工具的连续调用（一次检索并行查好几条）只发第一条
+                consumed = True
+            elif self.debug_sink is not None:
+                live = await self._send_debug_live(state.session_id, rendered)
+            elif outcome is not None:
+                outcome.add_debug(rendered)
                 line_added = True
 
         try:
@@ -7382,9 +7465,11 @@ class VirtualWorldEngine:
             )
             if new_id:
                 self._event_ids[state.session_id] = int(new_id)
-                if outcome is not None and (line_added or silent):
+                if outcome is not None and (line_added or silent or live or consumed):
                     # 这一行已经在发生的当下插好了位置：收尾那次批量回显要跳过它
                     outcome.echoed_event_ids.add(int(new_id))
+                if live or consumed:
+                    self._echoed_ids.setdefault(state.session_id, set()).add(int(new_id))
         except Exception as exc:  # 日志写失败不能影响主流程
             self._log("debug", f"写事件日志失败：{exc}")
             return

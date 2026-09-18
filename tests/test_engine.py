@@ -1571,7 +1571,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["tool_error"])
 
     async def test_one_search_action_echoes_a_single_line(self):
-        """一次检索查了三条：群里只出现一行「🔧 搜索 ×3」，不是三条调用。"""
+        """一次检索查了三条：同一工具的连续调用只发一行（防抖），不是三条。"""
 
         raw = self.store.raw_world()
         raw["echo_types"] = ["tool_call", "tool_result"]
@@ -1593,15 +1593,107 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
 
         tool_lines = [line for line in outcome.debug_messages if line.startswith("🔧")]
         self.assertEqual(len(tool_lines), 1, outcome.debug_messages)
-        self.assertIn("×3", tool_lines[0])
+        # 文案就是"调用「工具」参数 …"这一种，不再有 ×N
+        self.assertIn("调用「news_search」", tool_lines[0])
         self.assertIn("今日科技新闻", tool_lines[0])
-        # 每条查询单独一行的老格式不该再出现
-        self.assertFalse(
-            [line for line in outcome.debug_messages if "调用「news_search」" in line]
-        )
+        self.assertNotIn("×", tool_lines[0])
         self.assertTrue(
             [line for line in outcome.debug_messages if line.startswith("📥")]
         )
+
+    async def test_tool_echo_is_sent_live_and_only_once(self):
+        """有实时通道时：调用发生时立刻发一条，收尾那次批量回显不再重复发。"""
+
+        raw = self.store.raw_world()
+        raw["echo_types"] = ["tool_call", "tool_result"]
+        self.store.save_world(raw)
+        self.engine.reload_config()
+        self.use_search_tool()
+        definition = self.bind_search_flow(["news_search"], depth="quick")
+        await self.set_state(node_id="study")
+
+        async def sink(session_id, message):
+            return await self.messenger.send_text(session_id, [message])
+
+        self.engine.debug_sink = sink
+        payload = {
+            "type": "search_web",
+            "intent": "看看今天的科技新闻",
+            "queries": ["今日科技新闻", "AI 行业 最新进展", "芯片 动态"],
+        }
+        outcome = TickOutcome(session_id=SESSION)
+
+        await self.engine._run_tool_calls(
+            await self.get_state(), definition, payload, outcome=outcome
+        )
+
+        live = [text for text in self.messenger.flat_messages if text.startswith("🔧")]
+        # 三条查询同一个工具：防抖之后群里只出现一行
+        self.assertEqual(len(live), 1, self.messenger.flat_messages)
+        self.assertIn("调用「news_search」", live[0])
+        self.assertNotIn("×", live[0])
+        # 已经实时发过的，不再挂进回合末的批量队列
+        self.assertFalse(
+            [line for line in outcome.debug_messages if line.startswith("🔧")]
+        )
+        # 收尾那次批量回显也不能再补一遍
+        before = len(self.messenger.flat_messages)
+        state = await self.get_state()
+        await self.engine._echo_events_since(state, outcome, 0)
+        self.assertEqual(len(self.messenger.flat_messages), before)
+
+    async def test_search_loop_lets_the_main_model_decide(self):
+        """够不够、要不要再来一轮：由主模型判断（它说够了就停，并给下一轮的查询词）。"""
+
+        await self.set_state(node_id="study")
+        state = await self.get_state()
+
+        self.llm.replies = ['{"done": false, "queries": ["换个更具体的角度"]}']
+        done, queries = await self.engine._search_continue(
+            state, None, topic="查新闻", asked=["今日新闻"], items=[]
+        )
+        self.assertFalse(done)
+        self.assertEqual(queries, ["换个更具体的角度"])
+        asked_prompt = self.llm.calls[-1]["prompt"]
+        self.assertIn("查新闻", asked_prompt)
+        self.assertIn("今日新闻", asked_prompt)
+
+        # 说够了
+        self.llm.replies = ['{"done": true}']
+        done, queries = await self.engine._search_continue(
+            state, None, topic="查新闻", asked=["今日新闻"], items=[]
+        )
+        self.assertTrue(done)
+        self.assertEqual(queries, [])
+
+        # 返回不可解析 / 给不出新词：都当"够了"，不要无限查
+        self.llm.replies = ["我觉得差不多了"]
+        done, queries = await self.engine._search_continue(
+            state, None, topic="查新闻", asked=["今日新闻"], items=[]
+        )
+        self.assertTrue(done)
+        self.llm.replies = ['{"done": false, "queries": ["今日新闻"]}']
+        done, queries = await self.engine._search_continue(
+            state, None, topic="查新闻", asked=["今日新闻"], items=[]
+        )
+        self.assertTrue(done)  # 只给已经查过的词 = 没有新东西
+
+    async def test_busy_session_is_detected_without_waiting(self):
+        """她正忙时要能被"不排队"地发现：编辑器那次推进直接跳过，而不是等它做完。"""
+
+        import asyncio as _asyncio
+
+        self.assertFalse(self.engine.is_busy(SESSION))
+
+        async def hold():
+            async with self.engine.session_state(SESSION):
+                await _asyncio.sleep(0.3)
+
+        task = _asyncio.ensure_future(hold())
+        await _asyncio.sleep(0.05)
+        self.assertTrue(self.engine.is_busy(SESSION))  # 忙：这次的 tick 会被跳过
+        await task
+        self.assertFalse(self.engine.is_busy(SESSION))
 
     async def test_followup_round_cannot_search_again(self):
         """刚查完那一轮：她想再写一次检索会被拦下，只让她说话。"""
@@ -3810,8 +3902,8 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(echoed, outcomes[0].debug_messages)
         self.assertTrue(any("🔧" in text and "今天的新闻" in text for text in echoed), echoed)
         # 一次检索里的多次调用合并成一行：🔧 搜索 ×N：查询词…
-        self.assertTrue(any("🔧 搜索" in text for text in echoed), echoed)
-        self.assertTrue(any("📥" in text and "可用结果" in text for text in echoed), echoed)
+        self.assertTrue(any("🔧 调用" in text for text in echoed), echoed)
+        self.assertTrue(any("📥" in text and "返回" in text for text in echoed), echoed)
         # 回显不算"她说过的话"：不进聊天上下文（她自己真正说的那句才算）
         state = await self.get_state()
         self.assertFalse(
