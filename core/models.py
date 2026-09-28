@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .defaults import (
     DEFAULT_CAPTION_PROMPT,
     DEFAULT_CAPTION_RELATION_PROMPT,
+    DEFAULT_FORWARD_PROMPT,
     DEFAULT_WAKE_WORDS,
 )
 
@@ -38,8 +39,8 @@ Gender = Literal["female", "male", "other"]
 
 PRONOUNS: dict[str, str] = {"female": "她", "male": "他", "other": "ta"}
 
-# 这些动作在引擎里有专门逻辑（说话的出口、寻路、睡眠门禁、内心活动、分享上限），
-# 删掉会让整个世界跑不起来，所以只能停用、不能删除。
+# 这些动作在引擎里有专门逻辑（说话的出口、寻路、睡眠门禁、内心活动、分享上限、
+# 生图动作接到事件里……），删掉会让整个世界跑不起来，所以只能停用、不能删除。
 REQUIRED_BUILTIN_ACTIONS: tuple[str, ...] = (
     "say",
     "walk_to",
@@ -53,7 +54,27 @@ REQUIRED_BUILTIN_ACTIONS: tuple[str, ...] = (
     "schedule_list",
     "schedule_add",
     "schedule_remove",
+    # 生图：接了图片插件才有用，所以默认停用（只能用/停用，不能删）
+    "selfie",
+    "take_photo",
+    "leg_photo",
+    "change_clothes",
+    "make_video",
 )
+
+BUILTIN_ACTION_UPDATES: dict[str, dict[str, tuple[str, str]]] = {
+    # 动作 id -> {字段: (老内置值, 新内置值)}
+    # 老配置里存的是整套动作数据。**只有字段还等于老内置值时才跟着更新**——
+    # 用户自己改过的名字 / 文案不动。
+    "pour_tea": {
+        "name": ("倒杯茶", "倒茶提醒喝水"),
+        "template": ("（{bot}给你倒了杯热茶）", "（{bot}给你倒了杯茶，顺嘴提醒你去喝口水）"),
+        "description": (
+            "给某个人倒杯热茶，在吧台、厨房或客厅可用。",
+            "给某个人倒杯茶，顺便提醒他喝口水（他容易忘）。在吧台、厨房或客厅可用。",
+        ),
+    },
+}
 
 
 def _clean_names(names: Any, fallback: Any = "") -> list[str]:
@@ -81,6 +102,61 @@ class Permissive(BaseModel):
     """允许未知字段，方便未来扩展与用户手写多余配置。"""
 
     model_config = ConfigDict(extra="allow")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _tidy_string_lists(cls, data: Any) -> Any:
+        """声明成 ``list[str]`` 的字段统一洗一遍。
+
+        编辑器里的多选框在选项没有 id 时会写进 ``null``，手写 JSON 也可能留空串；
+        这种脏值不该让整份配置存不下去（以前报的是一串英文校验错误）。
+        """
+
+        if not isinstance(data, dict):
+            return data
+        cleaned = data
+        for name, field in cls.model_fields.items():
+            if name not in data or not _declares_str_list(field):
+                continue
+            value = data.get(name)
+            tidy = _clean_str_list(value)
+            if value != tidy:
+                if cleaned is data:
+                    cleaned = dict(data)
+                cleaned[name] = tidy
+        return cleaned
+
+
+def _clean_str_list(value: Any) -> list[str]:
+    """把"一串字符串"洗干净：丢掉 None / 空串、去掉首尾空白、去重。
+
+    只写了一个值时也认（``"42"`` 和 ``42`` 都当成"只有一个元素"）。
+    """
+
+    if value is None or isinstance(value, bool):
+        return []
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+    elif isinstance(value, (str, int, float)):
+        items = [value]
+    else:
+        return []
+    result: list[str] = []
+    for item in items:
+        if item is None or isinstance(item, bool):
+            continue
+        text = str(item).strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _declares_str_list(field: Any) -> bool:
+    """这个字段是不是 ``list[str]``（只对这类字段动手，别的类型一律不碰）。"""
+
+    annotation = getattr(field, "annotation", None)
+    origin = getattr(annotation, "__origin__", None)
+    return origin is list and getattr(annotation, "__args__", ()) == (str,)
 
 
 def _clamp01(value: Any, default: float = 0.0) -> float:
@@ -276,6 +352,25 @@ class Preconditions(Permissive):
     min_energy: float | None = None
 
 
+class ActionQuota(Permissive):
+    """动作的使用次数上限（0 = 那一档不限制）。"""
+
+    day: int = 0
+    week: int = 0
+    month: int = 0
+
+    @field_validator("day", "week", "month", mode="before")
+    @classmethod
+    def _non_negative(cls, value: Any) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    def limits(self) -> dict[str, int]:
+        return {"day": self.day, "week": self.week, "month": self.month}
+
+
 class ActionDef(Permissive):
     id: str
     name: str = ""
@@ -300,6 +395,14 @@ class ActionDef(Permissive):
     during: During = Field(default_factory=During)
     on_complete: OnComplete = Field(default_factory=OnComplete)
     template: str = ""
+    desc_mode: Literal["full", "brief"] = "full"
+    """动作说明写多细：``full`` = 写出描述（默认），``brief`` = 只写「id（名字）」。
+
+    亲昵 / 打招呼这类"看一眼名字就知道干嘛"的动作用 ``brief``：几十个这样的动作
+    各带一句说明，会把提示词撑得又长又没信息量；规则性的附加标记
+    （工具型 / 指令型 / 时长由你定 / 只有这个地点才能做）照旧会拼在后面。
+    """
+
     nickname_text: str = ""
     """她正在做这个动作时，群名片上显示什么（留空则退回"状态 → 文案"的兜底映射）。
 
@@ -367,6 +470,13 @@ class ActionDef(Permissive):
     search_cite: bool = False
     """讲结果时是否允许带一句来源（默认不带，来源只进日志与调试输出）。"""
 
+    search_satisfy_curiosity: float = 0.30
+    """检索型动作真查到东西之后，好奇心回落多少（0 = 不回落）。
+
+    动作自己配的 ``on_complete.effects`` 里那点好奇回落（默认 -0.06）抵不过每分钟的
+    自然增长（0.06/小时），不补这一刀她会整天停在"很好奇"，冷却一到又去查同一件事。
+    """
+
 
     trigger_command: str = ""
     """「指令触发」型动作要触发的 AstrBot 指令，例如 ``情感分析`` 或 ``/天气``。"""
@@ -379,6 +489,37 @@ class ActionDef(Permissive):
 
     builtin: bool = False
     """内置动作：引擎对它有专门逻辑，只能停用、不能删除（例如说话、移动、睡觉）。"""
+
+    event_usable: Literal["auto", "allow", "deny"] = "auto"
+    """她遇到事的时候，能不能为了这件事调用这个动作。
+
+    - ``auto``（默认）：工具型 / 指令型动作（能用外部能力做事）算可用；
+      「往群里发东西」那类（``target_type=group``）排除，免得事件里顺手刷屏；
+    - ``allow``：强制允许（即使不符合上面的默认口径）；
+    - ``deny``：事件里不允许调用。
+    """
+
+    quota: "ActionQuota" = Field(default_factory=lambda: ActionQuota())
+    """使用次数上限：超过之后**不再出现在提示词里**，计划里排到也会被跳过。
+
+    三个周期各自独立，填 0 表示那一档不限制（生图默认每天 5 次，录视频每天 2 次）。
+    """
+
+    state_slot: str = ""
+    """把工具 / 指令返回的结果记进状态槽（留空 = 不记）。
+
+    别的插件常常有自己的状态（生图插件的「今日穿搭」、背包、经济…）。填了槽名之后，
+    结果会存进 ``state.external_state``，之后每一轮提示词里都带着，她不会说完就忘。
+    """
+
+    state_label: str = ""
+    """这个槽在提示词里叫什么（例如「今日穿搭」）。留空就用槽名。"""
+
+    state_ttl_minutes: int = 0
+    """这个槽多久过期（分钟）。0 = 不过期（例如"今日穿搭"当天有效就填 720）。"""
+
+    state_summarize: bool = False
+    """开启后先让打杂模型把结果压成一句话再存（返回是一大段时用得上）。"""
 
     visible: bool = False
     priority: int = 5
@@ -435,11 +576,67 @@ class StateDynamics(Permissive):
     affect_decay_per_min: float = 0.02
     """心潮每分钟回落多少。默认 0.02 ≈ 50 分钟从满值回到平静。"""
 
+    valence_decay_per_min: float = 0.010
+    """效价偏移每分钟回落多少。默认 0.01 ≈ 一小时出头回落一半。"""
+
+    chat_valence_cap: float = 0.05
+    """一轮聊天最多推动效价多少。
+
+    取的是模型给的 -1~1 乘上这个数。0.05 的意思是：**说得再好听，一轮也只值 0.05**，
+    想看到明显起伏得靠真的经历（事件、约定、意外），而不是几句夸奖。
+    """
+
+    chat_valence_daily_cap: float = 0.15
+    """聊天一天最多把效价推动多少（正负各算一份）。
+
+    超过之后这一天再怎么聊都不再推高——日常陪伴改的是好感度，不是心情的量程。
+    填 0 = 不限制。
+    """
+
     boredom_growth_per_min: float = 0.0012
     sleep_energy_recovery_per_min: float = 0.0020
     nap_energy_recovery_per_min: float = 0.0008
+    sleep_curiosity_decay_per_min: float = 0.0012
+    """睡觉 / 小睡时好奇心每分钟回落多少（整觉 8 小时 ≈ 降 0.58）。
+
+    睡一觉本来就该把"昨天攒的那点好奇"放下，不然她会带着满格好奇心入睡、
+    醒来第一件事就是冲去查东西。
+    """
+
+    sleep_curiosity_floor: float = 0.30
+    """睡一觉最多把好奇心压到这个值：醒来还是要对新鲜事有点兴趣。"""
+
     atmosphere_multiplier: float = 0.5
     mood_override_duration: int = 600
+
+    # ---------------- 心事：她心里搁着的事 ----------------
+
+    heart_knot_enabled: bool = True
+    """心里会不会一直搁着一件事（"他上次那句话让我到现在还别扭"这种）。
+
+    和事件线不同：事件是一条会推进的线索，心事**不推进**，只是挂着——
+    影响她的语气与主动程度，时不时冒出来。所以它是"她自己的事"，不是"她在做的事"。
+    """
+
+    heart_knot_max: int = 2
+    """同时最多搁几件。多了她会变成一个整天苦大仇深的人。"""
+
+    heart_knot_decay_per_hour: float = 0.02
+    """每小时淡掉多少。默认 0.02 ≈ 两天从满值淡到没有。说出来会掉得快些。"""
+
+    heart_knot_max_days: float = 5.0
+    """最多挂几天，到点无论如何都放下（写进记忆）。"""
+
+    # ---------------- 她自己的事：答应过的、想做的 ----------------
+
+    own_topic_enabled: bool = True
+    """她自己记不记事（"答应过给他看照片""想做顿饭"这种还没做的）。"""
+
+    own_topic_max: int = 2
+    """同时最多记几件。多了她会变成一个待办清单。"""
+
+    own_topic_days: int = 3
+    """一件记多久（天）。太久了要么已经做完、要么她其实不在意，都该丢掉。"""
 
     @model_validator(mode="before")
     @classmethod
@@ -449,8 +646,15 @@ class StateDynamics(Permissive):
 
 class Limits(Permissive):
     max_actions_per_message: int = 3
-    max_autonomous_per_hour: int = 2
-    max_share_per_hour: int = 1
+    max_autonomous_per_hour: int = 6
+    max_share_per_hour: int = 4
+    max_replies_per_hour: int = 200
+    """每小时最多回几条「被动回复」（被 @ 到 / 私聊 / 明确对她说）。
+
+    超限之后仍然由本插件接管，但这一条**不回**（静默），也不会落回主人格。
+    填 0 = 不限制。大群里压测时用它兜住回复量。
+    """
+
     max_think_memory: int = 5
     max_messages_per_say: int = 3
     plan_valid_duration: int = 1800
@@ -465,16 +669,19 @@ class Limits(Permissive):
     llm_plan_min_interval_seconds: int = 900
     """两次「问 LLM 要计划」之间的最小间隔，避免每轮决策都烧 token。"""
 
-    max_llm_plan_per_hour: int = 4
+    max_llm_plan_per_hour: int = 10
     """每小时最多几次 LLM 计划决策。"""
 
-    max_llm_text_per_hour: int = 6
-    """每小时最多几次「用 LLM 生成自主发言」，超出后使用内置短句池。"""
+    max_llm_text_per_hour: int = 20
+    """每小时最多几次「用 LLM 生成自主发言」。超出后**不再开口**——
 
-    max_tool_param_per_hour: int = 30
+    宁可这一轮什么都不说，也不要拿一句跟人设无关的通用短句顶上去。
+    """
+
+    max_tool_param_per_hour: int = 60
     """每小时最多几次「把意图翻译成工具参数」的辅助模型调用。"""
 
-    max_arrival_decisions_per_hour: int = 12
+    max_arrival_decisions_per_hour: int = 20
     """每小时最多几次「走到新地方就地决策」。这类决策不占自主行动额度，单独限流。"""
 
     forced_plan_min_interval_seconds: int = 3600
@@ -502,6 +709,8 @@ class NicknameSync(Permissive):
     restore_on_idle_delay: int = 30
     status_map: dict[str, str] = Field(default_factory=dict)
     node_status: dict[str, str] = Field(default_factory=dict)
+    event_text: str = "事件中"
+    """她正在处理一件事件时，群名片上显示的那一截（默认「事件中」）。"""
 
 
 class ContentSafety(Permissive):
@@ -515,6 +724,7 @@ SleepReplyMode = Literal["template", "silent", "normal"]
 # 「调试输出」可以单独勾选的事件类型：key 是事件类型，值是行首图标。
 # 编辑器里的勾选清单要跟这里保持一致（tests/test_units.py 有一条对齐检查）。
 ECHO_EVENT_TYPES: dict[str, str] = {
+    "incoming": "📨",
     "plan": "🧠",
     "action_start": "▶️",
     "action_done": "✅",
@@ -543,6 +753,14 @@ ECHO_EVENT_TYPES: dict[str, str] = {
     "search_sources": "🔗",
     "weather": "🌤️",
     "search": "🌐",
+    "search_digest": "🧾",
+    "event": "🎰",
+    "event_choice": "🌙",
+    "event_action": "🧰",
+    "event_check": "🎲",
+    "event_result": "📖",
+    "help": "🆘",
+    "event_idle": "⏳",
 }
 # 「常用」那一档：决定、动作、工具、跳过——排查她"为什么这么做"最需要的几类
 DEFAULT_ECHO_TYPES: tuple[str, ...] = (
@@ -593,6 +811,59 @@ class MemoryConfig(Permissive):
     """窗口内最多打几折（0.5 = 最多降一半权重），出了窗口自动恢复。"""
 
 
+class SleepStartled(Permissive):
+    """迷糊惊醒：睡着时被吵得厉害，半睡半醒回两句，然后接着睡同一段觉。"""
+
+    enabled: bool = True
+    """总开关。关掉就只剩"固定文案"和"明确叫醒"两档。"""
+
+    window_minutes: int = 5
+    """"吵不吵"按这个时间窗口统计（分钟）。"""
+
+    noise_threshold: int = 8
+    """睡整觉时，窗口内被挡下多少条消息算吵。"""
+
+    noise_threshold_nap: int = 5
+    """小睡时用的门槛（沙发上被吵醒更常见，所以更低）。"""
+
+    named_threshold: int = 2
+    """窗口内被明确点她几次也算吵（@ 她 / 私聊 / 叫她名字）。"""
+
+    skip_first_minutes: int = 30
+    """睡下多久之内不惊醒（刚睡着最沉，也正撞上第一次记忆整理）。"""
+
+    max_per_sleep: int = 1
+    """一段睡眠最多惊醒几次（0 = 不许惊醒）。"""
+
+    awake_minutes: int = 3
+    """惊醒后的迷糊窗口（分钟）：这段时间能回两句，过了就安静睡回去。"""
+
+    energy_penalty: float = 0.05
+    """被吵醒扣掉的精力（固定值，不按比例）。"""
+
+    grumpy_minutes: int = 15
+    """惊醒带来的起床气持续多久（分钟）。"""
+
+    grumpy_valence: float = -0.05
+    grumpy_affect: float = 0.06
+
+
+class SleepQuality(Permissive):
+    """睡整觉醒来的结算：睡饱了就清爽，没睡够就有起床气。"""
+
+    enabled: bool = True
+    full_minutes: int = 360
+    """睡满这么多分钟才算睡饱（默认 6 小时）。"""
+
+    grumpy_minutes: int = 30
+    """起床气持续多久（分钟）。"""
+
+    grumpy_valence: float = -0.12
+    grumpy_affect: float = 0.10
+    rested_valence: float = 0.08
+    rested_affect: float = -0.05
+
+
 class SleepConfig(Permissive):
     """她睡觉时怎么回应消息、怎么把她叫起来。"""
 
@@ -635,6 +906,275 @@ class SleepConfig(Permissive):
     - ``all``：除了 `/指令` 和含唤醒词的 @ 消息，其余全部挡掉（连固定文案也不回）。
     """
 
+    startled: SleepStartled = Field(default_factory=SleepStartled)
+    """迷糊惊醒。"""
+
+    quality: SleepQuality = Field(default_factory=SleepQuality)
+    """醒来时的起床气结算。"""
+
+
+class EventConfig(Permissive):
+    """事件系统：她一个人待着的时候会不会遇上点事。
+
+    频率用**每小时期望次数**表示（不是"每 N 分钟一次"）：固定间隔会带上整点感，
+    一眼就能看出是定时器。命中之后由规则或打杂模型给出一个事件包。
+    """
+
+    enabled: bool = True
+    """事件系统总开关（关掉 = 她只按动作与日程生活，不会遇到随机事件）。"""
+
+    micro_per_hour: float = 1.0
+    """微事件：只影响她自己的状态和记忆，不会为此说话。"""
+
+    small_per_hour: float = 0.3
+    """小事件：她要做个选择，会判定。"""
+
+    big_per_hour: float = 0.02
+    """大事件：会说、可能需要找人商量（默认约两天一次）。"""
+
+    dwell_minutes: int = 5
+    """在一个地点待够这么久，才算"在这里生活"，可以遇上事。"""
+
+    min_gap_minutes: int = 30
+    """两件事之间至少隔这么久（自动掷骰）。填 0 = 不限制。"""
+
+    while_busy: bool = True
+    """做持续动作（做饭、看书、发呆…）期间也允许发生事件。"""
+
+    in_sleep: bool = False
+    """睡觉 / 小睡时是否允许事件（默认关：睡着还出事很出戏）。"""
+
+    max_steps: int = 6
+    """一条线索最多几步；到顶必须收尾，不能无限连环。"""
+
+    big_min_steps: int = 2
+    """大事件（``big``）最少走几幕。到下限之前，模型不留伏笔也会被补上一步。
+
+    大事件一步就收尾会显得特别潦草——"有人找我麻烦"下一句就是"我自己解决了"。
+    """
+
+    max_minutes: float = 120.0
+    """一条线索最长活多久（分钟），超了也收尾。"""
+
+    step_gap_seconds: float = 60.0
+    """同一条线索里，两步之间至少隔这么久（不然会一口气连演三幕）。"""
+
+    big_step_gap_minutes: float = 15.0
+    """大事件两步之间的间隔下限（分钟）。大事件最少两幕，不拉开间隔就会连着刷屏。"""
+
+    red_lines: list[str] = Field(
+        default_factory=lambda: [
+            "不要写她意识到自己是 AI / 机器人 / 程序这类自我指涉的事",
+            "不要写真实群友之间的吵架、针对，也不要把她卷进群里的人际矛盾",
+            "不要写流血、受伤、生病这类伤身的事（磕一下、烫一下不算）",
+            "不要写灵异、恐怖、鬼怪这类吓人的事",
+        ]
+    )
+    """不生成的事件类型（一句话一条，原样写进生成提示词）。"""
+
+    fail_result_menu: list[str] = Field(
+        default_factory=lambda: [
+            "搞砸了",
+            "误会了对方的意思",
+            "东西找不到了",
+            "白忙一场",
+            "被人怼了一句",
+            "网卡 / 设备出问题",
+            "东西弄坏了但还能用",
+            "被拒绝了",
+            "迟了一步",
+            "记错了",
+        ]
+    )
+    """"没成"的写法参考（一句话一条，写进结算提示词）。
+
+    不写这份清单时，模型会把每一次失败都写成"受伤了"——同一个梗连着出现三次就出戏了。
+    """
+
+    event_actor: Literal["admin", "all"] = "admin"
+    """谁能用 `/vw event` 投递事件：admin = 只有管理员，all = 群里所有人都可以。"""
+
+    persona_brief_chars: int = 250
+    """「简易人设」的长度上限（给打杂模型的裁剪版人设，按人格缓存）。"""
+
+    # ---------------- 日程闸门：日程撞上事件时怎么办 ----------------
+
+    schedule_gate: bool = True
+    """日程到点时如果她正在处理一件事件，先问一次"照做 / 推迟 / 今天算了"。
+
+    只对**睡觉、小睡、换地方**这三类日程问；别的（伸懒腰、吃饭、看书）照常执行。
+    没有正在进行的事件时完全不问，也不花模型调用。
+    """
+
+    schedule_delay_minutes: int = 30
+    """选「推迟」时，隔这么久再检查一次这条日程。"""
+
+    schedule_delay_limit_times: int = 2
+    """同一条日程一天里最多推迟几次。到顶就得执行——睡觉这件事没有商量余地。"""
+
+    schedule_delay_limit_minutes: int = 180
+    """同一条日程一天里累计最多推迟多久（分钟），和次数谁先到算谁。"""
+
+    stay_up_penalty: float = 1.5
+    """熬夜代价：**夜里醒着**、以及为了事件推迟睡觉时，精力衰减的倍数。
+
+    两处取较大值，不叠加。夜里该睡就睡（见「作息与夜晚」里的夜晚时段）。
+    """
+
+    max_say_lines: int = 4
+    """事件里她一次最多说几句。求助那种要分几条发的场合，比平时宽松一些。"""
+
+    max_say_lines_hard: int = 6
+    """事件发言的绝对硬顶，谁都不许越（防刷屏）。"""
+
+    event_action_calls: int = 2
+    """一条线索里，她最多能为了这件事调用几次动作（查资料、做点准备）。
+
+    每次调用之后都会把结果交回给她重新判断，所以这个数字同时也是"最多多问几轮"。
+    填 0 = 事件里完全不给动作。
+    """
+
+    photo_chance: float = 0.3
+    """事件每一幕推进 / 完结时，按这个概率让她拍一张图（自拍或拍照）。0 = 关闭。
+
+    触发时会把**当前这件事的内容**写进出图意图，所以照片和剧情对得上。
+    """
+
+    photo_actions: list[str] = Field(
+        default_factory=lambda: ["selfie", "take_photo"]
+    )
+    """事件出图用哪几个动作（按顺序挑第一个可用的）。留空 = 不出图。"""
+
+    result_emotion: bool = True
+    """判定结果要不要影响心潮 / 效价：大成功与成功偏正面，失败偏负面。
+
+    只给一个保守的基准值，再走饱和与两轴耦合；关掉就只改能力值。
+    """
+
+    recent_window_hours: float = 24.0
+    """「最近发生在我身上的事」往回看多久（小时）。超过就不写进提示词了。"""
+
+    recent_max_lines: int = 8
+    """「最近发生在我身上的事」最多几条。超了**先顶掉微事件**，再顶最旧的。"""
+
+    open_thread_hint: bool = True
+    """挂起中的那件事要不要留一行「我心里还挂着」（她做别的事时不会一直念叨）。"""
+
+    suspend_after_minutes: int = 30
+    """一件事的下一步要等超过这么久，就算"挂起"：不再占「我正在经历」那段。"""
+
+    thread_resume_max_hours: float = 24.0
+    """一件事挂多久就不再续演了（超过直接收尾写记忆）。"""
+
+    genres: list[dict[str, Any]] = Field(
+        default_factory=lambda: [
+            {"name": "日常小事", "weight": 40,
+             "examples": "做饭、找东西、东西坏了、收快递、打扫"},
+            {"name": "人际", "weight": 20,
+             "examples": "被误解、拌嘴、被冷落、被搭讪、被人跟着、遇到不讲理的"},
+            {"name": "情绪与身体", "weight": 15,
+             "examples": "失眠、头疼、太累、心里发闷、突然想起旧事"},
+            {"name": "意外与麻烦", "weight": 12,
+             "examples": "丢东西、下雨没带伞、被洒了一身、走错路、手机没电"},
+            {"name": "好奇与发现", "weight": 8,
+             "examples": "看到奇怪的东西、翻到旧物、听到传闻、想弄明白一件事"},
+            {"name": "游戏与想象", "weight": 3,
+             "examples": "打游戏卡关、看剧上头、脑补出一段剧情"},
+            {"name": "外面的事", "weight": 2,
+             "examples": "逛街、坐车、排队、去陌生地方"},
+        ]
+    )
+    """事件题材 + 权重。**权重由代码掷**，不是让模型自己分配比例——
+
+    模型每次调用都是独立采样，只会挑自己偏好的那类写，所以"请按 50/20/30 分配"
+    这种话它不会遵守。做法是：代码按权重抽一个题材 → 告诉模型"这一件属于【人际】"，
+    模型只负责在这个题材里编。权重为 0 就是不生成那一类。
+    """
+
+    genre_recency: int = 4
+    """最近几件用过的题材先排除掉，免得连着三四次都是"日常小事"。"""
+
+    genre_cooldown_minutes: int = 180
+    """同一个题材用完之后，这么久之内不再抽中它（0 = 只按 ``genre_recency`` 去重）。"""
+
+    genre_scale: str = ""
+    """题材的尺度边界（可留空）。留空 = 不额外限制；想收紧就写一句，例如"不要写受伤"。"""
+
+    # ---------------- 分享策略：哪些幕要说出来 ----------------
+
+    share_micro: Literal["silent", "nodes", "always"] = "silent"
+    """微事件要不要出声：``silent`` 只记进状态与记忆；``nodes`` 只在开场 / 收尾说；
+    ``always`` 每一幕都可以说。"""
+
+    share_small: Literal["silent", "nodes", "always"] = "nodes"
+    """小事件：默认只在开场和收尾那两幕说，中间那些幕静默推演。"""
+
+    share_big: Literal["silent", "nodes", "always"] = "always"
+    """大事件：默认每一幕都可以说（大事件本来就是值得讲的）。"""
+
+    event_into_chat_log: bool = True
+    """事件的结果要不要写进聊天留档（作为"她自己身上发生的事"，不是她说的话）。
+
+    写进去之后，后续对话里她能自然提起"我前两天把锅盖拧死了"这种事；
+    关掉则只留在「最近发生在我身上的事」那一段。
+    """
+
+    event_digest_lines: int = 12
+    """「这段时间你自己还遇上了这些事」最多留几条（顺手带一句时用）。"""
+
+    remind_when_ignored: bool = True
+    """她开口求助、群里没人接时，要不要再补一句（现由模型按人设写）。
+
+    关掉 = 她求助完就安静等着，到点自己拿主意——不追这一句。
+    """
+
+    # ---------------- 干涉（她开口求助） ----------------
+
+    intervene_enabled: bool = True
+    """允许「需要协助」的事件向她开口求助。关掉则这类事件就地自己处理。"""
+
+    active_seconds: float = 180.0
+    """活跃等待：刚求救完的这三分钟她注意力在这件事上。"""
+
+    idle_minutes: float = 60.0
+    """总超时（分钟）：轻等待到点就自己走默认方案收尾。"""
+
+    grace_seconds: float = 30.0
+    """宽限期：她已经不等了之后，这几十秒内到的建议仍然算数。"""
+
+    suggest_tools: bool = True
+    """群友的建议会影响判定（关掉 = 只当普通聊天，不改概率也不改选择）。"""
+
+
+class AbilitiesConfig(Permissive):
+    """四项能力值（体力 / 智力 / 灵巧 / 心性）。"""
+
+    enabled: bool = True
+    """关掉 = 判定一律用固定值 0.6，能力值不再变化。"""
+
+    stamina: float = 0.6
+    wits: float = 0.6
+    dexterity: float = 0.55
+    composure: float = 0.6
+
+    daily_limit: float = 0.10
+    """每项能力值每天的累计变化上限（带符号），防止数值膨胀。"""
+
+    step_limit: float = 0.05
+    """单次事件最多改变多少。"""
+
+    fail_growth: bool = True
+    """失败涨经验：失败时更容易长能力值（这是"失败了还能再试"的依据）。"""
+
+    @property
+    def initial(self) -> dict[str, float]:
+        return {
+            "stamina": float(self.stamina),
+            "wits": float(self.wits),
+            "dexterity": float(self.dexterity),
+            "composure": float(self.composure),
+        }
+
 
 class DeciderConfig(Permissive):
     """决策器参数：什么时候该主动搭话（插话）。"""
@@ -645,11 +1185,15 @@ class DeciderConfig(Permissive):
     interject_threshold: float = 0.6
     """孤独感高于这个值（且群里正在聊天、插话开关打开）时，她会想插一句。"""
 
-    chat_window_minutes: int = 20
+    chat_window_minutes: int = 60
     """多久之内的消息算「群里正在聊天」。"""
 
-    chat_max_messages: int = 12
-    """进提示词的最近聊天条数（原始留档见 ContextConfig.chat_history_max）。"""
+    chat_max_messages: int = 20
+    """**已废弃**：进提示词的聊天行数搬到了 ``context.chat_lines``。
+
+    老配置里这个键的含义是"原始条数"（默认 12，后来 60）；读取时会迁到
+    ``context.chat_lines``（还是旧默认值的升到 20 行）。保留字段只为迁移时看得见。
+    """
 
     llm_rate_min: float = 0.05
     """「要不要问大模型安排计划」的概率下限（她状态很平静时用这个）。"""
@@ -661,6 +1205,16 @@ class DeciderConfig(Permissive):
     """窗口内至少有几条别人说的话，才值得插话。"""
 
     interject_cooldown_minutes: int = 20
+
+    greet_gap_hours: int = 12
+    """这个人多久没露面了算"好久没来"（小时）。0 = 关掉打招呼。
+
+    只在群里算：有人隔了大半天又冒头，她可以戳一下、打个招呼；
+    每人每天最多一次，全群每天最多 ``greet_daily_max`` 次——免得变成"谁来都点名"。
+    """
+
+    greet_daily_max: int = 2
+    """一天最多这样主动打几次招呼（整个会话合计）。"""
     """两次主动插话之间的最短间隔，防止烦人。"""
 
     @model_validator(mode="before")
@@ -675,23 +1229,448 @@ class ContextConfig(Permissive):
     chat_history_max: int = 200
     """原始群聊留档条数（持久化，重启后仍在）。超出后按下面策略处理。"""
 
-    chat_overflow: Literal["discard", "compress"] = "discard"
+    chat_overflow: Literal["discard", "compress"] = "compress"
     """留档超出上限时怎么办：直接丢弃最早的，或用压缩模型压成摘要。"""
 
-    chat_compress_threshold: int = 80
+    chat_compress_threshold: int = 30
     """留档达到多少条才触发一次压缩。"""
 
     chat_keep_after_compress: int = 30
     """压缩后保留多少条原文（更早的变成摘要）。"""
 
-    summary_refresh_minutes: int = 60
+    summary_refresh_minutes: int = 10
     """两次压缩之间至少间隔多久，避免频繁调用模型。"""
+
+    chat_note_max_minutes: int = 30
+    """「刚才你们在聊什么」这句背景最多挂多久（分钟，0 = 不限）。
+
+    它是"上一轮的话题背景"，隔了几个小时再当成"刚才在聊"就会误导她；超时就不再带上。
+    """
 
     history_max_chars: int = 400
     """单条历史消息进入摘要前截断到多少字。"""
 
+    open_topic_delay_minutes: int = 60
+    """「还没聊完的事」隔多久之后可以提起来（分钟）。
+
+    太短会像查户口（刚问完又问），太长就凉了。默认一小时起步。
+    """
+
+    open_topic_max_asks: int = 2
+    """同一件事最多追问几次。问过还没结果就先放下，别变成催命。"""
+
+    open_topic_days: int = 7
+    """挂多久还没结果就不再当成"待续"（自动归档，不再进提示词）。"""
+
+    open_topic_per_person: int = 2
+    """同一个人身上同时最多挂几件没聊完的事。"""
+
+    chat_lines: int = 20
+    """**每个会话**「还没回过」的聊天最多带几行进提示词。
+
+    同一个人连着说的几句算一行。别处的会话各算各的额度，不会互相挤。
+    （老配置里这个值在 ``decider.chat_max_messages``，读取时自动迁过来。）
+    """
+
+    chat_answered_lines: int = 30
+    """「这里刚聊过的（你已经回过话了）」最多带几行（不受时间窗限制）。"""
+
+    chat_elsewhere_lines: int = 12
+    """「你在别处同时听到的」最多带几行（只当背景）。"""
+
+    chat_line_chars: int = 500
+    """还没回过她的那批聊天记录：每条最多写多少字。
+
+    这是她真正要读、要被回应的那几句，掐太短她就会以为对方"话说到一半"
+    （以前统一按 100 字截，长一点的更新公告、群公告都只剩半句）。
+    """
+
+    chat_answered_line_chars: int = 100
+    """她已经回过话的那批、以及别处同时听到的：每条最多写多少字（只当背景）。"""
+
+    chat_total_chars: int = 8000
+    """整段聊天记录（这里 + 已回过 + 别处）最多多少字。
+
+    超了先丢最早的背景（已回过的 → 别处的），还没回过的那批最后才动。
+    """
+
+    quote_chars: int = 1000
+    """群友引用一条聊天记录里没有的旧消息时，最多把那条原文写进来多少字。"""
+
     image_max: int = 3
-    """没配图片转述模型时，最多把几张图片直接交给多模态主模型（自上次回复以来）。"""
+    """一次回复最多把几张图直接交给能看图的主模型（自上次回复以来收到的那几张）。"""
+
+    chat_image_inline: Literal["auto", "always", "never"] = "auto"
+    """聊天记录里的图要不要直接发给主模型看。
+
+    - ``auto``：主模型支持图像时打开（读 AstrBot 里这个 Provider 勾选的模态）；
+    - ``always``：不管检测结果都发（自己确认主模型能吃图时用）；
+    - ``never``：图片只以文字转述的形式出现。
+    """
+
+    chat_image_max: int = 1
+    """聊天记录里最多附几张图（按时间取最近的几张，默认 1 张）。"""
+
+
+class BondType(Permissive):
+    """一种关系（主人 / 朋友 / 男友 / 敌人…）。
+
+    ``cap`` 是这种关系允许到的**亲密度上限**（``ProfileConfig.levels`` 的下标）：
+    普通关系聊再久也上不去，只有关系本身升级才会放宽——这就是"群友怎么聊都不能亲亲"。
+    """
+
+    name: str = ""
+    slot: str = ""
+    """槽位：同一个槽位里的关系互斥（``unique`` 时）：男友和女友同槽，一个人只能占一个。"""
+
+    group: str = ""
+    """同类关系：**同一个人身上，同一类只留一条**（留空 = 这条跟谁都不冲突）。
+
+    ``slot`` 管的是"同一类关系全组只能有一个人"（男友不能有两个），
+    ``group`` 管的是"同一个人身上哪几条是互相替代的"：群友 / 朋友 / 闺蜜 / 男友 / 女友
+    默认同属 ``close``，她判断成新的那条之后，旧的那条自动变成"曾经"——
+    所以"从朋友升到男友"是替换，而不是两条并排。
+    主人、家人这类身份关系不填，照旧能和亲密关系并存。
+    """
+
+    cap: int = 2
+    """这个关系允许到的**亲密度上限**（``levels`` 的下标）。
+
+    "普通关系聊再久也不能亲亲"就靠它：群友的上限压在「熟人」，好感再高也上不去。
+    """
+
+    floor: int = 0
+    """这个关系**至少**到哪一档（``levels`` 的下标，0 = 不抬）。
+
+    关系本身也是一种态度：绑成男友之后，哪怕好感还没养起来，抱抱亲亲也该放开——
+    否则提示词里会同时出现"他是你男友"和"你们还不熟，别贴贴"，自相矛盾。
+    生效档位 = 好感给的档位，先被 ``floor`` 抬起来、再被 ``cap`` 压下去。
+
+    只在好感**不为负**时生效：她可以对男友生气，惹到了就是「冷淡」，
+    不能因为"关系是男友"就把冷淡翻成亲近。
+    """
+
+    unique: bool = False
+
+    negative: bool = False
+    """负面关系（讨厌的人 / 敌人）：好感为负、亲密度压到最低。"""
+
+    aliases: list[str] = Field(default_factory=list)
+    """别名：模型或用户写"男朋友"时对上这里的"男友"。"""
+
+
+class IntimacyLevel(Permissive):
+    """亲密度分级：门槛、称呼、这一档还不能做的动作，以及给模型的提示词文本。"""
+
+    name: str = ""
+    min_affinity: float = -100.0
+    max_affinity: float = 100.0
+    address: str = ""
+    """她这一级怎么称呼他（留空 = 用名字）。"""
+
+    deny: list[str] = Field(default_factory=list)
+    """明确禁止的动作 id：写进提示词的"现在还不能：…"。
+
+    刻意**不**把动作从她的候选列表里摘掉：群里常常同时有亲疏不同的人，一刀切摘掉会连
+    最亲的那个人也用不了。分寸交给模型自己克制，提示词里会说明"动作按距离分档"。
+    """
+
+    proactive_per_day: int = 0
+    """这一级每天最多主动找他几次。"""
+
+    prompt: str = ""
+    """这一级的提示词文本（可配置）：她现在能做什么、不能做什么。"""
+
+
+def _default_profile_tables() -> tuple[list[BondType], list[IntimacyLevel]]:
+    """默认的关系表 / 亲密度分级：只认 ``core.defaults`` 那一份数据。"""
+
+    from .defaults import default_profile
+
+    data = default_profile()
+    bonds = [BondType.model_validate(item) for item in (data.get("bonds") or [])]
+    levels = [IntimacyLevel.model_validate(item) for item in (data.get("levels") or [])]
+    return bonds, levels
+
+
+ASK_ABOUT_FIELDS_DEFAULT = ["性别", "生日", "年龄", "爱吃的东西", "所在地"]
+"""「主动问」默认要打听的几件事（老清单里问的是"时区"，见 ``normalize_legacy_keys``）。"""
+
+
+class ProfileConfig(Permissive):
+    """用户画像 + 关系 + 好感度 + 回想回访（见 ``core/profile.py``）。"""
+
+    enabled: bool = True
+    """总开关：关掉就完全不记画像、不往提示词里带。"""
+
+    consolidate_enabled: bool = True
+    """睡眠整理开关（画像与记忆的消化 / 折叠都在那一步）。"""
+
+    sleep_consolidate_minutes: int = 20
+    """睡下多久开始第一次整理（分钟）：让"睡沉了"再整理，也避免刚躺下就动记忆。"""
+
+    sleep_consolidate_late_minutes: int = 300
+    """睡满多久补一次（分钟，默认 5 小时）：第一次整理发生在睡下 20 分钟，
+    睡前最后聊的那几句还没进去，所以睡到后半段再补一次——**一段睡眠最多两次**。0 = 只整理一次。"""
+
+    nap_consolidate: bool = True
+    """小睡要不要轻整理（要点化 + 缩略版 + 一条梦），一段小睡一次。"""
+
+    affinity_initial: float = 0.0
+    affinity_min: float = -100.0
+    affinity_max: float = 100.0
+
+    affinity_reply_max: float = 3.0
+    """主模型每轮能给同一个人的好感变化上限（±这个数）。"""
+
+    affinity_daily_max: float = 10.0
+    """主模型每天对同一个人能加（或减）的好感总量上限——防着靠私聊刷好感。"""
+
+    presence_affinity: float = 0.05
+    """「混脸熟」：他每出现一次加多少好感（不用 @ 她）。0 = 关掉。"""
+
+    presence_cooldown_minutes: int = 10
+    """同一个人多久之内只算一次混脸熟（连发一屏也只加一次）。"""
+
+    presence_daily_max: float = 2.0
+    """混脸熟每天给同一个人的上限。"""
+
+    affinity_decay_per_day: float = 0.2
+    """每天向 0 回落多少（疏远慢慢淡掉）。0 = 不回落。"""
+
+    digest_chars: int = 60
+    """缩略版画像最多多少字（非主要的人注入这一份）。"""
+
+    digest_limit: int = 5
+    """提示词里最多给几个"其他人"的缩略版画像。"""
+
+    recall_daily_max: int = 5
+    """回想回访：每天最多因此主动找人几次。"""
+
+    recall_per_user_daily_max: int = 2
+    """回想回访：同一个人每天最多几次。"""
+
+    recall_topic_gap_days: int = 7
+    """同一件事多久之内不重复提起。"""
+
+    miss_growth_per_min: float = 0.0006
+    """对某个人的"想念"涨多快（每分钟）：只在她没跟这个人说话时累积。"""
+
+    miss_cooldown_min_minutes: int = 45
+    """刚跟他聊过（或刚去找过他）之后，最少隔多久才会开始想他（分钟）。"""
+
+    miss_cooldown_max_minutes: int = 240
+    """最长隔多久开始想他（分钟）。每次清零后在这段区间里随机取一个，
+    所以"想他"不是固定节拍——有时一下午就想，有时一整天都没想起来。"""
+
+    miss_loneliness_weight: float = 0.8
+    """孤独感给"想念"的加成：越没人陪她，越容易想起某个人。
+
+    系数 = ``1 + 这个值 × 孤独感``：孤独 0 时不加成、孤独满了按 (1 + 这个值) 倍涨。
+    默认 0.8 就是"最多快 1.8 倍"。
+    """
+
+    miss_threshold: float = 0.6
+    """想念到什么程度会写进提示词（提醒她可以主动去找他）。"""
+
+    miss_limit: int = 3
+    """提示词里最多提几个"有点想的人"。"""
+
+    miss_push_enabled: bool = True
+    """「软推」：想念攒够了她会**主动去找他一次**（在哪说由她自己决定）。"""
+
+    miss_push_threshold: float = 0.85
+    """软推的触发线（比写进提示词的 ``miss_threshold`` 高：先想，真想得不行才动手）。"""
+
+    miss_push_daily_max: int = 2
+    """软推每天最多触发几次（整个会话组算一份，防着反复打扰）。"""
+
+    ask_about_enabled: bool = True
+    """关系熟了之后，主动问那些她还不知道的事（性别 / 生日 / 年龄…）。
+
+    不是查户口：一次只提一件、同一件过一阵再问、每天有上限，而且由她自己找时机。
+    """
+
+    ask_about_fields: list[str] = Field(
+        default_factory=lambda: list(ASK_ABOUT_FIELDS_DEFAULT)
+    )
+    """要问清哪些事。留空 = 不问。已经在画像事实里出现过的不会再问。"""
+
+    ask_about_min_level: int = 3
+    """从哪一档开始问（``levels`` 的下标，3 = 熟人）。刚认识就问生日很像查户口。"""
+
+    ask_about_daily_max: int = 3
+    """一天最多提几件（整个会话组算一份）。"""
+
+    ask_about_person_gap_hours: int = 24
+    """同一个人多久之内最多问一件（小时）。光有"同一件不重复问"不够——
+
+    一晚上把性别、生日、年龄挨个问一遍，那就是查户口，不是关心。
+    """
+
+    ask_about_cooldown_days: int = 7
+    """同一件事实多久之内不再问第二遍。"""
+
+    grudge_enabled: bool = True
+    """她会不会**记账**（他做了让她气着的事，她记着）。"""
+
+    grudge_days: int = 7
+    """一笔账记多久（天）。到期自己就淡了，并写进记忆。"""
+
+    grudge_max: int = 2
+    """同时最多记几笔（整个会话组算一份）。"""
+
+    grudge_daily_max: int = 1
+    """一天最多记几笔新的：不然她会天天记仇。"""
+
+    grudge_level_drop: int = 1
+    """气着的时候，对这个人的**生效亲密度降几档**（不改关系、不改好感数值）。"""
+
+    call_name_blacklist: list[str] = Field(default_factory=list)
+    """称呼黑名单：命中的候选直接丢掉（不想被叫的称呼）。"""
+
+    bond_conflict_policy: Literal["reject", "replace", "ask"] = "reject"
+    """关系撞车怎么办（同一个槽位只能有一个人的关系）：
+
+    - ``reject``（默认）：不改关系，把那句话记成"他自称"，她可以认也可以不认；
+    - ``replace``：新的顶掉旧的，旧的变成"曾经"；
+    - ``ask``：同 ``reject``，但画像里写明"她还在犹豫"。
+    """
+
+    default_bond: str = "陌生人"
+    bonds: list[BondType] = Field(default_factory=lambda: _default_profile_tables()[0])
+    levels: list[IntimacyLevel] = Field(default_factory=lambda: _default_profile_tables()[1])
+
+    @model_validator(mode="after")
+    def _migrate_legacy_fields(self) -> "ProfileConfig":
+        """把老配置补齐到现在这套语义。
+
+        两件老账：
+
+        - 默认初始关系以前用 ``bonds[].initial`` 标记，而**只有 ``default_bond`` 真的会被用来
+          给新人建档**——编辑器里那个复选框改了没用，还会在关系升级时收错槽位。
+          现在统一成一个来源。
+        - ``floor``（关系下限）是新字段：老配置里没有，直接读成 0 就等于不生效。
+          按关系名从内置默认表里补一份，这样"绑了男友却还不让抱抱"的老配置自动修好；
+          名字对不上自定义关系的保持 0（不猜）。
+        """
+
+        names = [str(item.name) for item in self.bonds]
+        if self.default_bond not in names:
+            self.default_bond = names[0] if names else ""
+        marked = [
+            str(item.name)
+            for item in self.bonds
+            if bool(getattr(item, "initial", False))
+        ]
+        if marked and self.default_bond != marked[0]:
+            self.default_bond = marked[0]
+        try:
+            from .defaults import default_profile
+
+            defaults = {
+                str(item.get("name") or ""): int(item.get("floor") or 0)
+                for item in (default_profile().get("bonds") or [])
+            }
+        except Exception:
+            defaults = {}
+        for item in self.bonds:
+            if "floor" in getattr(item, "model_fields_set", set()):
+                continue
+            item.floor = defaults.get(str(item.name), 0)
+        return self
+
+    # ---------------- 查询 ----------------
+
+    def bond_by_name(self, value: str) -> BondType | None:
+        """按关系名 / 别名找一种关系（她写的、模型写的都能对上）。"""
+
+        text = " ".join(str(value or "").split())
+        if not text:
+            return None
+        for bond in self.bonds:
+            if text == str(bond.name):
+                return bond
+        for bond in self.bonds:
+            if text in [str(alias) for alias in bond.aliases]:
+                return bond
+        return None
+
+    def bond_cap(self, names: list[str]) -> int:
+        """这几种关系里最高的亲密度上限（没有关系就用默认初始关系的上限）。"""
+
+        caps = [
+            int(bond.cap)
+            for bond in (self.bond_by_name(name) for name in names or [])
+            if bond is not None
+        ]
+        if caps:
+            return max(caps)
+        default = self.bond_by_name(self.default_bond)
+        return int(default.cap) if default is not None else 2
+
+    def bond_floor(self, names: list[str]) -> int:
+        """这几种关系里最高的**下限**（没有关系就按默认初始关系算）。
+
+        ``floor`` 放的是"关系本身带来的态度"：绑成男友之后，好感还没养起来也该能抱抱。
+        """
+
+        floors = [
+            int(bond.floor)
+            for bond in (self.bond_by_name(name) for name in names or [])
+            if bond is not None
+        ]
+        if floors:
+            return max(floors)
+        default = self.bond_by_name(self.default_bond)
+        return int(default.floor) if default is not None else 0
+
+    def level_index(self, affinity: float) -> int:
+        """好感度落在第几级（负数也认：冷淡 / 敌意）。"""
+
+        value = float(affinity)
+        for index, level in enumerate(self.levels):
+            if float(level.min_affinity) <= value < float(level.max_affinity):
+                return index
+        return max(0, len(self.levels) - 1)
+
+    def level_for(
+        self,
+        affinity: float,
+        *,
+        cap: int | None = None,
+        floor: int | None = None,
+    ) -> IntimacyLevel:
+        """这一轮生效的亲密度级别：好感给的级别，先被关系下限**抬起**、再被关系上限**压下**。
+
+        两个都写、而且下限比上限高时**以上限为准**（那是配置写反了，不是她想干什么）。
+        **好感是负的时候下限不生效**：关系再亲也拦不住她生气——男友惹到她了照样是「冷淡」。
+        """
+
+        if not self.levels:
+            return IntimacyLevel()
+        return self.levels[self.level_index_for(affinity, cap=cap, floor=floor)]
+
+    def level_index_for(
+        self,
+        affinity: float,
+        *,
+        cap: int | None = None,
+        floor: int | None = None,
+    ) -> int:
+        """生效档位在 ``levels`` 里的下标（带上下限夹取）。
+
+        需要"再熟一点会到哪一档"这类相邻档位信息时用它。
+        """
+
+        if not self.levels:
+            return 0
+        index = self.level_index(affinity)
+        if floor is not None and float(affinity) >= 0:
+            index = max(index, max(0, int(floor)))
+        if cap is not None:
+            index = min(index, max(0, int(cap)))
+        return max(0, min(index, len(self.levels) - 1))
 
 
 class VisionCaption(Permissive):
@@ -721,6 +1700,18 @@ class VisionCaption(Permissive):
     cache_days: int = 30
     """一张图的转述最多用这么久，过期后重新识别一次。"""
 
+    forward_summary: bool = True
+    """合并转发的聊天记录：让多模态模型读一遍（含里面的图）压成摘要，替换掉原来的占位符。
+
+    关掉就还是老样子——只在聊天记录里落一句「这是一条转发的聊天记录」。
+    """
+
+    forward_prompt: str = DEFAULT_FORWARD_PROMPT
+    """转发摘要的提示词（留空用内置默认）。"""
+
+    forward_max_chars: int = 300
+    """摘要最多多少字。"""
+
 
 class WeatherConfig(Permissive):
     """天气：全局共享一份，按需静默刷新，写进提示词也画在编辑器地图页顶部。"""
@@ -743,6 +1734,35 @@ class WeatherConfig(Permissive):
 
 class ReplyStyle(Permissive):
     """说话的节奏：分段之间的打字延迟，以及"话太密"的判定。"""
+
+    quote_mode: Literal["off", "always", "smart"] = "smart"
+    """回复群友时，第一条消息要不要引用触发她的那条消息（她发的图片同样算第一条）。
+
+    - ``off``：从不引用；
+    - ``always``：每次都引用；
+    - ``smart``（默认）：这一轮要回的是**一串消息**（她还在回上一条时又来了新的）才引用——
+      单独一句对答不用顶着引用。
+
+    只有自带引用段的平台能用（QQ / OneBot 这类，例如 aiocqhttp）；别的平台会跳过引用、
+    照常把这条发出去。
+    """
+
+    interrupt_pending: bool = True
+    """她还在生成回复时又来了一条消息：丢弃这次生成，让新消息重新触发一次回复。
+
+    被丢弃的那次**不算"已经回过话"**（水位线不推进），所以下一轮仍然看得到那几条消息，
+    相当于上一次回复没有触发过。关掉 = 旧行为：把两条并成一次请求一起回。
+    """
+
+    merge_wait_seconds: float = 5.0
+    """收到消息先等这么久（秒）再开口：期间每来一条新消息就**重新计时**。
+
+    对方连着打字时，她等对方说完再一起回，而不是答一句、再答一句。
+    0 = 不等，收到就答。同一个会话组里的消息互相算数（群和私聊连着说也一样）。
+    """
+
+    merge_wait_max_seconds: float = 30.0
+    """安静期的硬顶：一直有新消息时也不会等超过这么久，免得永远不开口。"""
 
     typing_delay_enabled: bool = True
     """分段发送时，按字数在两条之间停顿一下，像真的在打字。"""
@@ -779,14 +1799,90 @@ class DefaultState(Permissive):
         return _clamp01(value, 0.5)
 
 
+class NightConfig(Permissive):
+    """夜晚时段：几点到几点算晚上。
+
+    它同时管三件事：**睡觉动作只在夜里可选**、**夜里醒着要付熬夜代价**、
+    以及规则决策里"夜里睡整觉 / 白天只小睡"的分界。
+    """
+
+    start_hour: int = 23
+    """夜晚开始的小时（0~23，含）。默认 23 点。"""
+
+    end_hour: int = 7
+    """夜晚结束的小时（0~23，不含）。默认 7 点，即 23:00–07:00 算夜里。"""
+
+    sleep_only_at_night: bool = True
+    """开启后，非夜晚时段提示词里不提供「睡觉」，解析时也会把它挡掉。
+
+    只想在白天也能睡整觉时关掉它（夜里那段熬夜代价仍然照算）。
+    """
+
+
+class PersonaConfig(Permissive):
+    """她是谁：插件自己的一份人设。
+
+    以前插件是"问 AstrBot：这个会话用哪份人格"——那份人格是**按会话 / 配置文件**解析的，
+    所以换会话、改组、换主会话时她会跟着变成另一个人（甚至退回默认的助理人格）。
+    这里给一份插件自己的角色卡，写进预设里可以整套带走，所有会话 / 会话组共用同一份。
+    """
+
+    mode: Literal["astrbot", "plugin", "append"] = "astrbot"
+    """人设从哪来：
+
+    - ``astrbot``（默认）：沿用 AstrBot 里这个会话选的人格，跟以前一样；
+    - ``plugin``：用下面这份；**留空**时自动回落到 AstrBot 那份（免得不小心把人格弄没了）；
+    - ``append``：AstrBot 那份打底，再把下面这份接在后面（她的设定更靠后、更"近"）。
+    """
+
+    text: str = ""
+    """角色卡正文（她是谁、怎么说话、喜欢什么…）。跟着预设走。"""
+
+    samples: list[dict[str, Any]] = Field(default_factory=list)
+    """挑中的「声音样例」：她说过的、最能代表口吻的几句话。
+
+    这些**不是台词模板**，是喂给主模型的范例——模仿样例比服从描述有效得多。
+    按场景分（被撩 / 被怼 / 越界请求…），每一轮只抽 2~3 条相关的进去。
+    """
+
+    samples_per_turn: int = 3
+    """每轮最多进提示词几条样例。全塞进去既费 token 又会把她锁成复读机。"""
+
+    samples_max: int = 12
+    """样例库最多留几条（超了就不让再加，而不是悄悄删掉用户挑的）。"""
+
+    sample_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    """声音样例的**候选池**：生成出来、或者从聊天里挑出来的句子先攒在这儿。
+
+    候选池里的不进提示词——用户勾选「采用」之后才会挪进 ``samples``。
+    这样"生成一次就要当场决定"变成"先攒着，慢慢挑"。
+    """
+
+    candidates_max: int = 80
+    """候选池最多攒多少条（超了丢最旧的）。"""
+
+
 class WorldConfig(Permissive):
     world_id: str = "default"
     name: str = "小世界"
     bot_name: str = ""
     """Bot 的名字，用于动作模板里的 {bot} 占位符（留空时依次回落到群名片原名、再回落到"她"）。"""
 
+    ui_knobs: dict[str, int] = Field(default_factory=dict)
+    """「手感」滑块的档位（1~5，3 = 标准 = 内置默认值）。
+
+    只是给编辑器记住滑块停在哪：真正生效的是那些被写进去的字段。跟着预设走，
+    所以换预设时滑块位置也跟着换。缺项 = 还没动过，按标准算。
+    """
+
+    wizard_done: bool = False
+    """设置向导是不是跑过一次（第一次打开编辑器时自动弹，之后只在按钮里进）。"""
+
     gender: Gender = "female"
     """性别：决定文案里的称呼（她 / 他 / ta）。"""
+
+    persona: PersonaConfig = Field(default_factory=PersonaConfig)
+    """她是谁：插件自己的一份人设（跟着预设走，全会话共用一份）。"""
 
     tool_result_reply: bool = True
     """工具型动作拿到结果后，是否交回主模型说一句（关掉就只记进日志）。"""
@@ -803,6 +1899,13 @@ class WorldConfig(Permissive):
     echo_compact: bool = False
     """调试输出的精简模式：只发事件本身（谁调用了什么、决定了什么），
     不带参数、返回值、模型原话这些细节。"""
+
+    echo_modes: dict[str, str] = Field(default_factory=dict)
+    """每个调试输出类型的显示方式：``off`` / ``full`` / ``compact``。
+
+    比一个全局精简开关更好用：工具调用要完整、事件只要精简，各调各的。
+    老配置（``echo_types`` + ``echo_compact``）会在读取时自动迁到这里。
+    """
 
     style_injection: bool = True
     """把情绪两轴翻译成「这一轮的表达方式」写进提示词（关掉 = 完全交给人设）。"""
@@ -848,10 +1951,14 @@ class WorldConfig(Permissive):
     global_allowed_tools: list[str] = Field(default_factory=list)
     tool_filter_enabled: bool = True
     decider: DeciderConfig = Field(default_factory=DeciderConfig)
+    events: EventConfig = Field(default_factory=EventConfig)
+    abilities: AbilitiesConfig = Field(default_factory=AbilitiesConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
+    profile: ProfileConfig = Field(default_factory=ProfileConfig)
     reply_style: ReplyStyle = Field(default_factory=ReplyStyle)
     vision: VisionCaption = Field(default_factory=VisionCaption)
     weather: WeatherConfig = Field(default_factory=WeatherConfig)
+    night: NightConfig = Field(default_factory=NightConfig)
     content_safety: ContentSafety = Field(default_factory=ContentSafety)
     zones: list[ZoneDef] = Field(default_factory=list)
     zone_edges: list[ZoneEdgeDef] = Field(default_factory=list)
@@ -861,6 +1968,35 @@ class WorldConfig(Permissive):
     actions: list[ActionDef] = Field(default_factory=list)
 
     # --- 便捷索引 ---
+
+    def is_night_time(self, hour: int) -> bool:
+        """这一小时算不算「夜晚」（跨零点也算在内）。
+
+        ``start_hour == end_hour`` 视为"没有夜晚时段"：睡觉不受时段限制，
+        熬夜代价也不生效——想彻底关掉这套作息约束时就这么设。
+        """
+
+        start = int(self.night.start_hour) % 24
+        end = int(self.night.end_hour) % 24
+        if start == end:
+            return False
+        value = int(hour) % 24
+        if start < end:
+            return start <= value < end
+        return value >= start or value < end
+
+    def sleep_allowed_now(self, hour: int) -> bool:
+        """这个小时能不能写「睡觉」这个动作。"""
+
+        night = self.night
+        if not bool(getattr(night, "sleep_only_at_night", True)):
+            return True
+        start = int(getattr(night, "start_hour", 23)) % 24
+        end = int(getattr(night, "end_hour", 7)) % 24
+        if start == end:
+            return True
+        return self.is_night_time(hour)
+
     def node_map(self) -> dict[str, NodeDef]:
         return {node.id: node for node in self.nodes}
 
@@ -975,6 +2111,15 @@ class ScheduleDef(Permissive):
     关掉（默认）就是老老实实按动作链跑：每一步想干什么由动作链里的「意图」决定。
     """
 
+    once: bool = False
+    """一次性日程：跑完这一遍就删掉，不再每天重复。"""
+
+    date: str = ""
+    """一次性日程指定的日期（``YYYY-MM-DD``）。空着表示「下一次到点就跑」。"""
+
+    note: str = ""
+    """这条日程为什么排的（前因后果）。到点触发时带给主人格，免得忘了当初要干嘛。"""
+
     @field_validator("time")
     @classmethod
     def _valid_time(cls, value: str) -> str:
@@ -1004,8 +2149,22 @@ class SessionDef(Permissive):
     note: str = ""
 
 
+class SessionGroupDef(Permissive):
+    """一组共享生活的会话：几个群 / 私聊算同一个「她」。
+
+    ``main_session`` 是这一组的代表会话：她的状态、计划、事件都存在它名下，
+    tick 也按它走一份——不然她在两个群里会各老一分钟。
+    """
+
+    id: str
+    name: str = ""
+    sessions: list[str] = Field(default_factory=list)
+    main_session: str = ""
+
+
 class SessionsConfig(Permissive):
     sessions: list[SessionDef] = Field(default_factory=list)
+    groups: list[SessionGroupDef] = Field(default_factory=list)
 
 
 def normalize_edge_keys(data: dict[str, Any]) -> dict[str, Any]:
@@ -1046,16 +2205,61 @@ _DEFAULT_TEXT_UPGRADES: dict[str, dict[str, dict[str, str]]] = {
     "sleep": {
         "description": {
             "睡一觉恢复精力，需要先回到卧室。": (
-                "睡一整晚恢复精力（约 8 小时，夜里或精力见底时用），需要先回到卧室。"
-            )
+                "睡一整晚恢复精力（约 8 小时，夜里或凌晨、实在撑不住时用），需要先回到卧室。"
+                "白天只是犯困就小睡一会儿，别在白天睡整觉。"
+            ),
+            "睡一整晚恢复精力（约 8 小时，夜里或精力见底时用），需要先回到卧室。": (
+                "睡一整晚恢复精力（约 8 小时，夜里或凌晨、实在撑不住时用），需要先回到卧室。"
+                "白天只是犯困就小睡一会儿，别在白天睡整觉。"
+            ),
         }
     },
     "nap": {
         "description": {
             "打个盹，睡多久由你自己决定（10 分钟到 1 小时），睡得越久精力恢复越多。": (
-                "白天犯困时打个盹（10 分钟到 1 小时，睡多久由你自己决定），"
+                "白天犯困时打个盹（10 分钟到 1 小时，睡多久由你自己决定），缓过来接着过；"
                 "睡得越久精力恢复越多。"
-            )
+            ),
+            "白天犯困时打个盹（10 分钟到 1 小时，睡多久由你自己决定），睡得越久精力恢复越多。": (
+                "白天犯困时打个盹（10 分钟到 1 小时，睡多久由你自己决定），缓过来接着过；"
+                "睡得越久精力恢复越多。"
+            ),
+        }
+    },
+    "schedule_add": {
+        "description": {
+            # v1.4 的文案
+            "给自己加一条日程（到了点自动做某串动作）。"
+            "把打算写成一句自然语言填进 intent，例如「每天早上七点去书房查新闻」。"
+            "**加完不用再写别的动作**：系统会替你把时间、星期和动作链填好，再带着结果问你一次。": (
+                "给自己加一条日程（到了点自动做某串动作）。"
+                "把打算写成一句自然语言填进 intent，例如「每天早上七点去书房查新闻」；"
+                "**只是提醒**（到点说一句话）时，再给两个参数："
+                'params.at 写什么时候（「10 分钟后」「21:30」「晚上八点」都行），'
+                "params.say 写到时候要说的话（1~2 句），例如 "
+                '{"type":"schedule_add","intent":"十分钟后提醒主人喝水",'
+                '"params":{"at":"10 分钟后","say":["该喝水啦 笨蛋"]}}；'
+                "只做一次的事要说清哪天哪一刻、以及为什么要做，"
+                "例如「明天下午三点去收衣服，因为主人说下午可能下雨」。"
+                "**加完不用再写别的动作**：系统会替你把时间、星期和动作链填好，再带着结果问你一次。"
+            ),
+            # 2.0 早期版本的文案（还没带 params 说明）
+            "给自己加一条日程（到了点自动做某串动作）。"
+            "把打算写成一句自然语言填进 intent，例如「每天早上七点去书房查新闻」；"
+            "只做一次的事要说清哪天哪一刻、以及为什么要做，"
+            "例如「明天下午三点去收衣服，因为主人说下午可能下雨」。"
+            "**加完不用再写别的动作**：系统会替你把时间、星期和动作链填好，再带着结果问你一次。": (
+                "给自己加一条日程（到了点自动做某串动作）。"
+                "把打算写成一句自然语言填进 intent，例如「每天早上七点去书房查新闻」；"
+                "**只是提醒**（到点说一句话）时，再给两个参数："
+                'params.at 写什么时候（「10 分钟后」「21:30」「晚上八点」都行），'
+                "params.say 写到时候要说的话（1~2 句），例如 "
+                '{"type":"schedule_add","intent":"十分钟后提醒主人喝水",'
+                '"params":{"at":"10 分钟后","say":["该喝水啦 笨蛋"]}}；'
+                "只做一次的事要说清哪天哪一刻、以及为什么要做，"
+                "例如「明天下午三点去收衣服，因为主人说下午可能下雨」。"
+                "**加完不用再写别的动作**：系统会替你把时间、星期和动作链填好，再带着结果问你一次。"
+            ),
         }
     },
     "search_web": {
@@ -1189,10 +2393,65 @@ def normalize_legacy_keys(data: dict[str, Any]) -> dict[str, Any]:
     - 地图以前是一张平铺的图，现在分了区域：老配置里的节点全部归进默认区域「家中」。
     - 动作归属以前在节点和动作上各存一份（`node.allowed_actions` + `action.allowed_nodes`），
       现在只认动作那一份：节点自己声明过的、非全局的动作会补进它的 `allowed_nodes`，然后丢掉节点那份。
+    - 引用回复以前是个开关 `reply_style.quote_reply`，现在有三档 `quote_mode`
+      （关 / 总是 / 智能），老开关按"开 = 总是、关 = 不引用"迁移。
+    - 关系表新增的 `group`（同类关系只留一条）在老配置里没有这个键：按内置关系表补上，
+      想让它"跟谁都不冲突"的人显式写成空串就行。
     """
 
     nodes = data.get("nodes")
     result = data
+    # 「进提示词的聊天条数」以前按**原始条数**算、默认 12（后来改 60）：
+    # 现在按**合并后的行数**算、默认 20。还是旧默认值的顺手升上去，
+    # 用户自己调过的值不动。
+    context = result.get("context") if isinstance(result.get("context"), dict) else {}
+    # 「主动问」要打听的事：老内置清单里问的是时区，现在改成爱吃的东西。
+    # 清单里**只有内置项**的（包括自己删过几项的）跟着内置清单走；
+    # 一旦有自己加的项（比如"工作"）就一个字都不动。
+    profile = result.get("profile")
+    if isinstance(profile, dict):
+        fields = profile.get("ask_about_fields")
+        builtin = ["性别", "生日", "年龄", "时区", "所在地"]
+        if isinstance(fields, list) and [str(item) for item in fields] and all(
+            str(item) in builtin for item in fields
+        ):
+            result = {
+                **result,
+                "profile": {**profile, "ask_about_fields": ASK_ABOUT_FIELDS_DEFAULT},
+            }
+        # 「记的账要不要表现」这个开关删了（记仇直接生效），顺手把残留的键丢掉
+        if isinstance(result.get("profile"), dict) and "grudge_visible" in result["profile"]:
+            cleaned = {k: v for k, v in result["profile"].items() if k != "grudge_visible"}
+            result = {**result, "profile": cleaned}
+    decider = result.get("decider")
+    if isinstance(decider, dict) and "chat_lines" not in context:
+        # 「带几行聊天记录」以前挂在 decider 上、按原始条数算：迁到 context.chat_lines，
+        # 还是旧默认值的（12 / 60）直接升到新的 20 行。
+        legacy_lines = decider.get("chat_max_messages")
+        try:
+            legacy_value = int(legacy_lines) if legacy_lines is not None else 0
+        except (TypeError, ValueError):
+            legacy_value = 0
+        if legacy_value > 0:
+            result = {
+                **result,
+                "context": {
+                    **context,
+                    "chat_lines": 20 if legacy_value in (12, 60) else legacy_value,
+                },
+            }
+    # 聊天记录的字数预算：行数从 12 提到 20 之后，4000 字的老默认值会把尾巴砍掉
+    context = result.get("context")
+    if isinstance(context, dict):
+        try:
+            budget = int(context.get("chat_total_chars") or 0)
+        except (TypeError, ValueError):
+            budget = 0
+        if budget == 4000:
+            result = {
+                **result,
+                "context": {**context, "chat_total_chars": 8000},
+            }
     # 区域：老配置没有 zones 时，建一个默认区域，把已有节点全放进去
     zones = result.get("zones")
     if not isinstance(zones, list) or not zones:
@@ -1267,6 +2526,16 @@ def normalize_legacy_keys(data: dict[str, Any]) -> dict[str, Any]:
                 for node in nodes
             ],
         }
+    # 引用回复：老开关（开 / 关）→ 三档（总是 / 不引用）
+    style = result.get("reply_style")
+    if isinstance(style, dict) and "quote_reply" in style:
+        legacy = bool(style.get("quote_reply"))
+        migrated_style = {
+            key: value for key, value in style.items() if key != "quote_reply"
+        }
+        migrated_style.setdefault("quote_mode", "always" if legacy else "off")
+        result = {**result, "reply_style": migrated_style}
+        style = migrated_style
     actions = result.get("actions")
     if isinstance(actions, list):
         cleaned_actions: list[Any] = []
@@ -1332,7 +2601,64 @@ def normalize_legacy_keys(data: dict[str, Any]) -> dict[str, Any]:
             key: value for key, value in result.items() if key != "echo_actions"
         }
         result["echo_types"] = _expand_echo_types(migrated)
+    # 调试输出：老的「勾选类型 + 一个全局精简开关」→ 每个类型各自的显示方式
+    modes = result.get("echo_modes")
+    if not isinstance(modes, dict) or not modes:
+        # 走一遍别名展开：老配置里的「tool」要拆成调用 / 返回两条
+        picked = _expand_echo_types(
+            [str(name) for name in (result.get("echo_types") or []) if str(name).strip()]
+        )
+        if picked:
+            compact_all = bool(result.get("echo_compact"))
+            result = {
+                **result,
+                "echo_modes": {
+                    name: ("compact" if compact_all else "full") for name in picked
+                },
+            }
+    # 老的两个字段已经迁进 echo_modes，留在文件里只会让人以为还有效
+    result = {
+        key: value
+        for key, value in result.items()
+        if key not in ("echo_types", "echo_compact")
+    }
+    result = _migrate_bond_groups(result)
     return result
+
+
+def _migrate_bond_groups(data: dict[str, Any]) -> dict[str, Any]:
+    """给老关系表补上 ``group``：没写过这个键的按内置表补齐。
+
+    判断依据是**键在不在**，不是值空不空：显式写成 ``""`` 表示"这条关系要能跟别的并存"，
+    不能被这次迁移又填回去。
+    """
+
+    profile = data.get("profile")
+    if not isinstance(profile, dict):
+        return data
+    bonds = profile.get("bonds")
+    if not isinstance(bonds, list) or not bonds:
+        return data
+    from .defaults import default_world  # 局部导入：defaults 只用于这里的兜底
+
+    builtin = default_world().get("profile", {}).get("bonds", [])
+    groups = {
+        str(item.get("name") or ""): str(item.get("group") or "")
+        for item in builtin
+        if isinstance(item, dict)
+    }
+    migrated: list[Any] = []
+    changed = False
+    for item in bonds:
+        if isinstance(item, dict) and "group" not in item:
+            name = str(item.get("name") or "")
+            if name in groups:
+                item = {**item, "group": groups[name]}
+                changed = True
+        migrated.append(item)
+    if not changed:
+        return data
+    return {**data, "profile": {**profile, "bonds": migrated}}
 
 
 def _expand_echo_types(names: list[str]) -> list[str]:
@@ -1348,19 +2674,82 @@ def _expand_echo_types(names: list[str]) -> list[str]:
     return expanded
 
 
+_INVISIBLE_ID_CHARS = dict.fromkeys(
+    map(ord, "\u200b\u200c\u200d\u2060\ufeff"), None
+)
+
+
+def clean_identifier(value: Any) -> str:
+    """把 id 里的不可见字符和首尾空白清掉。
+
+    复制粘贴（尤其是从聊天里粘配置）很容易带上零宽字符：动作 id 看着是 ``selfie``，
+    实际是 ``selfie\\u200c``，模型写出来的 id 就对不上，表现为"这个动作在当前场景不可用"。
+    """
+
+    text = str(value or "").replace("\u00a0", " ")
+    text = text.translate(_INVISIBLE_ID_CHARS)
+    return "".join(ch for ch in text if ch.isprintable()).strip()
+
+
+# 配置字段的中文说明。编辑器里滑块明细的「会改哪些参数」用它，
+# 免得用户对着一串 limits.max_llm_plan_per_hour 猜这是干什么的。
+FIELD_LABELS: dict[str, str] = {
+    "limits.max_replies_per_hour": "每小时最多回你几次",
+    "limits.max_autonomous_per_hour": "每小时最多自己动几次",
+    "limits.max_share_per_hour": "每小时最多分享几次",
+    "limits.max_llm_text_per_hour": "每小时最多主动说几次话",
+    "limits.max_llm_plan_per_hour": "每小时最多让模型排几次计划",
+    "limits.max_tool_param_per_hour": "每小时最多补几次工具参数",
+    "limits.max_messages_per_say": "一次最多说几条",
+    "limits.max_history_rows": "数值曲线最多留几帧",
+    "decider.llm_rate_min": "最低多少概率交给模型定",
+    "decider.llm_rate_max": "最高多少概率交给模型定",
+    "decider.interject_threshold": "多孤独才插话（越大越难）",
+    "decider.interject_cooldown_minutes": "插话后至少安静几分钟",
+    "decider.min_messages_to_interject": "群里至少聊几条她才插嘴",
+    "profile.miss_growth_per_min": "想念涨得多快（每分钟）",
+    "profile.miss_threshold": "多想你才会主动找你",
+    "profile.miss_push_daily_max": "每天最多主动找你几次",
+    "profile.miss_cooldown_min_minutes": "两次主动找你的间隔（分钟）",
+    "profile.miss_loneliness_weight": "孤独感对想念的影响",
+    "profile.digest_chars": "画像缩略版最长几个字",
+    "profile.digest_limit": "缩略版最多写几个人",
+    "reply_style.dense_max_lines": "多少行算说话太密",
+    "reply_style.dense_window_minutes": "统计说话密度的窗口（分钟）",
+    "state_dynamics.chat_valence_cap": "聊一句最多涨多少效价",
+    "state_dynamics.chat_valence_daily_cap": "聊天涨效价的每天上限",
+    "state_dynamics.valence_decay_per_min": "效价每分钟回落多少",
+    "state_dynamics.mood_override_duration": "情绪上头压过理智多久（秒）",
+    "events.micro_per_hour": "每小时约几件小事",
+    "events.small_per_hour": "每小时约几件中等事",
+    "events.big_per_hour": "每小时约几件大事",
+    "events.min_gap_minutes": "两件事至少隔几分钟",
+    "events.photo_chance": "每幕顺手拍张照的概率",
+    "events.genre_cooldown_minutes": "同类事多久内不重复（分钟）",
+    "context.chat_compress_threshold": "攒多少条聊天记录压缩一次",
+    "context.summary_refresh_minutes": "多久重写一次聊天摘要",
+    "context.chat_answered_lines": "提示词里带多少条聊天记录",
+    "context.chat_history_max": "留档最多存多少条聊天记录",
+    "context.chat_overflow": "留档超了怎么办（丢弃 / 压缩）",
+}
+
+
 def parse_world(data: dict[str, Any]) -> tuple[WorldConfig, list[str]]:
     """校验并修复世界配置，返回 (配置, 警告列表)。"""
 
     warnings: list[str] = []
+    data = data or {}
     world = WorldConfig.model_validate(
-        normalize_legacy_keys(normalize_edge_keys(data or {}))
+        normalize_legacy_keys(normalize_edge_keys(data))
     )
 
     # 节点：去重、保证 id 非空
     seen: set[str] = set()
     nodes: list[NodeDef] = []
     for node in world.nodes:
-        node_id = str(node.id).strip()
+        node_id = clean_identifier(node.id)
+        if node_id != str(node.id):
+            warnings.append(f"节点 id 里混进了不可见字符，已清理：{node.id!r} → {node_id}")
         if not node_id:
             warnings.append("发现一个没有 id 的节点，已丢弃")
             continue
@@ -1379,7 +2768,9 @@ def parse_world(data: dict[str, Any]) -> tuple[WorldConfig, list[str]]:
     zone_ids: set[str] = set()
     zones: list[ZoneDef] = []
     for zone in world.zones:
-        zone_id = str(zone.id).strip()
+        zone_id = clean_identifier(zone.id)
+        if zone_id != str(zone.id):
+            warnings.append(f"区域 id 里混进了不可见字符，已清理：{zone.id!r} → {zone_id}")
         if not zone_id:
             warnings.append("发现一个没有 id 的区域，已丢弃")
             continue
@@ -1422,7 +2813,9 @@ def parse_world(data: dict[str, Any]) -> tuple[WorldConfig, list[str]]:
     action_ids: set[str] = set()
     actions: list[ActionDef] = []
     for action in world.actions:
-        action_id = str(action.id).strip()
+        action_id = clean_identifier(action.id)
+        if action_id != str(action.id):
+            warnings.append(f"动作 id 里混进了不可见字符，已清理：{action.id!r} → {action_id}")
         if not action_id:
             warnings.append("发现一个没有 id 的动作，已丢弃")
             continue
@@ -1431,6 +2824,10 @@ def parse_world(data: dict[str, Any]) -> tuple[WorldConfig, list[str]]:
             continue
         action_ids.add(action_id)
         action.id = action_id
+        for field, (before, after) in (BUILTIN_ACTION_UPDATES.get(action_id) or {}).items():
+            # 老配置里存的是老内置值：没被用户改过就跟着更新
+            if str(getattr(action, field, "") or "") == before:
+                setattr(action, field, after)
         if not action.name:
             action.name = action_id
         if action.scope == "node":
@@ -1470,6 +2867,24 @@ def parse_world(data: dict[str, Any]) -> tuple[WorldConfig, list[str]]:
             # 把这个标记带过来，留着它副本在编辑器里就删不掉了——这里直接清掉。
             action.builtin = False
     world.actions = actions
+
+    # 用户画像：老配置里没有这一节、或者关系表 / 分级表被清空时，按默认补回来
+    # （没有关系表和分级，画像没法判断"能做什么、不能做什么"）。
+    if not world.profile.bonds or not world.profile.levels:
+        from .defaults import default_profile
+
+        defaults = default_profile()
+        if not world.profile.bonds:
+            world.profile.bonds = [
+                BondType.model_validate(item) for item in (defaults.get("bonds") or [])
+            ]
+            warnings.append("关系表为空，已按默认关系补回")
+        if not world.profile.levels:
+            world.profile.levels = [
+                IntimacyLevel.model_validate(item)
+                for item in (defaults.get("levels") or [])
+            ]
+            warnings.append("亲密度分级为空，已按默认分级补回")
 
     # 跨区连线（门户对）：两端的区域与房间都必须存在，且房间确实属于那一端区域
     zone_edges: list[ZoneEdgeDef] = []
@@ -1564,6 +2979,55 @@ def parse_sessions(data: dict[str, Any]) -> tuple[SessionsConfig, list[str]]:
             session.platform = session_id.split(":", 1)[0]
         kept.append(session)
     config.sessions = kept
+
+    known = {session.session_id for session in kept}
+    groups: list[SessionGroupDef] = []
+    used: set[str] = set()
+    placed: dict[str, str] = {}
+    for group in config.groups:
+        group_id = str(group.id).strip()
+        if not group_id:
+            warnings.append("发现一个没有 id 的会话组，已丢弃")
+            continue
+        if group_id in used:
+            warnings.append(f"会话组 {group_id} 重复，已丢弃后一个")
+            continue
+        members = []
+        for item in group.sessions:
+            session_id = str(item).strip()
+            if not session_id:
+                continue
+            if session_id not in known:
+                # 组里的会话必须在白名单里：不然"共享上下文"会读到永远不动的空壳
+                warnings.append(f"会话组 {group_id} 里的 {session_id} 不在会话白名单里，已跳过")
+                continue
+            if session_id in members:
+                continue
+            if session_id in placed:
+                # 一个会话只能属于一个组：不然"共享上下文"到底跟谁共享就说不清了
+                warnings.append(
+                    f"{session_id} 已经在会话组 {placed[session_id]} 里了，"
+                    f"已从 {group_id} 里去掉"
+                )
+                continue
+            members.append(session_id)
+            placed[session_id] = group_id
+        main = str(group.main_session or "").strip()
+        if main and main not in members:
+            warnings.append(f"会话组 {group_id} 的主会话 {main} 不在成员里，已改回第一个成员")
+            main = ""
+        if not main:
+            main = members[0] if members else ""
+        used.add(group_id)
+        groups.append(
+            SessionGroupDef(
+                id=group_id,
+                name=str(group.name or group_id).strip(),
+                sessions=members,
+                main_session=main,
+            )
+        )
+    config.groups = groups
     return config, warnings
 
 

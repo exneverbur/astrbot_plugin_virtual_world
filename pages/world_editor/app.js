@@ -18,10 +18,15 @@ const ui = {
   selectedAction: "",
   selectedZone: "",
   mapLevel: "world",
+  // 全局设置：当前选中的分类标签，以及哪些标签里有未保存的改动
+  settingsTab: "basic",
+  dirtyTabs: new Set(),
+  events: {},
   // 「数值」默认只读展示（彩色条），点「编辑数值」才切成滑杆
   valuesEdit: false,
   valueDraft: {},
   selectedSchedule: "",
+  selectedGroup: "",
   presets: [],
   activePreset: "",
   token: "",
@@ -29,6 +34,10 @@ const ui = {
   historyHours: 24,
   historyBusy: false,
   defaults: { actions: {}, captions: {} },
+  // 通讯录：认识的人 + 当前选中的人
+  contacts: [],
+  contactUser: "",
+  contactDetail: null,
 };
 
 /* ================================================================== */
@@ -42,16 +51,12 @@ const ATTRS = [
   {
     key: "affect",
     label: "心潮",
-    hint:
-      "情绪被激起的强度（不是开心程度）。越高，她的内心活动越翻涌、说出来的感情越浓、越容易做出亲昵或冲动的举动；" +
-      "被夸、被抱、吵架、被冷落都会把它推高，然后随时间回落。",
+    hint: "情绪被激起的强度（不是开心程度）：越高越容易冲动、表达越浓；被夸、吵架、被冷落都会推高，之后慢慢回落。",
   },
   {
     key: "valence",
     label: "效价",
-    hint:
-      "心情的好坏（0.5 是中性，越高越偏正面）。它有一个由精力 / 孤独 / 无聊 / 好奇推导的基线，" +
-      "事件只在基线上产生短期偏移，过一阵会自己回落——所以\"今天心情不太好\"需要慢慢积累，不是一条消息就能翻转。",
+    hint: "心情好坏（0.5 为中性，越高越正面）：基线由精力 / 孤独 / 无聊 / 好奇推导，事件只造成短期偏移，之后回落。",
   },
   { key: "boredom", label: "无聊", hint: "越高越想换个地方待着" },
 ];
@@ -77,6 +82,15 @@ const GENDERS = [
  * key 必须和 core/models.py 里的 ECHO_EVENT_TYPES 一致（有一条单测做对齐检查）。
  */
 const ECHO_TYPE_CHOICES = [
+  {
+    key: "incoming",
+    icon: "📨",
+    label: "收到消息",
+    hint:
+      "每一条到达插件的消息都记一笔（谁说的、说了什么、有没有喊她）。" +
+      "选「完整」才发到群里，「精简」只留在日志页。",
+    group: "core",
+  },
   {
     key: "plan",
     icon: "🧠",
@@ -151,7 +165,7 @@ const ECHO_TYPE_CHOICES = [
     key: "nickname",
     icon: "🏷️",
     label: "群名片变化",
-    hint: "她的群名片改成什么、有没有改失败。",
+    hint: "群名片变动的目标文案与是否成功。",
     group: "misc",
   },
   {
@@ -275,6 +289,66 @@ const ECHO_TYPE_CHOICES = [
       "（只在「日志」页里逐条保留），免得一次检索刷出十几行。",
     group: "tool",
   },
+  {
+    key: "search_digest",
+    icon: "🧾",
+    label: "检索整理",
+    hint:
+      "检索到的材料（条数、开头几条的预览）与压缩模型返回的要点。" +
+      "用来分辨「源站只有入口页」和「压缩丢内容」这两种情况。",
+    group: "tool",
+  },
+  {
+    key: "event",
+    icon: "🎰",
+    label: "遇到事件",
+    hint: "她自己遇上了什么事（做饭糊了、锅盖卡住、群里吵起来了…）。",
+    group: "event",
+  },
+  {
+    key: "event_choice",
+    icon: "🌙",
+    label: "事件抉择",
+    hint: "这件事她打算怎么处理、派哪项能力值上。",
+    group: "event",
+  },
+  {
+    key: "event_action",
+    icon: "🧰",
+    label: "事件中调用动作",
+    hint:
+      "她为了这件事去调了动作（查资料、拍张照…），以及动作拿回来的结果。" +
+      "这类结果默认只用来帮她判断，不直接发到群里。",
+    group: "event",
+  },
+  {
+    key: "event_check",
+    icon: "🎲",
+    label: "掷骰判定",
+    hint: "能力值 × 情境修正 × 难度 = 概率 → 掷骰 → 四档结果（大成功 / 成功 / 勉强成功 / 失败）。",
+    group: "event",
+  },
+  {
+    key: "event_result",
+    icon: "📖",
+    label: "事件结果",
+    hint: "这件事的结果、能力值变化，以及线索还有没有后续。",
+    group: "event",
+  },
+  {
+    key: "help",
+    icon: "🆘",
+    label: "求助与建议",
+    hint: "她开口求助、收到群友的建议、等超时自己收尾。",
+    group: "event",
+  },
+  {
+    key: "event_idle",
+    icon: "⏳",
+    label: "挂起与收尾",
+    hint: "线索挂起 / 过期 / 收尾：这件事暂时告一段落。",
+    group: "event",
+  },
 ];
 
 /** 调试输出的分组：类型多了以后按用途分块，找起来快。 */
@@ -284,6 +358,7 @@ const ECHO_GROUPS = [
   { key: "mind", label: "记忆与回想", hint: "记忆写成什么样、主动回想翻到了什么" },
   { key: "schedule", label: "日程", hint: "日程什么时候被触发、她怎么改自己的日程" },
   { key: "sleep", label: "睡眠与保护", hint: "睡觉门禁、被叫醒、打断、兜底保护" },
+  { key: "event", label: "事件与线索", hint: "遇上什么事、怎么判定、求助与后续" },
   { key: "misc", label: "图片 · 上下文 · 名片", hint: "看图、上下文压缩、群名片变化" },
 ];
 
@@ -321,6 +396,12 @@ const LOG_TYPES = {
   search_sources: { icon: "🔗", label: "检索来源" },
   weather: { icon: "🌤️", label: "天气" },
   search: { icon: "🌐", label: "联网搜索" },
+  event: { icon: "🎰", label: "遇到事件" },
+  event_choice: { icon: "🌙", label: "事件抉择" },
+  event_check: { icon: "🎲", label: "掷骰判定" },
+  event_result: { icon: "📖", label: "事件结果" },
+  help: { icon: "🆘", label: "求助与建议" },
+  event_idle: { icon: "⏳", label: "挂起与收尾" },
   chain: { icon: "🔗", label: "动作链" },
   cold_start: { icon: "🌅", label: "冷启动" },
   bot_spoke: { icon: "🗣️", label: "发言等待回应" },
@@ -349,6 +430,7 @@ const REASONING_LABELS = [
   ["state", "状态"],
   ["mood", "心情"],
   ["who", "在和谁说话"],
+  ["inner", "心里想的"],
   ["intent", "打算怎么办"],
 ];
 
@@ -388,9 +470,7 @@ const LLM_LEVELS = [
   {
     key: "command",
     label: "指令触发",
-    hint:
-      "触发别的插件的一条指令（例如 /天气）。她只说想干什么，插件把小模型拼好的指令交出去，" +
-      "再把那条指令返回的内容交回给她说一句",
+    hint: "触发其他插件的一条指令（例如 /天气）：她只说想干什么，参数由辅助模型拼好，结果再交回给她说一句。",
   },
 ];
 
@@ -398,9 +478,7 @@ const TRIGGERS = [
   {
     key: "none",
     label: "什么都不做",
-    hint:
-      "动作做完就结束。工具型 / 指令型动作还看全局设置里的「工具结果回话」：" +
-      "那个开关开着时，拿到的结果会交回大模型说一句；想彻底不开口就把它关掉。",
+    hint: "动作做完即结束。工具 / 指令型动作看「工具结果回话」：打开则把结果交回大模型说一句，关闭则不开口。",
   },
   {
     key: "llm_followup",
@@ -420,6 +498,9 @@ const DEFAULT_CAPTION_PROMPT =
 
 const DEFAULT_CAPTION_RELATION_PROMPT =
   "你会拿到图片的文字转述和当前对话……（留空即用内置默认）";
+
+const DEFAULT_FORWARD_PROMPT =
+  "你在读一段被转发的聊天记录……（留空即用内置默认，点标题右侧的 ↺ 可以看默认内容）";
 
 const TARGET_TYPES = [
   { key: "none", label: "自己 / 空间", hint: "动作只作用于她自己或环境，默认不发到群里" },
@@ -444,9 +525,7 @@ const TOOL_FLOWS = [
   {
     key: "search",
     label: "联网检索",
-    hint:
-      "查东西专用：她可以一次给几条查询词 → 结果整理成带编号的证据 →（可选）用阅读工具抓正文 →" +
-      "证据不够时再补查一轮 → 她照着证据讲，不许编。适合「上网搜索」这类动作。",
+    hint: "查东西专用：多条查询词 → 整理成带编号的证据 → 可选抓正文 → 不够再补查，她照着证据讲，不许编。",
   },
 ];
 
@@ -460,6 +539,16 @@ const SEARCH_DEPTHS = [
 const SCOPE_MODES = [
   { key: "global", label: "全局", hint: "任何地点都能做这个动作" },
   { key: "node", label: "仅特定地点", hint: "这个动作属于指定地点；她不在那儿时想用它，会被带过去再做" },
+];
+
+const EVENT_USABLE_MODES = [
+  {
+    key: "auto",
+    label: "跟随规则",
+    hint: "工具型 / 指令型动作可用；会主动往群里发东西的动作（分享那类）排除在外",
+  },
+  { key: "allow", label: "强制允许", hint: "即使不符合上面的规则，事件里也可以调用它" },
+  { key: "deny", label: "事件中禁用", hint: "事件里不允许调用它" },
 ];
 
 const DURATION_MODES = [
@@ -511,6 +600,23 @@ function toast(message) {
   toast._timer = window.setTimeout(() => node.classList.add("hidden"), 2600);
 }
 
+/**
+ * 让一个按钮进入"处理中"状态，返回恢复用的函数。
+
+ * 那些要调模型的按钮（生成候选、出题、从聊天挑…）动辄几秒到几十秒，
+ * 不置灰、不写"生成中"的话，用户看到的就是"点了没反应"。
+ */
+function busyButton(button, text = "处理中…") {
+  if (!button) return () => {};
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = text;
+  return () => {
+    button.disabled = false;
+    button.textContent = original;
+  };
+}
+
 function setSaveState(text) {
   $("save-state").textContent = text || "";
 }
@@ -519,6 +625,10 @@ function setSaveState(text) {
 function markDirty() {
   ui.dirty = true;
   setSaveState("有未保存的改动");
+  // 哪个标签页里改的，就在那个标签上点一个小圆点：
+  // 分类以后最容易出的疏漏就是"在别的页改完，忘了保存"
+  if (ui.settingsTab) ui.dirtyTabs.add(ui.settingsTab);
+  renderSettingsTabs();
 }
 
 /** 当前性别对应的称呼：她 / 他 / ta。 */
@@ -555,7 +665,9 @@ function applyPronoun(root) {
   nodes.forEach((node) => {
     const text = node.nodeValue;
     if (!text) return;
-    const next = text.replace(/她/g, replacement).replace(/(?<!其)他/g, replacement);
+    // 只换界面文案里写死的「她」（默认称呼就是她）；
+    // 「他」在用户自己的内容里到处都是（动作名「提醒他喝水」、群友说的话），不能动。
+    const next = text.replace(/她/g, replacement);
     if (next !== text) node.nodeValue = next;
   });
 }
@@ -727,6 +839,7 @@ function comboField(label, value, options, onChange, opts = {}) {
 
 function inputField(label, value, onChange, opts = {}) {
   const wrapper = el("label");
+  if (opts.adv) wrapper.dataset.adv = "1";
   wrapper.appendChild(
     fieldHead(label, opts.hint, opts.onRestore
       ? () => {
@@ -760,6 +873,7 @@ function inputField(label, value, onChange, opts = {}) {
 
 function textareaField(label, value, onChange, opts = {}) {
   const wrapper = el("label");
+  if (opts.adv) wrapper.dataset.adv = "1";
   wrapper.appendChild(
     fieldHead(label, opts.hint, opts.onRestore
       ? () => {
@@ -779,8 +893,583 @@ function textareaField(label, value, onChange, opts = {}) {
   return wrapper;
 }
 
+/** 一行里的小输入框（关系表 / 亲密度分级那种密集编辑用）。 */
+function cellInput(value, onInput, opts = {}) {
+  const input = document.createElement("input");
+  input.type = opts.type || "text";
+  input.value = value ?? "";
+  if (opts.placeholder) input.placeholder = opts.placeholder;
+  if (opts.min !== undefined) input.min = opts.min;
+  if (opts.max !== undefined) input.max = opts.max;
+  if (opts.step !== undefined) input.step = opts.step;
+  if (opts.title) input.title = opts.title;
+  if (opts.width) input.style.width = `${opts.width}px`;
+  input.addEventListener("change", () => {
+    onInput(input.value);
+    markDirty();
+  });
+  return input;
+}
+
+function cellCheck(label, checked, onChange, title = "") {
+  const wrap = el("label", "cell-check");
+  if (title) wrap.title = title;
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.checked = Boolean(checked);
+  box.addEventListener("change", () => {
+    onChange(box.checked);
+    markDirty();
+  });
+  wrap.appendChild(box);
+  wrap.appendChild(el("span", "", label));
+  return wrap;
+}
+
+/** 一行里的小下拉框（关系表选档位这种"从固定几项里挑一个"用）。 */
+function cellSelect(value, options, onChange, opts = {}) {
+  const select = document.createElement("select");
+  (options || []).forEach((item) => {
+    select.appendChild(option(String(item.value), String(item.label)));
+  });
+  select.value = String(value ?? "");
+  if (opts.title) select.title = opts.title;
+  if (opts.width) select.style.width = `${opts.width}px`;
+  select.addEventListener("change", () => {
+    onChange(select.value);
+    markDirty();
+  });
+  return select;
+}
+
+/**
+ * 关系表：每行一种关系。以前是一整块 JSON，改一个上限都得对着括号数数。
+ * 槽位决定"同类关系只能有一个"（例如 romance 槽位里男友和女友不能并存）。
+ */
+/* ==================== 「手感」滑块 ====================
+ *
+ * 新用户脑子里想的是"话多话少""粘不粘人"，不是 max_llm_text_per_hour。
+ * 一个滑块 = 一组本来要一起调才自洽的字段（自主发言上限调高了、预算还卡着，
+ * 行为就自相矛盾）。规矩：
+ *
+ * - **每个滑块管的字段互不重叠**，不然拖完 A 再拖 B，A 的效果就没了；
+ * - **中间那档 = 内置默认值**，老用户拖到中间等于没改；
+ * - 拖动只写它管的那几个字段，别的一律不碰；
+ * - 明细摊开给用户看——只有滑块没有明细就是黑箱。
+ */
+
+const KNOB_LEVEL_NAMES = ["很低", "偏低", "标准", "偏高", "很高"];
+
+const KNOBS = [
+  {
+    id: "chat_freq",
+    label: "主动说话频率",
+    hint: "她多久主动冒一次头（被叫到时的回话不算）。这是上限与倾向：具体说多少还看她心情和孤独感。",
+    levels: [
+      { "limits.max_autonomous_per_hour": 2, "limits.max_llm_text_per_hour": 8,
+        "limits.max_llm_plan_per_hour": 4 },
+      { "limits.max_autonomous_per_hour": 4, "limits.max_llm_text_per_hour": 14,
+        "limits.max_llm_plan_per_hour": 7 },
+      { "limits.max_autonomous_per_hour": 6, "limits.max_llm_text_per_hour": 20,
+        "limits.max_llm_plan_per_hour": 10 },
+      { "limits.max_autonomous_per_hour": 10, "limits.max_llm_text_per_hour": 30,
+        "limits.max_llm_plan_per_hour": 16 },
+      { "limits.max_autonomous_per_hour": 16, "limits.max_llm_text_per_hour": 45,
+        "limits.max_llm_plan_per_hour": 24 },
+    ],
+  },
+  {
+    id: "group_lively",
+    label: "群聊活跃度",
+    hint: "群里在聊的时候她插话的意愿。调高会更爱接话，也更容易被热闹带动。",
+    levels: [
+      { "decider.interject_threshold": 0.75, "decider.interject_cooldown_minutes": 40,
+        "decider.min_messages_to_interject": 4, "limits.max_share_per_hour": 1 },
+      { "decider.interject_threshold": 0.68, "decider.interject_cooldown_minutes": 30,
+        "decider.min_messages_to_interject": 3, "limits.max_share_per_hour": 2 },
+      { "decider.interject_threshold": 0.6, "decider.interject_cooldown_minutes": 20,
+        "decider.min_messages_to_interject": 2, "limits.max_share_per_hour": 4 },
+      { "decider.interject_threshold": 0.5, "decider.interject_cooldown_minutes": 12,
+        "decider.min_messages_to_interject": 2, "limits.max_share_per_hour": 6 },
+      { "decider.interject_threshold": 0.4, "decider.interject_cooldown_minutes": 6,
+        "decider.min_messages_to_interject": 1, "limits.max_share_per_hour": 10 },
+    ],
+  },
+  {
+    id: "clingy",
+    label: "私聊粘人程度",
+    hint: "她想你的速度、主动来找你的次数，以及她有多在意被冷落。",
+    levels: [
+      { "profile.miss_growth_per_min": 0.0002, "profile.miss_threshold": 0.8,
+        "profile.miss_push_daily_max": 1, "profile.miss_cooldown_min_minutes": 120,
+        "profile.miss_loneliness_weight": 0.4 },
+      { "profile.miss_growth_per_min": 0.0004, "profile.miss_threshold": 0.7,
+        "profile.miss_push_daily_max": 1, "profile.miss_cooldown_min_minutes": 60,
+        "profile.miss_loneliness_weight": 0.6 },
+      { "profile.miss_growth_per_min": 0.0006, "profile.miss_threshold": 0.6,
+        "profile.miss_push_daily_max": 2, "profile.miss_cooldown_min_minutes": 45,
+        "profile.miss_loneliness_weight": 0.8 },
+      { "profile.miss_growth_per_min": 0.001, "profile.miss_threshold": 0.5,
+        "profile.miss_push_daily_max": 3, "profile.miss_cooldown_min_minutes": 25,
+        "profile.miss_loneliness_weight": 1.0 },
+      { "profile.miss_growth_per_min": 0.0016, "profile.miss_threshold": 0.4,
+        "profile.miss_push_daily_max": 5, "profile.miss_cooldown_min_minutes": 15,
+        "profile.miss_loneliness_weight": 1.2 },
+    ],
+  },
+  {
+    id: "verbosity",
+    label: "一次说几句",
+    hint: "单次回复的长度上限，以及说话太密的判定。调低她会更像群里随手打两行。",
+    levels: [
+      { "limits.max_messages_per_say": 1, "reply_style.dense_max_lines": 2,
+        "reply_style.dense_window_minutes": 15 },
+      { "limits.max_messages_per_say": 2, "reply_style.dense_max_lines": 3,
+        "reply_style.dense_window_minutes": 12 },
+      { "limits.max_messages_per_say": 3, "reply_style.dense_max_lines": 4,
+        "reply_style.dense_window_minutes": 10 },
+      { "limits.max_messages_per_say": 5, "reply_style.dense_max_lines": 6,
+        "reply_style.dense_window_minutes": 8 },
+      { "limits.max_messages_per_say": 6, "reply_style.dense_max_lines": 8,
+        "reply_style.dense_window_minutes": 5 },
+    ],
+  },
+  {
+    id: "mood_swing",
+    label: "情绪起伏",
+    hint: "她多容易被逗乐、多容易被惹到，以及情绪回得多快。调高会更容易兴奋起来。",
+    levels: [
+      { "state_dynamics.chat_valence_cap": 0.02, "state_dynamics.chat_valence_daily_cap": 0.06,
+        "state_dynamics.valence_decay_per_min": 0.02 },
+      { "state_dynamics.chat_valence_cap": 0.035, "state_dynamics.chat_valence_daily_cap": 0.1,
+        "state_dynamics.valence_decay_per_min": 0.015 },
+      { "state_dynamics.chat_valence_cap": 0.05, "state_dynamics.chat_valence_daily_cap": 0.15,
+        "state_dynamics.valence_decay_per_min": 0.01 },
+      { "state_dynamics.chat_valence_cap": 0.08, "state_dynamics.chat_valence_daily_cap": 0.25,
+        "state_dynamics.valence_decay_per_min": 0.006 },
+      { "state_dynamics.chat_valence_cap": 0.12, "state_dynamics.chat_valence_daily_cap": 0.4,
+        "state_dynamics.valence_decay_per_min": 0.003 },
+    ],
+  },
+  {
+    id: "life_rich",
+    label: "生活丰富度",
+    hint: "她一个人待着时遇上事的多少。调高更热闹（也更费模型），调低更像安静过日子。",
+    levels: [
+      { "events.micro_per_hour": 0.3, "events.small_per_hour": 0.1,
+        "events.big_per_hour": 0.01, "events.min_gap_minutes": 120 },
+      { "events.micro_per_hour": 0.6, "events.small_per_hour": 0.2,
+        "events.big_per_hour": 0.015, "events.min_gap_minutes": 60 },
+      { "events.micro_per_hour": 1, "events.small_per_hour": 0.3,
+        "events.big_per_hour": 0.02, "events.min_gap_minutes": 30 },
+      { "events.micro_per_hour": 2, "events.small_per_hour": 0.6,
+        "events.big_per_hour": 0.04, "events.min_gap_minutes": 15 },
+      { "events.micro_per_hour": 4, "events.small_per_hour": 1.2,
+        "events.big_per_hour": 0.08, "events.min_gap_minutes": 5 },
+    ],
+  },
+  {
+    id: "whimsy",
+    label: "任性度",
+    hint: "她有多凭性子来：调高会让这一轮更多交给大模型自由发挥，情绪上头更久，也爱随手拍张照。",
+    levels: [
+      { "decider.llm_rate_min": 0.01, "decider.llm_rate_max": 0.15,
+        "state_dynamics.mood_override_duration": 180, "events.photo_chance": 0.1,
+        "events.genre_cooldown_minutes": 480 },
+      { "decider.llm_rate_min": 0.03, "decider.llm_rate_max": 0.28,
+        "state_dynamics.mood_override_duration": 360, "events.photo_chance": 0.2,
+        "events.genre_cooldown_minutes": 300 },
+      { "decider.llm_rate_min": 0.05, "decider.llm_rate_max": 0.4,
+        "state_dynamics.mood_override_duration": 600, "events.photo_chance": 0.3,
+        "events.genre_cooldown_minutes": 180 },
+      { "decider.llm_rate_min": 0.09, "decider.llm_rate_max": 0.55,
+        "state_dynamics.mood_override_duration": 900, "events.photo_chance": 0.45,
+        "events.genre_cooldown_minutes": 90 },
+      { "decider.llm_rate_min": 0.15, "decider.llm_rate_max": 0.75,
+        "state_dynamics.mood_override_duration": 1500, "events.photo_chance": 0.6,
+        "events.genre_cooldown_minutes": 30 },
+    ],
+  },
+  {
+    id: "memory_diligence",
+    label: "记忆勤奋度",
+    hint: "她记你记得多细、整理得多勤。调高留下的画像与记忆更完整（也更容易花 token）。",
+    levels: [
+      { "profile.digest_chars": 40, "profile.digest_limit": 3,
+        "context.chat_compress_threshold": 60, "context.summary_refresh_minutes": 30,
+        "context.chat_answered_lines": 20 },
+      { "profile.digest_chars": 50, "profile.digest_limit": 4,
+        "context.chat_compress_threshold": 45, "context.summary_refresh_minutes": 20,
+        "context.chat_answered_lines": 25 },
+      { "profile.digest_chars": 60, "profile.digest_limit": 5,
+        "context.chat_compress_threshold": 30, "context.summary_refresh_minutes": 10,
+        "context.chat_answered_lines": 30 },
+      { "profile.digest_chars": 80, "profile.digest_limit": 7,
+        "context.chat_compress_threshold": 20, "context.summary_refresh_minutes": 6,
+        "context.chat_answered_lines": 40 },
+      { "profile.digest_chars": 100, "profile.digest_limit": 10,
+        "context.chat_compress_threshold": 12, "context.summary_refresh_minutes": 3,
+        "context.chat_answered_lines": 50 },
+    ],
+  },
+];
+
+function getPath(obj, path) {
+  return String(path)
+    .split(".")
+    .reduce((node, key) => (node == null ? undefined : node[key]), obj);
+}
+
+function setPath(obj, path, value) {
+  const keys = String(path).split(".");
+  let node = obj;
+  for (let i = 0; i < keys.length - 1; i += 1) {
+    if (node[keys[i]] == null || typeof node[keys[i]] !== "object") node[keys[i]] = {};
+    node = node[keys[i]];
+  }
+  node[keys[keys.length - 1]] = value;
+}
+
+/** 这一档写在配置里的位置（1~5）；没记过就是标准档。 */
+function knobLevel(world, knob) {
+  const stored = Number(((world.ui_knobs || {})[knob.id] || 3));
+  return Math.min(5, Math.max(1, Number.isFinite(stored) ? stored : 3));
+}
+
+/** 用户是不是在这一档上手动改过字段（改过就把滑块旁标一句，别让人以为是滑块没生效）。 */
+function knobTouched(world, knob) {
+  const values = knob.levels[knobLevel(world, knob) - 1];
+  return Object.keys(values).some((path) => Number(getPath(world, path)) !== Number(values[path]));
+}
+
+function applyKnobLevel(world, knob, level) {
+  const values = knob.levels[Math.min(5, Math.max(1, level)) - 1];
+  Object.keys(values).forEach((path) => setPath(world, path, values[path]));
+}
+
+/**
+ * 配置字段的中文人话。
+ *
+ * 说明文字只有后端一份（core/models.py 的 FIELD_LABELS，跟着 /defaults 一起下发），
+ * 前端不另抄一张表；取不到就退回字段路径，至少不会显示成空的。
+ */
+function fieldLabel(path) {
+  const map = (ui.defaults && ui.defaults.field_labels) || {};
+  return map[path] || path;
+}
+
+/** 「手感」滑块：向导和全局设置共用同一块。 */
+function knobEditor(world, onChange) {
+  world.ui_knobs = world.ui_knobs || {};
+  const box = el("div", "full knob-box");
+  KNOBS.forEach((knob) => {
+    const row = el("div", "knob-row");
+    const head = el("div", "knob-head");
+    head.appendChild(el("span", "knob-label", knob.label));
+    const levelText = el("span", "knob-level", "");
+    const touched = el("span", "knob-touched", "");
+    head.appendChild(touched);
+    head.appendChild(levelText);
+    row.appendChild(head);
+
+    const slider = document.createElement("input");
+    slider.type = "range";
+    slider.min = "1";
+    slider.max = "5";
+    slider.step = "1";
+    slider.value = String(knobLevel(world, knob));
+    slider.className = "knob-slider";
+    row.appendChild(slider);
+
+    const detail = document.createElement("details");
+    detail.className = "knob-detail";
+    const summary = document.createElement("summary");
+    summary.appendChild(el("span", "", "会改哪些参数"));
+    detail.appendChild(summary);
+    const body = el("div", "knob-detail-body");
+    detail.appendChild(body);
+    row.appendChild(detail);
+    if (knob.hint) row.appendChild(el("p", "muted knob-hint", knob.hint));
+
+    function draw() {
+      const level = knobLevel(world, knob);
+      slider.value = String(level);
+      levelText.textContent = `${KNOB_LEVEL_NAMES[level - 1]}（${level}/5）`;
+      const values = knob.levels[level - 1];
+      body.innerHTML = "";
+      Object.keys(values).forEach((path) => {
+        const now = Number(getPath(world, path));
+        const want = Number(values[path]);
+        const changed = now !== want;
+        const item = el("div", "knob-detail-row");
+        const nameCell = el("div", "knob-detail-name");
+        nameCell.appendChild(el("span", "", fieldLabel(path)));
+        nameCell.appendChild(el("code", "knob-detail-path", path));
+        item.appendChild(nameCell);
+        item.appendChild(el("span", "", `${want}`));
+        if (changed) {
+          item.appendChild(el("span", "muted", `（现在是 ${now}）`));
+        }
+        body.appendChild(item);
+      });
+      touched.textContent = knobTouched(world, knob) ? "已手动调整" : "";
+    }
+
+    slider.addEventListener("input", () => {
+      world.ui_knobs[knob.id] = Number(slider.value);
+      applyKnobLevel(world, knob, Number(slider.value));
+      markDirty();
+      draw();
+      if (typeof onChange === "function") onChange();
+    });
+    draw();
+    box.appendChild(row);
+  });
+  return box;
+}
+
+function bondsEditor(world) {
+  world.profile = world.profile || {};
+  if (!Array.isArray(world.profile.bonds)) world.profile.bonds = [];
+  const box = el("div", "full list-editor");
+  box.appendChild(fieldHead("关系表"));
+  box.appendChild(
+    el(
+      "p",
+      "muted",
+      "每行一种关系。槽位相同的算一类（例如 romance 里男友和女友不能并存）。"
+        + "「最低 / 最高档」是这个关系对应的亲密度区间：绑定男友之后，"
+        + "哪怕好感还没养起来也能抱抱，而群友聊再久也上不去——生效档位 = 好感给的档位，"
+        + "先被最低档抬起、再被最高档压下；绑上的那一刻好感也会被抬到最低档的下边界"
+        + "（已经更高的不动）。「别名」用逗号分隔。",
+    ),
+  );
+  const levelOptions = (world.profile.levels || [])
+    .map((item, index) => ({ value: String(index), label: `${index} · ${item.name || "未命名"}` }));
+
+  // 新认识的人默认挂哪一条关系：只认一个来源（profile.default_bond），
+  // 跟"第一次见到他先挂什么"用的是同一个字段。
+  const defaultRow = el("div", "list-row");
+  defaultRow.appendChild(el("span", "muted", "新认识的人默认是"));
+  const defaultSelect = document.createElement("select");
+  (world.profile.bonds || []).forEach((item) => {
+    defaultSelect.appendChild(option(String(item.name || ""), String(item.name || "（无名）")));
+  });
+  const fallbackName = String((world.profile.bonds[0] || {}).name || "");
+  defaultSelect.value = String(world.profile.default_bond || fallbackName);
+  defaultSelect.title = "第一次见到一个人时先给他这条关系；只能有一条";
+  defaultSelect.addEventListener("change", () => {
+    world.profile.default_bond = defaultSelect.value;
+    markDirty();
+  });
+  defaultRow.appendChild(defaultSelect);
+  box.appendChild(defaultRow);
+  const rows = el("div", "list-editor-rows");
+  box.appendChild(rows);
+
+  function redraw() {
+    rows.innerHTML = "";
+    world.profile.bonds.forEach((item, index) => {
+      const row = el("div", "list-row");
+      row.appendChild(
+        cellInput(item.name || "", (value) => (item.name = value), {
+          placeholder: "名称",
+          width: 72,
+        }),
+      );
+      row.appendChild(
+        cellInput(item.slot || "", (value) => (item.slot = value), {
+          placeholder: "槽位",
+          title: "同类关系靠槽位判重：槽位相同的只能有一个",
+          width: 84,
+        }),
+      );
+      row.appendChild(
+        el("span", "muted", "最低"),
+      );
+      row.appendChild(
+        cellSelect(item.floor ?? 0, levelOptions, (value) => (item.floor = num(value)), {
+          title: "这个关系至少到哪一档（关系本身就是一种态度）",
+          width: 112,
+        }),
+      );
+      row.appendChild(
+        el("span", "muted", "最高"),
+      );
+      row.appendChild(
+        cellSelect(item.cap ?? 0, levelOptions, (value) => (item.cap = num(value)), {
+          title: "这个关系最多到哪一档（普通关系聊再久也上不去）",
+          width: 112,
+        }),
+      );
+      row.appendChild(
+        cellInput((item.aliases || []).join("，"), (value) => {
+          item.aliases = value
+            .split(/[，,]/)
+            .map((one) => one.trim())
+            .filter(Boolean);
+        }, { placeholder: "别名，逗号分隔", width: 130 }),
+      );
+      row.appendChild(
+        cellCheck("唯一", item.unique, (value) => (item.unique = value), "同类里全球只能有一个"),
+      );
+      row.appendChild(
+        cellCheck("负面", item.negative, (value) => (item.negative = value), "负面关系：不惦记、不主动"),
+      );
+      const del = el("button", "icon-btn", "✕");
+      del.type = "button";
+      del.title = "删掉这种关系";
+      del.addEventListener("click", () => {
+        world.profile.bonds.splice(index, 1);
+        markDirty();
+        redraw();
+      });
+      row.appendChild(del);
+      rows.appendChild(row);
+    });
+    const add = el("button", "small ghost", "＋ 加一种关系");
+    add.type = "button";
+    add.addEventListener("click", () => {
+      world.profile.bonds.push({
+        name: "新关系",
+        slot: "",
+        cap: 3,
+        aliases: [],
+      });
+      markDirty();
+      redraw();
+    });
+    rows.appendChild(add);
+  }
+  redraw();
+  return box;
+}
+
+/** 亲密度分级：每一级的称呼、这一档还不能做的动作、主动频率，以及给模型的提示词。 */
+function levelsEditor(world) {
+  world.profile = world.profile || {};
+  if (!Array.isArray(world.profile.levels)) world.profile.levels = [];
+  const box = el("div", "full list-editor");
+  box.appendChild(fieldHead("亲密度分级"));
+  box.appendChild(
+    el(
+      "p",
+      "muted",
+      "按好感度分档：每档自己的称呼、这一档**还不能做**的动作、每天最多主动找几次，"
+        + "以及这一档给模型的提示词。动作写 id，逗号分隔。",
+    ),
+  );
+  const rows = el("div", "list-editor-rows");
+  box.appendChild(rows);
+
+  function redraw() {
+    rows.innerHTML = "";
+    world.profile.levels.forEach((item, index) => {
+      const card = el("div", "list-card");
+      const head = el("div", "list-row");
+      head.appendChild(
+        cellInput(item.name || "", (value) => (item.name = value), {
+          placeholder: "档位名",
+          width: 72,
+        }),
+      );
+      head.appendChild(el("span", "muted", "好感"));
+      head.appendChild(
+        cellInput(item.min_affinity ?? 0, (value) => (item.min_affinity = num(value)), {
+          type: "number",
+          min: -100,
+          max: 100,
+          width: 64,
+        }),
+      );
+      head.appendChild(el("span", "muted", "~"));
+      head.appendChild(
+        cellInput(item.max_affinity ?? 0, (value) => (item.max_affinity = num(value)), {
+          type: "number",
+          min: -100,
+          max: 100,
+          width: 64,
+        }),
+      );
+      head.appendChild(el("span", "muted", "称呼"));
+      head.appendChild(
+        cellInput(item.address || "", (value) => (item.address = value), { width: 56 }),
+      );
+      head.appendChild(el("span", "muted", "每天主动"));
+      head.appendChild(
+        cellInput(item.proactive_per_day ?? 0, (value) => (item.proactive_per_day = num(value)), {
+          type: "number",
+          min: 0,
+          max: 20,
+          width: 52,
+        }),
+      );
+      const del = el("button", "icon-btn", "✕");
+      del.type = "button";
+      del.title = "删掉这一档";
+      del.addEventListener("click", () => {
+        world.profile.levels.splice(index, 1);
+        markDirty();
+        redraw();
+      });
+      head.appendChild(del);
+      card.appendChild(head);
+
+      const promptArea = document.createElement("textarea");
+      promptArea.rows = 2;
+      promptArea.placeholder = "这一档给模型的提示词";
+      promptArea.value = item.prompt || "";
+      promptArea.addEventListener("change", () => {
+        item.prompt = promptArea.value;
+        markDirty();
+      });
+      card.appendChild(promptArea);
+
+      const io = el("div", "list-row");
+      io.appendChild(el("span", "muted", "这一档还不能做"));
+      io.appendChild(
+        cellInput((item.deny || []).join(","), (value) => {
+          item.deny = splitIds(value);
+        }, {
+          placeholder: "动作 id，逗号分隔（留空 = 不限制）",
+          width: 260,
+          title: "写进提示词的「这一档还不能做」，她说得出但不会做——分寸由她自己克制",
+        }),
+      );
+      card.appendChild(io);
+      rows.appendChild(card);
+    });
+    const add = el("button", "small ghost", "＋ 加一档");
+    add.type = "button";
+    add.addEventListener("click", () => {
+      world.profile.levels.push({
+        name: "新档位",
+        min_affinity: 0,
+        max_affinity: 10,
+        address: "你",
+        deny: [],
+        proactive_per_day: 0,
+        prompt: "",
+      });
+      markDirty();
+      redraw();
+    });
+    rows.appendChild(add);
+  }
+  redraw();
+  return box;
+}
+
+function splitIds(value) {
+  return String(value || "")
+    .split(/[，,\s]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 function selectField(label, value, choices, onChange, opts = {}) {
   const wrapper = el("label");
+  if (opts.adv) wrapper.dataset.adv = "1";
   wrapper.appendChild(fieldHead(label, opts.hint));
   const node = document.createElement("select");
   choices.forEach((choice) => {
@@ -796,6 +1485,7 @@ function selectField(label, value, choices, onChange, opts = {}) {
 
 function checkboxField(label, checked, onChange, opts = {}) {
   const wrapper = el("label", "inline");
+  if (opts.adv) wrapper.dataset.adv = "1";
   const input = document.createElement("input");
   input.type = "checkbox";
   input.checked = !!checked;
@@ -810,6 +1500,7 @@ function checkboxField(label, checked, onChange, opts = {}) {
 /** 单选按钮组（比下拉更直观）。 */
 function pillsField(label, value, choices, onChange, opts = {}) {
   const wrapper = el("div", "field");
+  if (opts.adv) wrapper.dataset.adv = "1";
   wrapper.appendChild(fieldHead(label, opts.hint));
   const row = el("div", "pill-row");
   choices.forEach((choice) => {
@@ -839,10 +1530,45 @@ function echoTypesField(world) {
     ),
   );
 
-  const chosen = () => (Array.isArray(world.echo_types) ? world.echo_types : []);
-  const setChosen = (names) => {
-    world.echo_types = Array.from(new Set(names));
+  /** 每个类型各自的显示方式：关（不在表里）/ 完整 full / 精简 compact。 */
+  const modes = () => {
+    const table =
+      world.echo_modes && typeof world.echo_modes === "object" ? world.echo_modes : {};
+    if (Object.keys(table).length) return table;
+    // 老配置（勾选列表 + 全局精简）在页面里直接迁过来
+    const migrated = {};
+    (Array.isArray(world.echo_types) ? world.echo_types : []).forEach((name) => {
+      migrated[name] = world.echo_compact ? "compact" : "full";
+    });
+    world.echo_modes = migrated;
+    return migrated;
   };
+  const chosen = () => Object.keys(modes());
+  const setMode = (key, value) => {
+    const table = { ...modes() };
+    if (!value || value === "off") delete table[key];
+    else table[key] = value;
+    world.echo_modes = table;
+  };
+  const nextMode = (key) => {
+    const now = modes()[key];
+    if (now === "full") return "compact";
+    if (now === "compact") return "off";
+    return "full";
+  };
+  const MODE_LABELS = { full: "完整", compact: "精简" };
+
+  /** 常用的一批：排查"她为什么这么做"最需要的几类。 */
+  const COMMON_ECHO_TYPES = [
+    "plan",
+    "action_start",
+    "action_done",
+    "action",
+    "search",
+    "tool_call",
+    "tool_result",
+    "skip",
+  ];
 
   const toolbar = el("div", "echo-toolbar");
   const counted = el(
@@ -852,23 +1578,24 @@ function echoTypesField(world) {
   );
   const buttons = el("div", "row-item");
   const quick = [
-    ["全选", () => ECHO_TYPE_CHOICES.map((item) => item.key)],
-    [
-      "常用",
-      () =>
-        ECHO_TYPE_CHOICES.filter((item) =>
-          ["plan", "action_start", "action_done", "action", "search", "tool_call", "tool_result", "skip"].includes(
-            item.key,
-          ),
-        ).map((item) => item.key),
-    ],
-    ["清空", () => []],
+    ["全选（完整）", () => setAll("full", true)],
+    ["常用", () => setAll("full", false, COMMON_ECHO_TYPES)],
+    ["清空", () => setAll("off")],
   ];
-  quick.forEach(([text, pick]) => {
+  function setAll(mode, everything, only = null) {
+    const table = {};
+    if (mode !== "off") {
+      ECHO_TYPE_CHOICES.forEach((item) => {
+        if (everything || (only || []).includes(item.key)) table[item.key] = mode;
+      });
+    }
+    world.echo_modes = table;
+  }
+  quick.forEach(([text, run]) => {
     const button = el("button", "ghost", text);
     button.type = "button";
     button.addEventListener("click", () => {
-      setChosen(pick());
+      run();
       renderSettings();
     });
     buttons.appendChild(button);
@@ -878,17 +1605,18 @@ function echoTypesField(world) {
 
   /** 每一类一个可点的小卡片：图标 + 名字，说明放在悬停提示里。 */
   const typeButton = (choice) => {
-    const box = el("button", `echo-chip${chosen().includes(choice.key) ? " on" : ""}`);
+    const mode = modes()[choice.key] || "";
+    const box = el("button", `echo-chip${mode ? " on" : ""}`);
     box.type = "button";
     box.appendChild(el("span", "echo-icon", choice.icon));
     box.appendChild(el("span", "", choice.label));
-    if (choice.hint) {
-      box.setAttribute("data-tip", choice.hint);
-      box.setAttribute("title", choice.hint);
-    }
+    if (mode) box.appendChild(el("span", "echo-mode", MODE_LABELS[mode] || mode));
+    const tip = `${choice.hint || ""}\n点一下切换：关 → 完整 → 精简。`;
+    box.setAttribute("data-tip", tip.trim());
+    box.setAttribute("title", tip.trim());
     box.addEventListener("click", () => {
-      const next = chosen().filter((name) => name !== choice.key);
-      setChosen(chosen().includes(choice.key) ? next : next.concat([choice.key]));
+      setMode(choice.key, nextMode(choice.key));
+      markDirty();
       renderSettings();
     });
     return box;
@@ -906,14 +1634,19 @@ function echoTypesField(world) {
       title.setAttribute("title", group.hint);
     }
     head.appendChild(title);
-    const onCount = items.filter((item) => chosen().includes(item.key)).length;
+    const table = modes();
+    const onCount = items.filter((item) => table[item.key]).length;
     head.appendChild(el("span", "hint", `${onCount}/${items.length}`));
     const toggle = el("button", "ghost tiny", onCount === items.length ? "取消本组" : "全选本组");
     toggle.type = "button";
     toggle.addEventListener("click", () => {
       const keys = items.map((item) => item.key);
-      const rest = chosen().filter((name) => !keys.includes(name));
-      setChosen(onCount === items.length ? rest : rest.concat(keys));
+      const next = { ...modes() };
+      keys.forEach((key) => {
+        if (onCount === items.length) delete next[key];
+        else next[key] = "full";
+      });
+      world.echo_modes = next;
       renderSettings();
     });
     head.appendChild(toggle);
@@ -926,19 +1659,10 @@ function echoTypesField(world) {
 
   wrapper.appendChild(toolbar);
   wrapper.appendChild(
-    checkboxField(
-      "精简模式",
-      !!world.echo_compact,
-      (value) => {
-        world.echo_compact = !!value;
-      },
-      {
-        hint:
-          "打开后只发要点，不带参数和结果：\n" +
-          "🔧 调用「anysearch_extract」\n" +
-          "📥 「anysearch_extract」返回\n" +
-          "排查「她做了什么」够用，内容不会刷屏。",
-      },
+    el(
+      "p",
+      "muted",
+      "点一个类型切换显示方式：关 → 完整（带参数与结果）→ 精简（只留要点）。",
     ),
   );
   wrapper.appendChild(groups);
@@ -1071,8 +1795,9 @@ function openPicker({
   onConfirm,
 }) {
   pickerState = {
-    items: items.map((item) => ({ ...item })),
-    chosen: new Set(selected),
+    // 兜底再洗一遍：别的入口直接调 openPicker 时也不会带进没有 id 的条目
+    items: pickerEntries(items),
+    chosen: new Set(pickerValues(selected)),
     multi,
     onConfirm,
     collapsed: {},
@@ -1331,6 +2056,26 @@ function openFormDialog({
       control.value = String(
         values[field.key] ?? field.value ?? (field.options?.[0]?.value ?? ""),
       );
+    } else if (field.type === "checkboxes") {
+      // 多选一组的勾选框（分块应用预设那种）
+      control = el("div", "picker-list");
+      const picked = new Set(
+        (values[field.key] ?? field.value ?? []).map((item) => String(item)),
+      );
+      (field.options || []).forEach((choice) => {
+        const row = el("label", "picker-row");
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.value = String(choice.value);
+        box.checked = picked.has(String(choice.value));
+        row.appendChild(box);
+        row.appendChild(el("span", "", choice.label));
+        control.appendChild(row);
+      });
+    } else if (field.type === "checkbox") {
+      control = document.createElement("input");
+      control.type = "checkbox";
+      control.checked = Boolean(values[field.key] ?? field.value ?? false);
     } else {
       control = document.createElement("input");
       control.type = field.type || "text";
@@ -1341,6 +2086,18 @@ function openFormDialog({
       control.value = values[field.key] ?? field.value ?? "";
     }
     control.dataset.dialogKey = field.key;
+    if (typeof field.onChange === "function") {
+      const handler = () => {
+        const current = {};
+        fields.forEach((item) => {
+          const node = body.querySelector(`[data-dialog-key="${item.key}"]`);
+          if (node) current[item.key] = node.value;
+        });
+        field.onChange({ control, values: current, body, fields });
+      };
+      control.addEventListener("change", handler);
+      if (field.watchInput) control.addEventListener("input", handler);
+    }
     wrap.appendChild(control);
     body.appendChild(wrap);
   });
@@ -1373,7 +2130,16 @@ function collectDialogValues() {
   dialogState.fields.forEach((field) => {
     const control = body.querySelector(`[data-dialog-key="${field.key}"]`);
     if (!control) return;
-    if (field.type === "number") {
+    if (field.type === "checkboxes") {
+      const boxes = body.querySelectorAll(
+        `[data-dialog-key="${field.key}"] input[type="checkbox"]`,
+      );
+      result[field.key] = Array.from(boxes)
+        .filter((box) => box.checked)
+        .map((box) => box.value);
+    } else if (field.type === "checkbox") {
+      result[field.key] = Boolean(control.checked);
+    } else if (field.type === "number") {
       const raw = control.value.trim();
       result[field.key] = raw === "" ? field.emptyValue ?? 0 : num(raw, field.emptyValue ?? 0);
     } else {
@@ -1475,13 +2241,17 @@ function pickerField(label, values, items, onChange, opts = {}) {
   wrapper.appendChild(fieldHead(label, opts.hint));
   const button = el("button", "picker");
   button.type = "button";
-  const selected = Array.isArray(values) ? values : [];
+  const entries = pickerEntries(items);
+  const selected = pickerValues(values);
   const text = el(
     "div",
     `picker-text${selected.length ? "" : " empty"}`,
     selected.length
       ? selected
-          .map((id) => (items.find((item) => item.id === id) || { name: id }).name || id)
+          .map(
+            (id) =>
+              (entries.find((item) => item.id === id) || { name: id }).name || id,
+          )
           .join("、")
       : opts.empty || "点击选择…",
   );
@@ -1489,14 +2259,14 @@ function pickerField(label, values, items, onChange, opts = {}) {
   button.appendChild(el("span", "picker-caret", "▾"));
   button.title = selected.length
     ? selected
-        .map((id) => (items.find((item) => item.id === id) || { name: id }).name || id)
+        .map((id) => (entries.find((item) => item.id === id) || { name: id }).name || id)
         .join("、")
     : opts.empty || "点击选择…";
   button.addEventListener("click", () => {
     openPicker({
       title: label,
       hint: opts.hint,
-      items,
+      items: entries,
       selected,
       multi: opts.multi !== false,
       col1: opts.col1 || "名称",
@@ -1508,12 +2278,34 @@ function pickerField(label, values, items, onChange, opts = {}) {
   if (selected.length && opts.renderChips) {
     const chips = el("div", "chips");
     selected.forEach((id) => {
-      const item = items.find((entry) => entry.id === id);
+      const item = entries.find((entry) => entry.id === id);
       chips.appendChild(el("span", "chip-item", item ? item.name : id));
     });
     wrapper.appendChild(chips);
   }
   return wrapper;
+}
+
+/** 选择器的条目：既认 `{ id, name }`，也认 `{ value, label }`（「选会话」那类选项用的是后者）。
+ *
+ * 没有 id 的条目一律丢掉：勾选写进配置的就是 id，塞进 null 保存会直接报校验错误。
+ */
+function pickerEntries(items) {
+  return (Array.isArray(items) ? items : [])
+    .map((raw) => {
+      const item = raw && typeof raw === "object" ? raw : {};
+      const id =
+        item.id !== undefined && item.id !== null ? item.id : item.value;
+      const name = item.name || item.label || String(id ?? "");
+      return { ...item, id: id === undefined || id === null ? "" : id, name };
+    })
+    .filter((item) => String(item.id).trim() !== "");
+}
+
+/** 选择器里已经勾上的值：过滤掉 null / 空串，显示的标题才对得上。 */
+function pickerValues(values) {
+  return (Array.isArray(values) ? values : [])
+    .filter((id) => id !== undefined && id !== null && String(id).trim() !== "");
 }
 
 /* ================================================================== */
@@ -1744,12 +2536,11 @@ function chainEditor(chain, onChange, opts = {}) {
   title.appendChild(el("span", "", "动作链"));
   title.appendChild(
     tipBox(
-      "按顺序执行。持续动作（睡觉、看书…）会先开始，完成后继续执行后面的步骤。" +
-        "注意：地点是硬条件——要求「在书房」的动作，如果她当时不在书房，这一步会被跳过。" +
-        "可以在这里补一步「移动到」，或者打开下面日程的「自动先走过去」。" +
+      "按顺序执行：持续动作先开始，做完再走下一步。地点是硬条件，" +
+        "不在该地点的步骤会被跳过——可以在前面补一步「移动到」。" +
         (opts.smart
-          ? "（这条日程开了「智能日程」：到点由大模型给这几步补「想干什么」，这里不用填。）"
-          : "工具型 / 指令型步骤要填「意图」——说清这一步想干什么，参数才会被补出来。"),
+          ? "（已开「智能日程」：意图由大模型到点补写，这里不用填。）"
+          : "工具型 / 指令型步骤要填「意图」，参数才补得出来。"),
     ),
   );
   wrapper.appendChild(title);
@@ -2011,6 +2802,9 @@ function kvEditor(label, hint, map, onChange, opts = {}) {
 async function boot() {
   bindPicker();
   bindDialog();
+  bindHistory();
+  bindReview();
+  bindEval();
   if (!bridge || typeof bridge.apiGet !== "function") {
     $("login").classList.remove("hidden");
     $("login-message").textContent =
@@ -2077,6 +2871,11 @@ async function startApp() {
   renderHistoryWindows();
   watchPronoun();
   await loadAll();
+  // 第一次打开：把她"必须先配的"和"最影响手感的"集中问一遍（关掉也算看过，不反复弹）
+  if (!ui.config || !ui.config.world) return;
+  if (ui.config.world.wizard_done !== true) {
+    openWizard();
+  }
 }
 
 async function loadAll() {
@@ -2132,6 +2931,7 @@ function bindTabs() {
       section.classList.toggle("active", section.id === `tab-${button.dataset.tab}`);
     });
     if (button.dataset.tab === "status") refreshStatus();
+    if (button.dataset.tab === "contacts") loadContacts();
     if (button.dataset.tab === "memories") loadMemories();
     if (button.dataset.tab === "logs") loadLogs();
     if (button.dataset.tab === "map") loadOverview();
@@ -2142,9 +2942,124 @@ function bindTabs() {
 
 function bindButtons() {
   $("save").addEventListener("click", saveAll);
+  if ($("settings-save-top")) {
+    $("settings-save-top").addEventListener("click", saveAll);
+  }
+  if ($("settings-search")) {
+    $("settings-search").addEventListener("input", (event) =>
+      searchSettings(event.target.value),
+    );
+  }
+  if ($("event-refresh")) {
+    $("event-refresh").addEventListener("click", loadEvents);
+  }
+  if ($("contacts-refresh")) {
+    $("contacts-refresh").addEventListener("click", loadContacts);
+  }
+  if ($("contacts-consolidate")) {
+    $("contacts-consolidate").addEventListener("click", async () => {
+      const session = $("contacts-session") ? $("contacts-session").value : "";
+      if (!session) return;
+      toast("正在整理…（会调用「睡眠整理模型」）");
+      try {
+        const result = await apiPost("profile/consolidate", { session });
+        toast(result.note || result.summary || "整理完了");
+        loadContacts();
+      } catch (error) {
+        toast(error.message || "整理失败");
+      }
+    });
+  }
+  if ($("contacts-preview")) {
+    $("contacts-preview").addEventListener("click", async () => {
+      const session = $("contacts-session") ? $("contacts-session").value : "";
+      if (!session) return;
+      toast("正在跑一遍整理（只看结果，不写库）…");
+      try {
+        const result = await apiPost("profile/consolidate", {
+          session,
+          dry_run: true,
+        });
+        renderConsolidatePreview(result);
+      } catch (error) {
+        toast(error.message || "预览失败");
+      }
+    });
+  }
+  if ($("contacts-search")) {
+    $("contacts-search").addEventListener("input", renderContactsList);
+  }
+  if ($("contacts-session")) {
+    $("contacts-session").addEventListener("change", () => {
+      ui.contactUser = "";
+      loadContacts();
+    });
+  }
+  if ($("contacts-goto-sessions")) {
+    $("contacts-goto-sessions").addEventListener("click", () => {
+      const button = document.querySelector('#tabs button[data-tab="sessions"]');
+      if (button) button.click();
+    });
+  }
+  if ($("contacts-list")) {
+    $("contacts-list").addEventListener("click", (event) => {
+      const row = event.target.closest(".contact-row");
+      if (!row) return;
+      ui.contactUser = row.dataset.user;
+      loadContactDetail(ui.contactUser);
+    });
+  }
+  if ($("contacts-detail")) {
+    $("contacts-detail").addEventListener("click", (event) => {
+      const node = event.target.closest("[data-act]");
+      if (!node) return;
+      contactAction(node);
+    });
+  }
+  if ($("event-history")) {
+    $("event-history").addEventListener("click", () => openEventModal());
+  }
+  if ($("event-modal-close")) {
+    $("event-modal-close").addEventListener("click", closeEventModal);
+  }
+  if ($("event-modal-done")) {
+    $("event-modal-done").addEventListener("click", closeEventModal);
+  }
+  if ($("event-modal")) {
+    // 点遮罩关掉弹窗（和动作抽屉一个手感）
+    $("event-modal").addEventListener("click", (event) => {
+      if (event.target === $("event-modal")) closeEventModal();
+    });
+  }
+  if ($("event-submit")) {
+    $("event-submit").addEventListener("click", async () => {
+      const box = $("event-seed");
+      const text = box ? box.value.trim() : "";
+      if (!text) {
+        toast("先写一件要发生的事，例如：出门忘了带伞");
+        return;
+      }
+      try {
+        const data = await apiPost("state/action", { action: "event", text, session: $("status-session").value });
+        toast((data && data.note) || "这件事发生了，看她怎么处理");
+        if (box) box.value = "";
+        ui.events = (data && data.events) || ui.events;
+        renderEventsPanel();
+        refreshStatus();
+      } catch (error) {
+        toast(`投递失败：${error.message || error}`);
+      }
+    });
+  }
 
   $("status-refresh").addEventListener("click", refreshStatus);
-  $("status-session").addEventListener("change", refreshStatus);
+  $("status-session").addEventListener("change", () => {
+    refreshStatus();
+    // 换会话 = 可能换了人格：简易人设跟着刷新一遍
+    if (typeof ui.loadPersonaBrief === "function") {
+      ui.loadPersonaBrief({ overwrite: true });
+    }
+  });
   $("values-edit").addEventListener("click", () => {
     ui.valuesEdit = !ui.valuesEdit;
     ui.valueDraft = {};
@@ -2192,9 +3107,12 @@ function bindButtons() {
   $("action-cancel").addEventListener("click", closeActionDrawer);
   // 点遮罩等同「取消」：草稿丢掉，不写回列表
   $("drawer-backdrop").addEventListener("click", closeActionDrawer);
-  $("action-save").addEventListener("click", saveActionDraft);
+  $("action-save").addEventListener("click", () => {
+    if (saveActionDraft()) closeActionDrawer();
+  });
   $("schedule-add").addEventListener("click", addSchedule);
   $("session-add").addEventListener("click", addSession);
+  $("group-add").addEventListener("click", addGroup);
   $("memory-search").addEventListener("click", loadMemories);
   $("memory-add").addEventListener("click", addMemory);
   $("memory-select-all").addEventListener("click", () =>
@@ -2239,6 +3157,7 @@ function bindButtons() {
   $("debug-inject").addEventListener("click", () => loadPrompt("inject"));
   $("preset-save").addEventListener("click", saveCurrentAsPreset);
   $("preset-import").addEventListener("click", importPreset);
+  $("preset-new-default").addEventListener("click", newDefaultPreset);
   $("preset-refresh").addEventListener("click", loadPresets);
   $("debug-auto").addEventListener("click", () => loadPrompt("autonomous"));
   $("debug-backup").addEventListener("click", async () => {
@@ -2282,6 +3201,8 @@ async function saveAll() {
     // 保存即生效：不用再单独点「热加载」
     const reloadResult = await apiPost("reload", {});
     ui.dirty = false;
+    ui.dirtyTabs.clear();
+    renderSettingsTabs();
     setSaveState("已保存并生效");
     toast(
       warnings.length
@@ -2456,7 +3377,7 @@ async function nicknameAction(action) {
 }
 
 function renderSessionSelects() {
-  const ids = ui.sessions.map((item) => item.session_id);
+  const options = scopeOptions();
   [
     "status-session",
     "memory-session",
@@ -2464,17 +3385,56 @@ function renderSessionSelects() {
     "log-session",
     "map-session",
     "schedule-session",
+    "contacts-session",
   ].forEach((id) => {
     const select = $(id);
+    if (!select) return;
     const previous = select.value;
     select.innerHTML = "";
-    if (!ids.length) {
+    if (!options.length) {
       select.appendChild(option("", "（还没有白名单会话）"));
       return;
     }
-    ids.forEach((sessionId) => select.appendChild(option(sessionId, sessionId)));
-    select.value = ids.includes(previous) ? previous : ids[0];
+    options.forEach((item) => select.appendChild(option(item.value, item.label)));
+    select.value = options.some((item) => item.value === previous)
+      ? previous
+      : options[0].value;
   });
+}
+
+/**
+ * 编辑器里所有"选会话"的地方都列这个：会话组 + 没进组的会话。
+ *
+ * ``withMembers``：连组里的成员会话也一起列（日程的落点需要——勾组是把话落在组代表那里，
+ * 想指定"就说给这个群听"得能单独勾到它）。
+ */
+function scopeOptions({ withMembers = false } = {}) {
+  const options = [];
+  const grouped = new Set();
+  const ownerOf = new Map();
+  groups().forEach((group) => {
+    (group.sessions || []).forEach((id) => {
+      grouped.add(id);
+      ownerOf.set(id, group);
+    });
+    options.push({
+      value: group.id,
+      label: `组：${group.name || group.id}（${(group.sessions || []).length} 个会话）`,
+      desc: (group.sessions || []).join("、") || "（还没有成员）",
+    });
+  });
+  ui.sessions.forEach((session) => {
+    const owner = ownerOf.get(session.session_id);
+    if (owner && !withMembers) return;
+    options.push({
+      value: session.session_id,
+      label: `${session.note ? session.note + " · " : ""}${session.session_id}`,
+      desc:
+        (session.type === "private" ? "私聊" : "群聊") +
+        (owner ? ` · 属于「${owner.name || owner.id}」` : ""),
+    });
+  });
+  return options;
 }
 
 const PLAN_SOURCES = {
@@ -2745,6 +3705,19 @@ function renderStatusSections(data, stateLabel) {
   } else {
     statusLine(timeBox, "下一条日程", "没有启用的日程", "muted");
   }
+  // 别的插件留下的状态（今日穿搭、背包…）：记在她这儿的状态槽
+  const slots = data.external_state || {};
+  const slotKeys = Object.keys(slots);
+  if (slotKeys.length) {
+    slotKeys.forEach((key) => {
+      const info = slots[key] || {};
+      const label = String(info.label || key);
+      const text = String(info.text || "").trim();
+      const at = Number(info.at || 0);
+      const when = at ? `（${agoText(Math.max(0, Date.now() / 1000 - at))}拿到的）` : "";
+      statusLine(timeBox, label, `${text}${when}`.trim() || "（空）", "muted");
+    });
+  }
 
   // ---------------- 正在进行 ----------------
   const progressBox = $("status-progress");
@@ -2829,9 +3802,9 @@ function renderStatusSections(data, stateLabel) {
   statusLine(
     runtimeBox,
     "未回应",
-    `群聊里攒了 ${Number(data.chat_unreplied_count || 0)} 条没回（留档 ${
-      data.chat_history_count || 0
-    } 条）`,
+    `本会话 ${Number(data.chat_unreplied_count || 0)} 行没回、${
+      Number(data.chat_replied_count || 0)
+    } 行已回（留档 ${data.chat_history_count || 0} 条）`,
   );
   const chatNote = String(data.chat_note || "").trim();
   statusLine(
@@ -2914,6 +3887,56 @@ function renderStatusSections(data, stateLabel) {
     budgetParts.length ? budgetParts.join(" · ") : "（没有额度配置）",
     budgetParts.length ? "" : "muted",
   );
+  const chatMood = data.chat_mood || {};
+  if (chatMood.daily_cap) {
+    const spent = Number(chatMood.spent || 0);
+    statusLine(
+      runtimeBox,
+      "聊天的情绪额度",
+      `今天 ${spent >= 0 ? "+" : ""}${spent.toFixed(3)} / ${Number(chatMood.daily_cap).toFixed(2)}`
+        + `（单轮最多 ${Number(chatMood.turn_cap || 0).toFixed(3)}）`
+        + "｜日常聊天改的是好感度，心情的量程留给真发生的事",
+      "",
+    );
+  }
+  const miss = data.miss || {};
+  const missPeople = miss.people || [];
+  if (missPeople.length || miss.push_cap) {
+    const parts = missPeople.slice(0, 3).map((item) => {
+      if (item.waiting) {
+        return `${item.name}（刚聊过，${item.ready_in_minutes} 分钟后才会开始想）`;
+      }
+      const flag = item.will_reach_out ? "，到点了会去找" : "";
+      return `${item.name} ${Number(item.value || 0).toFixed(2)}${flag}`;
+    });
+    const quota = miss.push_cap
+      ? `今天还能主动找 ${Number(miss.push_left || 0)}/${miss.push_cap} 次`
+      : "";
+    statusLine(
+      runtimeBox,
+      "想找的人",
+      (parts.length ? parts.join(" · ") : "（暂时没惦记谁）")
+        + `｜阈值 ${Number(miss.threshold || 0).toFixed(2)} 就会主动去找`
+        + (quota ? `｜${quota}` : "")
+        + (miss.enabled === false ? "｜（主动找人已关闭）" : ""),
+      "",
+    );
+  }
+  const topics = data.open_topics || [];
+  if (topics.length) {
+    statusLine(
+      runtimeBox,
+      "还没聊完的",
+      topics
+        .map(
+          (item) =>
+            `${item.who_name || item.who || "某人"}：${item.text}`
+            + (Number(item.asked) ? `（已问 ${item.asked} 次）` : ""),
+        )
+        .join("；"),
+      "",
+    );
+  }
   const channel = data.channel || {};
   const blocked = Number(channel.send_blocked_seconds || 0);
   statusLine(
@@ -2975,7 +3998,7 @@ async function renderHistory() {
   ui.historyBusy = true;
   let data = null;
   try {
-    data = await apiGet("history", { session: sessionId, hours: ui.historyHours });
+    data = await apiGet("state/history", { session: sessionId, hours: ui.historyHours });
   } catch (error) {
     data = null;
   } finally {
@@ -2997,7 +4020,7 @@ async function renderHistory() {
 function drawHistoryChart(canvas, points) {
   const ratio = window.devicePixelRatio || 1;
   const width = Math.max(320, canvas.clientWidth || 640);
-  const height = 160;
+  const height = 184;
   canvas.width = Math.round(width * ratio);
   canvas.height = Math.round(height * ratio);
   canvas.style.height = `${height}px`;
@@ -3005,16 +4028,19 @@ function drawHistoryChart(canvas, points) {
   if (!ctx) return;
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, width, height);
-  const pad = { left: 26, right: 8, top: 8, bottom: 16 };
+  // 图例放右上角：挤在左下角会和 0.0 这条网格线的刻度叠在一起
+  const pad = { left: 30, right: 12, top: 30, bottom: 12 };
   const innerW = width - pad.left - pad.right;
   const innerH = height - pad.top - pad.bottom;
   const style = getComputedStyle(document.body);
   const line = style.getPropertyValue("--line").trim() || "#e2e6ec";
   const muted = style.getPropertyValue("--muted").trim() || "#7a8798";
+  const accent = style.getPropertyValue("--accent").trim() || "#5b7cfa";
+  const second = style.getPropertyValue("--chart-2").trim() || "#e08c3c";
 
   ctx.strokeStyle = line;
   ctx.fillStyle = muted;
-  ctx.font = "10px sans-serif";
+  ctx.font = "10px ui-monospace, Menlo, Consolas, monospace";
   ctx.lineWidth = 1;
   [0, 0.5, 1].forEach((level) => {
     const y = pad.top + innerH * (1 - level);
@@ -3042,12 +4068,15 @@ function drawHistoryChart(canvas, points) {
   ctx.setLineDash([]);
 
   const series = [
-    { key: "affect", color: "#5b7cfa", label: "心潮" },
-    { key: "valence", color: "#e08c3c", label: "效价" },
+    // 颜色跟着 CSS 的 token 走，换主题不用回来改这里
+    { key: "affect", color: accent, label: "心潮" },
+    { key: "valence", color: second, label: "效价" },
   ];
   series.forEach((item) => {
     ctx.strokeStyle = item.color;
-    ctx.lineWidth = 1.6;
+    ctx.lineWidth = 1.8;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
     ctx.beginPath();
     points.forEach((point, index) => {
       const x = xOf(point.at);
@@ -3057,18 +4086,1321 @@ function drawHistoryChart(canvas, points) {
     });
     ctx.stroke();
   });
-  ctx.font = "10px sans-serif";
-  let legendX = pad.left;
-  series.forEach((item) => {
+  // 图例：右上角一排，色块 + 文字
+  ctx.font = "10px ui-monospace, Menlo, Consolas, monospace";
+  const legendWidths = series.map((item) => 14 + ctx.measureText(item.label).width);
+  let legendX = width - pad.right - legendWidths.reduce((acc, value) => acc + value + 12, -12);
+  series.forEach((item, index) => {
     ctx.fillStyle = item.color;
-    ctx.fillRect(legendX, height - 10, 8, 3);
+    ctx.beginPath();
+    ctx.roundRect(legendX, pad.top - 19, 10, 3, 2);
+    ctx.fill();
     ctx.fillStyle = muted;
-    ctx.fillText(item.label, legendX + 12, height - 7);
-    legendX += 46;
+    ctx.fillText(item.label, legendX + 14, pad.top - 15);
+    legendX += legendWidths[index] + 12;
   });
 }
 
+/* ================================================================== */
+/* 她遇上什么事：能力值雷达 + 当前这件事 + 历史事件                      */
+/* ================================================================== */
+
+ui.radarValues = null;
+ui.eventModalOpen = false;
+ui.eventModalFocus = "";
+ui.eventModalOpenRows = new Set();
+ui.eventPending = false;
+ui.renderSigs = {};
+
+/**
+ * 状态页每几秒会刷新一次：内容没变就别重画。
+ *
+ * 重画会把入场动画和弹窗滚动位置一起重置——看起来像页面在闪，
+ * 而且鼠标停在历史事件里翻细节时突然跳回顶部。
+ */
+function renderOnce(key, signature) {
+  ui.renderSigs = ui.renderSigs || {};
+  if (ui.renderSigs[key] === signature) return false;
+  ui.renderSigs[key] = signature;
+  return true;
+}
+
+/** 一条线索此刻的状态：进行中 / 等群友 / 挂着没演完 / 已完结。 */
+function eventStatusMeta(thread) {
+  if (!thread || thread.status !== "open") {
+    return { key: "closed", label: "已完结", cls: "closed" };
+  }
+  if (thread.waiting_help) {
+    return { key: "help", label: "等群友拿主意", cls: "help" };
+  }
+  if (thread.suspended) {
+    return { key: "idle", label: "挂着没演完", cls: "idle" };
+  }
+  return { key: "open", label: "进行中", cls: "open" };
+}
+
+function eventClockText(at) {
+  const stamp = Number(at || 0);
+  if (!stamp) return "";
+  const date = new Date(stamp * 1000);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/** 事件里的时间：刚发生说人话，久远的写日期。 */
+function eventTimeText(at, now) {
+  const stamp = Number(at || 0);
+  if (!stamp) return "";
+  const diff = Math.max(0, num(now, Date.now() / 1000) - stamp);
+  if (diff < 90) return "刚刚";
+  if (diff < 3600) return `${Math.round(diff / 60)} 分钟前`;
+  if (diff < 86400) return `${Math.round(diff / 3600)} 小时前`;
+  if (diff < 86400 * 3) return `${Math.round(diff / 86400)} 天前`;
+  return eventClockText(stamp);
+}
+
+/** 「还有多久」说成人话（下一幕什么时候来）。 */
+function eventWaitText(at, now) {
+  const left = Number(at || 0) - num(now, Date.now() / 1000);
+  if (!Number.isFinite(left) || left <= 0) return "马上就到";
+  if (left < 90) return `${Math.round(left)} 秒`;
+  if (left < 5400) return `${Math.round(left / 60)} 分钟`;
+  return `${(left / 3600).toFixed(1)} 小时`;
+}
+
+function eventBadge(text, cls = "") {
+  return el("span", `event-badge${cls ? ` ${cls}` : ""}`, text);
+}
+
+/* ---------------- 能力值雷达（替身面板那种） ---------------- */
+
+const RADAR_KEYS = ["stamina", "wits", "dexterity", "composure"];
+
+function radarPoints(values, cx, cy, radius) {
+  const count = values.length || 1;
+  return values.map((value, index) => {
+    const angle = -Math.PI / 2 + (index * 2 * Math.PI) / count;
+    const safe = Math.max(0, Math.min(1, num(value, 0)));
+    return [cx + Math.cos(angle) * radius * safe, cy + Math.sin(angle) * radius * safe];
+  });
+}
+
+function radarPointText(points) {
+  return points.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+}
+
+/**
+ * 画四维能力雷达。值变了就从上一帧补间过去——直接重画会「啪」地跳一下，
+ * 看起来像页面卡了一帧。
+ */
+function renderAbilityRadar(box, abilities) {
+  if (!box) return;
+  const items = RADAR_KEYS.map((key) => {
+    const item = (abilities || {})[key] || {};
+    return {
+      key,
+      label: item.label || key,
+      value: num(item.value, 0),
+      hint: item.hint || "",
+    };
+  });
+  if (!items.some((item) => item.value > 0)) {
+    box.innerHTML = "";
+    box.appendChild(el("p", "muted", "还没有能力值数据。"));
+    return;
+  }
+
+  const size = 210;
+  const cx = size / 2;
+  const cy = size / 2 + 2;
+  const radius = size / 2 - 42;
+  const svgNS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(svgNS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
+  svg.setAttribute("class", "radar");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "能力值雷达图");
+
+  const defs = document.createElementNS(svgNS, "defs");
+  const gradient = document.createElementNS(svgNS, "linearGradient");
+  gradient.setAttribute("id", "radar-fill");
+  gradient.setAttribute("x1", "0");
+  gradient.setAttribute("y1", "0");
+  gradient.setAttribute("x2", "1");
+  gradient.setAttribute("y2", "1");
+  // 渐变用页面 token，和数值条/曲线的颜色保持一致
+  const palette = getComputedStyle(document.body);
+  [
+    ["0%", palette.getPropertyValue("--accent").trim() || "#5b7cfa"],
+    ["100%", palette.getPropertyValue("--ok").trim() || "#35a06b"],
+  ].forEach(([offset, color]) => {
+    const stop = document.createElementNS(svgNS, "stop");
+    stop.setAttribute("offset", offset);
+    stop.setAttribute("stop-color", color);
+    gradient.appendChild(stop);
+  });
+  defs.appendChild(gradient);
+  svg.appendChild(defs);
+
+  [0.25, 0.5, 0.75, 1].forEach((ratio) => {
+    const ring = document.createElementNS(svgNS, "polygon");
+    ring.setAttribute("points", radarPointText(radarPoints(items.map(() => ratio), cx, cy, radius)));
+    ring.setAttribute("class", ratio === 1 ? "radar-ring outer" : "radar-ring");
+    svg.appendChild(ring);
+  });
+
+  const spokes = document.createElementNS(svgNS, "g");
+  spokes.setAttribute("class", "radar-spokes");
+  items.forEach((_item, index) => {
+    const angle = -Math.PI / 2 + (index * 2 * Math.PI) / items.length;
+    const line = document.createElementNS(svgNS, "line");
+    line.setAttribute("x1", String(cx));
+    line.setAttribute("y1", String(cy));
+    line.setAttribute("x2", (cx + Math.cos(angle) * radius).toFixed(1));
+    line.setAttribute("y2", (cy + Math.sin(angle) * radius).toFixed(1));
+    spokes.appendChild(line);
+  });
+  svg.appendChild(spokes);
+
+  const shape = document.createElementNS(svgNS, "polygon");
+  shape.setAttribute("class", "radar-shape");
+  svg.appendChild(shape);
+  const dots = [];
+  items.forEach((item, index) => {
+    const dot = document.createElementNS(svgNS, "circle");
+    dot.setAttribute("class", "radar-dot");
+    dot.setAttribute("r", "3.2");
+    svg.appendChild(dot);
+    dots.push(dot);
+
+    const angle = -Math.PI / 2 + (index * 2 * Math.PI) / items.length;
+    const text = document.createElementNS(svgNS, "text");
+    text.setAttribute("class", "radar-label");
+    text.setAttribute("x", (cx + Math.cos(angle) * (radius + 24)).toFixed(1));
+    text.setAttribute("y", (cy + Math.sin(angle) * (radius + 18)).toFixed(1));
+    text.setAttribute(
+      "text-anchor",
+      Math.abs(Math.cos(angle)) < 0.2 ? "middle" : Math.cos(angle) > 0 ? "start" : "end",
+    );
+    text.setAttribute("dominant-baseline", "middle");
+    text.textContent = `${item.label} ${item.value.toFixed(2)}`;
+    svg.appendChild(text);
+  });
+
+  const paint = (values) => {
+    const points = radarPoints(values, cx, cy, radius);
+    shape.setAttribute("points", radarPointText(points));
+    points.forEach(([x, y], index) => {
+      if (!dots[index]) return;
+      dots[index].setAttribute("cx", x.toFixed(1));
+      dots[index].setAttribute("cy", y.toFixed(1));
+    });
+  };
+
+  const target = items.map((item) => item.value);
+  const from =
+    Array.isArray(ui.radarValues) && ui.radarValues.length === target.length
+      ? ui.radarValues
+      : target.map(() => 0);
+  ui.radarValues = target;
+  paint(from);
+
+  box.innerHTML = "";
+  box.appendChild(svg);
+  const legend = el("div", "radar-legend");
+  items.forEach((item) => {
+    const row = el("div", "radar-legend-row");
+    row.appendChild(el("span", "radar-legend-name", item.label));
+    row.appendChild(el("span", "radar-legend-value", item.value.toFixed(2)));
+    row.appendChild(el("span", "radar-legend-hint muted", item.hint || ""));
+    legend.appendChild(row);
+  });
+  box.appendChild(legend);
+
+  const changed = from.some((value, index) => Math.abs(value - target[index]) > 0.001);
+  if (!changed) {
+    paint(target);
+    return;
+  }
+  const started = performance.now();
+  const duration = 420;
+  const step = (at) => {
+    const t = Math.min(1, (at - started) / duration);
+    const eased = 1 - (1 - t) ** 3;
+    paint(target.map((value, index) => from[index] + (value - from[index]) * eased));
+    if (t < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+/* ---------------- 一幕：她选了什么 → 判定 → 结果 ---------------- */
+
+function eventStepRow(step) {
+  const row = el("li", "event-step");
+  row.appendChild(el("span", "event-step-index", String(step.index || "")));
+  const body = el("div", "event-step-body");
+  const head = el("div", "event-step-head");
+  head.appendChild(el("span", "event-step-desc", step.desc || "（没有选择）"));
+  if (step.tier_label) head.appendChild(el("span", `tier-chip ${step.tier || ""}`, step.tier_label));
+  body.appendChild(head);
+  if (step.result) body.appendChild(el("p", "event-step-result", step.result));
+  const meta = [];
+  if (step.ability) meta.push(`拼的是${step.ability}`);
+  const delta = Object.entries(step.ability_delta || {})
+    .map(([name, value]) => `${name} ${Number(value) > 0 ? "+" : ""}${value}`)
+    .join("、");
+  if (delta) meta.push(delta);
+  if (meta.length) body.appendChild(el("p", "event-step-meta muted", meta.join(" · ")));
+  row.appendChild(body);
+  return row;
+}
+
+function eventTimeline(steps) {
+  const timeline = el("ol", "event-timeline");
+  (steps || []).forEach((step) => timeline.appendChild(eventStepRow(step)));
+  if (!(steps || []).length) {
+    timeline.appendChild(el("li", "event-step empty muted", "还没有分幕（微事件只写结果）。"));
+  }
+  return timeline;
+}
+
+/** 当前这件事：详情 + 「立即推进一幕」/「立刻完结」。 */
+function currentEventNote(thread, pending, now) {
+  const meta = eventStatusMeta(thread);
+  if (meta.key === "help") {
+    return `在等群友拿主意，${formatCountdown((pending || {}).until)}后自己动手`;
+  }
+  if (thread.pending_followup) {
+    return `下一幕：${eventWaitText(thread.next_step_at, now)}后（还没完的是「${thread.pending_followup}」）`;
+  }
+  return `${thread.step_count || 0} 幕 · 开始于 ${eventTimeText(thread.opened_at, now)}`;
+}
+
+function renderCurrentEvent(box, badgeBox, data) {
+  if (!box) return;
+  box.innerHTML = "";
+  ui.eventNoteNode = null;
+  const now = num(data.now, Date.now() / 1000);
+  const threads = data.threads || [];
+  const active = threads.find((item) => item.is_active && item.status === "open") || null;
+  const pending = data.pending_help || {};
+  const meta = active ? eventStatusMeta(active) : null;
+  if (badgeBox) {
+    badgeBox.textContent = meta ? meta.label : "";
+    badgeBox.className = `pane-badge${meta ? ` ${meta.cls}` : ""}`;
+  }
+  if (!active) {
+    box.appendChild(
+      el(
+        "p",
+        "muted event-empty",
+        "现在没遇上什么事。上面「给她安排一件事」可以直接投递一件，她会当场遇上。",
+      ),
+    );
+    return;
+  }
+
+  const titleRow = el("div", "event-title-row");
+  titleRow.appendChild(el("h4", "event-title", active.title || "一件事"));
+  if (active.tier_label) titleRow.appendChild(eventBadge(active.tier_label, "tier"));
+  if (active.place_name) titleRow.appendChild(eventBadge(active.place_name, "place"));
+  if (active.genre) titleRow.appendChild(eventBadge(active.genre, "genre"));
+  if (active.critical) titleRow.appendChild(eventBadge("危险", "danger"));
+  box.appendChild(titleRow);
+  if (active.hook) box.appendChild(el("p", "event-hook", active.hook));
+  box.appendChild(eventTimeline(active.steps));
+
+  const foot = el("div", "event-foot");
+  const note = el("span", "event-foot-note muted", currentEventNote(active, pending, now));
+  ui.eventNoteNode = note;
+  foot.appendChild(note);
+
+  const actions = el("span", "row-item");
+  if (active.can_advance) {
+    const advance = el("button", "ghost small", "立即推进一幕");
+    advance.type = "button";
+    advance.title = "不等那个间隔了，现在就往下演一幕";
+    advance.addEventListener("click", () => eventAction("advance_event", active.id));
+    actions.appendChild(advance);
+  }
+  if (active.can_close) {
+    const close = el("button", "danger small", "立刻完结");
+    close.type = "button";
+    close.title = "这件事就此收尾，写一句总结后结束";
+    close.addEventListener("click", () => closeEventThread(active));
+    actions.appendChild(close);
+  }
+  if (actions.childNodes.length) foot.appendChild(actions);
+  box.appendChild(foot);
+}
+
+/** 最近的线索：一行一条，点开进历史弹窗看细节。 */
+function renderRecentThreads(box, data) {
+  if (!box) return;
+  box.innerHTML = "";
+  const now = num(data.now, Date.now() / 1000);
+  const activeId = data.active_id || "";
+  const others = (data.threads || []).filter((item) => item.id !== activeId).slice(0, 4);
+  if (!others.length) {
+    box.appendChild(el("p", "muted", "还没有别的线索。"));
+    return;
+  }
+  others.forEach((thread) => {
+    const meta = eventStatusMeta(thread);
+    const row = el("button", "event-recent-row");
+    row.type = "button";
+    row.appendChild(el("span", `event-dot ${meta.cls}`));
+    row.appendChild(el("span", "event-recent-title", thread.title || "一件事"));
+    row.appendChild(eventBadge(meta.label, `status ${meta.cls}`));
+    row.appendChild(
+      el(
+        "span",
+        "event-recent-meta muted",
+        `${thread.step_count || 0} 幕 · ${eventTimeText(thread.updated_at || thread.opened_at, now)}`,
+      ),
+    );
+    row.addEventListener("click", () => openEventModal(thread.id));
+    box.appendChild(row);
+  });
+}
+
+/* ---------------- 历史事件弹窗 ---------------- */
+
+/* ==================== 改动历史 ==================== */
+/* ==================== 人设体检 ==================== */
+
+/* ==================== 测评 ==================== */
+
+function openEvalModal(rounds) {
+  const modal = $("eval-modal");
+  if (!modal) return;
+  ui.evalRounds = rounds || [];
+  if ($("eval-modal-hint")) {
+    $("eval-modal-hint").textContent =
+      `下面 ${ui.evalRounds.length} 轮就是要问的问题。确认没问题再点「开始跑」——`
+      + "它带着完整提示词（人设 + 声音样例 + 状态 + 画像）走真实调用，但**不写任何状态**，"
+      + "跑多少遍都不会弄脏她的世界。";
+  }
+  if ($("eval-status")) $("eval-status").textContent = "";
+  renderEvalQuestions();
+  modal.classList.remove("hidden");
+}
+
+function closeEvalModal() {
+  const modal = $("eval-modal");
+  if (modal) modal.classList.add("hidden");
+}
+
+function renderEvalQuestions() {
+  const box = $("eval-body");
+  if (!box) return;
+  box.innerHTML = "";
+  ui.evalRounds.forEach((item, index) => {
+    const card = el("div", "eval-card");
+    const head = el("div", "eval-card-head");
+    head.appendChild(el("span", "review-tag", item.scene || `第 ${index + 1} 轮`));
+    head.appendChild(el("span", "muted", `第 ${index + 1} 轮`));
+    card.appendChild(head);
+    card.appendChild(el("div", "eval-user", `用户：${item.user_text}`));
+    if (item.watch) card.appendChild(el("div", "muted eval-note", `看什么：${item.watch}`));
+    if (item.taboo) card.appendChild(el("div", "muted eval-note", `禁忌：${item.taboo}`));
+    box.appendChild(card);
+  });
+}
+
+function renderEvalResults(data) {
+  const box = $("eval-body");
+  if (!box) return;
+  box.innerHTML = "";
+  (data.results || []).forEach((item) => {
+    const card = el("div", "eval-card");
+    const head = el("div", "eval-card-head");
+    head.appendChild(el("span", "review-tag", item.scene || `第 ${item.index} 轮`));
+    head.appendChild(el("span", "muted", `第 ${item.index} 轮`));
+    if ((item.actions || []).length) {
+      head.appendChild(el("span", "muted", `动作：${item.actions.join("、")}`));
+    }
+    card.appendChild(head);
+    card.appendChild(el("div", "eval-user", `用户：${item.user_text}`));
+    if (item.error) {
+      card.appendChild(el("div", "eval-error", `这一轮挂了：${item.error}`));
+    } else if ((item.reply || []).length) {
+      (item.reply || []).forEach((text) => {
+        card.appendChild(el("div", "eval-reply", text));
+      });
+    } else {
+      card.appendChild(el("div", "muted", "她这一轮没说活（只做了动作，或者保持安静）"));
+    }
+    if (item.reasoning && Object.keys(item.reasoning).length) {
+      const details = el("details", "eval-reason");
+      details.appendChild(el("summary", "", "她的判断"));
+      details.appendChild(
+        el(
+          "div",
+          "muted",
+          Object.entries(item.reasoning)
+            .map(([key, value]) => `${key}：${value}`)
+            .join("\n"),
+        ),
+      );
+      card.appendChild(details);
+    }
+    if (item.watch) card.appendChild(el("div", "muted eval-note", `看什么：${item.watch}`));
+    if (item.taboo) card.appendChild(el("div", "muted eval-note", `禁忌：${item.taboo}`));
+    box.appendChild(card);
+  });
+}
+
+async function runEvalNow() {
+  if (!(ui.evalRounds || []).length) return;
+  const sessionId = $("status-session") ? $("status-session").value : "";
+  const concurrency = Number($("eval-concurrency").value || 3);
+  const providerId = $("eval-provider") ? $("eval-provider").value.trim() : "";
+  const button = $("eval-run");
+  button.disabled = true;
+  if ($("eval-status")) {
+    $("eval-status").textContent =
+      `跑着呢：${ui.evalRounds.length} 轮，并发 ${concurrency}…（真实调用，会花点时间）`;
+  }
+  try {
+    const data = await apiPost("eval-run", {
+      session: sessionId,
+      rounds: ui.evalRounds,
+      concurrency,
+      provider_id: providerId,
+    });
+    renderEvalResults(data);
+    const failed = (data.results || []).filter((item) => item.error).length;
+    if ($("eval-status")) {
+      $("eval-status").textContent = failed
+        ? `跑完 ${data.count} 轮，其中 ${failed} 轮出错`
+        : `跑完 ${data.count} 轮`;
+    }
+  } catch (error) {
+    if ($("eval-status")) $("eval-status").textContent = error.message || "跑失败";
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function bindEval() {
+  if ($("eval-modal-close")) $("eval-modal-close").addEventListener("click", closeEvalModal);
+  if ($("eval-modal-done")) $("eval-modal-done").addEventListener("click", closeEvalModal);
+  if ($("eval-run")) $("eval-run").addEventListener("click", runEvalNow);
+  if ($("eval-modal")) {
+    $("eval-modal").addEventListener("click", (event) => {
+      if (event.target === $("eval-modal")) closeEvalModal();
+    });
+  }
+}
+
+function openReviewModal(report, issueLines) {
+  const modal = $("review-modal");
+  if (!modal) return;
+  ui.reviewReport = report;
+  ui.reviewPicked = new Set();
+  const hint = $("review-modal-hint");
+  if (hint) {
+    hint.textContent =
+      `原文 ${report.persona_chars} 字｜${report.length_hint || ""}。`
+      + "下面每条勾了才会写进角色卡，没勾的原样保留。";
+  }
+  const issueBox = $("review-issues");
+  const changeBox = $("review-changes");
+  issueBox.innerHTML = "";
+  changeBox.innerHTML = "";
+
+  const okPoints = report.ok_points || [];
+  const issues = report.issues || [];
+  if (okPoints.length || issues.length || (report.questions || []).length) {
+    const card = el("div", "review-card");
+    card.appendChild(el("div", "review-card-title", "体检结果"));
+    okPoints.forEach((text) => {
+      const row = el("div", "review-line ok");
+      row.appendChild(el("span", "review-tag ok", "好"));
+      row.appendChild(el("span", "", text));
+      card.appendChild(row);
+    });
+    issues.forEach((item) => {
+      const row = el("div", "review-line");
+      row.appendChild(
+        el("span", `review-tag ${item.level.includes("冲突") ? "warn" : ""}`, item.level),
+      );
+      const body = el("div", "review-line-body");
+      body.appendChild(el("div", "", `${item.kind}：${item.detail}`));
+      if (item.quote) body.appendChild(el("div", "review-quote", item.quote));
+      row.appendChild(body);
+      card.appendChild(row);
+    });
+    (report.questions || []).forEach((text) => {
+      const row = el("div", "review-line");
+      row.appendChild(el("span", "review-tag", "待确认"));
+      row.appendChild(el("span", "", text));
+      card.appendChild(row);
+    });
+    issueBox.appendChild(card);
+  }
+
+  function updateCount() {
+    if ($("review-count")) {
+      $("review-count").textContent = `已选 ${ui.reviewPicked.size} / ${
+        (report.rewrite || []).length + (report.add || []).length
+      } 条`;
+    }
+  }
+
+  function addChangeCard(kind, item, index) {
+    const value = `${kind}${index}`;
+    const card = el("label", "review-card change");
+    const head = el("div", "review-card-head");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.addEventListener("change", () => {
+      if (box.checked) ui.reviewPicked.add(value);
+      else ui.reviewPicked.delete(value);
+      updateCount();
+    });
+    head.appendChild(box);
+    head.appendChild(
+      el("span", "review-tag", kind === "rewrite" ? "改写" : `新增·${item.field || "补充"}`),
+    );
+    if (item.why) head.appendChild(el("span", "muted", item.why));
+    card.appendChild(head);
+    if (kind === "rewrite") {
+      card.appendChild(el("div", "review-before", item.before));
+      card.appendChild(el("div", "review-arrow", "↓"));
+      card.appendChild(el("div", "review-after", item.after));
+    } else {
+      card.appendChild(el("div", "review-after", item.text));
+    }
+    changeBox.appendChild(card);
+  }
+
+  (report.rewrite || []).forEach((item, index) => addChangeCard("rewrite", item, index));
+  (report.add || []).forEach((item, index) => addChangeCard("add", item, index));
+  if (!changeBox.children.length) {
+    changeBox.appendChild(
+      el("p", "muted", "模型没给出可应用的改动——上面那些是它看到的问题，可以照着改。"),
+    );
+  }
+  updateCount();
+  modal.classList.remove("hidden");
+}
+
+function closeReviewModal() {
+  const modal = $("review-modal");
+  if (modal) modal.classList.add("hidden");
+}
+
+async function applyReviewPicked() {
+  const report = ui.reviewReport || {};
+  const picked = ui.reviewPicked || new Set();
+  if (!picked.size) {
+    toast("一条都没勾：那就什么都不改");
+    return;
+  }
+  const rewrite = [];
+  const add = [];
+  (report.rewrite || []).forEach((item, index) => {
+    if (picked.has(`rewrite${index}`)) rewrite.push(item);
+  });
+  (report.add || []).forEach((item, index) => {
+    if (picked.has(`add${index}`)) add.push(item);
+  });
+  try {
+    const result = await apiPost("persona/apply", { rewrite, add });
+    const bits = [`改了 ${(result.applied || []).length} 处`];
+    if ((result.skipped || []).length) bits.push(`跳过：${result.skipped.join("；")}`);
+    bits.push(`现在 ${result.chars} 字`);
+    toast(bits.join("｜"));
+    closeReviewModal();
+    ui.config = await apiGet("config");
+    renderSettings();
+  } catch (error) {
+    toast(error.message || "应用失败");
+  }
+}
+
+function bindReview() {
+  if ($("review-modal-close")) {
+    $("review-modal-close").addEventListener("click", closeReviewModal);
+  }
+  if ($("review-modal-cancel")) {
+    $("review-modal-cancel").addEventListener("click", closeReviewModal);
+  }
+  if ($("review-modal-apply")) {
+    $("review-modal-apply").addEventListener("click", applyReviewPicked);
+  }
+  if ($("review-modal")) {
+    $("review-modal").addEventListener("click", (event) => {
+      if (event.target === $("review-modal")) closeReviewModal();
+    });
+  }
+}
+
+const HISTORY_BLOCK_LABELS = {
+  map: "地图",
+  actions: "动作",
+  settings: "世界设置",
+  persona: "人设",
+  schedules: "日程",
+  sessions: "会话",
+};
+
+function historyBlockList() {
+  return Object.keys(HISTORY_BLOCK_LABELS);
+}
+
+function relativeTime(text) {
+  const stamp = Date.parse(String(text || "").replace(" ", "T"));
+  if (!stamp) return "";
+  const minutes = Math.round((Date.now() - stamp) / 60000);
+  if (minutes < 1) return "刚刚";
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  return `${Math.round(hours / 24)} 天前`;
+}
+
+async function openHistoryModal() {
+  const modal = $("history-modal");
+  if (!modal) return;
+  ui.historySelected = ui.historySelected || "";
+  ui.historyBlocks = ui.historyBlocks || new Set(historyBlockList());
+  modal.classList.remove("hidden");
+  await refreshHistory();
+}
+
+function closeHistoryModal() {
+  const modal = $("history-modal");
+  if (modal) modal.classList.add("hidden");
+}
+
+async function refreshHistory() {
+  const list = $("history-list");
+  if (!list) return;
+  let data = {};
+  try {
+    data = await apiGet("history");
+  } catch (error) {
+    toast(error.message || "读历史失败");
+    return;
+  }
+  const items = data.items || [];
+  ui.historyItems = items;
+  if ($("history-count")) {
+    $("history-count").textContent = items.length
+      ? `共 ${items.length} 条（上限 ${data.keep || 50}）`
+      : "还没有历史";
+  }
+  list.innerHTML = "";
+  if (!items.length) {
+    list.appendChild(el("p", "muted", "还没有记录：改一次配置（保存 / 应用预设 / 生成）之后这里就会有一条。"));
+    if ($("history-detail")) $("history-detail").innerHTML = "";
+    return;
+  }
+  if (!items.some((item) => item.id === ui.historySelected)) {
+    ui.historySelected = items[0].id;
+  }
+  items.forEach((item) => {
+    const row = el("button", "history-row");
+    row.type = "button";
+    if (item.id === ui.historySelected) row.classList.add("active");
+    const head = el("div", "history-row-head");
+    head.appendChild(el("strong", "", item.created_at || item.name || item.id));
+    const ago = relativeTime(item.created_at);
+    if (ago) head.appendChild(el("span", "muted", ago));
+    if (item.legacy) head.appendChild(el("span", "tag", "旧版备份"));
+    row.appendChild(head);
+    row.appendChild(
+      el("span", "muted", `${item.reason || "改动"}｜${item.summary || ""}`),
+    );
+    row.addEventListener("click", () => {
+      ui.historySelected = item.id;
+      renderHistoryRows();
+      loadHistoryDetail(item.id);
+    });
+    list.appendChild(row);
+  });
+  await loadHistoryDetail(ui.historySelected);
+}
+
+function renderHistoryRows() {
+  const list = $("history-list");
+  if (!list) return;
+  Array.from(list.children).forEach((row, index) => {
+    const item = (ui.historyItems || [])[index];
+    if (!item) return;
+    row.classList.toggle("active", item.id === ui.historySelected);
+  });
+}
+
+function historyText(value) {
+  return JSON.stringify(value ?? {}, null, 2);
+}
+
+function historyValueText(value) {
+  if (typeof value === "string") return value;
+  if (value === undefined) return "（没有）";
+  return JSON.stringify(value, null, 2);
+}
+
+/**
+ * 两份配置之间**改了哪几处**。
+ *
+ * 以前是把两边 JSON 逐行比一遍，然后把"删掉的行"和"新增的行"各列一坨——
+ * 整块 settings 好几千行，根本看不出动的是哪一处。现在按**路径**递归比：
+ * `persona.text`、`settings.profile.bonds[2].cap` 这样一条条列出来。
+ */
+function historyDiffPairs(before, after, limit = 60) {
+  const rows = [];
+  const push = (item) => {
+    if (rows.length < limit) rows.push(item);
+  };
+  const walk = (left, right, path) => {
+    if (rows.length >= limit) return;
+    const bothArrays = Array.isArray(left) && Array.isArray(right);
+    if (bothArrays) {
+      const max = Math.max(left.length, right.length);
+      for (let index = 0; index < max && rows.length < limit; index += 1) {
+        const at = path ? `${path}[${index}]` : `[${index}]`;
+        if (index >= left.length) push({ path: at, kind: "add", after: right[index] });
+        else if (index >= right.length) push({ path: at, kind: "del", before: left[index] });
+        else walk(left[index], right[index], at);
+      }
+      return;
+    }
+    const bothObjects =
+      left && right && typeof left === "object" && typeof right === "object";
+    if (bothObjects) {
+      const keys = [...Object.keys(left)];
+      Object.keys(right).forEach((key) => {
+        if (!keys.includes(key)) keys.push(key);
+      });
+      keys.forEach((key) => {
+        const at = path ? `${path}.${key}` : key;
+        if (!(key in left)) push({ path: at, kind: "add", after: right[key] });
+        else if (!(key in right)) push({ path: at, kind: "del", before: left[key] });
+        else walk(left[key], right[key], at);
+      });
+      return;
+    }
+    if (JSON.stringify(left) !== JSON.stringify(right)) {
+      push({ path: path || "（整块）", kind: "change", before: left, after: right });
+    }
+  };
+  walk(before ?? {}, after ?? {}, "");
+  return rows;
+}
+
+function historyBlockPayload(body, block) {
+  const source = body || {};
+  if (block === "schedules") return source.schedules || {};
+  if (block === "sessions") return source.sessions || {};
+  const world = source.world || {};
+  if (block === "map") {
+    return {
+      zones: world.zones,
+      zone_edges: world.zone_edges,
+      nodes: world.nodes,
+      edges: world.edges,
+    };
+  }
+  if (block === "actions") return world.actions || {};
+  if (block === "persona") return world.persona || {};
+  const skip = new Set(["zones", "zone_edges", "nodes", "edges", "actions", "persona"]);
+  const settings = {};
+  Object.keys(world).forEach((key) => {
+    if (!skip.has(key)) settings[key] = world[key];
+  });
+  return settings;
+}
+
+async function loadHistoryDetail(snapshotId) {
+  const box = $("history-detail");
+  if (!box) return;
+  box.innerHTML = "";
+  if (!snapshotId) return;
+  let detail = {};
+  try {
+    detail = await apiGet("history/item", { id: snapshotId });
+  } catch (error) {
+    box.appendChild(el("p", "muted", error.message || "读不到这条历史"));
+    return;
+  }
+  const head = el("div", "history-detail-head");
+  head.appendChild(el("strong", "", detail.created_at || detail.id));
+  head.appendChild(el("span", "muted", `｜${detail.reason || "改动"}｜${detail.summary || ""}`));
+  box.appendChild(head);
+
+  const picked = ui.historyBlocks || new Set(historyBlockList());
+  const pick = el("div", "history-blocks");
+  historyBlockList().forEach((key) => {
+    const changed = (detail.changed || []).includes(key);
+    const label = el("label", "history-block");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = picked.has(key);
+    input.addEventListener("change", () => {
+      if (input.checked) picked.add(key);
+      else picked.delete(key);
+      ui.historyBlocks = picked;
+    });
+    label.appendChild(input);
+    label.appendChild(
+      el("span", changed ? "history-changed" : "", HISTORY_BLOCK_LABELS[key] || key),
+    );
+    if (changed) label.appendChild(el("span", "tag", "和现在不同"));
+    pick.appendChild(label);
+  });
+  box.appendChild(pick);
+
+  const diffs = el("div", "history-diff");
+  let changedCount = 0;
+  historyBlockList().forEach((key) => {
+    if (!(detail.changed || []).includes(key)) return;
+    changedCount += 1;
+    const pairs = historyDiffPairs(
+      historyBlockPayload(detail.snapshot, key),
+      historyBlockPayload(detail.current, key),
+    );
+    const item = el("div", "history-diff-block");
+    item.appendChild(
+      el(
+        "div",
+        "history-diff-title",
+        `${HISTORY_BLOCK_LABELS[key]}：${pairs.length} 处改动`,
+      ),
+    );
+    if (!pairs.length) {
+      item.appendChild(el("p", "muted", "（这一块内容相同）"));
+    }
+    pairs.forEach((pair) => {
+      const card = el("div", "history-pair");
+      const head = el("div", "history-pair-head");
+      head.appendChild(el("code", "history-path", pair.path || "（整块）"));
+      head.appendChild(
+        el(
+          "span",
+          "review-tag",
+          pair.kind === "add" ? "新增" : pair.kind === "del" ? "删除" : "改动",
+        ),
+      );
+      card.appendChild(head);
+      if (pair.kind !== "add") {
+        card.appendChild(el("div", "review-before", historyValueText(pair.before).slice(0, 400)));
+      }
+      if (pair.kind !== "del") {
+        card.appendChild(el("div", "review-after", historyValueText(pair.after).slice(0, 400)));
+      }
+      item.appendChild(card);
+    });
+    diffs.appendChild(item);
+  });
+  if (!changedCount) {
+    diffs.appendChild(el("p", "muted", "这一版和现在的配置完全一样。"));
+  }
+  box.appendChild(diffs);
+
+  const actions = el("div", "history-actions");
+  const restore = el("button", "small primary", "恢复选中的部分");
+  restore.type = "button";
+  restore.addEventListener("click", () => restoreHistory(detail));
+  actions.appendChild(restore);
+  const remove = el("button", "small ghost danger", "删除这条");
+  remove.type = "button";
+  remove.disabled = Boolean(detail.legacy);
+  if (detail.legacy) remove.title = "旧版备份不在这里删，请到 presets/backups 目录处理";
+  remove.addEventListener("click", () => deleteHistoryItem(detail));
+  actions.appendChild(remove);
+  box.appendChild(actions);
+}
+
+async function restoreHistory(detail) {
+  const blocks = Array.from(ui.historyBlocks || new Set(historyBlockList()));
+  if (!blocks.length) {
+    toast("至少选一块要恢复的内容");
+    return;
+  }
+  const labels = blocks.map((key) => HISTORY_BLOCK_LABELS[key] || key).join("、");
+  const ok = await confirmDialog({
+    title: "恢复这一版？",
+    message: `会把当前配置里的「${labels}」换成 ${detail.created_at} 那一版。恢复前的这一版会自动存进历史，随时能再恢复回来。`,
+    confirmText: "恢复",
+  });
+  if (!ok) return;
+  try {
+    const result = await apiPost("history/restore", { id: detail.id, blocks });
+    const bits = [`已恢复 ${(result.blocks || []).length} 块`];
+    if ((result.warnings || []).length) bits.push(`提醒：${result.warnings.join("；")}`);
+    toast(bits.join("；"));
+    await loadAll();
+    await refreshHistory();
+  } catch (error) {
+    toast(error.message || "恢复失败");
+  }
+}
+
+async function deleteHistoryItem(detail) {
+  const ok = await confirmDialog({
+    title: "删除这条历史？",
+    message: `删除后就翻不回 ${detail.created_at} 这一版了（当前配置不受影响）。`,
+    confirmText: "删除",
+  });
+  if (!ok) return;
+  try {
+    await apiPost("history/delete", { id: detail.id });
+    ui.historySelected = "";
+    toast("已删除");
+    await refreshHistory();
+  } catch (error) {
+    toast(error.message || "删除失败");
+  }
+}
+
+async function clearHistory() {
+  const ok = await confirmDialog({
+    title: "清空改动历史？",
+    message: "会删掉所有历史快照（早期那批 before-apply 备份不受影响）。当前配置不受影响。",
+    confirmText: "清空",
+  });
+  if (!ok) return;
+  try {
+    const result = await apiPost("history/clear", {});
+    ui.historySelected = "";
+    toast(`已清空 ${result.removed || 0} 条`);
+    await refreshHistory();
+  } catch (error) {
+    toast(error.message || "清空失败");
+  }
+}
+
+function bindHistory() {
+  if ($("history-open")) $("history-open").addEventListener("click", () => openHistoryModal());
+  if ($("history-modal-close")) {
+    $("history-modal-close").addEventListener("click", closeHistoryModal);
+  }
+  if ($("history-modal-done")) {
+    $("history-modal-done").addEventListener("click", closeHistoryModal);
+  }
+  if ($("history-clear")) $("history-clear").addEventListener("click", clearHistory);
+  if ($("history-modal")) {
+    $("history-modal").addEventListener("click", (event) => {
+      if (event.target === $("history-modal")) closeHistoryModal();
+    });
+  }
+}
+
+function openEventModal(focusId = "") {
+  const modal = $("event-modal");
+  if (!modal) return;
+  ui.eventModalOpen = true;
+  ui.eventModalFocus = focusId || "";
+  ui.eventModalOpenRows = new Set(focusId ? [focusId] : []);
+  modal.classList.remove("hidden");
+  renderEventModal(true);
+}
+
+function closeEventModal() {
+  const modal = $("event-modal");
+  if (modal) modal.classList.add("hidden");
+  ui.eventModalOpen = false;
+}
+
+function renderEventModal(force = false) {
+  const body = $("event-modal-body");
+  const hint = $("event-modal-hint");
+  if (!body) return;
+  const data = ui.events || {};
+  const threads = data.threads || [];
+  const sessionId = $("status-session") ? $("status-session").value : "";
+  const sig = `${sessionId}|${threads
+    .map((item) => `${item.id}:${item.status}:${item.step_count}:${item.updated_at}`)
+    .join(",")}`;
+  if (force && ui.renderSigs) ui.renderSigs.modal = "";
+  // 刷新时内容没变就不重画：不然滚动位置会跳回顶部、入场动画也会重放一遍
+  if (!renderOnce("modal", sig)) return;
+  const now = num(data.now, Date.now() / 1000);
+  const opened = ui.eventModalOpenRows || new Set();
+  body.innerHTML = "";
+  if (hint) {
+    hint.textContent = threads.length
+      ? "点一条展开看每一幕：她选了什么、判定如何、结果怎样。没完结的可以在这里手动推进或直接完结。"
+      : "还没有经历过什么事。上面「给她安排一件事」可以主动投递一件。";
+  }
+  threads.forEach((thread) => {
+    const meta = eventStatusMeta(thread);
+    const card = el("div", `event-history-row${opened.has(thread.id) ? " open" : ""}`);
+    const head = el("button", "event-history-head");
+    head.type = "button";
+    head.appendChild(el("span", "event-chevron", "▸"));
+    head.appendChild(el("span", "event-history-title", thread.title || "一件事"));
+    head.appendChild(eventBadge(meta.label, `status ${meta.cls}`));
+    if (thread.tier_label) head.appendChild(eventBadge(thread.tier_label, "tier"));
+    head.appendChild(
+      el(
+        "span",
+        "event-history-meta muted",
+        [thread.place_name, `${thread.step_count || 0} 幕`, eventClockText(thread.opened_at)]
+          .filter(Boolean)
+          .join(" · "),
+      ),
+    );
+    head.addEventListener("click", () => {
+      if (opened.has(thread.id)) opened.delete(thread.id);
+      else opened.add(thread.id);
+      ui.eventModalOpenRows = opened;
+      card.classList.toggle("open", opened.has(thread.id));
+      if (opened.has(thread.id) && head.scrollIntoView) {
+        // 展开后把它滚进可见区域：内容多的时候不至于"展开了一屏外的东西"
+        head.scrollIntoView({ block: "nearest" });
+      }
+    });
+    card.appendChild(head);
+
+    const wrap = el("div", "event-history-panel");
+    const inner = el("div", "event-history-inner");
+    if (thread.hook) inner.appendChild(el("p", "event-hook", thread.hook));
+    inner.appendChild(eventTimeline(thread.steps));
+    if (thread.line) inner.appendChild(el("p", "event-history-line", `她自己的账：${thread.line}`));
+    if (thread.pending_followup) {
+      inner.appendChild(
+        el(
+          "p",
+          "event-history-note muted",
+          `还没完的是「${thread.pending_followup}」· 下一幕 ${eventWaitText(thread.next_step_at, now)}后`,
+        ),
+      );
+    }
+    if (thread.status === "closed") {
+      inner.appendChild(
+        el("p", "event-history-note muted", `完结于 ${eventClockText(thread.closed_at || thread.updated_at)}`),
+      );
+    }
+    const actions = el("div", "event-history-actions");
+    if (thread.can_advance) {
+      const advance = el("button", "ghost small", "立即推进一幕");
+      advance.type = "button";
+      advance.addEventListener("click", () => eventAction("advance_event", thread.id));
+      actions.appendChild(advance);
+    }
+    if (thread.can_close) {
+      const close = el("button", "danger small", "立刻完结");
+      close.type = "button";
+      close.addEventListener("click", () => closeEventThread(thread));
+      actions.appendChild(close);
+    }
+    if (actions.childNodes.length) inner.appendChild(actions);
+    wrap.appendChild(inner);
+    card.appendChild(wrap);
+    body.appendChild(card);
+  });
+}
+
+async function closeEventThread(thread) {
+  const ok = await confirmDialog({
+    title: "完结这件事？",
+    message:
+      `「${thread.title || "一件事"}」不再往下演了：她会写一句收尾，然后就翻过去。` +
+      "已经演过的那几幕和记忆都留着。",
+    confirmText: "完结",
+  });
+  if (!ok) return;
+  eventAction("close_event", thread.id);
+}
+
+/** 手动推进 / 立刻完结：回来之后把最新的概览画一遍。 */
+async function eventAction(action, threadId = "") {
+  const sessionId = $("status-session") ? $("status-session").value : "";
+  if (!sessionId) {
+    toast("先选一个会话");
+    return;
+  }
+  if (ui.eventPending) {
+    toast("上一次还在处理，这次点击已忽略");
+    return;
+  }
+  ui.eventPending = true;
+  try {
+    const data = await apiPost("state/action", {
+      session: sessionId,
+      action,
+      thread: threadId,
+    });
+    if (data && data.ok === false && data.note) {
+      toast(data.note);
+      return;
+    }
+    toast((data && data.note) || "已执行");
+    if (data && data.events) {
+      ui.events = data.events;
+      renderEventsPanel();
+    }
+    refreshStatus();
+  } catch (error) {
+    toast(error.message || "执行失败");
+  } finally {
+    ui.eventPending = false;
+  }
+}
+
+/** 拉一次事件概览（能力值 / 未了的事 / 最近的线索）。 */
+async function loadEvents() {
+  const box = $("status-events");
+  if (!box) return;
+  const sessionId = $("status-session") ? $("status-session").value : "";
+  if (!sessionId) {
+    box.textContent = "还没有会话。";
+    ui.events = null;
+    renderEventsPanel();
+    return;
+  }
+  try {
+    ui.events = await apiGet("events", { session: sessionId });
+    renderEventsPanel();
+  } catch (error) {
+    box.textContent = `读取事件失败：${error.message || error}`;
+  }
+}
+
+function renderEventsPanel() {
+  const data = ui.events || {};
+  const abilityBox = $("status-abilities");
+  const listBox = $("status-events");
+  const hintBox = $("event-hint");
+  if (!abilityBox || !listBox) return;
+  const sessionId = $("status-session") ? $("status-session").value : "";
+  const threads = data.threads || [];
+  const threadSig = threads
+    .map((item) => `${item.id}:${item.status}:${item.step_count}:${item.updated_at}`)
+    .join(",");
+
+  const radarSig = `${sessionId}|${RADAR_KEYS.map((key) => num((data.abilities || {})[key]?.value, 0)).join(",")}`;
+  if (renderOnce("radar", radarSig)) renderAbilityRadar(abilityBox, data.abilities || {});
+  const active = threads.find((item) => item.is_active && item.status === "open") || null;
+  const currentSig = active
+    ? [
+        sessionId,
+        active.id,
+        active.status,
+        active.step_count,
+        active.pending_followup,
+        active.can_advance,
+        active.can_close,
+        active.waiting_help,
+        active.suspended,
+        (data.pending_help || {}).state,
+      ].join("|")
+    : `${sessionId}|none`;
+  if (renderOnce("current", currentSig)) {
+    renderCurrentEvent($("event-current"), $("event-current-badge"), data);
+  } else if (active && ui.eventNoteNode) {
+    // 结构没变、只有"还有多久"在走：只改那一行字，不重画整块
+    ui.eventNoteNode.textContent = currentEventNote(
+      active,
+      data.pending_help || {},
+      num(data.now, Date.now() / 1000),
+    );
+  }
+  if (renderOnce("recent", `${sessionId}|${threadSig}`)) {
+    renderRecentThreads(listBox, data);
+  }
+  const countBox = $("event-history-count");
+  if (countBox) countBox.textContent = String(threads.length);
+  const historyButton = $("event-history");
+  if (historyButton) historyButton.disabled = !threads.length;
+  if (ui.eventModalOpen) renderEventModal();
+
+  renderRecentThreads(listBox, data);
+
+  if (hintBox) {
+    hintBox.textContent = data.enabled === false
+      ? "事件系统关着（在「全局设置 → 世界与事件 → 事件」里打开）。"
+      : "她遇上的事都是按当前场景现编的；投递的事件会立刻发生，也会进日志。" +
+        "雷达图是她的底子（只有事件结果会改它），每一幕的细节在上面的「现在这件事」和历史事件里。";
+  }
+}
+
+function formatCountdown(until) {
+  const left = Number(until || 0) - Date.now() / 1000;
+  if (!Number.isFinite(left) || left <= 0) return "一会儿";
+  if (left < 90) return `${Math.round(left)} 秒`;
+  return `${Math.round(left / 60)} 分钟`;
+}
+
+/** 事件题材与权重：代码按权重抽，不让模型自己分配比例。 */
+function genreEditor(world) {
+  world.events = world.events || {};
+  if (!Array.isArray(world.events.genres)) world.events.genres = [];
+  const box = el("div", "full");
+  box.appendChild(
+    fieldHead(
+      "事件题材与权重",
+      "代码按权重抽一个题材，再让模型「就在这个题材里」编——不这样写，模型永远只生成温馨小事，" +
+        "「被人跟着」这种偏暗的题材一次都不会出现。权重 0 = 不生成这一类。",
+    ),
+  );
+  const list = el("div", "genre-list");
+  const paint = () => {
+    list.innerHTML = "";
+    (world.events.genres || []).forEach((item, index) => {
+      const row = el("div", "genre-row");
+      const name = document.createElement("input");
+      name.type = "text";
+      name.value = item.name || "";
+      name.placeholder = "题材名";
+      name.addEventListener("change", () => {
+        item.name = name.value.trim();
+        markDirty();
+      });
+      const weight = document.createElement("input");
+      weight.type = "number";
+      weight.min = "0";
+      weight.step = "1";
+      weight.title = "权重：相对比例，0 就是不生成这一类";
+      weight.value = item.weight ?? 0;
+      weight.addEventListener("change", () => {
+        item.weight = num(weight.value, 0);
+        markDirty();
+      });
+      const examples = document.createElement("input");
+      examples.type = "text";
+      examples.value = item.examples || "";
+      examples.placeholder = "例子：被误解、被人跟着";
+      examples.addEventListener("change", () => {
+        item.examples = examples.value.trim();
+        markDirty();
+      });
+      const remove = el("button", "icon-btn", "✕");
+      remove.type = "button";
+      remove.title = "删掉这一类";
+      remove.addEventListener("click", () => {
+        world.events.genres.splice(index, 1);
+        markDirty();
+        paint();
+      });
+      row.appendChild(name);
+      row.appendChild(weight);
+      row.appendChild(examples);
+      row.appendChild(remove);
+      list.appendChild(row);
+    });
+    const add = el("button", "small ghost", "＋ 加一类题材");
+    add.type = "button";
+    add.addEventListener("click", () => {
+      world.events.genres.push({ name: "新题材", weight: 5, examples: "" });
+      markDirty();
+      paint();
+    });
+    list.appendChild(add);
+  };
+  paint();
+  box.appendChild(list);
+  return box;
+}
+
 async function refreshStatus() {
+  loadEvents();
   const sessionId = $("status-session").value;
   if (!sessionId) {
     setStatusEmpty("还没有添加任何会话白名单。");
@@ -3126,10 +5458,17 @@ async function refreshStatus() {
 
     // 更早的群聊摘要（只有在「上下文 → 留档超了怎么办 = 压成摘要」时才有）
     const summaryBlock = $("status-context");
-    const summary = String(data.chat_summary || "").trim();
-    summaryBlock.textContent = summary
-      ? `留档 ${Number(data.chat_history_count || 0)} 条；更早的群聊摘要：\n${summary}`
-      : `留档 ${Number(data.chat_history_count || 0)} 条，暂无摘要。`;
+    // 摘要按会话分开存：这里把每个会话那一份都列出来（当前会话标成「这里」）
+    const summaryRows = Array.isArray(data.chat_summaries)
+      ? data.chat_summaries.filter((item) => String((item && item.text) || "").trim())
+      : [];
+    const head = `留档 ${Number(data.chat_history_count || 0)} 条（本会话）`;
+    summaryBlock.textContent = summaryRows.length
+      ? `${head}；更早的群聊摘要：\n` +
+        summaryRows
+          .map((item) => `〔${item.label || item.session}〕${String(item.text).trim()}`)
+          .join("\n")
+      : `${head}，暂无摘要。`;
 
     const logs = await apiGet("logs", { session: sessionId, limit: 60 });
     const events = logs.events || [];
@@ -3508,6 +5847,8 @@ function renderWorldMap() {
     const from = byId[edge.from_zone];
     const to = byId[edge.to_zone];
     if (!from || !to) return;
+    // 连线跟着主题的灰阶走，别写死颜色
+    const linkColor = getComputedStyle(document.body).getPropertyValue("--muted").trim() || "#7f8ea8";
     const key = [edge.from_zone, edge.to_zone].sort().join("|");
     seen[key] = (seen[key] || 0) + 1;
     const offset = (seen[key] - 1) * 12;
@@ -3516,7 +5857,7 @@ function renderWorldMap() {
     line.setAttribute("y1", num(from.y) + 20);
     line.setAttribute("x2", num(to.x) + 48);
     line.setAttribute("y2", num(to.y) + 20);
-    line.setAttribute("stroke", "#7f8ea8");
+    line.setAttribute("stroke", linkColor);
     line.setAttribute("stroke-width", "2");
     if (!edge.bidirectional) line.setAttribute("stroke-dasharray", "6 4");
     svg.appendChild(line);
@@ -3630,12 +5971,13 @@ function renderZoneMap() {
     const from = byId[edge.from];
     const to = byId[edge.to];
     if (!from || !to) return;
+    const linkColor = getComputedStyle(document.body).getPropertyValue("--muted").trim() || "#9aa7bd";
     const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
     line.setAttribute("x1", num(from.x) + 48);
     line.setAttribute("y1", num(from.y) + 20);
     line.setAttribute("x2", num(to.x) + 48);
     line.setAttribute("y2", num(to.y) + 20);
-    line.setAttribute("stroke", "#9aa7bd");
+    line.setAttribute("stroke", linkColor);
     line.setAttribute("stroke-width", "2");
     if (!edge.bidirectional) line.setAttribute("stroke-dasharray", "6 4");
     svg.appendChild(line);
@@ -3859,9 +6201,8 @@ function zoneGeneratorBox(zone) {
   title.appendChild(el("span", "", "用大模型生成地点"));
   title.appendChild(
     tipBox(
-      "让模型按这个区域的样子想几个新地点，自动摆位并接上区域内的路线。" +
-        "生成结果只会列在弹窗里，改完、勾选之后才写进配置；动作请到每个地点里生成。" +
-        "模型在插件配置的「内容生成模型」里选。",
+      "按这个区域的样子生成新地点，自动摆位并接上路线。结果先列在弹窗，" +
+        "勾选后才写进配置；动作另到各地点里生成。",
     ),
   );
   wrapper.appendChild(title);
@@ -3915,8 +6256,8 @@ function nodeGeneratorBox(node) {
   title.appendChild(el("span", "", "用大模型生成动作"));
   title.appendChild(
     tipBox(
-      "让模型照着这个地点（以及它所属区域）的样子想几个动作，生成结果先列在弹窗里，" +
-        "改完名字、勾选之后才写进配置。模型在插件配置的「内容生成模型」里选。",
+      "按这个地点（及其区域）的样子生成动作，结果先列在弹窗里，" +
+        "改好名字、勾选后才写进配置。模型用「内容生成模型」。",
     ),
   );
   wrapper.appendChild(title);
@@ -4151,9 +6492,7 @@ async function generateZoneNodes(zoneId, count, button) {
       const problems = result.problems || [];
       openCustomDialog({
         title: `生成的地点（${drafts.length} 个）`,
-        hint:
-          "会自动摆好位置，并把它们连起来（第一个连到区域内最近的地点，之后依次相连，默认 1 tick）。" +
-          "「确认加入」会直接写进配置并生效。" +
+        hint: "自动摆好位置并按区域连成链（首个连最近的地点，默认 1 tick）。「确认加入」写入配置后立即生效。"
           (problems.length ? `模型那边有这些情况：${problems.join("；")}` : ""),
         confirmText: "确认加入选中的",
         build: (body) => buildNodeDraftList(body, drafts),
@@ -4246,8 +6585,8 @@ function portalEditor(zone) {
   title.appendChild(el("span", "", "跨区连线（通往其他区域的通道）"));
   title.appendChild(
     tipBox(
-      "每条线自带两端的地点：例如「北门 ↔ 商场大门」。同一对区域可以有多条线" +
-        "（公园的北门去商场、南门去学校）。她按最短路线自动挑一条走。",
+      "每条线自带两端地点，例如「北门 ↔ 商场大门」。同一对区域可以有多条线，" +
+        "她按最短路线自动挑一条。",
     ),
   );
   wrapper.appendChild(title);
@@ -4323,17 +6662,23 @@ function portalRow(edge, zone) {
   });
   line.appendChild(thereSelect);
 
+  // 只有一个数字输入框时没人知道那是"走过去要几步"：补上前后文字说明
+  const tickField = el("span", "row-item");
+  tickField.appendChild(el("span", "muted", "走过去"));
   const tickInput = document.createElement("input");
   tickInput.type = "number";
   tickInput.min = "1";
+  tickInput.className = "w-sm";
   tickInput.value = num(edge.ticks, 1);
-  tickInput.title = "跨过去要花几个 tick";
+  tickInput.title = "从这一端走到对面那一端要花几个 tick（1 tick = 世界时钟走一格，默认 60 秒）";
   tickInput.addEventListener("change", () => {
     edge.ticks = Math.max(1, Math.round(num(tickInput.value, 1)));
     markDirty();
     renderMap();
   });
-  line.appendChild(tickInput);
+  tickField.appendChild(tickInput);
+  tickField.appendChild(el("span", "muted", "tick"));
+  line.appendChild(tickField);
 
   const bidi = el("label", "inline");
   const box = document.createElement("input");
@@ -4404,9 +6749,7 @@ function addPortal() {
 
   openCustomDialog({
     title: `从「${zone.name || zone.id}」连到别的区域`,
-    hint:
-      "跨区连线是一条「门户对」：两端各自指定一个具体地点（例如公园·北门 ↔ 商场·大门）。" +
-      "同一对区域可以有多条线，她走路时会自动挑最近的那条。",
+    hint: "跨区连线是一对「门户」：两端各指定一个具体地点。同一对区域可以有多条，走路时自动挑最近的一条。",
     confirmText: "添加这条线",
     build: (body) => {
       body.appendChild(
@@ -4634,9 +6977,7 @@ function renderNodeForm() {
   );
   form.appendChild(
     inputField("在这里时名片文案", node.nickname_text || "", (value) => (node.nickname_text = value.trim()), {
-      hint:
-        "她人在这个地点、又没在做带文案的动作时，群名片上显示什么（例如「在书房」）。\n" +
-        "留空就不改名片。文案写在地点上：换预设时地点跟着换，名片也就配套了。",
+      hint: "她在这个地点且没有带文案的动作时，群名片显示的文字（例如「在书房」）。留空则不改名片。",
       placeholder: "例如 在书房",
     }),
   );
@@ -4899,9 +7240,7 @@ async function editMapJson() {
   };
   openFormDialog({
     title: "地图 JSON",
-    hint:
-      "整段替换地图结构：zones（区域）/ zone_edges（跨区连线，两端各自带地点）/ " +
-      "nodes（地点）/ edges（区域内连线）。不含全局设置、动作和日程，写错不会影响它们。",
+    hint: "整段替换地图结构：zones / zone_edges / nodes / edges。不影响全局设置、动作与日程。",
     wide: true,
     fields: [
       {
@@ -5152,9 +7491,7 @@ function fixedParamsEditor(action, toolNames) {
   const title = el("div", "sub-title");
   title.appendChild(el("span", "", "固定参数"));
   title.appendChild(
-    tipBox(
-      "填了之后这个参数每次都用你写的值，不再让模型猜。" +
-        "适合「参数写着可选、实现却必须要」的工具，例如查天气固定 city=武汉。",
+    tipBox("填上后该参数固定使用此值，不由模型决定。适合「参数写着可选、实现却必须要」的工具。",
     ),
   );
   wrapper.appendChild(title);
@@ -5332,6 +7669,107 @@ function renderActionForm() {
       { hint: "「全局」= 任何地点都能做；「仅特定地点」= 这个动作属于指定地点，她想去就会被带过去再做。" },
     ),
   );
+  form.appendChild(
+    pillsField(
+      "提示词里怎么写它",
+      action.desc_mode === "brief" ? "brief" : "full",
+      [
+        { key: "full", label: "带说明", hint: "在动作清单里写出这条描述（默认）。" },
+        {
+          key: "brief",
+          label: "只写名字",
+          hint: "只写「id（名字）」：看一眼就知道干嘛的动作（点头、抱抱、亲亲）用这个，省提示词。",
+        },
+      ],
+      (value) => {
+        action.desc_mode = value;
+        renderActionForm();
+      },
+      { hint: "工具型 / 时长由你定 / 只有这个地点才能做这些标记不受影响。" },
+    ),
+  );
+  form.appendChild(
+    pillsField(
+      "事件中可调用",
+      action.event_usable || "auto",
+      EVENT_USABLE_MODES,
+      (value) => {
+        action.event_usable = value;
+        // 药丸的选中态是我们自己画的：不重绘就看不到点了哪一项
+        renderActionForm();
+      },
+      {
+        hint: "她遇上事时能否为那件事调用这个动作。默认跟随规则：工具 / 指令型可用；也可强制允许或强制禁止。",
+      },
+    ),
+  );
+  action.quota = action.quota || { day: 0, week: 0, month: 0 };
+  [
+    ["day", "每天最多几次"],
+    ["week", "每周最多几次"],
+    ["month", "每月最多几次"],
+  ].forEach(([key, label]) => {
+    form.appendChild(
+      inputField(
+        label,
+        num(action.quota[key], 0),
+        (value) => (action.quota[key] = num(value, 0)),
+        {
+          hint: "超出后该动作不写进提示词，排到也会跳过。0 = 不限制；生图类默认每天 5 次、录视频 2 次。",
+          type: "number",
+          min: "0",
+          max: "999",
+          step: "1",
+        },
+      ),
+    );
+  });
+  // 把结果记进状态槽：别的插件的状态（今日穿搭、背包…）就不会说完就忘
+  form.appendChild(
+    inputField(
+      "结果记进状态槽",
+      action.state_slot || "",
+      (value) => {
+        action.state_slot = value.trim();
+        renderActionForm();
+      },
+      {
+        hint: "填一个槽名（例如 outfit）就把这个动作的结果存下来，之后每轮提示词都带着；留空 = 不记。",
+        placeholder: "outfit",
+      },
+    ),
+  );
+  if (action.state_slot) {
+    form.appendChild(
+      inputField(
+        "状态槽的称呼",
+        action.state_label || "",
+        (value) => (action.state_label = value.trim()),
+        { hint: "提示词里怎么叫它，例如「今日穿搭」。留空就用槽名。", placeholder: "今日穿搭" },
+      ),
+    );
+    form.appendChild(
+      inputField(
+        "状态槽有效期（分钟）",
+        num(action.state_ttl_minutes, 0),
+        (value) => (action.state_ttl_minutes = num(value, 0)),
+        {
+          hint: "过期后不再写进提示词。0 = 不过期；「今日穿搭」这类可以填 720（半天）。",
+          type: "number",
+          min: "0",
+          step: "10",
+        },
+      ),
+    );
+    form.appendChild(
+      checkboxField(
+        "用打杂模型压成一句话再存",
+        action.state_summarize === true,
+        (value) => (action.state_summarize = value),
+        { hint: "返回是一大段时压一下更省上下文；返回本来就短就不用开。" },
+      ),
+    );
+  }
   if (isNodeScoped) {
     form.appendChild(
       pickerField(
@@ -5419,9 +7857,7 @@ function renderActionForm() {
         action.nickname_text || "",
         (value) => (action.nickname_text = value.trim()),
         {
-          hint:
-            "她正在做这个动作时，群名片上显示什么（例如「做饭中」）。留空就用「状态 → 文案」的兜底映射。\n" +
-            "写在动作里而不是全局设置里：换预设时动作跟着换，文案也就配套了。",
+          hint: "她做这个动作时群名片显示的文字（例如「做饭中」）。留空则用「状态 → 文案」的兜底映射。",
           placeholder: "例如 做饭中",
         },
       ),
@@ -5432,8 +7868,7 @@ function renderActionForm() {
   if (action.llm_level === "template") {
     form.appendChild(
       inputField("模板文案", action.template || "", (value) => (action.template = value), {
-        hint:
-          "不调用大模型时直接发到群里的固定文案。可用占位符：{bot}=她自己、{user}=目标群友、{node}=当前地点，例如「（{bot}抱了你一下）」。",
+        hint: "不调大模型时直接发到群里的固定文案。占位符：{bot}=她自己、{user}=目标群友、{node}=当前地点。",
         placeholder: "例如：（伸了个懒腰）",
       }),
     );
@@ -5444,8 +7879,7 @@ function renderActionForm() {
     const toolTitle = el("div", "sub-title");
     toolTitle.appendChild(el("span", "", "工具设置"));
     toolTitle.appendChild(
-      tipBox(
-        "工具的参数由工具自己定义（AstrBot 里已经写好了名称和说明）。她做这个动作时只需要说明想干什么，参数由插件用辅助模型补全，不需要你手写、也不用配默认值。",
+      tipBox("参数由工具自己定义。她只需说明想干什么，插件用辅助模型补全，不必手写或配默认值。",
       ),
     );
     toolBox.appendChild(toolTitle);
@@ -5459,9 +7893,7 @@ function renderActionForm() {
           renderActionForm();
         },
         {
-          hint:
-            "直接调用 = 把工具结果交回给她说一句。\n" +
-            "联网检索 = 查东西专用的流水线：多条查询词 → 结果整理成证据 → 可选读正文 → 不够就补查。",
+          hint: "直接调用 = 把工具结果交回给她说一句；联网检索 = 多条查询词 → 证据 → 可选读正文 → 不够补查。",
         },
       ),
     );
@@ -5481,14 +7913,7 @@ function renderActionForm() {
           renderActionForm();
         },
         {
-          hint:
-            "工具型动作至少要选一个工具，而且是 AstrBot 里真实注册的那个。\n" +
-            "**没选工具 = 这个动作会被跳过**（例如「上网搜索」「查天气」现在都不带默认工具，要先在这里挑一个能用的）。\n" +
-            "选了多个就按顺序依次调用（比如先搜索、再把搜到的页面抓下来），结果一起交回给她。\n" +
-            "**联网检索形态下只有第一个能用的搜索工具会被当作搜索入口**，它坏了会自动换下一个；" +
-            "要抓网页正文请在下面的「阅读网页工具」里单独选。\n" +
-            "运行时她只要说明「想干什么」，具体参数由辅助模型按每个工具自己的定义补全，" +
-            "所以不用在这里配置默认参数。",
+          hint: "必须选一个 AstrBot 里已注册的工具，没选则跳过。选多个时按顺序调用、结果合并；参数由辅助模型补全。",
           empty: "点击选择工具…",
           renderChips: true,
         },
@@ -5504,12 +7929,7 @@ function renderActionForm() {
           renderActionForm();
         },
         {
-          hint:
-            "选了多个工具时怎么用：\n" +
-            "按顺序都调 = 每个都调一遍，结果合并（例如先搜索、再抓正文）。\n" +
-            "依次尝试 = 只用一个，按顺序挑第一个能用的；失败了换下一个。\n" +
-            "智能选择 = 让辅助模型按她的意图挑一个（挑工具和补参数一次完成），" +
-            "失败先补参数重试，仍失败就换下一个。",
+          hint: "多工具的用法：按顺序都调 = 全调并合并；依次尝试 = 只用一个、失败换下一个；智能选择 = 辅助模型挑一个。",
         },
       ),
     );
@@ -5558,8 +7978,8 @@ function renderActionForm() {
       searchTitle.appendChild(el("span", "", "联网检索设置"));
       searchTitle.appendChild(
         tipBox(
-          "她把要查的写进 intent，也可以一次给几条 queries 分角度查。\n" +
-            "插件把搜索工具返回的内容整理成带编号的证据交给她，证据里没有的她会直说没查到。",
+          "她在 intent 里写想查什么，也可给几条 queries 分角度查；" +
+            "结果整理成证据交给她，证据里没有的会直说没查到。",
         ),
       );
       searchBox.appendChild(searchTitle);
@@ -5575,11 +7995,7 @@ function renderActionForm() {
             renderActionForm();
           },
           {
-            hint:
-              "能传网址、返回正文的工具（例如把网页转成 markdown 的那种）。\n" +
-              "配了它，插件会挑搜索结果里最靠前的几篇抓正文再交给她；留空就只用搜索摘要。\n" +
-              "注意「检索深度」要选「标准」或「深挖」才会读正文——「快查」档只看摘要。\n" +
-              "同一篇网页 6 小时内不会重复抓。",
+            hint: "能传网址、返回正文的工具（如把网页转成 markdown）。配上后按检索深度抓最靠前的几篇正文；留空只用摘要。",
             empty: "点击选择工具…",
             renderChips: true,
           },
@@ -5595,10 +8011,7 @@ function renderActionForm() {
             renderActionForm();
           },
         {
-          hint:
-            "决定这一趟查多远，**配的是上限**：快查只查一轮不读正文；标准读前两篇、不够补查一轮；" +
-              "深挖至少读三篇、最多补查两轮。她可以在动作里写更浅的档位（例如简单问题自己选快查），" +
-              "但不能超过这里。",
+          hint: "查询上限：快查只查一轮；标准读前两篇、不够补查一轮；深挖至少三篇、最多补两轮。她只能选更浅的档。",
         },
         ),
       );
@@ -5643,12 +8056,7 @@ function renderActionForm() {
           action.search_topic || "",
           (value) => (action.search_topic = value.trim()),
           {
-            hint:
-              "这个动作「固定查什么」。日程里调用它、又没写意图时就用它当查询词" +
-              "（例如动作叫「搜索新闻」，主题写「今日新闻热点」）。\n" +
-              "优先级：她自己写的意图 > 这里 > 查询模板 > 让她按当时的处境和群里的话题自己说一句 > " +
-              "中性兜底（「今天有什么新鲜事」）。\n" +
-              "留空也能跑：规则触发（好奇心、日程）时她会自己想一句；配了主题则更稳定、也省一次调用。",
+            hint: "这个动作固定查什么：日程调用且没写意图时用它当查询词。留空则由她按当时处境自己想一句。",
             placeholder: "例如 今日新闻热点",
           },
         ),
@@ -5659,9 +8067,7 @@ function renderActionForm() {
           action.search_query_template || "",
           (value) => (action.search_query_template = value.trim()),
           {
-            hint:
-              "把主题套成固定格式，可用占位符 {topic} 和 {date}。\n" +
-              "例如 {date} 新闻热点 → 2026-09-17 新闻热点。",
+            hint: "把主题套成固定格式，占位符 {topic} 与 {date}，例如「{date} 新闻热点」。",
             placeholder: "例如 {date} 新闻热点",
           },
         ),
@@ -5679,6 +8085,19 @@ function renderActionForm() {
             renderActionForm();
           },
           { hint: "群里通常不想看到一串网址；要核对来源时再打开。" },
+        ),
+      );
+      searchBox.appendChild(
+        inputField(
+          "查完回落多少好奇",
+          num(action.search_satisfy_curiosity ?? 0.3),
+          (value) =>
+            (action.search_satisfy_curiosity = Math.min(1, Math.max(0, num(value, 0.3)))),
+          {
+            hint: "查完一次、真拿到东西之后好奇心降多少（默认 0.3）；0 = 不回落",
+            type: "number",
+            step: "0.05",
+          },
         ),
       );
       toolBox.appendChild(searchBox);
@@ -5714,9 +8133,7 @@ function renderActionForm() {
         action.trigger_hint || "",
         (value) => (action.trigger_hint = value),
         {
-          hint:
-            "写清这条指令需要什么参数、怎么给，例如「city：城市名，例如 武汉」。" +
-            "辅助模型只按这里的说明和她的意图拼参数，所以写得越清楚越不容易拼错。",
+          hint: "写清这条指令要什么参数、怎么给（例如「city：城市名」）。辅助模型只依据这里和她的意图拼参数。",
           rows: 3,
         },
       ),
@@ -5759,8 +8176,8 @@ function renderActionForm() {
   triggerTitle.appendChild(el("span", "", "完成后"));
   triggerTitle.appendChild(
     tipBox(
-      "动作结束后要做什么。默认什么都不做；「接着说一句」会让大模型把结果讲成人话。" +
-        "工具型和指令型动作还会受全局设置里的「工具结果回话」影响，结果里的图片会一起交给模型看。",
+      "动作结束后做什么：默认不额外开口；「接着说一句」让大模型把结果讲成人话。" +
+        "工具型动作还受全局「工具结果回话」影响。",
     ),
   );
   triggerBox.appendChild(triggerTitle);
@@ -5844,10 +8261,7 @@ function renderActionForm() {
       action.visible !== false,
       (value) => (action.visible = value),
       {
-        hint:
-          "关掉表示静默执行（例如换位置、发呆）。" +
-          "「单轮」动作例外：它的定义就是让大模型说一句，只要目标是「群」或「某个群友」，" +
-          "生成的话一定会发出去（想让它纯粹变成内心活动，用「想事情」那种动作）。",
+        hint: "关闭表示静默执行（换位置、发呆等）。「单轮」动作例外：目标为群或群友时，生成的话一定发出去。",
       },
     ),
   );
@@ -6180,6 +8594,15 @@ function addAction() {
 /* 日程                                                                */
 /* ================================================================== */
 
+/** 这条日程的落点写成名字（勾组 / 勾某个会话都认）；没勾就是"各自跑"。 */
+function scheduleScopeNames(schedule) {
+  const picked = (schedule && schedule.sessions) || [];
+  if (!picked.length) return "每个会话各自跑";
+  const options = scopeOptions({ withMembers: true });
+  const byValue = new Map(options.map((item) => [item.value, item.label]));
+  return picked.map((id) => byValue.get(id) || id).join("、");
+}
+
 function renderScheduleList() {
   const list = $("schedule-list");
   list.innerHTML = "";
@@ -6188,14 +8611,21 @@ function renderScheduleList() {
     if (schedule.id === ui.selectedSchedule) item.classList.add("selected");
     const info = el("div", "list-main");
     info.appendChild(
-      el("div", "", `${schedule.enabled === false ? "⛔" : "✅"} ${schedule.time}　${schedule.id}`),
+      el(
+        "div",
+        "",
+        `${schedule.enabled === false ? "⛔" : "✅"} ` +
+          `${schedule.once ? "① " : ""}${schedule.time}　${schedule.id}`,
+      ),
     );
     info.appendChild(
       el(
         "div",
         "meta",
         ((schedule.action_chain || []).map((step) => step.type).join(" → ") || "（没有动作）") +
-          (schedule.auto_travel ? "　🚶 自动前往" : ""),
+          (schedule.auto_travel ? "　🚶 自动前往" : "") +
+          (schedule.once ? `　① 只做这一次${schedule.date ? `（${schedule.date}）` : ""}` : "") +
+          `　🎯 落点：${scheduleScopeNames(schedule)}`,
       ),
     );
     item.appendChild(info);
@@ -6282,14 +8712,48 @@ function renderScheduleForm() {
       placeholder: "23:30",
     }),
   );
-  form.appendChild(weekdayField(schedule));
+  form.appendChild(
+    checkboxField(
+      "只做这一次（跑完自动删掉）",
+      schedule.once === true,
+      (value) => {
+        schedule.once = value;
+        if (!value) schedule.date = "";
+        renderScheduleForm();
+      },
+      {
+        hint: "开启后这条日程只在指定那天跑一遍，跑完自动删除；「星期」对它不生效。",
+      },
+    ),
+  );
+  if (schedule.once) {
+    form.appendChild(
+      inputField("日期", schedule.date || "", (value) => (schedule.date = value.trim()), {
+        hint: "格式 YYYY-MM-DD；留空表示下一次到点就跑。日期过了的会自己清掉。",
+        placeholder: "2026-09-22",
+      }),
+    );
+    form.appendChild(
+      inputField(
+        "当初为什么排这件事",
+        schedule.note || "",
+        (value) => (schedule.note = value.trim()),
+        {
+          hint: "到点触发时这句话会带给她，免得忘了当初要干什么。",
+          placeholder: "主人说下午可能下雨，记得收衣服",
+        },
+      ),
+    );
+  } else {
+    form.appendChild(weekdayField(schedule));
+  }
   form.appendChild(checkboxField("启用", schedule.enabled !== false, (value) => (schedule.enabled = value)));
 
   const conditionBox = el("div", "subsection");
   const conditionTitle = el("div", "sub-title");
   conditionTitle.appendChild(el("span", "", "触发条件"));
   conditionTitle.appendChild(
-    tipBox("满足这些条件才会执行；不满足就跳过这次（例如正在睡觉时不要执行早安）。"),
+    tipBox("满足这些条件才会执行，不满足则跳过本次（例如睡觉时不执行早安）。"),
   );
   conditionBox.appendChild(conditionTitle);
   conditionBox.appendChild(
@@ -6336,9 +8800,7 @@ function renderScheduleForm() {
         schedule.auto_travel = value;
       },
       {
-        hint:
-          "开启后，如果某一步要求的地点不满足（例如在书房才能上网），她会先自己走到那个地点再执行。" +
-          "关掉的话，地点不对的步骤会被直接跳过。",
+        hint: "开启后，某一步的地点不满足（例如上网要在书房）会先走到那里再执行；关闭则跳过该步骤。",
       },
     ),
   );
@@ -6352,10 +8814,25 @@ function renderScheduleForm() {
         renderScheduleForm();
       },
       {
+        hint: "到点把这条动作链交给大模型补写每步意图，再照原样执行（步数、动作、时长不变）。代价是每次多一次调用。",
+      },
+    ),
+  );
+
+  // 这条日程的话说给谁（会话 / 会话组）：勾了就落在那儿，不勾就各跑各的
+  form.appendChild(
+    pickerField(
+      "落点（会话 / 会话组）",
+      schedule.sessions || [],
+      scopeOptions({ withMembers: true }),
+      (chosen) => {
+        schedule.sessions = chosen;
+        renderScheduleForm();
+      },
+      {
         hint:
-          "开启后，到点会把这条动作链交给大模型，让它给工具 / 指令型步骤写一句「这一步想干什么」，" +
-          "再**照原样执行**（步数、动作、时长都不改，只会参考当下的时间和状态）。" +
-          "代价是每次到点多一次模型调用；关掉就用你在下面写死的意图。",
+          "勾了哪个，这条日程说的话就发到那儿；勾组 = 落在组代表，也可以单勾组里的某个会话。留空 = 各自跑。",
+        empty: "（每个会话各自跑）",
       },
     ),
   );
@@ -6449,6 +8926,20 @@ function renderSessionList() {
         } @ ${session.cold_start_node || "bedroom"}`,
       ),
     );
+    // 备注：她在提示词里就按这个名字认这个会话（有备注就不显示群名）
+    const noteRow = el("div", "session-note");
+    const noteInput = document.createElement("input");
+    noteInput.type = "text";
+    noteInput.value = session.note || "";
+    noteInput.placeholder = "备注（她看到的名字，留空用群名 / 号码）";
+    noteInput.addEventListener("change", () => {
+      session.note = noteInput.value.trim();
+      ui.config.sessions.sessions = ui.sessions;
+      markDirty();
+      renderGroupList();
+    });
+    noteRow.appendChild(noteInput);
+    info.appendChild(noteRow);
     const position = (ui.overview || []).find(
       (item) => item.session_id === session.session_id,
     );
@@ -6488,6 +8979,128 @@ function renderSessionList() {
       el("p", "muted", "还没有会话。填上面的输入框添加，或在群里发 /vw session add。"),
     );
   }
+  renderGroupList();
+}
+
+/** 会话组：组里的群 / 私聊共享聊天上下文与记忆。 */
+
+function groups() {
+  if (!ui.config.sessions) ui.config.sessions = { sessions: [], groups: [] };
+  if (!Array.isArray(ui.config.sessions.groups)) ui.config.sessions.groups = [];
+  return ui.config.sessions.groups;
+}
+
+function renderGroupList() {
+  const list = $("group-list");
+  if (!list) return;
+  list.innerHTML = "";
+  groups().forEach((group) => {
+    const item = el("div", "list-item");
+    const info = el("div", "list-main");
+    info.appendChild(el("div", "", `🔗 ${group.name || group.id}`));
+    info.appendChild(
+      el(
+        "div",
+        "meta",
+        (group.sessions || []).join("、") +
+          `　代表会话：${group.main_session || "（未指定）"}`,
+      ),
+    );
+    item.appendChild(info);
+    const box = el("div", "list-actions");
+    const edit = el("button", "small", ui.selectedGroup === group.id ? "收起" : "编辑");
+    edit.addEventListener("click", () => {
+      ui.selectedGroup = ui.selectedGroup === group.id ? "" : group.id;
+      renderGroupList();
+    });
+    box.appendChild(edit);
+    const del = el("button", "small danger", "删除");
+    del.addEventListener("click", () => {
+      ui.config.sessions.groups = groups().filter((row) => row.id !== group.id);
+      markDirty();
+      renderGroupList();
+    });
+    box.appendChild(del);
+    item.appendChild(box);
+    list.appendChild(item);
+    if (ui.selectedGroup === group.id) list.appendChild(buildGroupEditor(group));
+  });
+  if (!groups().length) {
+    list.appendChild(
+      el("p", "muted", "还没有会话组。想让几个群 / 私聊连着聊同一个话题，就加一个。"),
+    );
+  }
+}
+
+/** 展开的会话组编辑块：选成员、指定代表会话。 */
+
+function buildGroupEditor(group) {
+  const card = el("div", "card group-editor");
+  card.appendChild(
+    inputField("组名", group.name || "", (value) => (group.name = value.trim()), {
+      hint: "只用来区分这个组；它也是提示词里「来自…」显示的名字。",
+    }),
+  );
+  const picked = new Set(group.sessions || []);
+  card.appendChild(
+    fieldHead("成员", "勾上的会话共享聊天上下文与记忆；同一个会话只能属于一个组。"),
+  );
+  const members = el("div", "picker-list");
+  ui.sessions.forEach((session) => {
+    const row = el("label", "picker-row");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = picked.has(session.session_id);
+    box.addEventListener("change", () => {
+      if (box.checked) picked.add(session.session_id);
+      else picked.delete(session.session_id);
+      group.sessions = ui.sessions
+        .map((item) => item.session_id)
+        .filter((id) => picked.has(id));
+      if (!group.sessions.includes(group.main_session)) {
+        group.main_session = group.sessions[0] || "";
+      }
+      markDirty();
+      renderGroupList();
+    });
+    row.appendChild(box);
+    row.appendChild(
+      el("span", "", `${session.session_id}${session.type === "private" ? "（私聊）" : ""}`),
+    );
+    members.appendChild(row);
+  });
+  card.appendChild(members);
+
+  const mainBox = el("div", "field");
+  mainBox.appendChild(
+    fieldHead(
+      "代表会话",
+      "她的位置、数值、计划都存在它名下；这个会话停用时自动退到组里第一个可用的成员。",
+    ),
+  );
+  const select = document.createElement("select");
+  (group.sessions || []).forEach((id) => {
+    const row = document.createElement("option");
+    row.value = id;
+    row.textContent = id;
+    if (id === group.main_session) row.selected = true;
+    select.appendChild(row);
+  });
+  select.addEventListener("change", () => {
+    group.main_session = select.value;
+    markDirty();
+  });
+  mainBox.appendChild(select);
+  card.appendChild(mainBox);
+  return card;
+}
+
+function addGroup() {
+  const id = `group_${Date.now().toString(36).slice(-4)}`;
+  groups().push({ id, name: "新的会话组", sessions: [], main_session: "" });
+  markDirty();
+  ui.selectedGroup = id;
+  renderGroupList();
 }
 
 function addSession() {
@@ -6716,6 +9329,597 @@ function showLogDetail(item, event) {
   );
 }
 
+/* ================================================================== */
+/* 通讯录：她认识的人（画像 / 关系 / 好感度）                            */
+/* ================================================================== */
+
+function contactBadge(text, className = "pill") {
+  return el("span", className, text);
+}
+
+function formatStamp(seconds) {
+  if (!seconds) return "还没说过话";
+  const date = new Date(Number(seconds) * 1000);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+async function loadContacts() {
+  const list = $("contacts-list");
+  if (!list) return;
+  const session = $("contacts-session") ? $("contacts-session").value : "";
+  list.innerHTML = "<p class='muted'>加载中…</p>";
+  try {
+    const data = await apiGet("profile/people", { session });
+    ui.contacts = data.people || [];
+    if ($("contacts-note")) {
+      const bits = [];
+      bits.push(data.enabled ? "画像：开" : "画像：关");
+      bits.push(
+        data.consolidate_enabled ? "睡眠整理：开" : "睡眠整理：关",
+      );
+      bits.push(`提示词里最多带 ${data.digest_limit || 5} 个其他人`);
+      $("contacts-note").textContent = bits.join(" · ");
+    }
+    if (ui.contactUser && !ui.contacts.some((item) => item.user_id === ui.contactUser)) {
+      ui.contactUser = "";
+    }
+    if (!ui.contactUser && ui.contacts.length) {
+      ui.contactUser = ui.contacts[0].user_id;
+    }
+    renderContactsList();
+    renderContactPlaces();
+    if (ui.contactUser) {
+      await loadContactDetail(ui.contactUser);
+    } else {
+      $("contacts-title").textContent = "还没有认识的人";
+      $("contacts-detail").innerHTML =
+        "<p class='muted'>等她在群里见过人之后，这里就有画像了。</p>";
+    }
+  } catch (error) {
+    list.innerHTML = `<p class='muted'>读取失败：${error.message || error}</p>`;
+  }
+}
+
+function renderContactsList() {
+  const box = $("contacts-list");
+  const keyword = ($("contacts-search") ? $("contacts-search").value : "").trim();
+  box.innerHTML = "";
+  const rows = ui.contacts.filter((item) => {
+    if (!keyword) return true;
+    return (
+      String(item.name || "").includes(keyword) ||
+      String(item.user_id || "").includes(keyword) ||
+      String(item.digest || "").includes(keyword) ||
+      String(item.qq_name || "").includes(keyword)
+    );
+  });
+  if (!rows.length) {
+    box.appendChild(el("p", "muted", keyword ? "没有匹配的人。" : "还没有认识的人。"));
+    return;
+  }
+  rows.forEach((item) => {
+    const row = el("div", "contact-row");
+    row.classList.toggle("active", item.user_id === ui.contactUser);
+    row.dataset.user = item.user_id;
+    const head = el("div", "contact-row-head");
+    head.appendChild(el("strong", "", item.name || item.user_id));
+    (item.bonds || []).forEach((bond) => {
+      head.appendChild(contactBadge(bond, "pill pill-bond"));
+    });
+    (item.claims || []).forEach((bond) => {
+      head.appendChild(contactBadge(`${bond}？`, "pill pill-claim"));
+    });
+    row.appendChild(head);
+    const meta = el(
+      "div",
+      "contact-row-meta",
+      `${item.level || "陌生人"} · 好感 ${Math.round(Number(item.affinity) || 0)} · 聊过 ${item.message_count || 0} 句 · ${formatStamp(item.last_seen_at)}`,
+    );
+    row.appendChild(meta);
+    if (item.digest) {
+      row.appendChild(el("div", "contact-row-digest", item.digest));
+    }
+    box.appendChild(row);
+  });
+}
+
+function renderContactPlaces() {
+  const box = $("contacts-places");
+  if (!box) return;
+  box.innerHTML = "";
+  const options = scopeOptions({ withMembers: true });
+  if (!options.length) {
+    box.appendChild(el("p", "muted", "还没有白名单会话。"));
+    return;
+  }
+  options.forEach((item) => {
+    box.appendChild(el("div", "contact-place", item.label));
+  });
+}
+
+/** 好感日志里的来源标签：一眼看出这次是谁改的。 */
+const AFFINITY_SOURCE_LABELS = {
+  chat: "她自己判断",
+  presence: "混脸熟",
+  decay: "慢慢回落",
+  consolidate: "睡眠整理",
+  remember: "当场记住",
+  manual: "手动改的",
+};
+
+async function loadContactDetail(userId) {
+  const session = $("contacts-session") ? $("contacts-session").value : "";
+  const box = $("contacts-detail");
+  box.innerHTML = "<p class='muted'>加载中…</p>";
+  try {
+    const data = await apiGet("profile/person", { session, user_id: userId });
+    ui.contactDetail = data;
+    renderContactDetail(data);
+  } catch (error) {
+    box.innerHTML = `<p class='muted'>读取失败：${error.message || error}</p>`;
+  }
+}
+
+function renderContactDetail(data) {
+  const box = $("contacts-detail");
+  const person = data.person || {};
+  ui.contactUser = data.user_id;
+  $("contacts-title").textContent = `${person.name || data.user_id}（QQ ${data.user_id}）`;
+  box.innerHTML = "";
+  renderContactsList();
+
+  // 零、她对他已知的概况：认识多久、聊过多少、群名片、关系上限
+  const metaCard = el("div", "contact-section");
+  const metaBits = [];
+  if (person.days_known) metaBits.push(`认识 ${person.days_known} 天`);
+  if (person.message_count) metaBits.push(`聊过 ${person.message_count} 句`);
+  if (person.qq_name) metaBits.push(`昵称「${person.qq_name}」`);
+  const cards = Object.entries(person.cards || {});
+  cards.forEach(([sessionId, card]) => {
+    if (card) metaBits.push(`在 ${sessionId.split(":").slice(-1)[0]} 叫「${card}」`);
+  });
+  const caps = (data.bonds_config || [])
+    .filter((item) => (person.affinities || []).includes(item.name))
+    .map((item) => Number(item.cap) || 0);
+  const capIndex = caps.length ? Math.max(...caps) : null;
+  const levels = (data.levels_config || [])
+    .map((item) => item.name)
+    .filter(Boolean);
+  if (capIndex !== null && levels.length) {
+    const capName = levels[Math.max(0, Math.min(capIndex, levels.length - 1))] || "";
+    metaBits.push(`关系上限：${capName}级`);
+  }
+  metaCard.appendChild(
+    el("h3", "", `概况${person.digest ? `｜${person.digest}` : ""}`),
+  );
+  metaCard.appendChild(
+    el("p", "hint-line", metaBits.join("；") || "才刚认识，还没聊过几句。"),
+  );
+  metaCard.appendChild(
+    el(
+      "p",
+      "hint-line",
+      "好感度：说话时每轮由她自己判断（有每轮与每天上限），他露个面也会长一点（混脸熟），" +
+        "长期不理则每天慢慢回落。",
+    ),
+  );
+  box.appendChild(metaCard);
+
+  // 一、关系：当前 / 他自称 / 曾经（都带日期）
+  const bondCard = el("div", "contact-section");
+  bondCard.appendChild(el("h3", "", "关系"));
+  const bondLines = el("div", "list");
+  const bonds = data.bonds || [];
+  const currents = bonds.filter((item) => item.status === "current");
+  const claims = bonds.filter((item) => item.status === "claimed");
+  const past = bonds.filter((item) => item.status === "past");
+  currents.forEach((item) => {
+    const row = el("div", "contact-line");
+    row.appendChild(
+      el(
+        "span",
+        "pill pill-bond",
+        item.since_text ? `${item.type}（${item.since_text} 起）` : item.type,
+      ),
+    );
+    const close = el("button", "ghost tiny", "解除");
+    close.dataset.act = "bond-close";
+    close.dataset.id = item.id;
+    row.appendChild(close);
+    bondLines.appendChild(row);
+  });
+  claims.forEach((item) => {
+    const row = el("div", "contact-line");
+    row.appendChild(
+      el(
+        "span",
+        "pill pill-claim",
+        `${item.type}（他自称${item.since_text ? "，" + item.since_text : ""}）`,
+      ),
+    );
+    const accept = el("button", "ghost tiny", "认下");
+    accept.dataset.act = "bond-accept";
+    accept.dataset.id = item.id;
+    row.appendChild(accept);
+    const drop = el("button", "ghost tiny", "删掉");
+    drop.dataset.act = "bond-delete";
+    drop.dataset.id = item.id;
+    row.appendChild(drop);
+    bondLines.appendChild(row);
+  });
+  if (past.length) {
+    // 历史关系攒多了会把这一页顶得老长：默认折起来，要看再点开
+    const history = el("details", "contact-more");
+    history.appendChild(el("summary", "", `曾经的关系（${past.length}）`));
+    past.forEach((item) => {
+      const row = el("div", "contact-line");
+      row.appendChild(
+        el(
+          "span",
+          "pill pill-past",
+          `${item.type}（${item.since_text || "？"} → ${item.until_text || "？"}）`,
+        ),
+      );
+      const drop = el("button", "ghost tiny", "删掉");
+      drop.dataset.act = "bond-delete";
+      drop.dataset.id = item.id;
+      row.appendChild(drop);
+      history.appendChild(row);
+    });
+    bondLines.appendChild(history);
+  }
+  if (!bonds.length) bondLines.appendChild(el("p", "muted", "还没定过关系。"));
+  bondCard.appendChild(bondLines);
+  const bondAdd = el("div", "contact-inline");
+  const bondSelect = el("select");
+  (data.bonds_config || []).forEach((item) =>
+    bondSelect.appendChild(option(item.name, item.unique ? `${item.name}（唯一）` : item.name)),
+  );
+  const assertSelect = el("select");
+  assertSelect.appendChild(option("她的判断", "她认定"));
+  assertSelect.appendChild(option("他自称", "他自称"));
+  const bondButton = el("button", "primary tiny", "加关系");
+  bondButton.dataset.act = "bond-add";
+  bondAdd.appendChild(bondSelect);
+  bondAdd.appendChild(assertSelect);
+  bondAdd.appendChild(bondButton);
+  bondCard.appendChild(bondAdd);
+  box.appendChild(bondCard);
+
+  // 二、好感度：滑杆 + 保存 + 变化日志
+  const affinityCard = el("div", "contact-section");
+  affinityCard.appendChild(el("h3", "", "好感度"));
+  const affinityRow = el("div", "contact-inline");
+  const slider = el("input");
+  slider.type = "range";
+  slider.min = "-100";
+  slider.max = "100";
+  slider.value = String(Math.round(Number(person.affinity) || 0));
+  slider.dataset.act = "affinity-slider";
+  const valueLabel = el("span", "muted", `${slider.value} / 100`);
+  slider.addEventListener("input", () => {
+    valueLabel.textContent = `${slider.value} / 100`;
+  });
+  const saveAffinity = el("button", "primary tiny", "保存好感度");
+  saveAffinity.dataset.act = "affinity-save";
+  affinityRow.appendChild(slider);
+  affinityRow.appendChild(valueLabel);
+  affinityRow.appendChild(saveAffinity);
+  affinityCard.appendChild(affinityRow);
+  affinityCard.appendChild(
+    el(
+      "p",
+      "hint-line",
+      `现在这一级：${person.level ? person.level.name : "陌生人"}` +
+        (person.level && person.level.prompt ? `——${person.level.prompt}` : ""),
+    ),
+  );
+  if (person.level && (person.level.deny || []).length) {
+    affinityCard.appendChild(
+      el("p", "hint-line", `还不能：${(person.level.deny || []).join("、")}`),
+    );
+  }
+  // 她想不想这个人：数值 + 现在是什么状态（刚聊过就还在冷却里）
+  const missInfo = data.miss || {};
+  const missValue = Number(missInfo.value || 0);
+  const missThreshold = Number(data.miss_threshold || 0.85);
+  affinityCard.appendChild(
+    el(
+      "p",
+      "hint-line",
+      missInfo.waiting
+        ? `想念：刚聊过，${Number(missInfo.ready_in_minutes || 0)} 分钟后才会开始想他`
+        : `想念：${missValue.toFixed(2)} / ${missThreshold.toFixed(2)}`
+          + (missValue >= missThreshold
+            ? "——到点了，她会主动去找这个人"
+            : "（越接近阈值越想找人；孤独感越高涨得越快）"),
+    ),
+  );
+  const logs = el("div", "list");
+  (data.affinity_logs || []).slice(0, 8).forEach((item) => {
+    const sourceText = AFFINITY_SOURCE_LABELS[String(item.source || "")] || "";
+    logs.appendChild(
+      el(
+        "div",
+        "contact-line muted",
+        `${formatStamp(item.at)} ${Number(item.delta) >= 0 ? "+" : ""}${Math.round(Number(item.delta) * 10) / 10}` +
+          `（${item.reason || "没写原因"}${sourceText ? `｜${sourceText}` : ""}）`,
+      ),
+    );
+  });
+  if ((data.affinity_logs || []).length) {
+    logs.insertBefore(el("p", "hint-line", "最近 8 次变化："), logs.firstChild);
+    affinityCard.appendChild(logs);
+  }
+  box.appendChild(affinityCard);
+
+  // 二点五、她记着的账：记了就会对他冷一档，所以这里要写清现在算不算数
+  const grudge = data.grudge;
+  const grudgeCard = el("div", "contact-section");
+  grudgeCard.appendChild(el("h3", "", "她记着的账"));
+  if (grudge) {
+    const days = Number(grudge.days || 0);
+    grudgeCard.appendChild(
+      el(
+        "p",
+        "hint-line",
+        days < 1
+          ? `${grudge.reason}（今天记的）`
+          : `${grudge.reason}（${formatStamp(grudge.at)} 记的，已经 ${Math.ceil(days)} 天）`,
+      ),
+    );
+  } else {
+    grudgeCard.appendChild(el("p", "hint-line", "没记：他没做过让她记着的事。"));
+  }
+  grudgeCard.appendChild(
+    el(
+      "p",
+      "hint-line",
+      grudge
+        ? "她现在对他冷一档：只在跟他说话时提这件事，别人面前不说。"
+        : "记了账就会让他这一档冷下来（只在跟他说话时）。",
+    ),
+  );
+  const grudgeRow = el("div", "row");
+  const grudgeInput = el("input");
+  grudgeInput.placeholder = "手动记一笔：他答应的事又没做";
+  grudgeInput.dataset.act = "grudge-text";
+  const grudgeAdd = el("button", "small", "记一笔");
+  grudgeAdd.dataset.act = "grudge-add";
+  grudgeRow.appendChild(grudgeInput);
+  grudgeRow.appendChild(grudgeAdd);
+  if (grudge) {
+    const grudgeResolve = el("button", "small primary", "算了");
+    grudgeResolve.dataset.act = "grudge-resolve";
+    const grudgeDelete = el("button", "small danger", "删掉");
+    grudgeDelete.dataset.act = "grudge-delete";
+    grudgeRow.appendChild(grudgeResolve);
+    grudgeRow.appendChild(grudgeDelete);
+  }
+  grudgeCard.appendChild(grudgeRow);
+  box.appendChild(grudgeCard);
+
+  // 三、称呼与备注
+  const fieldCard = el("div", "contact-section");
+  fieldCard.appendChild(el("h3", "", "称呼与备注"));
+  const callMe = el("input");
+  callMe.placeholder = "他让你怎么称呼自己";
+  callMe.value = person.call_me || "";
+  callMe.dataset.act = "field-call-me";
+  const callHim = el("input");
+  callHim.placeholder = "你怎么称呼他";
+  callHim.value = person.call_him || "";
+  callHim.dataset.act = "field-call-him";
+  const note = el("input");
+  note.placeholder = "备注（只给你看，不进模型）";
+  note.value = person.note || "";
+  note.dataset.act = "field-note";
+  const digest = el("input");
+  digest.placeholder = "缩略版画像（给别人看的那一行）";
+  digest.value = person.digest || "";
+  digest.dataset.act = "field-digest";
+  [callMe, callHim, note, digest].forEach((node) => fieldCard.appendChild(node));
+  const saveFields = el("button", "primary tiny", "保存这些字段");
+  saveFields.dataset.act = "fields-save";
+  fieldCard.appendChild(saveFields);
+  box.appendChild(fieldCard);
+
+  // 四、事实列表
+  const factCard = el("div", "contact-section");
+  factCard.appendChild(el("h3", "", "关于他（事实）"));
+  const factRows = el("div", "list");
+  // 攒多了会很长：置顶的永远在，其余默认只显示最近几条，想看全部再展开
+  const allFacts = data.facts || [];
+  const pinnedFacts = allFacts.filter((item) => item.pinned);
+  const restFacts = allFacts.filter((item) => !item.pinned);
+  const FACT_PREVIEW = 8;
+  const visibleFacts = [...pinnedFacts, ...restFacts.slice(0, FACT_PREVIEW)];
+  const hiddenFacts = restFacts.slice(FACT_PREVIEW);
+  const factRow = (item, target = factRows) => {
+    const row = el("div", "contact-line");
+    const kind = el("span", "pill", item.kind || "其他");
+    row.appendChild(kind);
+    const text = el("span", "", item.text || "");
+    if (item.pinned) text.classList.add("pinned");
+    row.appendChild(text);
+    if (item.status && item.status !== "active") {
+      row.appendChild(el("span", "muted", `（${item.status === "past" ? "已过期" : "待确认"}）`));
+    }
+    if (item.evidence) {
+      row.appendChild(el("span", "muted", `｜原话：${item.evidence}`));
+    }
+    if (item.last_confirmed_at) {
+      row.appendChild(
+        el("span", "muted", `｜${formatStamp(item.last_confirmed_at)}`),
+      );
+    }
+    const pin = el("button", "ghost tiny", item.pinned ? "取消置顶" : "置顶");
+    pin.dataset.act = "fact-pin";
+    pin.dataset.id = item.id;
+    pin.dataset.pinned = item.pinned ? "0" : "1";
+    row.appendChild(pin);
+    const drop = el("button", "ghost tiny", "删");
+    drop.dataset.act = "fact-delete";
+    drop.dataset.id = item.id;
+    row.appendChild(drop);
+    target.appendChild(row);
+  };
+  // 注意：不能写成 forEach(factRow)——forEach 会把「下标」当第二个参数传进去，
+  // target 就成了数字，appendChild 直接报错（画像整块读不出来）。
+  visibleFacts.forEach((item) => factRow(item));
+  if (hiddenFacts.length) {
+    const more = el("details", "contact-more");
+    more.appendChild(el("summary", "", `还有 ${hiddenFacts.length} 条（展开）`));
+    const moreBox = el("div", "list");
+    hiddenFacts.forEach((item) => factRow(item, moreBox));
+    more.appendChild(moreBox);
+    factRows.appendChild(more);
+  }
+  if (!(data.facts || []).length) {
+    factRows.appendChild(el("p", "muted", "还没记下关于他的事。"));
+  }
+  factCard.appendChild(factRows);
+  const factAdd = el("div", "contact-inline");
+  const kindSelect = el("select");
+  ["基本信息", "喜好", "厌恶", "习惯", "关系", "约定", "近况", "other"].forEach((kind) =>
+    kindSelect.appendChild(option(kind, kind)),
+  );
+  const factInput = el("input");
+  factInput.placeholder = "例如：喜欢猫 / 生日是 10 月 3 日";
+  factInput.dataset.act = "fact-input";
+  const factButton = el("button", "primary tiny", "记下");
+  factButton.dataset.act = "fact-add";
+  factAdd.appendChild(kindSelect);
+  factAdd.appendChild(factInput);
+  factAdd.appendChild(factButton);
+  factCard.appendChild(factAdd);
+  const forget = el("button", "danger tiny", "忘掉这个人");
+  forget.dataset.act = "person-forget";
+  factCard.appendChild(forget);
+  box.appendChild(factCard);
+}
+
+/** 预览整理的结果：提示词、模型原话、解析出来的 JSON 都摆出来。 */
+function renderConsolidatePreview(result) {
+  const box = $("contacts-detail");
+  if (!box) return;
+  const card = el("div", "contact-section contact-preview");
+  card.appendChild(el("h3", "", "整理预览（没有写库）"));
+  card.appendChild(el("p", "hint-line", result.note || ""));
+  const parsed = result.parsed || {};
+  const summary = [];
+  if ((parsed.memories || []).length) summary.push(`要点 ${parsed.memories.length} 条`);
+  if ((parsed.facts || []).length) summary.push(`关于他的事 ${parsed.facts.length} 条`);
+  if ((parsed.relations || []).length) summary.push(`关系 ${parsed.relations.length} 条`);
+  if ((parsed.digests || {}) && Object.keys(parsed.digests || {}).length) {
+    summary.push(`缩略版 ${Object.keys(parsed.digests).length} 份`);
+  }
+  if (parsed.dream) summary.push("做了一个梦");
+  card.appendChild(el("p", "", summary.join("、") || "模型没给出可用的改动"));
+  const raw = el("pre", "contact-preview-raw");
+  raw.textContent = (result.raw || "").slice(0, 1200);
+  card.appendChild(el("p", "hint-line", "模型原话："));
+  card.appendChild(raw);
+  const promptBox = el("details", "contact-preview-prompt");
+  promptBox.appendChild(el("summary", "", "看喂进去的提示词"));
+  const user = el("pre", "contact-preview-raw");
+  user.textContent = ((result.preview || {}).user || "").slice(0, 4000);
+  promptBox.appendChild(user);
+  card.appendChild(promptBox);
+  box.insertBefore(card, box.firstChild);
+}
+
+async function contactAction(node) {
+  const act = node.dataset.act;
+  const session = $("contacts-session").value;
+  const userId = ui.contactUser;
+  if (!session || !userId) return;
+  const detail = ui.contactDetail || {};
+  try {
+    if (act === "bond-add") {
+      const selects = node.parentElement.querySelectorAll("select");
+      const type = selects[0] ? selects[0].value : "";
+      const asserted = selects[1] ? selects[1].value : "她的判断";
+      await apiPost("profile/bond", {
+        session,
+        user_id: userId,
+        action: "note",
+        type,
+        asserted_by: asserted,
+      });
+    } else if (act === "bond-close") {
+      await apiPost("profile/bond", { session, user_id: userId, action: "close", id: node.dataset.id });
+    } else if (act === "bond-accept") {
+      await apiPost("profile/bond", { session, user_id: userId, action: "accept", id: node.dataset.id, policy: "replace" });
+    } else if (act === "bond-delete") {
+      await apiPost("profile/bond", { session, user_id: userId, action: "delete", id: node.dataset.id });
+    } else if (act === "fact-add") {
+      const box = node.parentElement;
+      const kind = box.querySelector("select").value;
+      const input = box.querySelector("input");
+      if (!input.value.trim()) throw new Error("先写点什么");
+      await apiPost("profile/fact", {
+        session,
+        user_id: userId,
+        action: "add",
+        kind,
+        text: input.value.trim(),
+      });
+    } else if (act === "fact-pin") {
+      await apiPost("profile/fact", {
+        session,
+        user_id: userId,
+        action: "update",
+        id: node.dataset.id,
+        pinned: node.dataset.pinned === "1",
+      });
+    } else if (act === "fact-delete") {
+      await apiPost("profile/fact", { session, user_id: userId, action: "delete", id: node.dataset.id });
+    } else if (act === "affinity-save") {
+      const slider = node.parentElement.querySelector("input[type=range]");
+      await apiPost("profile/affinity", {
+        session,
+        user_id: userId,
+        value: Number(slider.value),
+        reason: "主人手动调的",
+      });
+    } else if (act === "grudge-add") {
+      const input = node.parentElement.querySelector("[data-act=grudge-text]");
+      const reason = (input && input.value.trim()) || "";
+      if (!reason) {
+        toast("先写一句她记着的事");
+        return;
+      }
+      await apiPost("profile/grudge", { session, user_id: userId, action: "add", reason });
+    } else if (act === "grudge-resolve") {
+      await apiPost("profile/grudge", { session, user_id: userId, action: "resolve" });
+    } else if (act === "grudge-delete") {
+      await apiPost("profile/grudge", { session, user_id: userId, action: "delete" });
+    } else if (act === "fields-save") {
+      const box = node.parentElement;
+      await apiPost("profile/person", {
+        session,
+        user_id: userId,
+        call_me: box.querySelector("[data-act=field-call-me]").value,
+        call_him: box.querySelector("[data-act=field-call-him]").value,
+        note: box.querySelector("[data-act=field-note]").value,
+        digest: box.querySelector("[data-act=field-digest]").value,
+      });
+    } else if (act === "person-forget") {
+      if (!window.confirm("真的要忘掉这个人吗？画像、事实、关系都会删掉。")) return;
+      await apiPost("profile/forget", { session, user_id: userId });
+      ui.contactUser = "";
+    } else {
+      return;
+    }
+    toast("改好了");
+    await loadContacts();
+  } catch (error) {
+    toast(error.message || "没改成");
+  }
+}
+
 async function loadMemories() {
   const list = $("memory-list");
   list.innerHTML = "<p class='muted'>加载中…</p>";
@@ -6745,6 +9949,23 @@ async function loadMemories() {
       `平均权重 ${stats.avg_weight}`,
     ].forEach((text) => statsBox.appendChild(el("span", "", text)));
 
+    // 上次整理到底干了什么：不写这一行，"记忆没变化"永远只能靠猜
+    try {
+      const session = $("memory-session") ? $("memory-session").value : "";
+      const logs = await apiGet("logs", { session, type: "consolidate", limit: 3 });
+      const rows = logs.events || [];
+      if (rows.length) {
+        const last = rows[0];
+        statsBox.appendChild(
+          el("span", "", `上次整理：${last.text || "（没写说明）"}`),
+        );
+      } else {
+        statsBox.appendChild(el("span", "", "上次整理：还没有跑过（她睡下 20 分钟后会整理一次）"));
+      }
+    } catch (error) {
+      statsBox.appendChild(el("span", "", "上次整理：读不到"));
+    }
+
     list.innerHTML = "";
     (data.memories || []).forEach((memory) => {
       const item = el("div", "list-item");
@@ -6760,11 +9981,16 @@ async function loadMemories() {
             memory.node_id || "无节点"
           } · ${memory.type} · 权重 ${Number(memory.weight).toFixed(
             2,
-          )} · 召回 ${memory.recall_count}`,
+          )} · 召回 ${memory.recall_count}` +
+            // 整理过的记忆正文会换成要点、原文挪到 context：不标出来会以为"整理没跑"
+            (memory.tier === "gist" ? "　· 已整理成要点" : "　· 原文"),
         ),
       );
       item.appendChild(info);
       const box = el("div", "inline");
+      const more = el("button", "small", "详情");
+      more.title = "看这条记忆的完整字段（含整理前的原文）";
+      more.addEventListener("click", () => openMemoryDetail(memory));
       const edit = el("button", "small", "编辑");
       edit.addEventListener("click", () => openMemoryDialog(memory));
       const del = el("button", "small danger", "删除");
@@ -6780,6 +10006,7 @@ async function loadMemories() {
       });
       box.appendChild(edit);
       box.appendChild(del);
+      box.insertBefore(more, edit);
       item.appendChild(box);
       list.appendChild(item);
     });
@@ -6916,8 +10143,178 @@ function openMemoryDialog(memory, preset = {}) {
 /* 全局设置                                                            */
 /* ================================================================== */
 
-function settingsSection(title, note, tipText) {
+/** 全局设置的分组：小节标题 → 标签页。标题改了这里要跟着改。 */
+const SETTINGS_TABS = [
+  {
+    key: "basic",
+    label: "基础",
+    hint: "她是谁、生活在什么样的世界、谁是管理员",
+    sections: ["基础", "persona", "persona_brief", "她的初始状态"],
+  },
+  {
+    key: "state",
+    label: "状态与外观",
+    hint: "数值怎么变、她的本事、睡觉、群名片",
+    sections: ["状态变化速度", "她的本事（能力值）", "睡眠与打断", "群名片同步"],
+  },
+  {
+    key: "talk",
+    label: "说话与决策",
+    hint: "多久开口、说什么、怎么分句",
+    sections: [
+      "手感（滑块）",
+      "自主决策",
+      "孤独感与插话",
+      "没人理她时怎么办",
+      "说话频率与预算",
+      "说话节奏",
+    ],
+  },
+  {
+    key: "world",
+    label: "世界与事件",
+    hint: "她遇上什么事、怎么求助、动作与地点、工具、天气",
+    sections: [
+      "事件",
+      "作息与夜晚",
+      "她自己的账",
+      "干涉与线索",
+      "动作与地点",
+      "工具",
+      "天气",
+    ],
+  },
+  {
+    key: "mind",
+    label: "记忆与上下文",
+    hint: "记得什么、怎么把信息喂给模型",
+    sections: [
+      "记忆",
+      "用户画像",
+      "上下文",
+      "图片转述",
+    ],
+  },
+  {
+    key: "debug",
+    label: "调试与安全",
+    hint: "排查用，以及不许做的事",
+    sections: ["调试输出", "内容安全与隐私"],
+  },
+];
+
+function settingsTabOf(section) {
+  // 按"稳定 key"归口：标题是给人看的（会随性别变成她/他/ta），不能拿它当身份
+  const key = typeof section === "string"
+    ? section
+    : String((section && section.dataset && section.dataset.sectionKey) || "");
+  const title = typeof section === "string"
+    ? section
+    : String((section && section.dataset && section.dataset.sectionTitle) || "");
+  const found = SETTINGS_TABS.find(
+    (item) => item.sections.includes(key) || item.sections.includes(title),
+  );
+  return found ? found.key : "basic";
+}
+
+function renderSettingsTabs() {
+  const box = $("settings-tabs");
+  if (!box) return;
+  box.innerHTML = "";
+  const current = ui.settingsTab || SETTINGS_TABS[0].key;
+  SETTINGS_TABS.forEach((tab) => {
+    const button = el("button", `settings-tab${tab.key === current ? " active" : ""}`);
+    button.type = "button";
+    button.title = tab.hint;
+    button.appendChild(el("span", "", tab.label));
+    if (ui.dirtyTabs.has(tab.key)) {
+      button.appendChild(el("i", "dirty-dot", ""));
+    }
+    button.addEventListener("click", () => {
+      ui.settingsTab = tab.key;
+      applySettingsTabs();
+    });
+    box.appendChild(button);
+  });
+}
+
+/** 按当前选中的标签显示/隐藏小节（分类只影响显示，world JSON 一点不动）。 */
+function applySettingsTabs() {
+  const form = $("settings-form");
+  if (!form) return;
+  const current = ui.settingsTab || SETTINGS_TABS[0].key;
+  Array.from(form.children).forEach((section) => {
+    if (!section.classList.contains("card-section")) return;
+    section.classList.toggle("hidden", settingsTabOf(section) !== current);
+  });
+  renderSettingsTabs();
+}
+
+/** 设置搜索：按小节标题、字段名、字段说明找，点结果直接跳到对应标签。 */
+function searchSettings(keyword) {
+  const box = $("settings-search-hits");
+  if (!box) return;
+  const word = String(keyword || "").trim().toLowerCase();
+  if (!word) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    return;
+  }
+  const hits = [];
+  const form = $("settings-form");
+  Array.from(form.children).forEach((section) => {
+    if (!section.classList.contains("card-section")) return;
+    const title = String(section.dataset.sectionTitle || "");
+    const tab = settingsTabOf(section);
+    const headMatch = title.toLowerCase().includes(word);
+    const fields = Array.from(section.querySelectorAll(".field-head")).map((head) =>
+      String(head.textContent || "").trim(),
+    );
+    const tips = Array.from(section.querySelectorAll("[data-tip]")).map((node) =>
+      String(node.getAttribute("data-tip") || ""),
+    );
+    const fieldHit = fields.find((item) => item.toLowerCase().includes(word));
+    const tipHit = tips.find((item) => item.toLowerCase().includes(word));
+    if (!headMatch && !fieldHit && !tipHit) return;
+    hits.push({
+      tab,
+      title,
+      label: headMatch ? title : fieldHit || title,
+      tip: tipHit ? tipHit.slice(0, 80) + "…" : "",
+    });
+  });
+  box.innerHTML = "";
+  box.classList.remove("hidden");
+  if (!hits.length) {
+    box.appendChild(el("span", "muted", "没找到这个设置项"));
+    return;
+  }
+  hits.slice(0, 12).forEach((hit) => {
+    const item = el("button", "settings-hit");
+    item.type = "button";
+    item.appendChild(el("b", "", hit.label));
+    item.appendChild(el("span", "muted", `（${hit.title}）`));
+    if (hit.tip) item.title = hit.tip;
+    item.addEventListener("click", () => {
+      ui.settingsTab = hit.tab;
+      applySettingsTabs();
+      const form = $("settings-form");
+      const target = Array.from(form.children).find(
+        (section) => String(section.dataset.sectionTitle || "") === hit.title,
+      );
+      if (target && target.scrollIntoView) {
+        target.scrollIntoView({ block: "center", behavior: "smooth" });
+      }
+      box.classList.add("hidden");
+    });
+    box.appendChild(item);
+  });
+}
+
+function settingsSection(title, note, tipText, key = "") {
   const section = el("div", "card-section");
+  section.dataset.sectionKey = key || title;
+  section.dataset.sectionTitle = title;
   const heading = el("h3");
   heading.appendChild(el("span", "", title));
   const tip = tipBox(tipText);
@@ -6928,6 +10325,90 @@ function settingsSection(title, note, tipText) {
   section.appendChild(fields);
   section._fields = fields;
   return section;
+}
+
+/**
+ * 把标了 ``adv`` 的字段收进小节底部的「高级设置」。
+ *
+ * 用得着的没几个、但一个都不能少的那些（频率、预算、上限、阈值）留在这儿：
+ * 默认收起，页面第一眼只剩真正要改的东西。
+ */
+const ADVANCED_LABELS = {
+  "事件": [
+    "大事件两步之间至少隔多久（分钟）",
+    "「最近发生在我身上的事」最多带几条",
+    "一条线索最多几步",
+    "一条线索最长多久（分钟）",
+    "事件里她一次最多说几句",
+    "事件发言的硬顶",
+    "两件事之间至少隔多久（分钟）",
+    "一条线索里最多调用几次动作",
+    "每一幕出图的概率",
+    "事件出图用哪些动作",
+    "判定结果影响情绪",
+    "题材的尺度边界（可留空）",
+    "最近几件用过的题材先不重复",
+    "推迟一次隔多久再检查（分钟）",
+    "同一条日程一天最多推迟几次",
+    "同一条日程一天最多推迟多久（分钟）",
+  ],
+  "上下文": [
+    "别处同时听到的带多少行",
+    "没回过的那批每条最多多少字",
+    "已经回过的那批每条最多多少字",
+    "「刚聊过什么」有效期（分钟）",
+    "引用旧消息最多写多少字",
+    "攒到多少条开始压缩",
+    "压缩后保留多少条原文",
+    "两次压缩至少间隔（分钟）",
+    "一次最多带几张图（没配转述模型时）",
+    "聊天记录最多带几张图",
+  ],
+  "图片转述": [
+    "最多记住多少张图",
+    "缓存保留多少天",
+    "摘要最多多少字",
+    "转发摘要提示词",
+  ],
+  "说话节奏": [
+    "每个字停顿（秒）",
+    "单条最多停顿（秒）",
+    "回答前先等几秒（安静期）",
+    "安静期最长等多久（秒）",
+    "说话密度统计窗口（分钟）",
+    "窗口内说几句算太密",
+  ],
+};
+
+function fieldLabelOf(node) {
+  if (!node || !node.querySelector) return "";
+  const head = node.querySelector(".field-head > span");
+  if (head) return String(head.textContent || "").trim();
+  const own = node.querySelector(":scope > span");
+  return own ? String(own.textContent || "").trim() : "";
+}
+
+function collapseAdvancedFields(form) {
+  Array.from(form.querySelectorAll(":scope > .card-section")).forEach((section) => {
+    const fields = section.querySelector(":scope > .fields");
+    if (!fields) return;
+    const wanted = new Set(ADVANCED_LABELS[String(section.dataset.sectionTitle || "")] || []);
+    const advanced = Array.from(fields.children).filter((node) => {
+      if (node.dataset && node.dataset.adv === "1") return true;
+      const label = fieldLabelOf(node);
+      return Boolean(label) && wanted.has(label);
+    });
+    if (!advanced.length) return;
+    const box = document.createElement("details");
+    box.className = "adv-fields";
+    const summary = document.createElement("summary");
+    summary.appendChild(el("span", "", `高级设置（${advanced.length} 项）`));
+    box.appendChild(summary);
+    const inner = el("div", "fields adv-inner");
+    advanced.forEach((node) => inner.appendChild(node));
+    box.appendChild(inner);
+    fields.appendChild(box);
+  });
 }
 
 function renderSettings() {
@@ -6951,6 +10432,16 @@ function renderSettings() {
     "新手只需要改「全局提示词」，其它保持默认即可。",
   );
   const basicFull = el("div", "full");
+  const wizardRow = el("div", "row");
+  const wizardButton = el("button", "small primary", "重新运行设置向导…");
+  wizardButton.type = "button";
+  wizardButton.title = "把「她在哪儿生活 / 她是谁 / 模型 / 手感 / 记忆」再走一遍（每一步都会预填当前值）";
+  wizardButton.addEventListener("click", () => openWizard());
+  wizardRow.appendChild(wizardButton);
+  wizardRow.appendChild(
+    el("span", "muted", "第一次用不知道从哪下手就点它；只会覆盖你在这几步里改过的东西"),
+  );
+  basicFull.appendChild(wizardRow);
   basicFull.appendChild(
     textareaField("世界规则（全局提示词）", world.global_prompt || "", (value) => (world.global_prompt = value), {
       hint:
@@ -6965,25 +10456,6 @@ function renderSettings() {
     }),
   );
   basic._fields.appendChild(
-    inputField("Bot 名称", world.bot_name || "", (value) => (world.bot_name = value), {
-      hint:
-        "互动动作文案里的 {bot} 会替换成这个名字，例如「（小鲸鱼抱了你一下）」。留空时先用群名片原名，再回落到「她」。",
-      placeholder: "例如：小鲸鱼",
-    }),
-  );
-  const genderField = pillsField(
-    "性别",
-    world.gender || "female",
-    GENDERS,
-    (value) => {
-      world.gender = value;
-      renderSettings();
-      applyPronoun($("app"));
-    },
-    { hint: "决定文案里的称呼：女→她、男→他、塑料袋→ta。界面文字和 /vw status 都会跟着变。" },
-  );
-  basic._fields.appendChild(genderField);
-  basic._fields.appendChild(
     pillsField(
       "被 @ 时的回复方式",
       world.reply_mode || "takeover",
@@ -6991,8 +10463,7 @@ function renderSettings() {
         {
           key: "takeover",
           label: "接管回复（推荐）",
-          hint:
-            "本插件自己调大模型、按 JSON 动作执行并发送，主人格不会再重复回复。她说不出话或模型出错时自动交回主人格。注意：此时回复用的是插件配置里的 Provider（llm_provider_id），回复质量由它决定；若想用主人格的好模型说话，请切到「仅注入状态」。",
+          hint: "插件自己调模型、按 JSON 动作执行并发送，主人格不重复回复；模型出错时交回主人格。",
         },
         {
           key: "inject",
@@ -7014,8 +10485,7 @@ function renderSettings() {
       world.reasoning_enabled !== false,
       (value) => (world.reasoning_enabled = value),
       {
-        hint:
-          "让大模型在输出动作之前，先写下「我在哪 / 什么状态 / 什么心情 / 在和谁说话 / 打算怎么办」。草稿不会发到群里、不计入动作数量，但能明显减少「状态说错、答错对象」这类低级错误。关掉可以省一点 token。",
+        hint: "输出动作前先写「在哪 / 状态 / 心情 / 和谁说话 / 打算怎么办」。草稿不进群、不占动作数，能减少答错对象。",
       },
     ),
   );
@@ -7032,16 +10502,576 @@ function renderSettings() {
         world.admin_ids = value;
       },
       {
-        hint:
-          "这些 QQ 号也能用管理类指令（重载配置、重置状态、改群名片、跑日程、调试）。\n" +
-          "AstrBot 自己的管理员始终可以用，所以不用担心把自己锁在外面。\n" +
-          "输入 QQ 号后按回车添加。",
+        hint: "这些 QQ 号也能用管理类指令（重载、重置状态、改名片、跑日程、调试）。AstrBot 管理员始终可用。",
         placeholder: "输入 QQ 号后按回车",
         emptyText: "（没有额外管理员：只有 AstrBot 的管理员能用管理指令）",
       },
     ),
   );
   form.appendChild(basic);
+
+  /* --- 她 / 他 / ta（人设）：构成"这个人"的设置都收在这一节 --- */
+  world.persona = world.persona || { mode: "astrbot", text: "" };
+  const personaSection = settingsSection(
+    pronoun(),
+    "构成这个人的东西都在这一节：称呼与名字、说话的样子（角色卡）、给打杂模型的摘要。",
+    "标题跟着性别走，默认沿用 AstrBot 那份人格；想让她不随会话漂移就选「用这一份」。",
+    "persona",
+  );
+  personaSection._fields.appendChild(
+    pillsField(
+      "性别",
+      world.gender || "female",
+      GENDERS,
+      (value) => {
+        world.gender = value;
+        renderSettings();
+        applyPronoun($("app"));
+      },
+      {
+        hint:
+          "决定文案里的称呼：女→她、男→他、塑料袋→ta。这一页的标题和界面文字都会跟着变。",
+      },
+    ),
+  );
+  personaSection._fields.appendChild(
+    inputField("Bot 名称", world.bot_name || "", (value) => (world.bot_name = value), {
+      hint:
+        "互动动作文案里的 {bot} 会替换成这个名字，例如「（小鲸鱼抱了你一下）」。留空时先用群名片原名，再回落到「她」。",
+      placeholder: "例如：小鲸鱼",
+    }),
+  );
+  personaSection._fields.appendChild(
+    selectField(
+      "人设来源",
+      world.persona.mode || "astrbot",
+      [
+        { key: "astrbot", label: "跟随 AstrBot（每个会话各自的人格）" },
+        { key: "plugin", label: "用下面这一份（所有会话共用）" },
+        { key: "append", label: "AstrBot 那份 + 下面这一份（接在后面）" },
+      ],
+      (value) => {
+        world.persona.mode = value;
+        renderSettings();
+      },
+      {
+        hint: "「跟随 AstrBot」= 现在的行为：换会话 / 改组时她的人设可能跟着变。",
+      },
+    ),
+  );
+  const personaText = textareaField(
+    "角色卡（她是谁）",
+    world.persona.text || "",
+    (value) => (world.persona.text = value),
+    {
+      rows: 12,
+      hint: "她是谁、怎么说话、在意什么。留空时自动回落到 AstrBot 那份，免得把人格弄没。",
+      placeholder: "例如：你是……（身份、说话习惯、喜欢和讨厌的事）",
+    },
+  );
+  // 角色卡是这一页最该先看的东西：让它独占一行，别跟别的字段挤在网格里
+  personaText.classList.add("full");
+  const personaImport = el("button", "small ghost", "从 AstrBot 导入当前人设");
+  personaImport.type = "button";
+  personaImport.title = "把 AstrBot 给这个会话选的人格抄进上面的框里，之后它就跟着预设走";
+  personaImport.addEventListener("click", async () => {
+    try {
+      // 借白名单里第一条会话去问 AstrBot 现在用哪份人格（人格一般是全局的，
+      // 但 AstrBot 是"按会话 / 配置文件"解析的，所以随便挑一条能读到的）
+      const session = String((ui.sessions[0] || {}).session_id || "");
+      const data = await apiGet("persona-source", { session });
+      const text = String(data.text || "");
+      if (!text.trim()) {
+        toast("AstrBot 这个会话没读到人格，先在 AstrBot 里给这个会话选一份");
+        return;
+      }
+      world.persona.text = text;
+      world.persona.mode = "plugin";
+      markDirty();
+      renderSettings();
+      toast(`已导入 ${data.chars || text.length} 字，记得保存`);
+    } catch (error) {
+      toast(error.message || "读取失败");
+    }
+  });
+  personaText.appendChild(personaImport);
+  personaSection._fields.appendChild(personaText);
+
+  /* --- 优化人设：先体检、再逐条接受（绝不自动覆盖） --- */
+  const reviewFull = el("div", "full");
+  const reviewRow = el("div", "row");
+  const reviewButton = el("button", "small primary", "优化人设…");
+  reviewButton.type = "button";
+  reviewButton.title = "让生成器模型先体检这份角色卡，再把改动一条条列出来给你挑";
+  const evalButton = el("button", "small ghost", "生成测评剧本…");
+  evalButton.type = "button";
+  evalButton.title = "写一份考卷：同一份剧本跑不同模型，盲选哪版更像她（不会进提示词）";
+  const historyButton = el("button", "small ghost", "改动历史…");
+  historyButton.type = "button";
+  historyButton.title = "改坏了随时翻回去：每次保存 / 应用预设 / 优化人设之前都留了一版";
+  const reviewNote = el("span", "muted", "先体检，再给你逐条挑；只写你点过的那些");
+  reviewRow.appendChild(reviewButton);
+  reviewRow.appendChild(evalButton);
+  reviewRow.appendChild(historyButton);
+  reviewRow.appendChild(reviewNote);
+  reviewFull.appendChild(reviewRow);
+  personaSection._fields.appendChild(reviewFull);
+  historyButton.addEventListener("click", () => openHistoryModal());
+
+  evalButton.addEventListener("click", async () => {
+    const sessionId = $("status-session") ? $("status-session").value : "";
+    let data = {};
+    evalButton.disabled = true;
+    reviewNote.textContent = "出题中…（要调一次生成器模型）";
+    try {
+      data = await apiPost("eval-script", { session: sessionId, rounds: 20 });
+    } catch (error) {
+      reviewNote.textContent = error.message || "生成失败";
+      evalButton.disabled = false;
+      return;
+    }
+    evalButton.disabled = false;
+    reviewNote.textContent = `出了 ${data.count} 轮题，确认后开跑`;
+    openEvalModal(data.rounds || []);
+  });
+
+  reviewButton.addEventListener("click", async () => {
+    const sessionId = $("status-session") ? $("status-session").value : "";
+    let report = {};
+    reviewButton.disabled = true;
+    reviewNote.textContent = "体检中…（要调一次生成器模型）";
+    try {
+      report = await apiPost("persona/review", { session: sessionId });
+    } catch (error) {
+      reviewNote.textContent = error.message || "体检失败";
+      reviewButton.disabled = false;
+      return;
+    }
+    reviewButton.disabled = false;
+    reviewNote.textContent = `原文 ${report.persona_chars} 字｜${report.length_hint || ""}`;
+
+    const lines = [];
+    if ((report.ok_points || []).length) {
+      lines.push("已经写得好的：");
+      report.ok_points.forEach((item) => lines.push(`· ${item}`));
+    }
+    (report.issues || []).forEach((item) => {
+      lines.push(`【${item.level}／${item.kind}】${item.detail}`);
+      if (item.quote) lines.push(`    原文：${item.quote}`);
+    });
+    (report.questions || []).forEach((item) => lines.push(`？${item}`));
+    if (!report.rewrite.length && !report.add.length) {
+      openFormDialog({
+        title: "体检结果",
+        hint: lines.join("\n") || "没发现问题。",
+        fields: [],
+        confirmText: "知道了",
+        onSubmit: () => true,
+      });
+      return;
+    }
+    openReviewModal(report, lines);
+  });
+
+
+  /* --- 声音样例：页面上只放"已采用"，候选池挪进弹窗 --- */
+  const sampleFull = el("div", "full");
+  sampleFull.appendChild(fieldHead("声音样例"));
+  sampleFull.appendChild(
+    el(
+      "p",
+      "muted",
+      "只有下面这份「已采用」会进提示词（每轮抽 2~3 条相关的；一条都没有时整段不出现）。"
+        + "候选先攒在弹窗里，挑中的才挪进来；每条都能改文字、换场景。",
+    ),
+  );
+  const sampleList = el("div", "sample-list");
+  sampleFull.appendChild(sampleList);
+  const candidateRow = el("div", "row");
+  const candidateOpen = el("button", "small primary", "挑选候选…");
+  candidateOpen.type = "button";
+  candidateOpen.title = "候选池：生成出来的、从聊天里挑出来的句子都先攒在这里";
+  const candidateGenerate = el("button", "small primary", "生成候选…");
+  candidateGenerate.type = "button";
+  const candidateFromChat = el("button", "small", "从近期聊天挑");
+  candidateFromChat.type = "button";
+  candidateRow.appendChild(candidateOpen);
+  candidateRow.appendChild(candidateGenerate);
+  candidateRow.appendChild(candidateFromChat);
+  const candidateNote = el("span", "muted", "");
+  candidateRow.appendChild(candidateNote);
+  sampleFull.appendChild(candidateRow);
+  const sampleNote = el("span", "muted", "");
+  sampleFull.appendChild(sampleNote);
+  personaSection._fields.appendChild(sampleFull);
+
+  ui.voiceSamples = [];
+  ui.voiceCandidates = [];
+  ui.voiceScenes = [];
+  ui.voiceMax = 12;
+  ui.voiceCandidatesMax = 80;
+  const voicePicked = new Set();
+
+  function voiceSceneLabel(scene) {
+    const hit = ui.voiceScenes.find((one) => one.id === scene);
+    return hit ? String(hit.label).split("：")[0] : "";
+  }
+
+  function renderVoiceSummary() {
+    candidateNote.textContent =
+      `候选池 ${ui.voiceCandidates.length}/${ui.voiceCandidatesMax} 条`;
+  }
+
+  /** 候选池弹窗：勾选要采用的，✕ 从候选里删掉。 */
+  function openCandidatePicker() {
+    openCustomDialog({
+      title: "候选池",
+      hint: "勾中的会加进「已采用」；✕ 是从候选里删掉。候选池里的句子不进提示词。",
+      confirmText: "采用选中",
+      build: (body) => {
+        const list = el("div", "sample-list");
+        body.appendChild(list);
+        const foot = el("div", "row");
+        const note = el("span", "muted", "");
+        const clear = el("button", "small ghost", "清空候选池");
+        clear.type = "button";
+        clear.addEventListener("click", async () => {
+          if (!ui.voiceCandidates.length) return;
+          const yes = await confirmDialog({
+            title: "清空候选池",
+            message: `确定要删掉全部 ${ui.voiceCandidates.length} 条候选吗？（已采用的不受影响）`,
+            confirmText: "清空",
+          });
+          if (!yes) return;
+          ui.voiceCandidates = [];
+          voicePicked.clear();
+          persistVoiceSamples();
+          draw();
+        });
+        foot.appendChild(clear);
+        foot.appendChild(note);
+        body.appendChild(foot);
+
+        function draw() {
+          list.innerHTML = "";
+          if (!ui.voiceCandidates.length) {
+            list.appendChild(
+              el(
+                "p",
+                "muted",
+                "还没有候选。关掉这个弹窗，用「生成候选」让她按场景说几句，" +
+                  "或者「从近期聊天挑」翻她自己说过的话。",
+              ),
+            );
+          }
+          ui.voiceCandidates.forEach((item) => {
+            const row = el("div", "sample-item");
+            const head = el("div", "sample-item-head");
+            const box = document.createElement("input");
+            box.type = "checkbox";
+            box.checked = voicePicked.has(item.id);
+            box.addEventListener("change", () => {
+              if (box.checked) voicePicked.add(item.id);
+              else voicePicked.delete(item.id);
+              draw();
+            });
+            head.appendChild(box);
+            const label = voiceSceneLabel(item.scene);
+            if (label) head.appendChild(el("span", "tag", label));
+            if (item.source === "chat") head.appendChild(el("span", "tag", "来自聊天"));
+            const del = el("button", "icon-btn", "✕");
+            del.type = "button";
+            del.title = "从候选里删掉这一条";
+            del.addEventListener("click", () => {
+              ui.voiceCandidates = ui.voiceCandidates.filter((one) => one !== item);
+              voicePicked.delete(item.id);
+              persistVoiceSamples();
+              draw();
+            });
+            head.appendChild(del);
+            row.appendChild(head);
+            row.appendChild(el("div", "sample-item-text", item.text));
+            if (item.context) {
+              row.appendChild(el("div", "muted", `当时对方说：${item.context}`));
+            }
+            list.appendChild(row);
+          });
+          note.textContent =
+            `${ui.voiceCandidates.length}/${ui.voiceCandidatesMax} 条` +
+            (voicePicked.size ? `，选了 ${voicePicked.size} 条` : "");
+        }
+        draw();
+      },
+      onSubmit: async () => {
+        const picked = ui.voiceCandidates.filter((item) => voicePicked.has(item.id));
+        if (!picked.length) {
+          $("dialog-error").textContent = "先勾几条要采用的";
+          return false;
+        }
+        const room = Math.max(0, ui.voiceMax - ui.voiceSamples.length);
+        if (picked.length > room) {
+          $("dialog-error").textContent = `样例库最多 ${ui.voiceMax} 条，还能再加 ${room} 条`;
+          return false;
+        }
+        adoptCandidates(picked);
+        persistVoiceSamples();
+        toast(`采用了 ${picked.length} 条，记得点右上角保存`);
+        return true;
+      },
+    });
+  }
+
+  function adoptCandidates(picked) {
+    picked.forEach((item) => {
+      ui.voiceSamples.push({
+        id: `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+        scene: item.scene || "",
+        label: item.label || "",
+        move: item.move || "",
+        text: item.text,
+        source: item.source || "model",
+      });
+    });
+    const takenIds = new Set(picked.map((item) => item.id));
+    ui.voiceCandidates = ui.voiceCandidates.filter((one) => !takenIds.has(one.id));
+    voicePicked.clear();
+  }
+
+  /** 改一条已采用的样例：文字 / 场景 / 动作说明。 */
+  function editVoiceSample(item) {
+    openFormDialog({
+      title: "编辑样例",
+      hint: "这一句会被喂给她当口吻样本——宁缺毋滥，别写成你想让她说的台词。",
+      fields: [
+        { key: "text", label: "内容", type: "textarea", rows: 3, value: item.text || "" },
+        {
+          key: "scene",
+          label: "场景（决定什么时候抽到它）",
+          type: "select",
+          value: item.scene || "",
+          options: [
+            { value: "", label: "不限（任何时候都可能抽到）" },
+            ...ui.voiceScenes.map((one) => ({ value: one.id, label: one.label })),
+          ],
+        },
+        {
+          key: "move",
+          label: "动作说明（可留空）",
+          type: "text",
+          value: item.move || "",
+          placeholder: "例如：把脸埋进抱枕里",
+        },
+      ],
+      confirmText: "保存",
+      onSubmit: async (values) => {
+        const text = String(values.text || "").trim();
+        if (!text) {
+          $("dialog-error").textContent = "内容不能为空";
+          return false;
+        }
+        item.text = text.slice(0, 120);
+        item.scene = String(values.scene || "");
+        item.move = String(values.move || "").trim().slice(0, 20);
+        item.source = item.source || "model";
+        persistVoiceSamples();
+        toast("改好了，记得点右上角保存");
+        return true;
+      },
+    });
+  }
+
+  function renderVoiceSamples() {
+    sampleList.innerHTML = "";
+    if (!ui.voiceSamples.length) {
+      sampleList.appendChild(
+        el("p", "muted", "还没有样例。点上面的「挑选候选…」选几条「采用」，它们才会进提示词。"),
+      );
+    }
+    ui.voiceSamples.forEach((item) => {
+      const row = el("div", "sample-item");
+      const head = el("div", "sample-item-head");
+      const label = voiceSceneLabel(item.scene) || item.label || "样例";
+      head.appendChild(el("span", "tag", String(label).split("：")[0]));
+      if (item.move) head.appendChild(el("span", "muted", item.move));
+      const edit = el("button", "icon-btn", "✎");
+      edit.type = "button";
+      edit.title = "改这一条的文案 / 场景 / 动作说明";
+      edit.addEventListener("click", () => editVoiceSample(item));
+      head.appendChild(edit);
+      const del = el("button", "icon-btn", "✕");
+      del.type = "button";
+      del.title = "删掉这一条";
+      del.addEventListener("click", () => {
+        ui.voiceSamples = ui.voiceSamples.filter((one) => one !== item);
+        persistVoiceSamples();
+        renderVoiceSamples();
+      });
+      head.appendChild(del);
+      row.appendChild(head);
+      row.appendChild(el("div", "sample-item-text", item.text));
+      sampleList.appendChild(row);
+    });
+    sampleNote.textContent = `${ui.voiceSamples.length}/${ui.voiceMax} 条`;
+    renderVoiceSummary();
+  }
+
+  /**
+   * 样例和候选池跟着**设置页那份内存配置**走，和别的字段一样：改完标脏，点保存才落盘。
+   *
+   * 以前这里直接调 `voice-samples/save` 写盘，编辑器的内存却不知道——随后点右上角
+   * 「保存」就把旧的那份覆盖回去了，于是"挑完候选一保存就没了"。
+   */
+  function persistVoiceSamples() {
+    world.persona = world.persona || {};
+    world.persona.samples = ui.voiceSamples;
+    world.persona.sample_candidates = ui.voiceCandidates;
+    markDirty();
+  }
+
+  function pushCandidates(items, source) {
+    const seen = new Set(ui.voiceCandidates.map((one) => String(one.text || "")));
+    (items || []).forEach((item) => {
+      const text = String(item.text || "").trim();
+      if (!text || seen.has(text)) return;
+      seen.add(text);
+      ui.voiceCandidates.push({
+        id: `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+        scene: item.scene || "",
+        label: item.label || "",
+        move: item.move || "",
+        text,
+        context: item.context || "",
+        source: item.source || source,
+      });
+    });
+    const over = ui.voiceCandidates.length - ui.voiceCandidatesMax;
+    if (over > 0) ui.voiceCandidates = ui.voiceCandidates.slice(over);
+    renderVoiceSummary();
+  }
+
+  async function generateVoiceSamples() {
+    const sessionId = $("status-session") ? $("status-session").value : "";
+    if (!sessionId) {
+      toast("先在「实时状态」里选一个会话（她要拿这个会话的角色卡去写）");
+      return;
+    }
+    let added = 0;
+    // 生成要调一次模型，几秒到几十秒：**弹窗等生成完再关**，
+    // 出错也留在弹窗里显示（渲染在 #dialog-error），不然看着就是"点了没反应"。
+    await openFormDialog({
+      title: "生成声音样例",
+      hint: "选几个场景，每个场景让她说三条不同走法的话。生成的结果会先放进候选池，你可以慢慢挑。",
+      fields: [
+        {
+          key: "scenes",
+          label: "场景",
+          type: "checkboxes",
+          value: ["tease", "snapped", "ignored", "night", "cant", "boundary"].filter(
+            (key) => ui.voiceScenes.some((one) => one.id === key),
+          ),
+          options: ui.voiceScenes.map((one) => ({ value: one.id, label: one.label })),
+        },
+      ],
+      confirmText: "生成",
+      onSubmit: async (values) => {
+        if (!(values.scenes || []).length) {
+          const box = $("dialog-error");
+          if (box) box.textContent = "至少选一个场景";
+          return false;
+        }
+        const restore = busyButton($("dialog-ok"), "生成中…（要调一次生成模型）");
+        try {
+          const data = await apiPost("voice-samples/generate", {
+            session: sessionId,
+            scenes: values.scenes,
+            // 同上：拿编辑器里这份角色卡（向导里可能还没保存）
+            persona: ((ui.config.world || {}).persona || {}).text || "",
+          });
+          const items = [];
+          (data.scenes || []).forEach((group) => {
+            (group.candidates || []).forEach((cand) => {
+              items.push({
+                text: cand.text,
+                move: cand.move || "",
+                scene: group.scene,
+                label: group.label,
+                source: "model",
+              });
+            });
+          });
+          if (!items.length) {
+            throw new Error("模型没给出可用的候选，可以再点一次，或者换个「内容生成模型」");
+          }
+          pushCandidates(items, "model");
+          persistVoiceSamples();
+          added = items.length;
+          return true;
+        } finally {
+          restore();
+        }
+      },
+    });
+    if (added) {
+      toast(`候选池加了 ${added} 条，点「候选池」去挑，记得保存`);
+    }
+  }
+
+  async function pickCandidatesFromChat() {
+    const sessionId = $("status-session") ? $("status-session").value : "";
+    if (!sessionId) {
+      toast("先在状态页选一个会话");
+      return;
+    }
+    const restore = busyButton(candidateFromChat, "翻聊天记录…");
+    let data = {};
+    try {
+      data = await apiPost("voice-samples/from-chat", { session: sessionId, limit: 12 });
+    } catch (error) {
+      restore();
+      toast(error.message || "挑不出来");
+      return;
+    }
+    restore();
+    const found = data.candidates || [];
+    if (!found.length) {
+      toast(data.note || "这段时间没挑出合适的");
+      return;
+    }
+    pushCandidates(found, "chat");
+    persistVoiceSamples();
+    toast(`从聊天里挑了 ${found.length} 条候选，记得点右上角保存`);
+  }
+
+  candidateGenerate.addEventListener("click", generateVoiceSamples);
+  candidateFromChat.addEventListener("click", pickCandidatesFromChat);
+  candidateOpen.addEventListener("click", openCandidatePicker);
+  // 向导要用同一套流程：生成的结果一样进候选池（走内存，点保存才落盘）
+  ui.generateVoiceSamples = generateVoiceSamples;
+
+  /**
+   * 样例与候选池以**编辑器内存里的配置**为准（跟别的设置一样，点保存才落盘）；
+   * 接口只用来拿"有哪些场景 / 上限多少"这类只读信息。
+   */
+  async function loadVoiceSamples() {
+    const persona = world.persona || (world.persona = {});
+    ui.voiceSamples = Array.isArray(persona.samples) ? persona.samples : [];
+    ui.voiceCandidates = Array.isArray(persona.sample_candidates)
+      ? persona.sample_candidates
+      : [];
+    renderVoiceSamples();
+    try {
+      const data = await apiGet("voice-samples");
+      ui.voiceScenes = data.scenes || [];
+      ui.voiceMax = Number(data.max || 12);
+      ui.voiceCandidatesMax = Number(data.candidates_max || 80);
+      renderVoiceSummary();
+    } catch (error) {
+      sampleNote.textContent = `读取失败：${error.message || error}`;
+    }
+  }
+  loadVoiceSamples();
+
+  form.appendChild(personaSection);
 
   /* --- 她的基础状态 --- */
   const stateSection = settingsSection(
@@ -7066,20 +11096,84 @@ function renderSettings() {
   );
   form.appendChild(stateSection);
 
+  /* --- 她的本事（能力值） --- */
+  const abilitySection = settingsSection(
+    "她的本事（能力值）",
+    "体力 / 智力 / 灵巧 / 心性：她遇上事时用来判断「这件事她做得到吗」，0~1。",
+    "这四项是慢变量：只由事件结果改变，睡一觉不会回来。" +
+      "精力管「今天累不累」，能力值管「她平时是什么底子」。",
+  );
+  const abilityFull = el("div", "full");
+  abilityFull.appendChild(
+    checkboxField(
+      "启用能力值",
+      world.abilities.enabled !== false,
+      (value) => (world.abilities.enabled = value),
+      { hint: "关闭后判定一律用固定值，能力值不变、也不写进提示词。" },
+    ),
+  );
+  abilitySection._fields.appendChild(abilityFull);
+  [
+    ["stamina", "体力", "力气活、熬夜、跑腿"],
+    ["wits", "智力", "想办法、应付复杂局面"],
+    ["dexterity", "灵巧", "手工、做饭、手稳不稳"],
+    ["composure", "心性", "扛压力、忍住不炸"],
+  ].forEach(([key, label, hint]) => {
+    abilitySection._fields.appendChild(
+      inputField(
+        label,
+        world.abilities[key] ?? 0.6,
+        (value) => (world.abilities[key] = Number(value) || 0),
+        { hint: `${hint}。新会话从这个值开始，0~1。`, type: "number", min: "0.05", max: "1", step: "0.05" },
+      ),
+    );
+  });
+  abilitySection._fields.appendChild(
+    inputField(
+      "单次变化上限",
+      world.abilities.step_limit ?? 0.05,
+      (value) => (world.abilities.step_limit = Number(value) || 0),
+      { hint: "一件事最多让某项能力值变化多少，默认 0.05。防止一件事就让她脱胎换骨。", type: "number", min: "0.01", max: "0.2", step: "0.01" },
+    ),
+  );
+  abilitySection._fields.appendChild(
+    inputField(
+      "每日变化上限",
+      world.abilities.daily_limit ?? 0.1,
+      (value) => (world.abilities.daily_limit = Number(value) || 0),
+      { hint: "同一项一天里累计最多变化多少，默认 0.1。数值膨胀是这类系统最容易崩的地方。", type: "number", min: "0.01", max: "1", step: "0.01" },
+    ),
+  );
+  abilitySection._fields.appendChild(
+    checkboxField(
+      "失败涨经验",
+      world.abilities.fail_growth !== false,
+      (value) => (world.abilities.fail_growth = value),
+      { hint: "失败比成功更容易长能力值——这是「失败了还能再试」的依据，不是靠文案鼓励。", },
+    ),
+  );
+  form.appendChild(abilitySection);
+
   /* --- 状态变化速度 --- */
   const dynamics = settingsSection(
     "状态变化速度",
-    "数值每分钟变化多少。默认值下，精力大约 11 小时掉到 0，孤独大约 20 小时涨满，心潮大约 50 分钟回落干净。",
-    "觉得她太爱睡觉就调小精力衰减；觉得她太黏人就调小孤独增长。",
+    "数值每分钟变化多少。默认值下，精力大约 11 小时掉到 0，孤独大约 20 小时涨满，心潮大约 50 分钟回落干净；"
+      + "好奇心过了 0.7 之后涨得越来越慢，不会一路顶死在满值。",
+    "觉得她太爱睡觉就调小精力衰减；觉得她太黏人就调小孤独增长；觉得她老跑去上网查东西就调小好奇增长。",
   );
   [
     ["energy_decay_per_min", "精力衰减/分钟", "越大越容易累"],
     ["loneliness_growth_per_min", "孤独增长/分钟", "越大越容易想找人"],
     ["curiosity_growth_per_min", "好奇增长/分钟", "越大越想上网查东西"],
     ["affect_decay_per_min", "心潮回落/分钟", "越大情绪平复得越快（默认 0.02 ≈ 50 分钟从满值回到平静）"],
+    ["valence_decay_per_min", "效价回落/分钟", "越大心情平复得越快（默认 0.01 ≈ 一小时出头回落一半）"],
+    ["chat_valence_cap", "聊天单轮最多推动效价", "一轮聊天最多让心情变化多少。调大她会因为几句夸奖就明显开心；默认 0.05 偏向「心情靠经历，不靠嘴甜」"],
+    ["chat_valence_daily_cap", "聊天每天最多推动效价", "日常聊天一天最多把心情推多少（正负各算一份）。填 0 = 不限制；日常陪伴改的是好感度，不是心情的量程"],
     ["boredom_growth_per_min", "无聊增长/分钟", "越大越想换地方"],
     ["sleep_energy_recovery_per_min", "睡觉恢复精力/分钟", "越大睡一觉回得越多"],
     ["nap_energy_recovery_per_min", "小睡恢复精力/分钟", "小睡时的恢复速度"],
+    ["sleep_curiosity_decay_per_min", "睡觉时好奇回落/分钟", "睡一觉把昨天攒的好奇放下（默认 0.0012 ≈ 整觉降 0.58）"],
+    ["sleep_curiosity_floor", "睡醒时最低的好奇", "睡一觉最多把好奇心压到这儿：醒来还是会对新鲜事感兴趣"],
     ["atmosphere_multiplier", "地点氛围影响强度", "0 表示地点氛围完全不影响数值"],
   ].forEach(([key, label, hint]) => {
     dynamics._fields.appendChild(
@@ -7093,6 +11187,15 @@ function renderSettings() {
   form.appendChild(dynamics);
 
   /* --- 说话频率 --- */
+  const knobs = settingsSection(
+    "手感（滑块）",
+    "不想逐个调参数就用这几个滑块：一格一格拖，它会同时改掉一组相关的设置。",
+    "中间那档就是内置默认值。滑块给的是上限与倾向，具体说多少还看她当时的心情和孤独感。" +
+      "想精调就展开「会改哪些参数」，改过之后这里会标「已手动调整」。",
+  );
+  knobs._fields.appendChild(knobEditor(world));
+  form.appendChild(knobs);
+
   const limits = settingsSection(
     "说话频率与预算",
     "控制她多久主动说一次话、每次最多说几句，以及大模型的调用预算。",
@@ -7101,13 +11204,18 @@ function renderSettings() {
   [
     ["max_autonomous_per_hour", "每小时最多自主行动次数", "包括主动搭话、去搜索、换地方"],
     ["max_share_per_hour", "每小时最多分享次数", "「分享见闻」这类动作的上限"],
+    [
+      "max_replies_per_hour",
+      "每小时最多被动回复次数",
+      "被 @ 到 / 私聊 / 明确对她说时给的回复；超过之后这一条不回（仍然由本插件接管，不落回主人格）。默认 200，填 0 = 完全不限制",
+    ],
     ["max_messages_per_say", "每次最多说几句", "一次回复拆成几条消息发送"],
     ["max_actions_per_message", "一次最多执行几个动作", "一条消息里允许的动作数量"],
     ["plan_valid_duration", "计划有效期（秒）", "一次 LLM 计划覆盖多长时间，默认 1800（30 分钟）"],
     ["max_action_chain_depth", "动作链最大深度", "防止动作套动作无限循环"],
     ["llm_plan_min_interval_seconds", "问计划的间隔（秒）", "两次「问大模型要计划」之间至少隔多久，默认 900"],
     ["max_llm_plan_per_hour", "每小时最多计划决策次数", "降低 token 消耗"],
-    ["max_llm_text_per_hour", "每小时最多生成发言次数", "超出后改用内置短句池（零成本）"],
+    ["max_llm_text_per_hour", "每小时最多生成发言次数", "超出后她这一轮保持安静（不会再退到一句写死的通用台词）"],
     [
       "max_arrival_decisions_per_hour",
       "每小时最多抵达决策次数",
@@ -7141,11 +11249,7 @@ function renderSettings() {
       world.style_injection !== false,
       (value) => (world.style_injection = value),
       {
-        hint:
-          "开启后，提示词末尾会多一段「这一轮的表达方式」：由心潮 × 效价两个数值决定" +
-          "（几条、多长、能不能分段、要不要用动作代替说话）。\n" +
-          "心情好的时候话多一点、心情差的时候话短一点，都是这一段在起作用。\n" +
-          "关掉 = 完全交给人设：她任何心情下都按同一种风格说话。",
+        hint: "开启后提示词多一段「这一轮的表达方式」：由心潮 × 效价决定条数、长度与是否用动作代替说话。",
       },
     ),
   );
@@ -7182,6 +11286,67 @@ function renderSettings() {
         hint: "上限。长句子不会一直等下去，默认 2.5 秒。",
         type: "number",
         step: "0.5",
+        min: 0,
+      },
+    ),
+  );
+  style._fields.appendChild(
+    pillsField(
+      "回复时引用触发她的消息",
+      world.reply_style.quote_mode || "smart",
+      [
+        { key: "off", label: "不引用", hint: "任何情况下都不带引用段" },
+        { key: "always", label: "总是引用", hint: "每次回复的第一条都引用触发她的那条消息" },
+        {
+          key: "smart",
+          label: "智能",
+          hint: "这一轮要回一串消息（她还在回上一条时又来了新的）才引用，单独一句对答不引用",
+        },
+      ],
+      (value) => {
+        world.reply_style.quote_mode = value;
+        markDirty();
+        renderSettings();
+      },
+      {
+        hint: "她的话或图片的第一条带引用段。仅在 QQ / OneBot 这类平台生效，其他平台自动跳过。",
+      },
+    ),
+  );
+  style._fields.appendChild(
+    checkboxField(
+      "新消息打断还没回完的回复",
+      world.reply_style.interrupt_pending !== false,
+      (value) => (world.reply_style.interrupt_pending = value),
+      {
+        hint: "生成回复期间又来新消息：本次生成作废并重来，新消息仍能带上未回复的那几条。",
+      },
+    ),
+  );
+  style._fields.appendChild(
+    inputField(
+      "回答前先等几秒（安静期）",
+      world.reply_style.merge_wait_seconds ?? 5,
+      (value) => (world.reply_style.merge_wait_seconds = num(value, 5)),
+      {
+        hint:
+          "收到消息先等这么久再开口：期间每来一条新消息就重新计时，连着打字就等他说完一起回。" +
+          "0 = 立即回答。",
+        type: "number",
+        step: "0.5",
+        min: 0,
+      },
+    ),
+  );
+  style._fields.appendChild(
+    inputField(
+      "安静期最长等多久（秒）",
+      world.reply_style.merge_wait_max_seconds ?? 30,
+      (value) => (world.reply_style.merge_wait_max_seconds = num(value, 30)),
+      {
+        hint: "一直有新消息时也不会等超过这么久，免得永远不开口。",
+        type: "number",
+        step: "1",
         min: 0,
       },
     ),
@@ -7227,9 +11392,7 @@ function renderSettings() {
       num(world.decider.llm_rate_min, 0.05),
       (value) => (world.decider.llm_rate_min = num(value, 0.05)),
       {
-        hint:
-          "她的决策意愿接近 0（很平静、不无聊、刚被冷落过）时的概率。0.05 = 5%。\n" +
-          "调大 = 她更常被大模型安排事情（更费 token），调小 = 更常安安静静待着。",
+        hint: "决策意愿接近 0（平静、不无聊、刚被冷落）时的触发概率，0.05 = 5%。调大则更常交大模型安排。",
         type: "number",
         min: 0,
         max: 1,
@@ -7243,9 +11406,7 @@ function renderSettings() {
       num(world.decider.llm_rate_max, 0.4),
       (value) => (world.decider.llm_rate_max = num(value, 0.4)),
       {
-        hint:
-          "她的决策意愿接近 1（很孤独、很无聊、心潮很高）时的概率。0.4 = 40%。\n" +
-          "实际概率在上下限之间按意愿线性插值；当前值可以在「实时状态」页看到。",
+        hint: "决策意愿接近 1（孤独、无聊、心潮高）时的触发概率，0.4 = 40%；中间按意愿线性插值。",
         type: "number",
         min: 0,
         max: 1,
@@ -7286,6 +11447,14 @@ function renderSettings() {
       }),
     );
   });
+  engagement._fields.appendChild(
+    checkboxField(
+      "她求助没人接时，补一句自我圆场",
+      world.events.remind_when_ignored !== false,
+      (value) => (world.events.remind_when_ignored = value),
+      { hint: "这一句由模型按人设现写（写不出来就不说）。关掉 = 她求助完就安静等，到点自己拿主意。" },
+    ),
+  );
   engagement._fields.appendChild(
     checkboxField(
       "冷却结束后计数减半",
@@ -7375,11 +11544,7 @@ function renderSettings() {
       ],
       (value) => (world.sleep.reply_mode = value),
       {
-        hint:
-          "睡着时被 @ 但没有唤醒词：\n" +
-          "固定文案 = 只发下面那句模板，不调大模型（省钱，也不会让她熬夜聊天）；\n" +
-          "完全不回 = 群里什么也不显示，同时挡掉主人格的回复；\n" +
-          "照常回复 = 不拦，她照旧半睡半醒地聊天。",
+        hint: "睡着时被 @ 但没有唤醒词：固定文案 = 只发模板；完全不回 = 群里不显示并挡下主人格；照常回复 = 不拦。",
       },
     ),
   );
@@ -7471,10 +11636,7 @@ function renderSettings() {
       world.sleep.block_plugins !== false,
       (value) => (world.sleep.block_plugins = value),
       {
-        hint:
-          "开启（默认）：没 @ 她的消息在她这里就被截住，后面的插件（例如意图路由）也不会执行——" +
-          "省掉一次判断，也不会把睡着的她拖进对话。\n" +
-          "关掉（方案 B）：只保证本插件不出声，其他插件照常处理这条消息。",
+        hint: "开启（默认）：没 @ 她的消息在本插件被截住，后续插件也不执行。关闭：只保证本插件不出声。",
       },
     ),
   );
@@ -7488,9 +11650,7 @@ function renderSettings() {
       ],
       (value) => (world.sleep.block_scope = value),
       {
-        hint:
-          "只挡没 @ 她的：别人 @ 她还是会收到「她在睡觉」那句固定文案。\n" +
-          "全挡：只有 /指令 和带唤醒词的 @ 能进来，其余一点动静都没有。",
+        hint: "只挡没 @ 她的：@ 她仍收到睡眠文案。全挡：只有 /指令 与带唤醒词的 @ 能进来。",
       },
     ),
   );
@@ -7509,6 +11669,7 @@ function renderSettings() {
       SCOPE_MODES_MEMORY,
       (value) => {
         world.memory_scope_mode = value;
+        renderSettings();
       },
       {},
     ),
@@ -7533,10 +11694,7 @@ function renderSettings() {
       world.memory.dialogue_summary !== false,
       (value) => (world.memory.dialogue_summary = value),
       {
-        hint:
-          "开启后不再逐条记录「谁说了什么」，而是把一段对话攒起来，" +
-          "到触发点时让大模型压成一句以她的视角写的记忆（例如「小明说他加班很累，我有点心疼」）。\n" +
-          "关掉后聊天内容完全不进记忆，只留她做过的事和内心活动。",
+        hint: "开启后把一段对话攒起来交给大模型，压成一句以她视角写的记忆；关闭则聊天内容不进记忆。",
       },
     ),
   );
@@ -7568,9 +11726,7 @@ function renderSettings() {
       world.memory.summary_on_move !== false,
       (value) => (world.memory.summary_on_move = value),
       {
-        hint:
-          "她走开时把刚才在那个地点聊的内容总结成一条记忆，挂在原来那个地点上，" +
-          "下次回到那里就能想起来。",
+        hint: "她走开时把该地点聊过的内容总结成一条记忆，挂在那里，下次回去能想起来。",
       },
     ),
   );
@@ -7600,9 +11756,7 @@ function renderSettings() {
         renderSettings();
       },
       {
-        hint:
-          "这里勾选的工具在提示词里会直接列出来，她任何地方都能调用。\n" +
-          "只在一个地点用得上的工具（比如只在书房上网搜索）不用放这儿——把它绑到那个地点的动作上就行。",
+        hint: "这里勾选的工具直接列进提示词，任何地点都能调用。只在一处用的工具请绑到该地点的动作上。",
         empty: "（没有通用工具）",
       },
     ),
@@ -7613,9 +11767,7 @@ function renderSettings() {
       world.tool_filter_enabled !== false,
       (value) => (world.tool_filter_enabled = value),
       {
-        hint:
-          "开启后，主人格在她当前地点能用的工具 = 这里的通用工具 + 当前地点可用动作绑定的工具，" +
-          "避免「在卧室里上网搜索」。工具改成挂在动作上之后，这里已经不需要再单独勾一遍。",
+        hint: "主人格可用工具 = 这里的通用工具 + 当前地点动作绑定的工具，避免在卧室里上网搜索。",
       },
     ),
   );
@@ -7625,9 +11777,7 @@ function renderSettings() {
       world.tool_result_reply !== false,
       (value) => (world.tool_result_reply = value),
       {
-        hint:
-          "工具调用完成后，把结果交回主模型，让她用自己的话说出来（而不是把原始结果直接贴到群里）。\n" +
-          "关掉的话，工具结果只记进日志，动作完成后不额外说话，能省一次模型调用。",
+        hint: "工具调用完成后把结果交回主模型，由她用自己的话说出来。关闭则结果只进日志、结束后不额外说话。",
       },
     ),
   );
@@ -7646,14 +11796,493 @@ function renderSettings() {
       world.remote_action_travel !== false,
       (value) => (world.remote_action_travel = value),
       {
-        hint:
-          "开启后：她答应了「去书房查新闻」却没写移动动作时，插件会补一步「移动」再执行那件事，" +
-          "日志里会标注「已自动前往」。\n" +
-          "关掉后：只有当前地点能做的事才会被执行，别的会被跳过——更像是「场景决定她能想到什么」。",
+        hint: "开启后，她答应做某件事却漏写移动时，插件补一步移动再执行，日志标注「已自动前往」。",
       },
     ),
   );
   form.appendChild(placeSection);
+
+  /* --- 事件 --- */
+  world.events = world.events || {};
+  const eventSection = settingsSection(
+    "事件",
+    "她一个人待着的时候会不会遇上点事。频率用「每小时大约几次」表示，不是定时器。",
+    "微事件只改她自己的状态和记忆；小事件要她做选择、会掷骰；大事件会说，也可能找人商量。",
+  );
+  eventSection._fields.appendChild(
+    checkboxField(
+      "启用事件系统",
+      world.events.enabled !== false,
+      (value) => (world.events.enabled = value),
+      { hint: "关掉之后她只按动作和日程生活，不会再有随机事件。" },
+    ),
+  );
+  [
+    ["micro_per_hour", "微事件：每小时几次", 1, "只影响她自己的状态和记忆，群里不主动说。默认 1 次/小时。"],
+    ["small_per_hour", "小事件：每小时几次", 0.3, "她要做个选择、会掷骰。默认 0.3 次/小时（约三个小时一次）。"],
+    ["big_per_hour", "大事件：每小时几次", 0.02, "会说、可能需要找人商量。默认 0.02 次/小时（约两天一次）。"],
+  ].forEach(([key, label, fallback, hint]) => {
+    eventSection._fields.appendChild(
+      inputField(
+        label,
+        world.events[key] ?? fallback,
+        (value) => (world.events[key] = Number(value) || 0),
+        { hint, type: "number", min: "0", max: "12", step: "0.05" },
+      ),
+    );
+  });
+  eventSection._fields.appendChild(
+    inputField(
+      "在一个地方待够多久才算「在这儿生活」（分钟）",
+      num(world.events.dwell_minutes, 5),
+      (value) => (world.events.dwell_minutes = num(value, 5)),
+      { hint: "刚走到一个地方就出事会很假；待够这么久才有机会遇上什么。默认 5 分钟。", type: "number", min: "0", max: "240", step: "1" },
+    ),
+  );
+  eventSection._fields.appendChild(
+    checkboxField(
+      "做持续动作时也能出事",
+      world.events.while_busy !== false,
+      (value) => (world.events.while_busy = value),
+      { hint: "做饭、看书、发呆期间也会遇上事；关掉就只在她闲下来时才有。" },
+    ),
+  );
+  eventSection._fields.appendChild(
+    checkboxField(
+      "睡觉时也出事",
+      world.events.in_sleep === true,
+      (value) => (world.events.in_sleep = value),
+      { hint: "默认关闭：睡着还出事很出戏。" },
+    ),
+  );
+  eventSection._fields.appendChild(
+    inputField(
+      "大事件最少演几幕",
+      num(world.events.big_min_steps, 2),
+      (value) => (world.events.big_min_steps = num(value, 2)),
+      { hint: "大事件一步就收尾会显得潦草。到下限之前，模型没留伏笔也会被补上一步。默认 2。", type: "number", min: "1", max: "6", step: "1" },
+    ),
+  );
+  eventSection._fields.appendChild(
+    inputField(
+      "大事件两步之间至少隔多久（分钟）",
+      num(world.events.big_step_gap_minutes, 15),
+      (value) => (world.events.big_step_gap_minutes = num(value, 15)),
+      { hint: "大事件要演两幕以上，不拉开间隔就会连着刷屏。默认 15 分钟。", type: "number", min: "0", max: "1440", step: "5" },
+    ),
+  );
+  [
+    ["share_micro", "微事件", "silent", "默认 silent：只进状态和记忆，不出声。"],
+    ["share_small", "小事件", "nodes", "默认 nodes：只在开场和收尾那两幕说，中间静默推演。"],
+    ["share_big", "大事件", "always", "默认 always：大事件每一幕都可以说。"],
+  ].forEach(([key, label, fallback, hint]) => {
+    eventSection._fields.appendChild(
+      inputField(
+        `${label}：要不要说出来`,
+        world.events[key] || fallback,
+        (value) => (world.events[key] = value),
+        {
+          hint: `${hint} silent = 从不说；nodes = 只在开场 / 收尾说；always = 每幕都能说。`,
+          placeholder: "silent / nodes / always",
+        },
+      ),
+    );
+  });
+  eventSection._fields.appendChild(
+    checkboxField(
+      "事件结果写进聊天留档",
+      world.events.event_into_chat_log !== false,
+      (value) => (world.events.event_into_chat_log = value),
+      { hint: "写成「她自己身上发生的事」——不是她说的，但以后聊天时能自然提起。默认开。" },
+    ),
+  );
+  eventSection._fields.appendChild(
+    inputField(
+      "「最近发生在我身上的事」最多带几条",
+      num(world.events.event_digest_lines, 12),
+      (value) => (world.events.event_digest_lines = num(value, 12)),
+      { hint: "续说时顺口带一句用的那份清单。默认 12 条。", type: "number", min: "1", max: "40", step: "1" },
+    ),
+  );
+  eventSection._fields.appendChild(
+    inputField(
+      "谁能用 /vw event 投递事件",
+      world.events.event_actor || "admin",
+      (value) => (world.events.event_actor = value === "all" ? "all" : "admin"),
+      { hint: "admin = 只有管理员（默认）；all = 群里所有人都可以给她安排事情。", placeholder: "admin / all" },
+    ),
+  );
+  eventSection._fields.appendChild(
+    inputField(
+      "一条线索最多几步",
+      num(world.events.max_steps, 6),
+      (value) => (world.events.max_steps = num(value, 6)),
+      { hint: "一件事最多连着演几步，到顶必须收尾，默认 6。", type: "number", min: "1", max: "20", step: "1" },
+    ),
+  );
+  eventSection._fields.appendChild(
+    inputField(
+      "一条线索最长多久（分钟）",
+      num(world.events.max_minutes, 120),
+      (value) => (world.events.max_minutes = num(value, 120)),
+      { hint: "超过这么久这件事就告一段落，默认 120 分钟。", type: "number", min: "5", max: "2880", step: "5" },
+    ),
+  );
+  eventSection._fields.appendChild(
+    inputField(
+      "事件里她一次最多说几句",
+      num(world.events.max_say_lines, 4),
+      (value) => (world.events.max_say_lines = num(value, 4)),
+      {
+        hint: "求助分几条发，所以比平时（群聊 2 句）宽松，默认 4 条；结果那几句仍最多 2 条。",
+        type: "number",
+        min: "1",
+        max: "20",
+        step: "1",
+      },
+    ),
+  );
+  eventSection._fields.appendChild(
+    inputField(
+      "事件发言的硬顶",
+      num(world.events.max_say_lines_hard, 6),
+      (value) => (world.events.max_say_lines_hard = num(value, 6)),
+      { hint: "不管上面配多大，都不会超过这个数（防刷屏）。默认 6。", type: "number", min: "1", max: "20", step: "1" },
+    ),
+  );
+  eventSection._fields.appendChild(
+    inputField(
+      "两件事之间至少隔多久（分钟）",
+      num(world.events.min_gap_minutes, 30),
+      (value) => (world.events.min_gap_minutes = num(value, 30)),
+      {
+        hint: "自动掷骰的两件事之间至少隔这么久，免得刚收尾又来一件。默认 30；填 0 = 不限制。",
+        type: "number",
+        min: "0",
+        max: "1440",
+        step: "5",
+      },
+    ),
+  );
+  eventSection._fields.appendChild(
+    inputField(
+      "一条线索里最多调用几次动作",
+      num(world.events.event_action_calls, 2),
+      (value) => (world.events.event_action_calls = num(value, 2)),
+      {
+        hint:
+          "她可以为了这件事先去做点什么（查资料、做点准备），动作结果交回给她再判断。" +
+          "默认 2 次；填 0 = 事件里不给动作。",
+        type: "number",
+        min: "0",
+        max: "10",
+        step: "1",
+      },
+    ),
+  );
+  eventSection._fields.appendChild(
+    inputField(
+      "每一幕出图的概率",
+      num(world.events.photo_chance, 0.3),
+      (value) => (world.events.photo_chance = num(value, 0.3)),
+      {
+        hint:
+          "事件每推进一幕 / 完结时，按这个概率让她拍一张（自拍或拍照），图片会带上这件事的内容。" +
+          "默认 0.3；填 0 = 关闭。",
+        type: "number",
+        min: "0",
+        max: "1",
+        step: "0.05",
+      },
+    ),
+  );
+  eventSection._fields.appendChild(
+    inputField(
+      "事件出图用哪些动作",
+      (world.events.photo_actions || []).join(", "),
+      (value) =>
+        (world.events.photo_actions = String(value)
+          .split(",")
+          .map((item) => item.trim())
+          .filter(Boolean)),
+      {
+        hint: "按顺序挑第一个启用的动作，写动作 id，用逗号分隔。默认 selfie, take_photo。",
+        placeholder: "selfie, take_photo",
+      },
+    ),
+  );
+  eventSection._fields.appendChild(
+    checkboxField(
+      "判定结果影响情绪",
+      world.events.result_emotion !== false,
+      (value) => (world.events.result_emotion = value),
+      {
+        hint:
+          "大成功 / 成功轻微抬高兴致，失败往下压一点（心潮与效价，保守幅度）。" +
+          "关掉 = 判定只改能力值，不改情绪。",
+      },
+    ),
+  );
+  eventSection._fields.appendChild(genreEditor(world));
+  const scaleFull = el("div", "full");
+  scaleFull.appendChild(
+    textareaField(
+      "题材的尺度边界（可留空）",
+      world.events.genre_scale || "",
+      (value) => (world.events.genre_scale = value),
+      {
+        hint: "留空不额外限制。例如「不要写受伤」。与「不生成哪些事件」一正一反，都写进生成提示词。",
+        rows: 2,
+      },
+    ),
+  );
+  eventSection._fields.appendChild(scaleFull);
+  eventSection._fields.appendChild(
+    inputField(
+      "最近几件用过的题材先不重复",
+      num(world.events.genre_recency, 2),
+      (value) => (world.events.genre_recency = num(value, 2)),
+      { hint: "默认 2：接着两次不会撞同一个题材（不然会连着好几次都是「日常小事」）。", type: "number", min: "0", max: "7", step: "1" },
+    ),
+  );
+  eventSection._fields.appendChild(
+    checkboxField(
+      "日程到点先问她一下（日程闸门）",
+      world.events.schedule_gate !== false,
+      (value) => (world.events.schedule_gate = value),
+      {
+        hint: "她正处理一件事时，睡觉 / 小睡 / 换地方这三类日程会先问她照做、推迟还是算了；其他日程照常执行。",
+      },
+    ),
+  );
+  eventSection._fields.appendChild(
+    inputField(
+      "推迟一次隔多久再检查（分钟）",
+      num(world.events.schedule_delay_minutes, 30),
+      (value) => (world.events.schedule_delay_minutes = num(value, 30)),
+      { hint: "默认 30 分钟。", type: "number", min: "5", max: "600", step: "5" },
+    ),
+  );
+  eventSection._fields.appendChild(
+    inputField(
+      "同一条日程一天最多推迟几次",
+      num(world.events.schedule_delay_limit_times, 2),
+      (value) => (world.events.schedule_delay_limit_times = num(value, 2)),
+      { hint: "到上限就必须执行——睡觉这件事没有商量余地。默认 2 次。", type: "number", min: "0", max: "20", step: "1" },
+    ),
+  );
+  eventSection._fields.appendChild(
+    inputField(
+      "同一条日程一天最多推迟多久（分钟）",
+      num(world.events.schedule_delay_limit_minutes, 180),
+      (value) => (world.events.schedule_delay_limit_minutes = num(value, 180)),
+      { hint: "和次数谁先到算谁。默认 180 分钟（3 小时）。", type: "number", min: "0", max: "1440", step: "10" },
+    ),
+  );
+  form.appendChild(eventSection);
+
+  /* --- 作息与夜晚 --- */
+  world.night = world.night || {};
+  const nightSection = settingsSection(
+    "作息与夜晚",
+    "夜晚时段决定「睡觉」这个动作什么时候可选，也决定熬夜的代价。",
+    "默认 23:00–07:00 算夜里。起止小时填成一样表示没有夜晚时段：睡觉不受时段限制，熬夜代价也不生效。",
+  );
+  nightSection._fields.appendChild(
+    inputField(
+      "夜晚开始（小时，0~23）",
+      num(world.night.start_hour, 23),
+      (value) => (world.night.start_hour = num(value, 23)),
+      {
+        hint: "夜晚时段的起始整点，含该点。默认 23。",
+        type: "number",
+        min: "0",
+        max: "23",
+        step: "1",
+      },
+    ),
+  );
+  nightSection._fields.appendChild(
+    inputField(
+      "夜晚结束（小时，0~23）",
+      num(world.night.end_hour, 7),
+      (value) => (world.night.end_hour = num(value, 7)),
+      {
+        hint: "夜晚时段的结束整点，不含该点。默认 7，即 23:00–07:00 算夜里。",
+        type: "number",
+        min: "0",
+        max: "23",
+        step: "1",
+      },
+    ),
+  );
+  nightSection._fields.appendChild(
+    checkboxField(
+      "睡觉只在夜里可选",
+      world.night.sleep_only_at_night !== false,
+      (value) => (world.night.sleep_only_at_night = value),
+      {
+        hint:
+          "开启后，非夜晚时段不向模型提供「睡觉」动作，模型写出也会被忽略。\n" +
+          "关闭后任何时段都可以睡整觉。",
+      },
+    ),
+  );
+  nightSection._fields.appendChild(
+    inputField(
+      "熬夜时精力衰减倍数",
+      num(world.events.stay_up_penalty, 1.5),
+      (value) => (world.events.stay_up_penalty = num(value, 1.5)),
+      {
+        hint:
+          "夜间醒着、以及为处理事件推迟睡觉时，精力衰减的倍数；两处取较大值，不叠加。\n" +
+          "默认 1.5；填 1 表示不惩罚。",
+        type: "number",
+        min: "1",
+        max: "3",
+        step: "0.05",
+      },
+    ),
+  );
+  form.appendChild(nightSection);
+
+  /* --- 她自己的账 --- */
+  const journalSection = settingsSection(
+    "她自己的账",
+    "她记着自己的经历和还没了结的事，这几段会跟着提示词一起交给主模型。",
+    "时间一律写成人话（今天 / 昨天 / 前天），她自己会换算；这里只决定「往回看多久、留几条」。",
+  );
+  journalSection._fields.appendChild(
+    inputField(
+      "往前看多久（小时）",
+      num(world.events.recent_window_hours, 24),
+      (value) => (world.events.recent_window_hours = num(value, 24)),
+      { hint: "「最近发生在我身上的事」只写这段时间内的。默认 24 小时。", type: "number", min: "1", max: "168", step: "1" },
+    ),
+  );
+  journalSection._fields.appendChild(
+    inputField(
+      "最近经历最多记几条",
+      num(world.events.recent_max_lines, 8),
+      (value) => (world.events.recent_max_lines = num(value, 8)),
+      { hint: "超了先顶掉微事件（最旧的），再顶最旧的。默认 8 条。", type: "number", min: "1", max: "30", step: "1" },
+    ),
+  );
+  journalSection._fields.appendChild(
+    inputField(
+      "下一步要等多久算「挂起」（分钟）",
+      num(world.events.suspend_after_minutes, 30),
+      (value) => (world.events.suspend_after_minutes = num(value, 30)),
+      {
+        hint:
+          "某件事下一步要等到超过这么久以后，就不算「我正在经历」——中间她照常做饭看书，" +
+          "那件事只留一行轻提示。默认 30 分钟。",
+        type: "number",
+        min: "0",
+        max: "1440",
+        step: "5",
+      },
+    ),
+  );
+  journalSection._fields.appendChild(
+    checkboxField(
+      "挂起的事留一行「我心里还挂着」",
+      world.events.open_thread_hint !== false,
+      (value) => (world.events.open_thread_hint = value),
+      { hint: "关掉 = 挂起的事完全不进提示词（她还是记得，只是不会主动提）。" },
+    ),
+  );
+  journalSection._fields.appendChild(
+    inputField(
+      "一件旧事最多隔多久还能接着演（小时）",
+      num(world.events.thread_resume_max_hours, 24),
+      (value) => (world.events.thread_resume_max_hours = num(value, 24)),
+      {
+        hint: "超过这个时间直接收尾，并写一条「那件事后来没再提」。默认 24 小时。",
+        type: "number",
+        min: "1",
+        max: "336",
+        step: "1",
+      },
+    ),
+  );
+  form.appendChild(journalSection);
+
+  /* --- 干涉与线索 --- */
+  const interveneSection = settingsSection(
+    "干涉与线索",
+    "需要拿主意的事，她会开口在群里求助——等群友回话，等不到就自己动手。",
+    "等待不是冻结：她照常做自己的事、照常接群聊；同类的事不会反复问。",
+  );
+  interveneSection._fields.appendChild(
+    checkboxField(
+      "允许她开口求助",
+      world.events.intervene_enabled !== false,
+      (value) => (world.events.intervene_enabled = value),
+      { hint: "关掉 = 这类事件她直接自己拿主意，不会在群里问。" },
+    ),
+  );
+  interveneSection._fields.appendChild(
+    inputField(
+      "活跃等待（秒）",
+      num(world.events.active_seconds, 180),
+      (value) => (world.events.active_seconds = num(value, 180)),
+      { hint: "刚求助完这段时间她注意力在这件事上：有人回就优先处理。默认 180 秒。", type: "number", min: "30", max: "1800", step: "10" },
+    ),
+  );
+  interveneSection._fields.appendChild(
+    inputField(
+      "总超时（分钟）",
+      num(world.events.idle_minutes, 60),
+      (value) => (world.events.idle_minutes = num(value, 60)),
+      { hint: "活跃等待结束后降为「轻等待」：不主动提，事情仍在；到总超时收尾。默认 60 分钟。", type: "number", min: "1", max: "1440", step: "1" },
+    ),
+  );
+  interveneSection._fields.appendChild(
+    inputField(
+      "宽限期（秒）",
+      num(world.events.grace_seconds, 30),
+      (value) => (world.events.grace_seconds = num(value, 30)),
+      { hint: "她已经决定不等了之后，这几十秒内到的建议还算数。默认 30 秒。", type: "number", min: "0", max: "600", step: "5" },
+    ),
+  );
+  interveneSection._fields.appendChild(
+    checkboxField(
+      "群友的建议影响判定",
+      world.events.suggest_tools !== false,
+      (value) => (world.events.suggest_tools = value),
+      { hint: "关掉 = 群友的回应只当普通聊天，不改概率也不改她的选择。" },
+    ),
+  );
+  interveneSection._fields.appendChild(
+    inputField(
+      "线索里两步之间的间隔（秒）",
+      num(world.events.step_gap_seconds, 60),
+      (value) => (world.events.step_gap_seconds = num(value, 60)),
+      { hint: "同一件事的下一步至少隔这么久，免得一口气连演三幕。默认 60 秒。", type: "number", min: "0", max: "3600", step: "10" },
+    ),
+  );
+  const redLineFull = el("div", "full");
+  redLineFull.appendChild(
+    textareaField(
+      "不生成哪些事件（每行一条）",
+      (world.events.red_lines || []).join("\n"),
+      (value) => {
+        world.events.red_lines = value
+          .split("\n")
+          .map((item) => item.trim())
+          .filter(Boolean);
+      },
+      {
+        hint:
+          "原样写进生成提示词，例如「不写自伤」「不写违法的事」。" +
+          "建议留几条，免得模型把她卷进不该有的剧情。",
+        rows: 3,
+      },
+    ),
+  );
+  interveneSection._fields.appendChild(redLineFull);
+  form.appendChild(interveneSection);
 
   /* --- 调试输出 --- */
   const debugSection = settingsSection(
@@ -7672,18 +12301,6 @@ function renderSettings() {
     "上下文",
     "群聊记录怎么留档、带多少进提示词、超了怎么办。",
     "留档会持久化，重启后还在；带进提示词的那份可以更小，避免提示词越来越长。",
-  );
-  contextSection._fields.appendChild(
-    inputField(
-      "最多携带多少条聊天",
-      num(world.decider.chat_max_messages, 12),
-      (value) => (world.decider.chat_max_messages = num(value, 12)),
-      {
-        hint: "每轮提示词里带多少条最近的群聊。太大既费 token 又容易让她被带偏，10~15 条足够了。",
-        type: "number",
-        min: 1,
-      },
-    ),
   );
   contextSection._fields.appendChild(
     inputField(
@@ -7710,6 +12327,110 @@ function renderSettings() {
     ),
   );
   contextSection._fields.appendChild(
+    inputField(
+      "每个会话带多少行（还没回过的）",
+      num(world.context.chat_lines, 20),
+      (value) => {
+        world.context.chat_lines = Math.max(1, Math.round(num(value, 20)));
+      },
+      {
+        hint: "同一个人连着说的几句算一行；每个会话各算各的，私聊聊得多不会挤掉群里的。",
+        type: "number",
+        min: 1,
+      },
+    ),
+  );
+  contextSection._fields.appendChild(
+    inputField(
+      "已回过的那批带多少行",
+      num(world.context.chat_answered_lines, 30),
+      (value) => {
+        world.context.chat_answered_lines = Math.max(1, Math.round(num(value, 30)));
+      },
+      {
+        hint: "「这里刚聊过的（你已经回过话了）」最多带几行，不受那 60 分钟时间窗限制。",
+        type: "number",
+        min: 1,
+      },
+    ),
+  );
+  contextSection._fields.appendChild(
+    inputField(
+      "别处同时听到的带多少行",
+      num(world.context.chat_elsewhere_lines, 12),
+      (value) => {
+        world.context.chat_elsewhere_lines = Math.max(1, Math.round(num(value, 12)));
+      },
+      {
+        hint: "同一个她在别的群 / 私聊里说的话，只当背景；行数越多提示词越长。",
+        type: "number",
+        min: 1,
+      },
+    ),
+  );
+  contextSection._fields.appendChild(
+    inputField(
+      "没回过的那批每条最多多少字",
+      num(world.context.chat_line_chars, 500),
+      (value) => (world.context.chat_line_chars = num(value, 500)),
+      {
+        hint: "还没回过她的消息要给足（那是她真正要读、要回的内容）；超了会截断并标明还剩多少字。",
+        type: "number",
+        min: 40,
+      },
+    ),
+  );
+  contextSection._fields.appendChild(
+    inputField(
+      "已经回过的那批每条最多多少字",
+      num(world.context.chat_answered_line_chars, 100),
+      (value) => (world.context.chat_answered_line_chars = num(value, 100)),
+      {
+        hint: "已经回过话的那批、以及别处同时听到的：只当背景，短一点省 token。",
+        type: "number",
+        min: 20,
+      },
+    ),
+  );
+  contextSection._fields.appendChild(
+    inputField(
+      "聊天记录总字数上限",
+      num(world.context.chat_total_chars, 8000),
+      (value) => (world.context.chat_total_chars = num(value, 8000)),
+      {
+        hint: "整段聊天记录（这里 + 已回过 + 别处）的字数预算：超了先丢最早的背景。",
+        type: "number",
+        min: 400,
+      },
+    ),
+  );
+  contextSection._fields.appendChild(
+    inputField(
+      "「刚聊过什么」有效期（分钟）",
+      num(world.context.chat_note_max_minutes, 30),
+      (value) => {
+        world.context.chat_note_max_minutes = Math.max(0, Math.round(num(value, 30)));
+      },
+      {
+        hint: "她上一轮写的那句话题背景最多挂多久，超时就不带了；0 = 不限。",
+        type: "number",
+        min: 0,
+      },
+    ),
+  );
+  contextSection._fields.appendChild(
+    inputField(
+      "引用旧消息最多写多少字",
+      num(world.context.quote_chars, 1000),
+      (value) => (world.context.quote_chars = num(value, 1000)),
+      {
+        hint: "他引用的那条已经不在聊天记录里时，把原文写进提示词的上限（0 = 不写）。",
+        type: "number",
+        min: 0,
+      },
+    ),
+  );
+  contextSection._fields.appendChild(
     pillsField(
       "留档超了怎么办",
       world.context.chat_overflow || "discard",
@@ -7717,7 +12438,7 @@ function renderSettings() {
         {
           key: "discard",
           label: "直接丢弃最早的",
-          hint: "不额外调用模型，最省；代价是很久以前聊过什么就真的忘了。",
+          hint: "不额外调用模型，最省；代价是更早的聊天内容会丢失。",
         },
         {
           key: "compress",
@@ -7765,14 +12486,438 @@ function renderSettings() {
       (value) => (world.context.image_max = Math.max(1, Math.round(num(value, 3)))),
       {
         hint:
-          "没配「图片转述模型」时，插件会把图片直接交给多模态主模型：" +
-          "自上次回复以来收到的图片 + 这条消息自己的图，最多带这么多张。配了转述模型则走文字转述，不受这里影响。",
+          "一次回复最多把几张图直接交给能看图的主模型：超出的先来的旧图会转述成文字。",
         type: "number",
         min: 1,
       },
     ),
   );
+  contextSection._fields.appendChild(
+    pillsField(
+      "聊天记录里的图",
+      world.context.chat_image_inline || "auto",
+      [
+        {
+          key: "auto",
+          label: "自动",
+          hint: "读 AstrBot 里主模型勾选的模态：支持图像就直接把聊天记录里的图发过去，读不到就不发。",
+        },
+        {
+          key: "always",
+          label: "总是发",
+          hint: "不管检测结果都发（确认主模型能吃图时用）；主模型不支持时会退回纯文字重试。",
+        },
+        {
+          key: "never",
+          label: "只发描述",
+          hint: "图只以图片转述的文字形式出现，不占用主模型的图像输入。",
+        },
+      ],
+      (value) => {
+        world.context.chat_image_inline = value;
+        renderSettings();
+      },
+      {},
+    ),
+  );
+  if ((world.context.chat_image_inline || "auto") !== "never") {
+    contextSection._fields.appendChild(
+      inputField(
+        "聊天记录最多带几张图",
+        num(world.context.chat_image_max, 1),
+        (value) =>
+          (world.context.chat_image_max = Math.max(
+            1,
+            Math.round(num(value, 1)),
+          )),
+        {
+        hint:
+          "按时间取最近几张。带过去的图会在聊天记录里标成「（见图1）」，没带过去的旧图转述成文字。",
+          type: "number",
+          min: 1,
+        },
+      ),
+    );
+  }
   form.appendChild(contextSection);
+
+  /* --- 用户画像与睡眠整理 --- */
+  const profileSection = settingsSection(
+    "用户画像",
+    "她认识的人：画像、关系、好感度，以及睡着时怎么整理记忆。",
+    "画像会在每一轮提示词里给出「你在跟谁说话」；睡眠整理把这段时间的经历消化成记忆与画像，" +
+      "一段睡眠最多两次（睡下 20 分钟一次、睡满 5 小时补一次）。",
+  );
+  profileSection._fields.appendChild(
+    pillsField(
+      "用户画像",
+      world.profile && world.profile.enabled === false ? "off" : "on",
+      [
+        { key: "on", label: "开", hint: "记画像、记关系与好感度，并写进提示词。" },
+        { key: "off", label: "关", hint: "完全不记，也不往提示词里带。" },
+      ],
+      (value) => {
+        world.profile = world.profile || {};
+        world.profile.enabled = value === "on";
+        renderSettings();
+      },
+      {},
+    ),
+  );
+  profileSection._fields.appendChild(
+    pillsField(
+      "睡眠整理",
+      world.profile && world.profile.consolidate_enabled === false ? "off" : "on",
+      [
+        { key: "on", label: "开", hint: "她睡着时消化这段时间的经历（记忆 + 画像）。" },
+        { key: "off", label: "关", hint: "不整理；记忆只按日常节奏累积。" },
+      ],
+      (value) => {
+        world.profile = world.profile || {};
+        world.profile.consolidate_enabled = value === "on";
+        renderSettings();
+      },
+      {},
+    ),
+  );
+  profileSection._fields.appendChild(
+    inputField(
+      "睡下多久开始整理（分钟）",
+      num(world.profile && world.profile.sleep_consolidate_minutes, 20),
+      (value) => {
+        world.profile = world.profile || {};
+        world.profile.sleep_consolidate_minutes = Math.max(
+          1,
+          Math.round(num(value, 20)),
+        );
+      },
+      {
+        hint: "睡沉了再整理：一段睡眠的第一次整理在这里。",
+        type: "number",
+        min: 1,
+      },
+    ),
+  );
+  profileSection._fields.appendChild(
+    inputField(
+      "睡满多久补一次（分钟，0 = 只整理一次）",
+      num(world.profile && world.profile.sleep_consolidate_late_minutes, 300),
+      (value) => {
+        world.profile = world.profile || {};
+        world.profile.sleep_consolidate_late_minutes = Math.max(
+          0,
+          Math.round(num(value, 300)),
+        );
+      },
+      {
+        hint: "睡到后半段补一次；一段睡眠最多两次。",
+        type: "number",
+        min: 0,
+      },
+    ),
+  );
+  profileSection._fields.appendChild(
+    pillsField(
+      "小睡也轻整理",
+      world.profile && world.profile.nap_consolidate === false ? "off" : "on",
+      [
+        { key: "on", label: "开", hint: "小睡做要点化 + 刷新缩略版 + 一条梦，不碰关系与事实。" },
+        { key: "off", label: "关", hint: "小睡完全不整理。" },
+      ],
+      (value) => {
+        world.profile = world.profile || {};
+        world.profile.nap_consolidate = value === "on";
+        renderSettings();
+      },
+      {},
+    ),
+  );
+  profileSection._fields.appendChild(
+    inputField(
+      "提示词里最多带几个其他人",
+      num(world.profile && world.profile.digest_limit, 5),
+      (value) => {
+        world.profile = world.profile || {};
+        world.profile.digest_limit = Math.max(1, Math.round(num(value, 5)));
+      },
+      { hint: "当前说话人永远是全文；群里其他人各给一行缩略版。", type: "number", min: 1 },
+    ),
+  );
+  profileSection._fields.appendChild(el("div", "sub-title", "想念"));
+  [
+    [
+      "想念增长/分钟",
+      "miss_growth_per_min",
+      0.0006,
+      "只在她没跟这个人说话时才涨；越大越容易想起某个人。",
+      "0.0001",
+    ],
+    [
+      "孤独加成",
+      "miss_loneliness_weight",
+      0.8,
+      "越孤独涨得越快：系数 = 1 + 这个值 × 孤独感（默认 0.8，最多快 1.8 倍）。",
+      "0.1",
+    ],
+    [
+      "多少开始想他",
+      "miss_threshold",
+      0.6,
+      "想念超过这个值才写进提示词（「你有点想他们了」）。",
+      "0.05",
+    ],
+    [
+      "提示词里最多写几个人",
+      "miss_limit",
+      3,
+      "超过阈值的按想念程度取前几名。",
+      "1",
+    ],
+    [
+      "聊完多久才会再想他（最短/最长，分钟）",
+      "miss_cooldown_min_minutes",
+      45,
+      "刚聊过（或刚去找过他）之后先等一段，在这两个值之间随机取。",
+      "5",
+    ],
+  ].forEach(([label, key, fallback, hint, step]) => {
+    profileSection._fields.appendChild(
+      inputField(
+        label,
+        num(world.profile && world.profile[key], fallback),
+        (value) => {
+          world.profile = world.profile || {};
+          world.profile[key] = Math.max(0, num(value, fallback));
+        },
+        { hint, type: "number", step },
+      ),
+    );
+  });
+  profileSection._fields.appendChild(
+    inputField(
+      "想念冷却上限（分钟）",
+      num(world.profile && world.profile.miss_cooldown_max_minutes, 240),
+      (value) => {
+        world.profile = world.profile || {};
+        world.profile.miss_cooldown_max_minutes = Math.max(0, Math.round(num(value, 240)));
+      },
+      { hint: "和上面那个「最短」一起组成随机区间，上限不会小于下限。", type: "number", step: "5" },
+    ),
+  );
+  profileSection._fields.appendChild(
+    pillsField(
+      "想他想得不行就主动找他",
+      world.profile && world.profile.miss_push_enabled === false ? "off" : "on",
+      [
+        { key: "on", label: "开", hint: "想念到「软推」阈值时，她自己决定去哪说（私聊或群里）。" },
+        { key: "off", label: "关", hint: "只在提示词里提一句，不主动找。" },
+      ],
+      (value) => {
+        world.profile = world.profile || {};
+        world.profile.miss_push_enabled = value === "on";
+        renderSettings();
+      },
+      {},
+    ),
+  );
+  profileSection._fields.appendChild(el("div", "sub-title", "主动问"));
+  profileSection._fields.appendChild(
+    pillsField(
+      "主动问还不知道的事",
+      world.profile && world.profile.ask_about_enabled === false ? "off" : "on",
+      [
+        {
+          key: "on",
+          label: "开",
+          hint: "关系够熟、好奇心又高的时候，她自己找机会问一句对方的事。",
+        },
+        { key: "off", label: "关", hint: "永远不问，画像只能靠她平时的观察。" },
+      ],
+      (value) => {
+        world.profile = world.profile || {};
+        world.profile.ask_about_enabled = value === "on";
+        renderSettings();
+      },
+      {},
+    ),
+  );
+  [
+    [
+      "熟到第几档才问",
+      "ask_about_min_level",
+      3,
+      "分级表的下标（0 起）：不够熟就不打听，免得像查户口。",
+      "1",
+    ],
+    [
+      "每天最多问几件",
+      "ask_about_daily_max",
+      3,
+      "整个会话组一天的总数上限。",
+      "1",
+    ],
+    [
+      "对同一个人隔多久再问（小时）",
+      "ask_about_person_gap_hours",
+      24,
+      "同一个人一次只提一件，免得一晚上把生日年龄挨个问一遍。",
+      "1",
+    ],
+    [
+      "同一件隔几天才能再问",
+      "ask_about_cooldown_days",
+      7,
+      "问过的记一笔，这段时间里不再重复提。",
+      "1",
+    ],
+  ].forEach(([label, key, fallback, hint, step]) => {
+    profileSection._fields.appendChild(
+      inputField(
+        label,
+        num(world.profile && world.profile[key], fallback),
+        (value) => {
+          world.profile = world.profile || {};
+          world.profile[key] = Math.max(0, Math.round(num(value, fallback)));
+        },
+        { hint, type: "number", step },
+      ),
+    );
+  });
+  profileSection._fields.appendChild(
+    textareaField(
+      "想打听的事（一行一个）",
+      (
+        (world.profile && world.profile.ask_about_fields) || [
+          "性别",
+          "生日",
+          "年龄",
+          "爱吃的东西",
+          "所在地",
+        ]
+      ).join("\n"),
+      (value) => {
+        world.profile = world.profile || {};
+        world.profile.ask_about_fields = value
+          .split("\n")
+          .map((item) => item.trim())
+          .filter(Boolean);
+      },
+      {
+        rows: 4,
+        hint: "留空 = 不问；已经记进画像的那件不会再问。",
+      },
+    ),
+  );
+  profileSection._fields.appendChild(el("div", "sub-title", "记仇"));
+  profileSection._fields.appendChild(
+    pillsField(
+      "会不会记着他一笔账",
+      world.profile && world.profile.grudge_enabled === false ? "off" : "on",
+      [
+        { key: "on", label: "开", hint: "他做了让你气着的事（答应的事没做、放鸽子…），记下来。" },
+        { key: "off", label: "关", hint: "不记，什么都当场过去。" },
+      ],
+      (value) => {
+        world.profile = world.profile || {};
+        world.profile.grudge_enabled = value === "on";
+        renderSettings();
+      },
+      {},
+    ),
+  );
+  [
+    ["一笔账记几天", "grudge_days", 7, "到期自己就淡了，并写进记忆。", "1"],
+    ["同时最多记几笔", "grudge_max", 2, "整个会话组算一份；同一个人最多一笔。", "1"],
+    ["一天最多记几笔", "grudge_daily_max", 1, "不让它变成天天记仇。", "1"],
+    ["气着时降几档亲密", "grudge_level_drop", 1, "只在这一档的判定上降，关系与好感数值都不动。", "1"],
+  ].forEach(([label, key, fallback, hint, step]) => {
+    profileSection._fields.appendChild(
+      inputField(
+        label,
+        num(world.profile && world.profile[key], fallback),
+        (value) => {
+          world.profile = world.profile || {};
+          world.profile[key] = Math.max(0, Math.round(num(value, fallback)));
+        },
+        { hint, type: "number", step },
+      ),
+    );
+  });
+  profileSection._fields.appendChild(el("div", "sub-title", "她自己的事"));
+  profileSection._fields.appendChild(
+    checkboxField(
+      "记她自己答应过、想做的事",
+      !(world.state_dynamics && world.state_dynamics.own_topic_enabled === false),
+      (value) => {
+        world.state_dynamics = world.state_dynamics || {};
+        world.state_dynamics.own_topic_enabled = value;
+      },
+      { hint: "「答应给他看照片」这种她自己还没做的事，她会记着并找机会做掉。" },
+    ),
+  );
+  [
+    ["同时最多记几件", "own_topic_max", 2, "多了她会变成一个待办清单。", "1"],
+    ["一件记几天", "own_topic_days", 3, "到期丢掉：要么早做完了，要么她其实不在意。", "1"],
+  ].forEach(([label, key, fallback, hint, step]) => {
+    profileSection._fields.appendChild(
+      inputField(
+        label,
+        num(world.state_dynamics && world.state_dynamics[key], fallback),
+        (value) => {
+          world.state_dynamics = world.state_dynamics || {};
+          world.state_dynamics[key] = Math.max(0, Math.round(num(value, fallback)));
+        },
+        { hint, type: "number", step },
+      ),
+    );
+  });
+  profileSection._fields.appendChild(
+    textareaField(
+      "称呼黑名单（一行一个）",
+      ((world.profile && world.profile.call_name_blacklist) || []).join("\n"),
+      (value) => {
+        world.profile = world.profile || {};
+        world.profile.call_name_blacklist = value
+          .split("\n")
+          .map((item) => item.trim())
+          .filter(Boolean);
+      },
+      {
+        rows: 3,
+        hint: "命中的称呼直接拒绝，她不会这么叫他。",
+      },
+    ),
+  );
+  profileSection._fields.appendChild(bondsEditor(world));
+  profileSection._fields.appendChild(levelsEditor(world));
+  profileSection._fields.appendChild(
+    el(
+      "p",
+      "hint-line",
+      "关系表字段：name（关系名）/ slot（槽位，同槽互斥）/ floor 与 cap（这个关系的" +
+        "亲密度区间，都填分级表的下标）/ group（同类关系，同一个人身上只留一条，例如群友 / " +
+        "朋友 / 闺蜜 / 男友 / 女友 都是 close；留空 = 能和别的并存）/ unique（只能有一个）/ " +
+        "negative（负面关系）/ aliases（别名）。默认初始关系在表头那个下拉里选，只有一条。",
+    ),
+  );
+  profileSection._fields.appendChild(
+    el(
+      "p",
+      "hint-line",
+      "分级表字段：name / min_affinity / max_affinity（好感区间）/ address（称呼）/ " +
+        "deny（这一档**还不能做**的动作 id，会写成「这一档还不能做」给她看；留空 = 不限制）/ " +
+        "proactive_per_day（每天最多主动找他几次）/ prompt（这一级写给模型的提示词文本，可随便改）。",
+    ),
+  );
+  profileSection._fields.appendChild(
+    el(
+      "p",
+      "hint-line",
+      "生效亲密度 = 好感度达到的档位，先被关系的「最低档」抬起、再被「最高档」压下：" +
+        "绑成男友之后哪怕好感还没养起来也能抱抱，而群友聊再久也上不去。改完点右上角「保存」。",
+    ),
+  );
+  form.appendChild(profileSection);
 
   /* --- 图片转述 --- */
   const visionSection = settingsSection(
@@ -7788,10 +12933,7 @@ function renderSettings() {
       world.vision.prompt || "",
       (value) => (world.vision.prompt = value),
       {
-        hint:
-          "留空就用内置默认（推荐）。默认要求输出「画面描述｜类型｜文字」，" +
-          "并写明是不是表情包、什么梗、什么情绪；图里的文字会照抄关键句。\n" +
-          "**不要在这里要求它写与话题的关系**——那部分由下面的提示词单独生成，写在这里就不能跨话题缓存了。",
+        hint: "留空用内置默认（推荐）。默认要求输出「画面描述｜类型｜文字」，并照抄图里的关键文字。",
         rows: 8,
         placeholder: DEFAULT_CAPTION_PROMPT,
         onRestore: () => (ui.defaults.captions || {}).look || DEFAULT_CAPTION_PROMPT,
@@ -7804,9 +12946,7 @@ function renderSettings() {
       world.vision.relation_prompt || "",
       (value) => (world.vision.relation_prompt = value),
       {
-        hint:
-          "第二步用：拿上一步的转述 + 当前消息 + 最近群聊，写一句「与话题的关系」。\n" +
-          "这一步**不带图**，所以很便宜（可以配一个便宜的文本模型来跑，见插件配置）。留空用内置默认。",
+        hint: "第二步用：拿转述 + 当前消息 + 最近群聊写一句「与话题的关系」。不带图，可用便宜的文本模型。",
         rows: 4,
         placeholder: DEFAULT_CAPTION_RELATION_PROMPT,
         onRestore: () =>
@@ -7821,9 +12961,7 @@ function renderSettings() {
       world.vision.relation_enabled !== false,
       (value) => (world.vision.relation_enabled = value),
       {
-        hint:
-          "开启后多一次纯文本调用，她会知道这张图和正在聊的事有什么关系。\n" +
-          "关掉就只把画面/类型/文字交给主模型，由它自己判断关系（省一次调用）。",
+        hint: "开启后多一次纯文本调用，她会知道这张图和正在聊的事有什么关系；关闭则交给主模型自行判断。",
       },
     ),
   );
@@ -7833,11 +12971,7 @@ function renderSettings() {
       world.vision.cache_enabled !== false,
       (value) => (world.vision.cache_enabled = value),
       {
-        hint:
-          "按图片内容缓存转述结果：表情包、梗图会反复出现，第二次起不再调用多模态模型。\n" +
-          "缓存是持久的，重启插件后仍然有效；换话题重发同一张图时会复用它" +
-          "「画面 / 类型 / 文字」，只重算「与话题的关系」。\n" +
-          "多张图会合并成一次调用；模型没按格式输出时自动退回逐张。",
+        hint: "按图片内容缓存转述结果：表情包、梗图第二次起复用缓存，缓存持久，多图合并成一次调用。",
       },
     ),
   );
@@ -7868,7 +13002,156 @@ function renderSettings() {
       )} 次识别（本次运行 ${num(cacheStats.session_hits, 0)} 次）。`,
     ),
   );
+  visionSection._fields.appendChild(
+    checkboxField(
+      "合并转发压成摘要",
+      world.vision.forward_summary !== false,
+      (value) => {
+        world.vision.forward_summary = value;
+        renderSettings();
+      },
+      {
+        hint: "把转发的聊天记录（含里面的图）交给看图模型读一遍，压成一段摘要替换进聊天记录；关掉则只落一句「这是一条转发的聊天记录」。",
+      },
+    ),
+  );
+  if (world.vision.forward_summary !== false) {
+    visionSection._fields.appendChild(
+      inputField(
+        "摘要最多多少字",
+        num(world.vision.forward_max_chars, 300),
+        (value) =>
+          (world.vision.forward_max_chars = Math.max(
+            80,
+            Math.round(num(value, 300)),
+          )),
+        { hint: "超出的部分截断，摘要太短会丢掉细节。", type: "number", min: 80 },
+      ),
+    );
+    const forwardFull = el("div", "full");
+    forwardFull.appendChild(
+      textareaField(
+        "转发摘要提示词",
+        world.vision.forward_prompt || "",
+        (value) => (world.vision.forward_prompt = value),
+        {
+          hint: "留空用内置默认（推荐）。默认要求写清谁和谁在聊、事情与结论、图上有用的信息，不分点不换行。",
+          rows: 6,
+          placeholder: DEFAULT_FORWARD_PROMPT,
+          onRestore: () =>
+            (ui.defaults.captions || {}).forward || DEFAULT_FORWARD_PROMPT,
+        },
+      ),
+    );
+    visionSection._fields.appendChild(forwardFull);
+  }
   form.appendChild(visionSection);
+
+  /* --- 简易人设（给打杂模型） --- */
+  const briefSection = settingsSection(
+    "简易人设（给打杂模型）",
+    "生成事件、整理结果时给打杂模型的人设摘要：只留说话风格，不带世界观和背景故事。",
+    "按人格缓存：换人格或改主人设之后要重新生成一次（键跟着人设内容变）。没生成过就退回主人设前 200 字。",
+    "persona_brief",
+  );
+  const briefFull = el("div", "full");
+  const briefArea = document.createElement("textarea");
+  briefArea.rows = 4;
+  briefArea.id = "persona-brief-text";
+  briefArea.placeholder = "还没有生成，点下面的按钮从主人设生成一段";
+  briefFull.appendChild(fieldHead("简易人设"));
+  briefFull.appendChild(briefArea);
+  const briefRow = el("div", "row");
+  const briefGenerate = el("button", "small primary", "从主人设生成");
+  briefGenerate.type = "button";
+  briefGenerate.addEventListener("click", async () => {
+    const sessionId = $("status-session") ? $("status-session").value : "";
+    if (!sessionId) {
+      toast("先在「实时状态」里选一个会话");
+      return;
+    }
+    briefGenerate.disabled = true;
+    briefGenerate.textContent = "生成中…";
+    try {
+      const data = await apiPost("persona-brief", { session: sessionId, generate: true });
+      const state = (data && data.persona_brief) || {};
+      briefArea.value = state.brief || "";
+      toast("生成好了，记得点右上角保存");
+    } catch (error) {
+      toast(`生成失败：${error.message || error}`);
+    } finally {
+      briefGenerate.disabled = false;
+      briefGenerate.textContent = "从主人设生成";
+    }
+  });
+  const briefSave = el("button", "small ghost", "保存到这个人格");
+  briefSave.type = "button";
+  briefSave.addEventListener("click", async () => {
+    const sessionId = $("status-session") ? $("status-session").value : "";
+    if (!sessionId) {
+      toast("先在「实时状态」里选一个会话");
+      return;
+    }
+    try {
+      await apiPost("persona-brief", { session: sessionId, brief: briefArea.value });
+      toast("已保存（立即生效）");
+    } catch (error) {
+      toast(`保存失败：${error.message || error}`);
+    }
+  });
+  briefRow.appendChild(briefGenerate);
+  briefRow.appendChild(briefSave);
+  briefFull.appendChild(briefRow);
+  const briefNote = el("p", "muted", "正在读取…");
+  briefFull.appendChild(briefNote);
+  briefFull.appendChild(
+    el("p", "muted", "提示：这段摘要给打杂模型用，主人格用的是完整人设。它不跟预设走，按人格单独存。")
+  );
+  // 打开页面就把这一份读出来：以前只在点过"生成"之后才填，重开页面看着像是被重置了
+  async function loadPersonaBrief({ overwrite = false } = {}) {
+    const sessionId = $("status-session") ? $("status-session").value : "";
+    if (!sessionId) {
+      briefNote.textContent = "先在「实时状态」里选一个会话。";
+      return;
+    }
+    try {
+      const data = await apiGet("persona-brief", { session: sessionId });
+      const state = (data && data.persona_brief) || {};
+      const brief = String(state.brief || "");
+      if (!brief) {
+        const latest = (state.latest && state.latest.brief) || "";
+        const latestAt = Number((state.latest && state.latest.at) || 0);
+        if (latest) {
+          if (overwrite || !briefArea.value.trim()) briefArea.value = latest;
+          const when = latestAt ? `（${agoText(Date.now() / 1000 - latestAt)}）` : "";
+          briefNote.textContent =
+            `当前会话读出的人设和这份不一致${when}，先显示上次那份；` +
+            "点「从主人设生成」会按现在的人设重写。";
+        } else {
+          briefNote.textContent =
+            "还没有生成过：打杂模型会退回到主人设前 200 字。";
+        }
+        return;
+      }
+      if (overwrite || !briefArea.value.trim()) briefArea.value = brief;
+      const source = state.source === "generated" ? "由主人设生成" : "手动保存";
+      const at = Number(state.at || 0);
+      const when = at ? ` · ${agoText(Date.now() / 1000 - at)}` : "";
+      briefNote.textContent =
+        `${source}${when}（按 ${Number(state.persona_chars || 0)} 字的人设）`;
+    } catch (error) {
+      briefNote.textContent = `读取失败：${error.message || error}`;
+    }
+  }
+  ui.loadPersonaBrief = loadPersonaBrief;
+  loadPersonaBrief();
+  briefSection._fields.appendChild(briefFull);
+  // 「她这个人」相关的设置都收在人设那一节下面：简易人设紧跟主人设
+  if (personaSection && personaSection.parentElement === form) {
+    personaSection.insertAdjacentElement("afterend", briefSection);
+  } else {
+    form.appendChild(briefSection);
+  }
 
   /* --- 天气 --- */
   world.weather = world.weather || {};
@@ -7883,7 +13166,7 @@ function renderSettings() {
       "启用天气",
       world.weather.enabled !== false,
       (value) => (world.weather.enabled = value),
-      { hint: "关掉之后不再后台查天气、也不写进提示词（她主动查天气照常可用）。" },
+      { hint: "关闭后不后台查天气、也不写进提示词；她主动查天气照常可用。" },
     ),
   );
   weather._fields.appendChild(
@@ -7915,7 +13198,7 @@ function renderSettings() {
       num(world.weather.stale_hours, 24),
       (value) => (world.weather.stale_hours = Math.max(0, num(value, 24))),
       {
-        hint: "默认 24 小时（超过一天就当过时了，不再写进提示词）。地图页横幅仍会显示，只是标着「很久以前」。",
+        hint: "默认 24 小时；超过这个时长的天气不写进提示词，横幅仍显示并标注时间。",
         type: "number",
         min: 0,
       },
@@ -7927,9 +13210,7 @@ function renderSettings() {
       world.weather.normalize !== false,
       (value) => (world.weather.normalize = value),
       {
-        hint:
-          "查询结果先交给小模型压成「城市｜温度｜天气｜湿度｜风力｜预报」，横幅和提示词都用这一行；" +
-          "工具返回图片时会先调图片转述模型把图读成文字。关掉就直接存原文。",
+        hint: "查询结果先压成「城市｜温度｜天气｜湿度｜风力｜预报」，横幅和提示词都用这一行；关闭则存原文。",
       },
     ),
   );
@@ -7952,7 +13233,7 @@ function renderSettings() {
   nickname._fields.appendChild(
     inputField("名片模板", world.nickname_sync.template || "{base} | {status}", (value) => {
       world.nickname_sync.template = value;
-    }, { hint: "{base} 是原名，{status} 是状态文案。例如改成「{base}（{status}）」。" }),
+    }, { hint: "{base} 是原名，{status} 是状态文案，例如「{base}（{status}）」。" }),
   );
   nickname._fields.appendChild(
     inputField("名片最大长度", num(world.nickname_sync.max_length, 30), (value) => {
@@ -7963,6 +13244,16 @@ function renderSettings() {
     inputField("改名冷却（秒）", num(world.nickname_sync.cooldown_seconds, 60), (value) => {
       world.nickname_sync.cooldown_seconds = num(value, 60);
     }, { hint: "两次改名片之间至少隔多久，防止频繁调用平台接口。", type: "number" }),
+  );
+  nickname._fields.appendChild(
+    inputField(
+      "事件进行中显示什么",
+      world.nickname_sync.event_text ?? "事件中",
+      (value) => (world.nickname_sync.event_text = value),
+      {
+        hint: "她手上有一件没演完的事时，名片显示这截文字（默认「事件中」）；留空则不特别标注。",
+      },
+    ),
   );
   nickname._fields.appendChild(
     el(
@@ -8034,6 +13325,11 @@ function renderSettings() {
   advanced.appendChild(rawArea);
   advanced.appendChild(applyButton);
   form.appendChild(advanced);
+
+  // 低频但一个都不能少的字段收进「高级设置」，页面第一眼只剩要改的东西
+  collapseAdvancedFields(form);
+  // 分类标签：只影响显示，不影响存下来的数据结构
+  applySettingsTabs();
 }
 
 async function savePassword() {
@@ -8210,28 +13506,91 @@ async function saveCurrentAsPreset() {
   });
 }
 
-async function applyPreset(preset) {
-  const ok = await confirmDialog({
-    title: `应用预设「${preset.name || preset.id}」？`,
-    message:
-      "当前配置会先自动备份一份。应用后：地图 / 动作 / 日程 / 会话白名单换成这个预设的内容；" +
-      "所有会话的位置、数值、计划、群聊留档会被清空。\n\n" +
-      "记忆和日志不受影响；需要清理请去「记忆库」「日志」页自己删。",
-    confirmText: "应用",
-    danger: true,
+/** 用内置默认世界新建一份预设：不覆盖当前配置，应用以后才切过去。 */
+async function newDefaultPreset() {
+  openFormDialog({
+    title: "新建默认预设",
+    hint: "把内置的默认世界存成一份新预设；当前配置不动，去列表点「应用」才切过去。",
+    fields: [
+      {
+        key: "id",
+        label: "预设 id",
+        value: `default_${Date.now().toString(36).slice(-4)}`,
+        hint: "文件名，用英文/数字",
+      },
+      { key: "name", label: "名字", value: "默认世界", hint: "给自己看的名字" },
+      { key: "note", label: "说明", value: "", hint: "可选" },
+    ],
+    confirmText: "新建",
+    onSubmit: async (values) => {
+      try {
+        const result = await apiPost("presets/new-default", values);
+        toast(`已新建预设 ${result.id}`);
+        await loadPresets();
+      } catch (error) {
+        toast(error.message || "新建失败");
+        return false;
+      }
+    },
   });
-  if (!ok) return;
-  try {
-    const result = await apiPost("presets/apply", { id: preset.id, clear_state: true });
-    toast(
-      `已切换到「${preset.name || preset.id}」，清空状态 ${result.cleared_sessions || 0} 个会话` +
-        ((result.warnings || []).length ? `；提醒：${result.warnings.join("；")}` : ""),
-    );
-    await loadAll();
-    await loadPresets();
-  } catch (error) {
-    toast(error.message || "应用失败");
-  }
+}
+
+async function applyPreset(preset) {
+  // 分块应用：想换哪一块就勾哪一块。会话白名单与会话组默认不勾——
+  // 切预设本来是想换世界，把会话一起换掉等于顺手清空了她聊天的地方。
+  openFormDialog({
+    title: `应用预设「${preset.name || preset.id}」`,
+    hint: "当前配置会先自动备份一份。只勾中的部分会被替换，其它保持你现在这套。",
+    fields: [
+      {
+        key: "blocks",
+        label: "要替换的部分",
+        type: "checkboxes",
+        value: ["map", "actions", "settings", "persona", "schedules"],
+        options: [
+          { value: "map", label: "地图（区域 / 地点 / 连线）" },
+          { value: "actions", label: "动作（含动作设置与生图动作）" },
+          { value: "settings", label: "世界设置（作息 / 情绪 / 画像 / 事件…）" },
+          { value: "persona", label: `${pronoun()}（人设）` },
+          { value: "schedules", label: "日程" },
+          { value: "sessions", label: "会话白名单与会话组（会把现在的换掉）" },
+        ],
+        hint: "「会话」默认不勾：勾了会连着把会话组一起换掉。",
+      },
+      {
+        key: "clear_state",
+        label: "同时清空所有会话状态（位置 / 数值 / 计划 / 群聊留档）",
+        type: "checkbox",
+        value: false,
+        hint: "不勾就是保留原会话的上下文，只按上面勾的部分替换配置。",
+      },
+    ],
+    confirmText: "应用",
+    onSubmit: async (values) => {
+      const blocks = Array.isArray(values.blocks) ? values.blocks : [];
+      if (!blocks.length) {
+        toast("至少勾一块要替换的内容");
+        return false;
+      }
+      try {
+        const result = await apiPost("presets/apply", {
+          id: preset.id,
+          blocks,
+          clear_state: Boolean(values.clear_state),
+        });
+        const bits = [`已应用 ${(result.blocks || []).length} 块`];
+        if (result.cleared_sessions) bits.push(`清空状态 ${result.cleared_sessions} 个会话`);
+        if ((result.repairs || []).length) bits.push(`修状态：${result.repairs.join("；")}`);
+        if ((result.warnings || []).length) bits.push(`提醒：${result.warnings.join("；")}`);
+        toast(bits.join("；"));
+        await loadAll();
+        await loadPresets();
+      } catch (error) {
+        toast(error.message || "应用失败");
+        return false;
+      }
+    },
+  });
 }
 
 function renamePreset(preset) {
@@ -8270,24 +13629,132 @@ async function deletePreset(preset) {
   }
 }
 
+/** 预设 JSON 的分区：整段 / 只看地图 / 只看动作…… */
+const PRESET_SECTIONS = [
+  { value: "all", label: "整段（完整文件）" },
+  { value: "map", label: "只看地图（区域 / 地点 / 连线）" },
+  { value: "actions", label: "只看动作" },
+  { value: "settings", label: "只看世界设置（作息 / 情绪 / 画像 / 事件…）" },
+  { value: "schedules", label: "只看日程" },
+  { value: "sessions", label: "只看会话白名单" },
+];
+
+const PRESET_MAP_KEYS = ["zones", "zone_edges", "nodes", "edges"];
+const PRESET_WORLD_SKIP = [...PRESET_MAP_KEYS, "actions"];
+
+/** 按分区切出要显示的那一段。 */
+function presetSectionValue(full, section) {
+  const world = (full && full.world) || {};
+  switch (section) {
+    case "map": {
+      const out = {};
+      PRESET_MAP_KEYS.forEach((key) => {
+        out[key] = world[key] ?? [];
+      });
+      return out;
+    }
+    case "actions":
+      return { actions: world.actions ?? [] };
+    case "settings": {
+      const out = {};
+      Object.keys(world).forEach((key) => {
+        if (!PRESET_WORLD_SKIP.includes(key)) out[key] = world[key];
+      });
+      return out;
+    }
+    case "schedules":
+      return full.schedules ?? {};
+    case "sessions":
+      return full.sessions ?? {};
+    default:
+      return full;
+  }
+}
+
+/** 把某一分区改过的内容并回整份预设。 */
+function mergePresetSection(full, section, patch) {
+  const merged = JSON.parse(JSON.stringify(full || {}));
+  merged.world = merged.world || {};
+  if (section === "map" || section === "actions" || section === "settings") {
+    Object.keys(patch || {}).forEach((key) => {
+      merged.world[key] = patch[key];
+    });
+    return merged;
+  }
+  if (section === "schedules") {
+    merged.schedules = patch;
+    return merged;
+  }
+  if (section === "sessions") {
+    merged.sessions = patch;
+    return merged;
+  }
+  return patch;
+}
+
 async function editPresetJson(preset) {
-  let text = "";
+  let full = {};
   try {
     const data = await apiGet("presets/json", { id: preset.id });
-    text = JSON.stringify(data.preset || {}, null, 2);
+    full = data.preset || {};
   } catch (error) {
     toast(error.message || "读取失败");
     return;
   }
+  const jsonField = {
+    key: "json",
+    label: "预设（JSON）",
+    type: "textarea",
+    value: JSON.stringify(full, null, 2),
+    rows: 22,
+  };
   openFormDialog({
     title: `预设 JSON：${preset.name || preset.id}`,
-    hint: "整段内容都可以改；复制走就是导出，贴别人的进来就是导入。保存时会做结构校验并自动补回必需的内置动作。",
+    hint:
+      "整段可改；也能只挑一个分区看/改，保存时只并回这一段。复制走就是导出，贴进来就是导入。",
     wide: true,
-    fields: [{ key: "json", label: "预设（JSON）", type: "textarea", value: text, rows: 20 }],
+    fields: [
+      {
+        key: "section",
+        label: "查看范围",
+        type: "select",
+        value: "all",
+        options: PRESET_SECTIONS,
+        hint: "换一个分区就只显示那一段，改它也只改这一段",
+        onChange: ({ control, body }) => {
+          const textarea = body.querySelector('[data-dialog-key="json"]');
+          if (!textarea) return;
+          // 先把当前编辑框里的改动收回 full，再切分区，免得切一下丢改动
+          const previous = control.dataset.prevSection || "all";
+          try {
+            const edited = JSON.parse(textarea.value || "{}");
+            full = mergePresetSection(full, previous, edited);
+          } catch (error) {
+            // 有语法错误就先不收回，切过去看别的，用户回来还能接着改
+          }
+          const section = control.value || "all";
+          control.dataset.prevSection = section;
+          textarea.value = JSON.stringify(presetSectionValue(full, section), null, 2);
+        },
+      },
+      jsonField,
+    ],
     confirmText: "保存",
     onSubmit: async (values) => {
+      const section = String(values.section || "all");
+      let patch;
       try {
-        const result = await apiPost("presets/json", { id: preset.id, json: values.json });
+        patch = JSON.parse(values.json || "{}");
+      } catch (error) {
+        toast(`JSON 格式不对：${error.message}`);
+        return false;
+      }
+      const payload = section === "all" ? patch : mergePresetSection(full, section, patch);
+      try {
+        const result = await apiPost("presets/json", {
+          id: preset.id,
+          payload,
+        });
         toast(
           (result.warnings || []).length
             ? `已保存，提醒：${result.warnings.join("；")}`
@@ -8357,6 +13824,490 @@ async function loadTools() {
   }
 }
 
+/* ==================== 设置向导 ====================
+ *
+ * 第一次打开编辑器时自动走一遍：把"必须先配的"和"最影响手感的一批"集中问一遍，
+ * 省得新用户面对 20 多个小节不知道从哪下手。之后可以在全局设置里随时重开。
+ */
+
+/**
+ * 第一步：她在哪儿生活。
+ *
+ * **不要**在这里回调 ``render`` 去重画整步：render 会再调一次这个 build，
+ * 两边互相递归，直接把弹窗顶成空白（栈溢出）。
+ * 「重新获取」之后只要重画列表本身（下面的 ``draw``），这一步就够了。
+ */
+function wizardSessionStep(body) {
+  const listBox = el("div", "wizard-list");
+  const draw = () => {
+    listBox.innerHTML = "";
+    if (!ui.sessions.length) {
+      listBox.appendChild(
+        el(
+          "p",
+          "muted",
+          "还没有会话。去群里（或私聊）对她说一句「/vw session add」，" +
+            "她收到之后点下面的「重新获取」就会出现在这里。",
+        ),
+      );
+    }
+    ui.sessions.forEach((item) => {
+      const row = el("label", "picker-row");
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = item.enabled !== false;
+      box.addEventListener("change", () => {
+        item.enabled = box.checked;
+        markDirty();
+      });
+      row.appendChild(box);
+      row.appendChild(
+        el("span", "", `${item.session_id}${item.note ? `（${item.note}）` : ""}`),
+      );
+      listBox.appendChild(row);
+    });
+  };
+  draw();
+  body.appendChild(listBox);
+
+  const groups = (ui.groups || [])
+    .map((group) => {
+      const members = (group.sessions || []).length;
+      return members ? `${group.name || group.id}（${members} 个会话）` : "";
+    })
+    .filter(Boolean);
+  body.appendChild(
+    el(
+      "p",
+      "muted",
+      groups.length
+        ? `勾上的才算「她在这儿生活」。会话组（${groups.join("、")}）在「会话」页里管，` +
+            "组里的会话共享状态和记忆。"
+        : "勾上的才算「她在这儿生活」；想让几个会话共享状态和记忆，去「会话」页建一个会话组。",
+    ),
+  );
+
+  const row = el("div", "row");
+  const again = el("button", "small primary", "重新获取");
+  again.type = "button";
+  again.title = "让 bot 加完会话之后点这里，把最新的白名单拉回来";
+  again.addEventListener("click", async () => {
+    const restore = busyButton(again, "获取中…");
+    try {
+      const data = await apiGet("config");
+      const sessions = (data.sessions && data.sessions.sessions) || [];
+      const groups = (data.sessions && data.sessions.groups) || [];
+      ui.sessions = sessions;
+      ui.groups = groups;
+      // **整份替换**：只更新 ui.sessions 的话，之后点「保存」会把旧白名单写回去，
+      // 刚加的那个会话又没了
+      ui.config.sessions = data.sessions || { sessions, groups };
+      if (typeof renderSessionSelects === "function") renderSessionSelects();
+      draw();
+      toast(sessions.length ? `拿到 ${sessions.length} 个会话` : "还是空的");
+    } catch (error) {
+      toast(error.message || "获取失败");
+    } finally {
+      restore();
+    }
+  });
+  row.appendChild(again);
+  body.appendChild(row);
+}
+
+function wizardPersonaStep(body) {
+  const world = ui.config.world;
+  world.persona = world.persona || { mode: "astrbot", text: "" };
+  body.appendChild(
+    inputField("她的名字（Bot 名称）", world.bot_name || "", (value) => {
+      world.bot_name = value;
+      markDirty();
+    }, { hint: "互动动作里的「{bot}」会换成它。留空就先用群名片原名。", placeholder: "例如：小鲸鱼" }),
+  );
+  body.appendChild(
+    pillsField("性别（决定文案里的称呼）", world.gender || "female", GENDERS, (value) => {
+      world.gender = value;
+      markDirty();
+      applyPronoun($("app"));
+    }),
+  );
+  body.appendChild(
+    selectField("人设从哪来", world.persona.mode || "astrbot", [
+      { key: "astrbot", label: "跟随 AstrBot（每个会话各自的人格）" },
+      { key: "plugin", label: "用下面这一份（所有会话共用）" },
+      { key: "append", label: "AstrBot 那份 + 下面这一份（接在后面）" },
+    ], (value) => {
+      world.persona.mode = value;
+      markDirty();
+    }, { hint: "想让她不随会话漂移就选「用下面这一份」。" }),
+  );
+  const area = document.createElement("textarea");
+  area.rows = 8;
+  area.value = world.persona.text || "";
+  area.placeholder = "她是谁、怎么说话、在意什么…留空会回落到 AstrBot 那份，不会把人格弄没";
+  area.addEventListener("change", () => {
+    world.persona.text = area.value;
+    markDirty();
+  });
+  const wrap = el("div", "field");
+  wrap.appendChild(fieldHead("角色卡（她是谁）"));
+  wrap.appendChild(area);
+  const importRow = el("div", "row");
+  const importButton = el("button", "small ghost", "从 AstrBot 导入当前人设");
+  importButton.type = "button";
+  importButton.addEventListener("click", async () => {
+    const session = String((ui.sessions[0] || {}).session_id || "");
+    const restore = busyButton(importButton, "读取中…");
+    try {
+      const data = await apiGet("persona-source", { session });
+      const text = String(data.text || "");
+      if (!text.trim()) {
+        toast("AstrBot 这个会话没读到人格，先去 AstrBot 里给它选一份");
+        return;
+      }
+      world.persona.text = text;
+      world.persona.mode = "plugin";
+      area.value = text;
+      markDirty();
+      toast(`导入了 ${data.chars || text.length} 字`);
+    } catch (error) {
+      toast(error.message || "读取失败");
+    } finally {
+      restore();
+    }
+  });
+  importRow.appendChild(importButton);
+  wrap.appendChild(importRow);
+  body.appendChild(wrap);
+}
+
+function wizardProviderStep(body) {
+  const slots = ui.config.providers || {};
+  const rows = [
+    ["主模型", "llm", "说话用的那个"],
+    ["打杂模型", "helper", "补工具参数、压上下文"],
+    ["判断模型", "judge", "挑一个 / 打分这类轻决策"],
+    ["看图模型", "vision", "把图片转成文字"],
+    ["内容生成模型", "creator", "编她身边发生的事"],
+    ["事件模型", "event", "写事件最后怎么样了"],
+    ["睡眠整理模型", "consolidate", "消化记忆与画像"],
+  ];
+  const box = el("div", "wizard-list");
+  rows.forEach(([label, key, note]) => {
+    const row = el("div", "picker-row");
+    row.appendChild(el("span", "", label));
+    row.appendChild(el("span", "muted", note));
+    row.appendChild(el("span", "wizard-provider", String(slots[key] || "（没读到）")));
+    box.appendChild(row);
+  });
+  body.appendChild(box);
+  body.appendChild(
+    el(
+      "p",
+      "muted",
+      "这些在 AstrBot 面板 → 插件 → 虚拟世界VW 里选；留空的会按括号里的规则回落到别的槽位，" +
+        "所以这里全是回落值也能跑。想省钱就把打杂 / 判断换便宜快的模型。",
+    ),
+  );
+}
+
+function wizardMemoryStep(body) {
+  const world = ui.config.world;
+  world.profile = world.profile || {};
+  world.context = world.context || {};
+  body.appendChild(
+    checkboxField("记住每个人（通讯录）", world.profile.enabled !== false, (value) => {
+      world.profile.enabled = value;
+      markDirty();
+    }, { hint: "关掉就完全不记画像、也不往提示词里带。" }),
+  );
+  body.appendChild(
+    checkboxField("睡觉时整理记忆与画像", world.profile.consolidate_enabled !== false, (value) => {
+      world.profile.consolidate_enabled = value;
+      markDirty();
+    }, { hint: "睡下 20 分钟后整理一次；关掉就一直攒着不消化。" }),
+  );
+  body.appendChild(
+    selectField("聊天留档超了怎么办", world.context.chat_overflow || "compress", [
+      { key: "compress", label: "压成摘要（推荐）" },
+      { key: "discard", label: "直接丢掉最早的" },
+    ], (value) => {
+      world.context.chat_overflow = value;
+      markDirty();
+    }, { hint: "压成摘要会保留「更早聊过什么」，她不会失忆；丢就是真的没了。" }),
+  );
+}
+
+function wizardGenerateStep(body) {
+  const world = ui.config.world;
+  body.appendChild(
+    el(
+      "p",
+      "muted",
+      "这两样都要调一次模型生成，跳过也完全能用——想让她更像她的时候再回来做。",
+    ),
+  );
+  // ① 简易人设：给打杂模型用的摘要，事件、整理都靠它
+  const briefArea = document.createElement("textarea");
+  briefArea.rows = 4;
+  briefArea.placeholder = "还没有生成，点下面的按钮从主人设生成一段";
+  briefArea.value =
+    ($("persona-brief-text") && $("persona-brief-text").value) || "";
+  const briefWrap = el("div", "field");
+  briefWrap.appendChild(fieldHead("简易人设（给打杂模型）"));
+  briefWrap.appendChild(briefArea);
+  const briefRow = el("div", "row");
+  const briefButton = el("button", "small primary", "从主人设生成");
+  briefButton.type = "button";
+  briefButton.addEventListener("click", async () => {
+    const session = String((ui.sessions[0] || {}).session_id || "");
+    if (!session) {
+      toast("先去第一步加一个会话，她才知道用哪份人设");
+      return;
+    }
+    const restore = busyButton(briefButton, "生成中…");
+    try {
+      // 带上编辑器里这份角色卡（可能是刚在向导上一步写的、还没保存）：
+      // 不带的话后端读的是配置里那份旧的，生成的摘要跟眼前的人设对不上
+      const data = await apiPost("persona-brief", {
+        session,
+        generate: true,
+        persona: (world.persona && world.persona.text) || "",
+      });
+      const state = (data && data.persona_brief) || {};
+      briefArea.value = state.brief || "";
+      const mirror = $("persona-brief-text");
+      if (mirror) mirror.value = briefArea.value;
+      toast("生成好了（保存到这个人格）");
+    } catch (error) {
+      toast(`生成失败：${error.message || error}`);
+    } finally {
+      restore();
+    }
+  });
+  const briefSave = el("button", "small ghost", "保存到这个人格");
+  briefSave.type = "button";
+  briefSave.title = "按人格缓存：换人格之后要重新生成一次";
+  briefSave.addEventListener("click", async () => {
+    const session = String((ui.sessions[0] || {}).session_id || "");
+    if (!session) return;
+    try {
+      await apiPost("persona-brief", { session, brief: briefArea.value });
+      const mirror = $("persona-brief-text");
+      if (mirror) mirror.value = briefArea.value;
+      toast("已保存");
+    } catch (error) {
+      toast(error.message || "保存失败");
+    }
+  });
+  briefRow.appendChild(briefButton);
+  briefRow.appendChild(briefSave);
+  briefWrap.appendChild(briefRow);
+  body.appendChild(briefWrap);
+
+  // ② 声音样例：让她学着"自己说过的话"说话
+  const sampleWrap = el("div", "field");
+  sampleWrap.appendChild(fieldHead("声音样例（口吻样本）"));
+  sampleWrap.appendChild(
+    el(
+      "p",
+      "muted",
+      "按场景让她说几句，生成的结果先进候选池；之后在「她 / 他 / ta」那一页挑中的才会进提示词。",
+    ),
+  );
+  const sampleRow = el("div", "row");
+  const sampleButton = el("button", "small primary", "生成候选…");
+  sampleButton.type = "button";
+  sampleButton.addEventListener("click", () => {
+    if (typeof ui.generateVoiceSamples === "function") ui.generateVoiceSamples();
+  });
+  sampleRow.appendChild(sampleButton);
+  sampleWrap.appendChild(sampleRow);
+  body.appendChild(sampleWrap);
+}
+
+function openWizard() {
+  const world = ui.config.world;
+  const steps = [
+    {
+      title: "她在哪儿生活",
+      hint: "先告诉插件：她该在哪些群 / 私聊里出现。没选会话，后面配了也不会生效。",
+      build: (body) => wizardSessionStep(body),
+    },
+    {
+      title: "她是谁",
+      hint: "名字、性别、角色卡。都可以先跳过——留空会沿用 AstrBot 那份人格。",
+      build: (body) => wizardPersonaStep(body),
+    },
+    {
+      title: "模型配了吗",
+      hint: "这一步不改配置，只是让你看清插件现在用的是哪些模型。",
+      build: (body) => wizardProviderStep(body),
+    },
+    {
+      title: "调手感",
+      hint: "不用逐个调参数：拖这几个滑块，它会同时改掉一组相关的设置。中间那档就是默认。",
+      build: (body) => body.appendChild(knobEditor(world)),
+    },
+    {
+      title: "记忆与画像",
+      hint: "要不要记住每个人、要不要在她睡觉时消化这些经历。",
+      build: (body) => wizardMemoryStep(body),
+    },
+    {
+      title: "让她说话像自己（可跳过）",
+      hint: "这两样要调模型生成，跳过也完全能用。",
+      build: (body) => wizardGenerateStep(body),
+    },
+  ];
+  let index = 0;
+
+  const backdrop = el("div", "wizard-backdrop");
+  const card = el("div", "wizard-card");
+  const head = el("div", "wizard-head");
+  const title = el("div", "wizard-title", "");
+  const stepNote = el("div", "muted wizard-step", "");
+  head.appendChild(title);
+  head.appendChild(stepNote);
+  card.appendChild(head);
+  const hintBox = el("p", "muted wizard-hint", "");
+  card.appendChild(hintBox);
+  // 走完就藏起来了：留一句在哪儿能再打开，省得用户调过一次之后找不着
+  card.appendChild(
+    el(
+      "p",
+      "muted wizard-step",
+      "以后想再走一遍：全局设置 → 基础 → 最上面的「重新运行设置向导…」",
+    ),
+  );
+  const body = el("div", "wizard-body");
+  card.appendChild(body);
+  const foot = el("div", "wizard-foot");
+  const back = el("button", "small ghost", "上一步");
+  back.type = "button";
+  const skip = el("button", "small ghost", "跳过这步");
+  skip.type = "button";
+  const next = el("button", "small primary", "下一步");
+  next.type = "button";
+  const done = el("button", "small ghost", "以后再说");
+  done.type = "button";
+  foot.appendChild(done);
+  foot.appendChild(skip);
+  foot.appendChild(back);
+  foot.appendChild(next);
+  card.appendChild(foot);
+  backdrop.appendChild(card);
+  document.body.appendChild(backdrop);
+
+  function close() {
+    backdrop.remove();
+  }
+
+  function render() {
+    const step = steps[index];
+    title.textContent = step.title;
+    stepNote.textContent = `第 ${index + 1} / ${steps.length} 步`;
+    hintBox.textContent = step.hint || "";
+    body.innerHTML = "";
+    step.build(body, render);
+    back.disabled = index === 0;
+    skip.style.display = index === steps.length - 1 ? "none" : "";
+    next.textContent = index === steps.length - 1 ? "完成" : "下一步";
+  }
+
+  async function finish() {
+    ui.config.world.wizard_done = true;
+    markDirty();
+    close();
+    toast("向导走完了，这就保存…");
+    try {
+      await saveAll();
+      toast("已保存，可以开始用了");
+    } catch (error) {
+      toast(`保存失败：${error.message || error}（点右上角「保存」重试）`);
+    }
+  }
+
+  back.addEventListener("click", () => {
+    if (index > 0) {
+      index -= 1;
+      render();
+    }
+  });
+  skip.addEventListener("click", () => {
+    if (index < steps.length - 1) {
+      index += 1;
+      render();
+    } else {
+      finish();
+    }
+  });
+  next.addEventListener("click", () => {
+    if (index < steps.length - 1) {
+      index += 1;
+      render();
+    } else {
+      finish();
+    }
+  });
+  // 「以后再说」也标记已看过：不然每次打开都弹
+  done.addEventListener("click", () => {
+    ui.config.world.wizard_done = true;
+    markDirty();
+    close();
+    toast("向导先关了；全局设置顶部有按钮可以再打开");
+  });
+  render();
+}
+
+/**
+ * 一条记忆的完整字段。
+ *
+ * 重点是把**整理前后的样子**摆在一起：整理过的那条正文是"要点"，原文留在 ``context`` 里。
+ * 之前列表只渲染 content，整理过的和没整理过的长得一模一样，看起来就像"整理没生效"。
+ */
+function openMemoryDetail(memory) {
+  const rows = [
+    ["整理状态", memory.tier === "gist" ? "已整理成要点" : "原文（还没整理）"],
+    ["内容", String(memory.content || "")],
+  ];
+  if (String(memory.context || "").trim()) {
+    rows.push(["整理前的原文", String(memory.context)]);
+  }
+  rows.push(
+    ["类型 / 作用域", `${memory.type || ""} · ${memory.scope || ""}`],
+    ["地点", memory.node_id || "无"],
+    ["相关的人", (memory.related_users || []).join("、") || "无"],
+    ["参与者", (memory.participants || []).join("、") || "无"],
+    ["情绪 / 权重", `${memory.emotion || "无"} · ${Number(memory.weight || 0).toFixed(2)}`],
+    ["来源", memory.source || "runtime"],
+    ["写入时间", memoryStamp(memory.created_at)],
+    ["整理时间", memory.folded_at ? memoryStamp(memory.folded_at) : "没整理过"],
+    [
+      "召回 / 回访",
+      `召回 ${Number(memory.recall_count || 0)} 次` +
+        (memory.next_review_at
+          ? `；下次回访 ${memoryStamp(memory.next_review_at)}`
+          : "；没有排回访"),
+    ],
+    ["钉住", memory.pinned ? "是（不会被顶掉）" : "否"],
+  );
+  openCustomDialog({
+    title: "这条记忆",
+    hint: "整理过的记忆只保留要点，原文收在「整理前的原文」里——忘的是细节，不是那件事。",
+    confirmText: "关闭",
+    build: (body) => {
+      rows.forEach(([label, text]) => {
+        const field = el("div", "field");
+        field.appendChild(el("div", "field-head", label));
+        field.appendChild(el("div", "sample-item-text", String(text || "（空）")));
+        body.appendChild(field);
+      });
+    },
+    onSubmit: () => true,
+  });
+}
+
 async function loadPrompt(mode) {
   const session = $("debug-session").value;
   if (!session) {
@@ -8372,7 +14323,33 @@ async function loadPrompt(mode) {
         sections.map((item) => `· ${item.title}：${item.chars} 字符`).join("\n") +
         "\n\n──────────── 以下是全文 ────────────\n"
       : "";
-    $("debug-output").textContent = head + (data.prompt || "（空）");
+    // 状态槽单独说一句：槽里有东西却没进提示词，只可能是过期了
+    const slots = data.state_slots || [];
+    const slotHead = slots.length
+      ? slots
+          .map((item) => {
+            const label = String(item.label || item.slot || "");
+            const text = String(item.text || "").trim() || "（空）";
+            return `· 【${label}】${text}${item.expired ? "（已过期，不会写进提示词）" : ""}`;
+          })
+          .join("\n") + "\n"
+      : "· （没有状态槽）\n";
+    // 声音样例单独点出来：它就排在第 2 段，两万字的提示词里靠肉眼翻太费劲
+    const samples = data.voice_samples || [];
+    const sampleHead = samples.length
+      ? samples
+          .map(
+            (item) =>
+              `· 【${item.scene_label || "不限"}】${String(item.text || "")}` +
+              (item.move ? `（${item.move}）` : ""),
+          )
+          .join("\n") + "\n"
+      : "· （没有已采用的样例，这一段整段不会出现在提示词里）\n";
+    $("debug-output").textContent =
+      `声音样例（本轮抽到 ${samples.length} 条）：\n${sampleHead}` +
+      `状态槽：\n${slotHead}` +
+      head +
+      (data.prompt || "（空）");
   } catch (error) {
     toast(error.message || "读取失败");
   }

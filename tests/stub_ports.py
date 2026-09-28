@@ -65,6 +65,7 @@ class StubMessenger:
 
     def __init__(self, *, card_result: bool = True, card: str = "小鲸鱼") -> None:
         self.sent: list[tuple[str, list[str]]] = []
+        self.sent_images: list[tuple[str, list[str]]] = []
         self.cards: list[tuple[str, str]] = []
         self.pokes: list[tuple[str, str]] = []
         self.card_result = card_result
@@ -73,6 +74,10 @@ class StubMessenger:
 
     async def send_text(self, session_id: str, messages: list[str]) -> bool:
         self.sent.append((session_id, list(messages)))
+        return True
+
+    async def send_images(self, session_id: str, images: list[str]) -> bool:
+        self.sent_images.append((session_id, list(images)))
         return True
 
     async def set_group_card(self, session_id: str, card: str) -> CardResult:
@@ -88,11 +93,15 @@ class StubMessenger:
         self.pokes.append((session_id, str(user_id)))
         if self.poke_result is False:
             return PokeResult(False, "测试里指定戳不动")
-        return PokeResult(True)
+        return PokeResult(True, route="测试通道")
 
     @property
     def flat_messages(self) -> list[str]:
         return [message for _session, group in self.sent for message in group]
+
+    @property
+    def flat_images(self) -> list[str]:
+        return [ref for _session, group in self.sent_images for ref in group]
 
 
 class StubTools:
@@ -103,9 +112,11 @@ class StubTools:
         tools: dict[str, str] | None = None,
         results: dict[str, str] | None = None,
         schemas: dict[str, dict] | None = None,
+        images: dict[str, list[str]] | None = None,
     ) -> None:
         self._tools = tools if tools is not None else {"web_search": "搜索网页"}
         self.results = results or {}
+        self.images = images or {}
         self.failures: dict[str, str] = {}
         self.schemas = schemas or {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -127,9 +138,16 @@ class StubTools:
         if name in self.failures:
             return ToolCallResult(ok=False, error=self.failures[name], tool=name)
         text = self.results.get(name, f"{name} 的结果")
-        if not text:
+        images = list(self.images.get(name) or [])
+        if not text and not images:
             return ToolCallResult(ok=False, error="工具返回了空结果", tool=name)
-        return ToolCallResult(ok=True, text=text, tool=name)
+        return ToolCallResult(
+            ok=True,
+            text=text,
+            tool=name,
+            image_urls=list(images),
+            attachments=list(images),
+        )
 
 
 class StubPersona:

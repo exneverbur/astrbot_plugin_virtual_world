@@ -19,6 +19,17 @@ DEFAULT_NODES_PER_RUN = 3
 
 _ID_RE = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
 _ATTRS = ("energy", "loneliness", "curiosity", "affect", "boredom")
+# 群名片里的地点文案：「在书房」这种，短到不会把昵称挤没
+NODE_NICKNAME_CHARS = 5
+
+
+def _node_nickname_text(value: Any, name: str) -> str:
+    """地点自己的名片文案；模型没给就用「在<地点名>」兜底。"""
+
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        text = f"在{name}" if name else ""
+    return text[:NODE_NICKNAME_CHARS]
 
 
 def clamp_per_node(value: Any, default: int = DEFAULT_ACTIONS_PER_NODE) -> int:
@@ -249,6 +260,9 @@ def parse_generated_nodes(
             "preset_memories": item.get("preset_memories")
             if isinstance(item.get("preset_memories"), list)
             else [],
+            "nickname_text": _node_nickname_text(
+                item.get("nickname_text"), str(item.get("name") or node_id).strip()
+            ),
             "x": 60,
             "y": 60,
         }

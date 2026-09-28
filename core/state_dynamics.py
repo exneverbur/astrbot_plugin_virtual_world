@@ -28,7 +28,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 from .models import NodeDef, StateDynamics as DynamicsConfig, WorldConfig
-from .mood import mood_label
+from .mood import cause_text, mood_label
 from .state import WorldState
 
 # ---------------- 事件表 ----------------
@@ -38,11 +38,14 @@ from .state import WorldState
 # 心潮的加成会按「当时的效价 × tone」做不对称——心情好时更容易被逗乐，
 # 心情差时更容易被惹毛（见 valence_asymmetry）。
 EVENT_EFFECTS: dict[str, dict[str, float]] = {
-    "mention_bot": {"affect": 0.045, "loneliness": -0.05, "_tone": 0.0},
+    # 正面的这几条刻意压得小：它们是"每天都可能连着来"的脉冲，
+    # 一句玩笑就推 0.2 的话，几句闲聊就能把她顶到满值、之后一直卡在兴奋档。
+    # 真正的起伏交给主模型自己写的 valence_delta 和事件系统。
+    "mention_bot": {"affect": 0.03, "loneliness": -0.04, "_tone": 0.0},
     "positive_words": {
-        "affect": 0.10,
-        "valence": 0.06,
-        "loneliness": -0.15,
+        "affect": 0.06,
+        "valence": 0.04,
+        "loneliness": -0.12,
         "_tone": 1.0,
     },
     "negative_words": {
@@ -51,12 +54,22 @@ EVENT_EFFECTS: dict[str, dict[str, float]] = {
         "loneliness": 0.10,
         "_tone": -1.0,
     },
-    "hug_bot": {"affect": 0.15, "valence": 0.07, "loneliness": -0.20, "_tone": 1.0},
-    "group_lively": {"affect": 0.02, "loneliness": -0.05, "_tone": 0.0},
+    "hug_bot": {"affect": 0.08, "valence": 0.04, "loneliness": -0.16, "_tone": 1.0},
+    # 群里热闹**既不算有人陪她，也不算"她不闷"**：
+    # - 孤独要有"有人直接跟她说话"才降（mention_bot / positive_words / hug_bot）；
+    # - 无聊是"她自己没事做"，跟群里热闹无关——以前这条扣无聊，群里活跃一整天
+    #   她就一直待在一个地方不动（换地点是无聊驱动的）。
+    # 只留一点心潮：氛围热闹，她跟着有点精神。
+    "group_lively": {"affect": 0.02, "_tone": 0.0},
+    # 群里热闹但没人在跟她说话：看着别人聊，自己插不上话——会更闷、更想找人说两句
+    "left_out": {"boredom": 0.03, "loneliness": 0.02, "valence": -0.01, "_tone": -0.5},
+    # 她记下一笔账：当场就有点上头，之后靠"降一档 + 提示词"体现，
+    # 不在这里反复扣心情（不然一件旧账会把她一直吊在气头上）
+    "grudge": {"affect": 0.06, "valence": -0.05, "_tone": -0.6},
     "group_quiet": {"loneliness": 0.05, "boredom": 0.10},
     "user_joined": {"curiosity": 0.10},
     "user_left": {"loneliness": 0.05},
-    "topic_engaged": {"affect": 0.015, "boredom": -0.05, "_tone": 0.0},
+    "topic_engaged": {"affect": 0.01, "boredom": -0.05, "_tone": 0.0},
     # 被冷落只压心情，不再抬高心潮：否则她会从"退缩"直接跳成"发作"，
     # 群里看到的就是"刚被无视完突然开始阴阳怪气"。
     "ignored": {"valence": -0.08, "loneliness": 0.05, "boredom": 0.05, "_tone": -1.0},
@@ -67,10 +80,24 @@ EVENT_EFFECTS: dict[str, dict[str, float]] = {
     "send_failed": {"affect": 0.04, "valence": -0.03, "_tone": -1.0},
 }
 
-# 边际递减：已经很激动时，同样的刺激能加进去的更少（最低保留 25% 效力）。
+MOOD_CAUSE_TEXT: dict[str, str] = {
+    "mention_bot": "有人点名找你",
+    "positive_words": "被夸了",
+    "negative_words": "被怼了",
+    "hug_bot": "被哄了一下",
+    "ignored": "你说了话没人接",
+    "tool_failed": "手上的活没做成",
+    "interrupted": "手上的事被打断了",
+    "schedule_done": "安排的事做成了",
+    "send_failed": "消息没发出去",
+}
+"""这类事件推动情绪时，顺手记一句来源（提示词里会写"因为：…"）。"""
+
+# 边际递减：已经很激动时，同样的刺激能加进去的更少（最低保留 10% 效力）。
 # 没有这一层的话，一两轮聊天就能把心潮顶到满值，之后一直卡在"难以平静"。
-AFFECT_SATURATION_FLOOR = 0.25
-VALENCE_SATURATION_FLOOR = 0.25
+# 地板压到 0.10 是因为满值附近几乎不该再被推动——100 分只该留给真的极端时刻。
+AFFECT_SATURATION_FLOOR = 0.10
+VALENCE_SATURATION_FLOOR = 0.10
 
 # ---------------- 情绪两轴的基线 / 衰减 ----------------
 
@@ -89,7 +116,11 @@ VALENCE_HOUR_WEIGHT = 0.4
 """以上几项决定效价基线：精力高偏正，孤独 / 无聊 / 好奇长期没被满足偏负。"""
 
 VALENCE_DECAY_PER_MIN = 0.010
-"""效价偏移每分钟回落的比例系数（指数衰减，永远朝基线）。"""
+"""效价偏移每分钟回落的比例系数（指数衰减，永远朝基线）。
+
+回落速度别再往上加：真正该收紧的是"一下能推多少"，不是"多久忘掉"——
+吵一架难受两个小时是对的，被夸两句就满值才是错的。
+"""
 
 COUPLING_CAP = 0.5
 """两轴互相影响的上限：倍率夹在 0.5~1.5，避免情绪雪崩。"""
@@ -115,6 +146,29 @@ IGNORED_RESET_MINUTES = 30
 
 IGNORED_STREAK_MAGNITUDES = (1.0, 0.5, 0.0)
 """第 1/2/3 次被冷落的力度：第一次最疼，之后递减，三次之后暂时放下。"""
+
+REPEAT_TRACKED = ("mention_bot", "positive_words", "hug_bot")
+"""会被"连着来"磨掉效力的事件：被叫、被夸、被哄。
+
+这三条是每天来得最密的正面脉冲。不递减的话，语速快的会话几十轮下来
+心潮必然钉在满值——之后一直"激动得不行"，表达格子也永远落在同一格。
+"""
+
+REPEAT_MAGNITUDES = (1.0, 0.6, 0.35, 0.2, 0.12)
+"""连着第 1/2/3/4/5 次的力度，第 6 次起固定为 REPEAT_FLOOR。"""
+
+REPEAT_FLOOR = 0.08
+"""麻木之后保留的效力：不是完全没有反应，只是不再叠加。"""
+
+REPEAT_RESET_MINUTES = 20
+"""隔这么久没有同类好事，就当"缓过来了"，重新按第一次算。"""
+
+CURIOSITY_SOFT_CAP = 0.7
+"""好奇心过了这条线就开始"饱和"：越接近满值涨得越慢。
+
+没有这一层的话，好奇心是**只涨不落**的（自然增长 1.44/天，而唯一的下落是随机事件里
+那几口干 -0.02，以及动作配的 -0.06），一天下来必然钉死在 1.0，之后就一直"想知道点什么"。
+"""
 
 
 def clamp_value(value: float, low: float, high: float) -> float:
@@ -164,6 +218,19 @@ def nonlinear_factor(gap: float) -> float:
     if value >= 0.12:
         return 1.0
     return 0.6
+
+
+def curiosity_growth_factor(curiosity: float) -> float:
+    """好奇心的增长系数：软上限以下照常涨，以上越接近满值涨得越慢。
+
+    到 1.0 时系数归零，所以好奇心是**渐近**贴近满值，而不是一口气顶死在那里。
+    """
+
+    value = clamp_value(float(curiosity or 0.0), 0.0, 1.0)
+    if value <= CURIOSITY_SOFT_CAP:
+        return 1.0
+    span = max(1e-6, 1.0 - CURIOSITY_SOFT_CAP)
+    return clamp_value((1.0 - value) / span, 0.0, 1.0)
 
 
 def hour_curve(hour: int) -> float:
@@ -270,6 +337,13 @@ class StateDynamics:
                 else self.config.nap_energy_recovery_per_min
             )
             state.energy += rate * minutes
+            # 睡一觉把"昨天攒的好奇"放下：不然她会是带着满格好奇心入睡、
+            # 一醒来（所有门禁放开）就冲去查东西。无聊 / 孤独在睡眠里维持原样。
+            curiosity = float(state.curiosity)
+            if curiosity > 0:
+                cool = max(0.0, float(self.config.sleep_curiosity_decay_per_min)) * minutes
+                floor = clamp_value(float(self.config.sleep_curiosity_floor), 0.0, 1.0)
+                state.curiosity = max(min(floor, curiosity), curiosity - cool)
             # 睡着了也要让情绪平复：醒来时不该还揣着昨晚那口气
             reset = self._sync_emotions(state, now=now, node=node)
             self._clamp(state)
@@ -299,6 +373,8 @@ class StateDynamics:
         # 好奇：基础增长；氛围调制；搜索时消耗
         curiosity_rate = self.config.curiosity_growth_per_min
         curiosity_rate *= 1 + curious_air * mult
+        # 已经很想知道点什么了：再涨就慢下来，别一天下来钉死在满值（见 CURIOSITY_SOFT_CAP）
+        curiosity_rate *= curiosity_growth_factor(state.curiosity)
         state.curiosity += curiosity_rate * minutes
         if state.state == "searching":
             state.curiosity -= 0.002 * minutes
@@ -308,6 +384,8 @@ class StateDynamics:
         boredom_rate = self.config.boredom_growth_per_min
         boredom_rate *= 1 - calm * mult * 0.5
         boredom_rate *= 1 - liveliness * mult * 0.5
+        # 同一个地方待得越久越坐不住：换地点（node_since 重置）就把这个系数清零
+        boredom_rate *= self.dwell_factor(state, now)
         state.boredom += boredom_rate * minutes
 
         # 情绪两轴：按真实时间结算（tick 长度改了也不影响曲线形状）
@@ -360,7 +438,7 @@ class StateDynamics:
 
         # 效价偏移：指数衰减回 0（也就回到了基线）
         offset = float(state.valence_offset)
-        v_rate = VALENCE_DECAY_PER_MIN * nonlinear_factor(offset)
+        v_rate = self._valence_decay_per_min() * nonlinear_factor(offset)
         state.valence_offset = offset * math.exp(-v_rate * minutes)
 
         state.affect_synced_at = stamp
@@ -449,20 +527,81 @@ class StateDynamics:
         effects = EVENT_EFFECTS.get(kind)
         if not effects:
             return False
-        return self._apply_pulse(state, effects, magnitude=magnitude, now=now)
+        if kind in REPEAT_TRACKED:
+            # 连着被哄会麻木：第二次起同样的好事推不动那么多了
+            magnitude = float(magnitude) * self.repeat_magnitude(state, kind, now=now)
+        return self._apply_pulse(
+            state,
+            effects,
+            magnitude=magnitude,
+            now=now,
+            cause=MOOD_CAUSE_TEXT.get(kind, ""),
+            chat=kind in REPEAT_TRACKED,
+        )
 
     def apply_event_delta(
-        self, state: WorldState, field: str, delta: float, *, now: float | None = None
+        self,
+        state: WorldState,
+        field: str,
+        delta: float,
+        *,
+        now: float | None = None,
+        cause: str = "",
+        chat: bool = False,
     ) -> bool:
         """按事件的规则施加一个临时增量。
 
         主模型给的 `valence_delta` 走这条：它享受同样的边际递减与两轴耦合，
         但不在事件表里——那是个"这一刻她的感受"，不是预设好的一类事件。
+
+        ``chat=True`` 表示这一下是**聊天**推的（不是她真经历了什么）：
+        正向部分要占当天的聊天额度，见 ``_spend_chat_valence``。
         """
 
         if not delta:
             return False
-        return self._apply_pulse(state, {field: float(delta)}, magnitude=1.0, now=now)
+        return self._apply_pulse(
+            state,
+            {field: float(delta)},
+            magnitude=1.0,
+            now=now,
+            cause=cause,
+            chat=chat,
+        )
+
+    def apply_pulse(
+        self,
+        state: WorldState,
+        effects: dict[str, Any],
+        *,
+        now: float | None = None,
+        cause: str = "",
+        chat: bool = False,
+    ) -> bool:
+        """事件系统给的一串状态脉冲（``{字段: 增量}``）。
+
+        和 ``apply_event`` 走同一条路：饱和、两轴耦合、夹紧、重算心情都照旧，
+        只是这次的数值不是预设好的事件表，而是当场算出来的。
+        """
+
+        if not effects:
+            return False
+        clean: dict[str, float] = {}
+        for name, value in dict(effects).items():
+            key = str(name).strip()
+            if key.startswith("_") or not hasattr(state, key):
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if number:
+                clean[key] = number
+        if not clean:
+            return False
+        return self._apply_pulse(
+            state, clean, magnitude=1.0, now=now, cause=cause, chat=chat
+        )
 
     def _apply_pulse(
         self,
@@ -471,8 +610,17 @@ class StateDynamics:
         *,
         magnitude: float = 1.0,
         now: float | None = None,
+        cause: str = "",
+        chat: bool = False,
     ) -> bool:
-        """事件脉冲的公共实现：先补衰减，再用同一个快照算两轴的互相影响。"""
+        """事件脉冲的公共实现：先补衰减，再用同一个快照算两轴的互相影响。
+
+        ``cause`` 是"为什么变成这样"的一句短语；这一下如果**真的**把情绪推动了
+        （心潮 ≥0.03 或效价 ≥0.02），就把它记成当前的心情来源，供提示词与状态页用。
+
+        ``chat``：这一下是聊天推的。**正向**的效价要占当天的聊天额度——
+        日常陪伴改的是好感度，不是心情的量程；负向不占（难过不因为今天被怼过就不算数）。
+        """
 
         reset = self._sync_emotions(state, now=now)
         # 快照：两轴的互相影响都用"事件发生前"的值算，先后顺序不影响结果
@@ -494,6 +642,10 @@ class StateDynamics:
             if field == "valence":
                 value *= valence_saturation(snap_valence)
                 value *= arousal_scale(snap_affect)
+                if chat and value > 0:
+                    value = self._spend_chat_valence(state, value, now=now)
+                if not value:
+                    continue
                 state.valence_offset = clamp_value(
                     float(state.valence_offset) + value, -0.5, 0.5
                 )
@@ -503,7 +655,14 @@ class StateDynamics:
         self._clamp(state)
         hour = self._hour(now)
         self._refresh(state, hour=hour)
-        self._update_storm(state, now=self._now() if now is None else float(now))
+        stamp = self._now() if now is None else float(now)
+        self._update_storm(state, now=stamp)
+        moved = abs(float(state.affect) - snap_affect) >= 0.03 or abs(
+            float(state.valence) - float(snap_valence)
+        ) >= 0.02
+        if cause and moved:
+            state.mood_cause = " ".join(str(cause).split())[:24]
+            state.mood_cause_at = stamp
         state.mood = self.derive_mood(state)
         return reset
 
@@ -579,11 +738,24 @@ class StateDynamics:
 
         动作里写了 `mood:温柔` 时，覆盖期内直接用它——那是她在"演"这个语气，
         不是心境变了。
+
+        标签 = 格子词 + 修饰（困 / 想找人 / 闲得发慌 / 心痒）+ 来源（为什么变成这样）。
+        修饰和来源都是**当下成立**才加：来源超过半小时就不再挂了。
         """
 
         if state.world_time < state.mood_override_until:
             return state.mood
-        return mood_label(state.affect, state.valence, energy=state.energy)
+        return mood_label(
+            state.affect,
+            state.valence,
+            energy=state.energy,
+            loneliness=state.loneliness,
+            boredom=state.boredom,
+            curiosity=state.curiosity,
+            cause=cause_text(
+                state.mood_cause, at=state.mood_cause_at, now=self._now()
+            ),
+        )
 
     # ---------------- 极端保护 ----------------
 
@@ -625,11 +797,109 @@ class StateDynamics:
         state.ignored_at = now
         return magnitude
 
+    def repeat_magnitude(
+        self, state: WorldState, kind: str, *, now: float | None = None
+    ) -> float:
+        """同一类好事连着来的递减力度（被夸第 N 次就不稀奇了）。
+
+        和 ``ignored_magnitude`` 同一套思路，只是按事件名分开记：
+        "被叫了 20 次"和"被夸了 20 次"是两回事，不该互相磨掉。
+        """
+
+        stamp = self._now() if now is None else float(now)
+        streak_at = state.praise_streak_at if isinstance(state.praise_streak_at, dict) else {}
+        streak_map = state.praise_streak if isinstance(state.praise_streak, dict) else {}
+        last = float(streak_at.get(kind) or 0.0)
+        streak = 0 if (last and stamp - last >= REPEAT_RESET_MINUTES * 60) else max(
+            0, int(streak_map.get(kind) or 0)
+        )
+        magnitude = (
+            REPEAT_MAGNITUDES[streak]
+            if streak < len(REPEAT_MAGNITUDES)
+            else REPEAT_FLOOR
+        )
+        streak_at[kind] = stamp
+        streak_map[kind] = streak + 1
+        state.praise_streak = streak_map
+        state.praise_streak_at = streak_at
+        return magnitude
+
     # ---------------- 工具 ----------------
+
+    def _valence_decay_per_min(self) -> float:
+        """效价回落速度：读配置，读不到（老存档 / 测试桩）就用默认常量。"""
+
+        try:
+            value = float(getattr(self.config, "valence_decay_per_min", VALENCE_DECAY_PER_MIN))
+        except (TypeError, ValueError):
+            return VALENCE_DECAY_PER_MIN
+        return value if value > 0 else VALENCE_DECAY_PER_MIN
+
+    def _spend_chat_valence(
+        self, state: WorldState, value: float, *, now: float | None = None
+    ) -> float:
+        """聊天能推动的效价走当天额度：额度用完了就不再推。
+
+        正负各算一份：今天开心够了不该挡着她难过。
+        额度是"聊天"这条路专用的——她真经历一件事（事件系统）不受它限制。
+        """
+
+        try:
+            budget = float(
+                getattr(self.config, "chat_valence_daily_cap", 0.15) or 0.0
+            )
+        except (TypeError, ValueError):
+            budget = 0.15
+        if budget <= 0:
+            return value
+        stamp = self._now() if now is None else float(now)
+        try:
+            today = datetime.fromtimestamp(stamp).strftime("%Y-%m-%d")
+        except (OverflowError, OSError, ValueError):
+            today = ""
+        if str(state.chat_day or "") != today:
+            state.chat_day = today
+            state.chat_valence_spent = 0.0
+        try:
+            spent = float(state.chat_valence_spent or 0.0)
+        except (TypeError, ValueError):
+            spent = 0.0
+        left = budget - max(0.0, spent)
+        allowed = min(float(value), max(0.0, left))
+        if allowed <= 0:
+            return 0.0
+        state.chat_valence_spent = spent + allowed
+        return allowed
 
     @staticmethod
     def _clamp(state: WorldState) -> None:
         state.clamp()
+
+    # 「在这儿待了多久」的分段：越久，无聊涨得越快
+    DWELL_STEPS: tuple[tuple[float, float], ...] = (
+        (10.0, 1.0),
+        (30.0, 1.3),
+        (60.0, 1.6),
+        (180.0, 2.0),
+    )
+    """``(停留分钟上限, 系数)``：超过 180 分钟按最后一档算。"""
+
+    def dwell_minutes(self, state: WorldState, now: float | None = None) -> float:
+        """她在当前这个地点待了多久（分钟；拿不到起始时间就返回 0）。"""
+
+        since = float(state.node_since or 0.0)
+        if since <= 0:
+            return 0.0
+        return max(0.0, (self._now() if now is None else float(now)) - since) / 60.0
+
+    def dwell_factor(self, state: WorldState, now: float | None = None) -> float:
+        """无聊增长要乘的"待久了"系数（换地点就回到 1.0）。"""
+
+        minutes = self.dwell_minutes(state, now)
+        for limit, value in self.DWELL_STEPS:
+            if minutes < limit:
+                return value
+        return self.DWELL_STEPS[-1][1]
 
     def values(self, state: WorldState) -> dict[str, float]:
         return {

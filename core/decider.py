@@ -22,6 +22,8 @@ WILLINGNESS_WEIGHTS = {
     "boredom": 0.20,
     "curiosity": 0.10,
     "affect": 0.15,
+    # 效价按「离中性多远」算：心情好加一点意愿，心情差减一点（均值不偏移）
+    "valence": 0.10,
     "tired": 0.35,
     "unanswered": 0.25,
 }
@@ -33,6 +35,10 @@ INTERJECT_SOCIAL_VALENCE_FLOOR = 0.35
 INTERJECT_VENT_AROUSAL = 0.6
 INTERJECT_THRESHOLD_BUMP_MAX = 0.10
 INTERJECT_THRESHOLD_BUMP_CLOSED = 0.15
+"""心情差 / 长期低落时，插话阈值上浮多少（更不想开口）。"""
+
+HAPPY_THRESHOLD_DROP = 0.05
+"""心情好时插话阈值往下走多少：高心潮 + 高效价才是"想找人玩"那种主动。"""
 
 # 心情低落时，自我调节类动作（发呆、看书）的门槛下调：
 # 安全阀不是"触发一个动作"，而是让她的行为自然偏向自我修复。
@@ -43,6 +49,13 @@ SELF_CARE_IDLE = 0.3
 # 好奇心触发的"去查点东西"两次之间至少隔这么久：查一次只降一点点好奇心，
 # 不设冷却的话她会每隔几分钟就查同一件事，群里看到的就是她在刷新闻。
 SEARCH_COOLDOWN_MINUTES = 45
+
+# 白天小睡睡多久：按小睡动作自己写的「每持续 1 分钟恢复多少精力」反推，
+# 睡到大约这个精力为止，再卡在动作声明的时长范围内。
+NAP_TARGET_ENERGY = 0.42
+NAP_FALLBACK_SECONDS = 45 * 60
+NAP_MIN_SECONDS = 10 * 60
+NAP_MAX_SECONDS = 60 * 60
 
 
 def reply_willingness(state: WorldState, weights: dict[str, float] | None = None) -> float:
@@ -58,6 +71,8 @@ def reply_willingness(state: WorldState, weights: dict[str, float] | None = None
         + w["boredom"] * float(state.boredom)
         + w["curiosity"] * float(state.curiosity)
         + w["affect"] * float(state.affect)
+        # 效价按"离中性多远"算：心情好更想说话，心情差更不想（不改整体均值）
+        + w["valence"] * (float(state.valence) - 0.5)
         - w["tired"] * (1.0 - float(state.energy))
     )
     if int(state.unanswered_count or 0) > 0:
@@ -74,11 +89,13 @@ class Decider:
         rng: random.Random | None = None,
         *,
         now_provider: Any = None,
+        hour_provider: Any = None,
         tick_seconds: float = 60.0,
     ) -> None:
         self.world = world
         self.rng = rng or random.Random()
         self._now_provider = now_provider
+        self._hour_provider = hour_provider
         self.tick_seconds = max(1.0, float(tick_seconds))
 
     def _now(self) -> float:
@@ -91,6 +108,67 @@ class Decider:
 
     def set_world(self, world: WorldConfig) -> None:
         self.world = world
+
+    def local_hour(self) -> int:
+        """现在几点（0~23）。
+
+        拿不到时间就按白天算：宁可让她小睡一会儿，也别让她在不知几点的时候睡 8 小时。
+        """
+
+        if self._hour_provider is None:
+            return 12
+        try:
+            return int(self._hour_provider()) % 24
+        except Exception:
+            return 12
+
+    def is_night(self) -> bool:
+        """是不是该睡整觉的时段（默认 23:00–07:00，在「作息与夜晚」里可改）。
+
+        拿不到钟点时按白天算：宁可让她小睡一会儿，也别让她在不知几点的时候睡 8 小时。
+        """
+
+        return self.world.is_night_time(self.local_hour())
+
+    def can_nap(self) -> bool:
+        """小睡这条路能不能用：动作在、没停用，而且真的回得了精力。"""
+
+        if not self.action_usable("nap"):
+            return False
+        return self._nap_recovery_per_minute(self.world.action_map().get("nap")) > 0
+
+    def nap_seconds(self, state: WorldState) -> int:
+        """白天小睡睡多久：按小睡动作写的恢复速度，算到够她缓过来为止。
+
+        小睡动作写的是「每持续 1 分钟精力 +0.0015」，睡多久由计划决定；
+        不按恢复量反推的话，睡 10 分钟只回来 0.015，醒来立刻又困，一天就全在打盹。
+        用户把小睡的恢复速度调高了，这里的时长也会跟着变短。
+        """
+
+        action = self.world.action_map().get("nap")
+        low, high = NAP_MIN_SECONDS, NAP_MAX_SECONDS
+        if action is not None:
+            try:
+                low = max(60, int(action.duration_min or NAP_MIN_SECONDS))
+                high = max(low, int(action.duration_max or NAP_MAX_SECONDS))
+            except (TypeError, ValueError):
+                pass
+        per_minute = self._nap_recovery_per_minute(action)
+        need = max(0.0, NAP_TARGET_ENERGY - float(state.energy))
+        minutes = need / per_minute if per_minute > 0 else NAP_FALLBACK_SECONDS / 60.0
+        return max(low, min(high, int(round(minutes * 60))))
+
+    def _nap_recovery_per_minute(self, action: Any) -> float:
+        """小睡动作配的「每分钟恢复多少精力」（配成设值 / 倍数时返回 0，用兜底时长）。"""
+
+        effects = getattr(getattr(action, "on_complete", None), "effects_per_minute", None) or {}
+        raw = str(effects.get("energy") or "").strip()
+        if not raw or raw[0] not in "+-":
+            return 0.0
+        try:
+            return float(raw[1:])
+        except ValueError:
+            return 0.0
 
     # ---------------- 是否需要新计划 ----------------
 
@@ -162,15 +240,21 @@ class Decider:
                     source="rule",
                 )
 
-        # 1) 精力过低 -> 回卧室睡觉（刚被叫醒的保护期里不安排，免得叫醒几分钟又被抓回去睡）
+        # 1) 精力过低 -> 该休息了（刚被叫醒的保护期里不安排，免得叫醒几分钟又被抓回去睡）。
+        #    夜里睡整觉，白天先小睡：白天一睡八小时，醒来正好是半夜，日子直接过乱。
         if state.energy < 0.25 and state.world_time >= state.no_sleep_until:
             steps = self._travel_then(node_id, home, graph)
-            steps.append({"action": "sleep", "duration": self._action_duration("sleep")})
+            if self.is_night() or not self.can_nap():
+                steps.append({"action": "sleep", "duration": self._action_duration("sleep")})
+                reason = "夜深了，该睡了"
+            else:
+                steps.append({"action": "nap", "duration": self.nap_seconds(state)})
+                reason = "白天精力低，先小睡一会儿"
             return create_plan(
                 steps=steps,
                 world_time=state.world_time,
                 valid_for=self._plan_valid(),
-                reason="精力过低，该休息了",
+                reason=reason,
                 source="rule",
             )
 
@@ -249,12 +333,18 @@ class Decider:
         home = self.world.default_node_id()
         if flag == "force_sleep":
             steps = self._travel_then(state.node_id, home, graph)
-            steps.append({"action": "sleep", "duration": self._action_duration("sleep")})
+            # 白天透支不该一睡八小时：先眯到小睡动作的上限，缓过来再说过。
+            if self.is_night() or not self.can_nap():
+                steps.append({"action": "sleep", "duration": self._action_duration("sleep")})
+                reason = "精力透支，强制休息"
+            else:
+                steps.append({"action": "nap", "duration": self.nap_seconds(state)})
+                reason = "精力透支，先眯一会儿"
             return create_plan(
                 steps=steps,
                 world_time=state.world_time,
                 valid_for=self._plan_valid(),
-                reason="精力透支，强制休息",
+                reason=reason,
                 source="extreme",
             )
         if flag == "force_reach_out":
@@ -369,20 +459,24 @@ class Decider:
 
         **浮动阈值**（不是浮动意愿值）：心情差的时候更难开口，但一旦开口，
         说成什么样仍归风格格管——两件事不混在一起。
+
+        心情好时反过来：阈值往下走一点（最多 ``HAPPY_THRESHOLD_DROP``）——
+        "高心潮 + 高效价"才该变成想找人玩，而不是只让她说话更外放。
         """
 
         base = float(self.world.decider.interject_threshold)
-        bump = max(
-            0.0,
-            min(
-                INTERJECT_THRESHOLD_BUMP_MAX,
-                (0.5 - float(state.valence)) / 3.0,
-            ),
-        )
+        valence = float(state.valence)
+        if valence < 0.5:
+            bump = max(
+                0.0,
+                min(INTERJECT_THRESHOLD_BUMP_MAX, (0.5 - valence) / 3.0),
+            )
+        else:
+            bump = -HAPPY_THRESHOLD_DROP * min(1.0, (valence - 0.5) / 0.4)
         if self.motive_a_closed(state):
             # 长期低落：动机 A 关闭，而且至少关 15 分钟（避免阈值边上反复抖）
             bump = INTERJECT_THRESHOLD_BUMP_CLOSED
-        return base + bump
+        return max(0.0, base + bump)
 
     def motive_a_closed(self, state: WorldState) -> bool:
         """「想被注意到」这条动机是不是被关掉了。"""

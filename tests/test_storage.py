@@ -98,6 +98,46 @@ class TestConfigStore(TempDirMixin, unittest.TestCase):
         self.assertTrue(store.remove_session("aiocqhttp:GroupMessage:100"))
         self.assertEqual(store.load_sessions().sessions, [])
 
+    def test_builtin_world_does_not_duplicate_model_defaults(self):
+        """内置默认世界不能另存一份"说话频率 / 上下文预算"。
+
+        两边各存一份的后果真的发生过：改了模型默认值，"新建默认预设"却把旧的保守值
+        又装回来。这条把"两份必须一致"钉住。
+        """
+
+        from core.models import ContextConfig, Limits, WorldConfig, parse_world
+
+        raw = default_world()
+        for section in ("limits", "context"):
+            self.assertNotIn(
+                section,
+                raw,
+                f"DEFAULT_WORLD 里不该再写一份 {section}（它会盖掉模型默认值）",
+            )
+        world, _warnings = parse_world(raw)
+        self.assertEqual(world.limits, Limits())
+        self.assertEqual(world.context, ContextConfig())
+        self.assertEqual(world.limits.max_replies_per_hour, 200)
+        self.assertEqual(world.context.chat_overflow, "compress")
+
+    def test_old_defaults_are_neither_rewritten_nor_reported(self):
+        """还停在旧版默认值的项：**不替用户改，也不提醒**。
+
+        值分不清"没动过"和"特意选的"：把 discard 悄悄换成 compress 会动到成本，
+        把 15 换成 200 会动到防刷屏上限。所以一律保持原样、一声不吭——
+        每次保存都跳一句"这几项还是旧版默认值"，只会变成噪音。
+        """
+
+        from core.models import parse_world
+
+        raw = default_world()
+        raw["limits"] = {"max_replies_per_hour": 15}
+        raw["context"] = {"chat_overflow": "discard"}
+        world, warnings = parse_world(raw)
+        self.assertEqual(world.limits.max_replies_per_hour, 15, "不该替用户改")
+        self.assertEqual(world.context.chat_overflow, "discard")
+        self.assertEqual([], [item for item in warnings if "默认值" in str(item)], warnings)
+
     def test_invalid_node_references_are_repaired(self):
         raw = default_world()
         raw["edges"].append({"id": "bad", "from": "bedroom", "to": "nowhere", "ticks": 1})
@@ -116,6 +156,32 @@ class TestConfigStore(TempDirMixin, unittest.TestCase):
         self.assertTrue(all(edge.to != "nowhere" for edge in world.edges))
         self.assertEqual(world.action_map()["ghost"].scope, "global")
         self.assertTrue(warnings)
+
+    def test_old_builtin_action_name_follows_the_rename(self):
+        """内置动作改名（倒杯茶 → 倒茶提醒喝水）：老配置里没改过的名字 / 文案 / 说明一起换。"""
+
+        raw = default_world()
+        for action in raw["actions"]:
+            if action["id"] == "pour_tea":
+                action["name"] = "倒杯茶"
+                action["template"] = "（{bot}给你倒了杯热茶）"
+                action["description"] = "给某个人倒杯热茶，在吧台、厨房或客厅可用。"
+        world, _warnings = parse_world(raw)
+        updated = world.action_map()["pour_tea"]
+        self.assertEqual(updated.name, "倒茶提醒喝水")
+        self.assertIn("喝口水", updated.template)
+        self.assertIn("提醒他喝口水", updated.description)
+
+        # 用户自己改过的名字 / 文案不要动
+        raw = default_world()
+        for action in raw["actions"]:
+            if action["id"] == "pour_tea":
+                action["name"] = "给我倒水"
+                action["template"] = "（{bot}把水递给你）"
+        world, _warnings = parse_world(raw)
+        kept = world.action_map()["pour_tea"]
+        self.assertEqual(kept.name, "给我倒水")
+        self.assertEqual(kept.template, "（{bot}把水递给你）")
 
 
 class TestDatabase(TempDirMixin, unittest.TestCase):

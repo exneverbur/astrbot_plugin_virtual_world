@@ -14,10 +14,46 @@ from core.pathfinding import travel_cost  # noqa: E402
 from core.prompt import PromptBuilder  # noqa: E402
 
 
-def world_with_park():
-    """默认世界 + 一个室外区域：北门 / 鸽子广场，大厅 ↔ 北门 是跨区门户。"""
+def home_only() -> dict:
+    """只留「家中」区域的默认世界。
+
+    默认世界本身已经有 5 个区域了，这里要测的是"自己搭一个室外区域"，
+    所以先把内置的室外部分去掉，免得和测试自己的 park 撞 id。
+    """
 
     raw = default_world()
+    keep = {"bedroom", "study", "window", "bar", "kitchen", "lobby", "bathroom"}
+    raw["zones"] = [zone for zone in raw["zones"] if zone.get("id") == "home"]
+    raw["nodes"] = [node for node in raw["nodes"] if node.get("id") in keep]
+    raw["edges"] = [
+        edge
+        for edge in raw["edges"]
+        if edge.get("from") in keep and edge.get("to") in keep
+    ]
+    raw["zone_edges"] = []
+    # 只留还算得出归属的动作：被砍掉的室外动作（逛店、踩水…）在这里没有意义
+    actions: list[dict] = []
+    for action in raw["actions"]:
+        if str(action.get("scope")) != "node":
+            actions.append(action)
+            continue
+        nodes = [
+            str(item)
+            for item in (action.get("allowed_nodes") or [])
+            if str(item) in keep
+        ]
+        if not nodes:
+            continue
+        action = {**action, "allowed_nodes": nodes}
+        actions.append(action)
+    raw["actions"] = actions
+    return raw
+
+
+def world_with_park():
+    """家中 + 一个室外区域：北门 / 鸽子广场，客厅 ↔ 北门 是跨区门户。"""
+
+    raw = home_only()
     raw["zones"].append(
         {
             "id": "park",
@@ -91,7 +127,7 @@ class TestZoneModel(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(
             [node.id for node in world.nodes_in_zone("home")],
-            ["bedroom", "study", "window", "bar", "kitchen", "lobby"],
+            ["bedroom", "study", "window", "bar", "kitchen", "lobby", "bathroom"],
         )
         self.assertEqual(
             [node.id for node in world.nodes_in_zone("park")],
@@ -102,6 +138,7 @@ class TestZoneModel(unittest.TestCase):
 
     def test_broken_portals_are_dropped(self):
         raw = world_with_park()
+        good_portals = len([item for item in raw["zone_edges"] if item.get("id")])
         raw["zone_edges"].append(
             {"from_zone": "home", "to_zone": "没有这个区", "from_node": "lobby", "to_node": "park_gate"}
         )
@@ -113,7 +150,7 @@ class TestZoneModel(unittest.TestCase):
             {"from_zone": "home", "to_zone": "park", "from_node": "park_gate", "to_node": "park_square"}
         )
         world, warnings = parse_world(raw)
-        self.assertEqual(len(world.zone_edges), 1)  # 只剩本来就对的那条
+        self.assertEqual(len(world.zone_edges), good_portals)  # 只剩本来就对的那条
         self.assertEqual(len(warnings), 3)
 
 

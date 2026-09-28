@@ -55,6 +55,13 @@ class ToolCallResult:
     这条路才会把地址带上来。
     """
 
+    attachments: list[str] = field(default_factory=list)
+    """结果里带回来的图片原始地址——**用来发到群里**，不跟着转述走。
+
+    和 ``image_urls`` 的区别：那个是"要给模型看的"（配了转述模型就被描述顶掉了），
+    这个不管转述成不成功都留着。生图这类工具的结果是要给群友看的，不能只喂给模型。
+    """
+
 
 @dataclass
 class CardResult:
@@ -75,6 +82,12 @@ class PokeResult:
 
     ok: bool = False
     reason: str = ""
+    route: str = ""
+    """实际走通的那条路（``poke 消息段`` / ``friend_poke`` / ``send_poke``…）。
+
+    群聊和私聊走的不是同一条路（私聊里 poke 消息段不被支持，发出去客户端只会显示成
+    一个认不出的占位），日志里要能看出这次到底是哪条路通了、哪条路为什么没通。
+    """
 
 
 @runtime_checkable
@@ -99,6 +112,9 @@ class MessagePort(Protocol):
     """向会话发送消息。"""
 
     async def send_text(self, session_id: str, messages: list[str]) -> bool: ...
+
+    async def send_images(self, session_id: str, images: list[str]) -> bool: ...
+    """把图片发到会话里（工具 / 指令生成的结果图走这条路）。"""
 
     async def set_group_card(self, session_id: str, card: str) -> CardResult: ...
 

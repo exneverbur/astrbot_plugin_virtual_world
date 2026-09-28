@@ -19,6 +19,7 @@ import hmac
 import inspect
 import json
 import os
+import re
 import secrets
 import time
 import types
@@ -29,28 +30,47 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import Image, Plain, Reply
 from astrbot.api.star import Context, Star, register
 from astrbot.api.web import error_response, json_response, request
+from pydantic import ValidationError
 
-from .core.config_store import ConfigStore
+from .core.config_store import HISTORY_KEEP, ConfigStore
 from .core.db import AsyncDatabase
 from .core.defaults import (
     DEFAULT_CAPTION_PROMPT,
     DEFAULT_CAPTION_RELATION_PROMPT,
+    DEFAULT_FORWARD_PROMPT,
     DEFAULT_WORLD,
 )
-from .core.engine import MessageContext, VirtualWorldEngine
-from .core.models import normalize_edge_keys, normalize_legacy_keys, pronoun_for
+from .core.engine import (
+    PENDING_IMAGE_KEEP,
+    REPLY_INTERRUPTED,
+    REPLY_MUTED,
+    MessageContext,
+    VirtualWorldEngine,
+)
+from .core.models import (
+    FIELD_LABELS,
+    normalize_edge_keys,
+    normalize_legacy_keys,
+    pronoun_for,
+)
 from .core.nickname import compute_nickname
 from .core.ports import CardResult, LLMReply, PokeResult, ToolCallResult, ToolInfo
-from .core.prompt import prompt_section_index
+from .core.prompt import clip_line, prompt_section_index
+from .core.state import FORWARD_SUMMARY_MARK
 from .core.timeline import build_timeline
 
 PLUGIN_NAME = "astrbot_plugin_virtual_world"
 # 状态页那些按钮（推进 tick / 触发决策 / 打断 / 叫醒）最多等这么久：
 # 她正在检索或调模型时可能占着会话，超时就明确回一句，别让前端"点了没反应"
 STATE_ACTION_TIMEOUT = 6.0
+# 她正在调模型时点「推进 tick」：这次推进不排队，但愿意等这一轮跑完（秒）
+STATE_ACTION_BUSY_TIMEOUT = 90.0
+# 「推进 tick」这一下最多等多久（秒）：这一轮里可能夹着大模型调用（刚走到新地点要就地决定、
+# 检索…），等不到就把它留在后台跑完，**绝不中途取消**——取消会把这一轮砍在半路。
+STATE_TICK_WAIT_SECONDS = 45.0
 # 钩子优先级：比默认 0 低，让其他插件先写完 system_prompt / 先决定要不要接管。
 # AstrBot 按 priority 从高到低执行钩子，并且一旦某个钩子 stop 了事件，后面的就不再执行。
 LLM_HOOK_PRIORITY = -100
@@ -59,6 +79,8 @@ LLM_HOOK_PRIORITY = -100
 SLEEP_GUARD_PRIORITY = 200
 # 同一条会话的前一条回复最多让后一条等这么久；超时就不再排队（宁可多说一句，也别一直不说话）
 REPLY_TURN_WAIT_SECONDS = 25.0
+# 事件上挂的「这条消息已经在待回队列里了」标记（连发合并用）
+VW_INCOMING_EXTRA = "vw_incoming_record"
 TOKEN_TTL_SECONDS = 24 * 3600
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_SECONDS = 300
@@ -127,6 +149,34 @@ def _is_at_bot(event: Any) -> bool:
     return False
 
 
+def _is_soft_wake(event: Any) -> bool:
+    """意图路由放行时补的 @ 是假的：原话里没人 @ 她，只是"顺着话题对她说"。"""
+
+    try:
+        return bool(event.get_extra("intent_router_no_at", False))
+    except Exception:
+        return False
+
+
+def _group_name(event: Any) -> str:
+    """平台报的群名（拿不到就返回空串，提示词里就只显示群号 / 备注）。"""
+
+    getter = getattr(event, "get_group_name", None)
+    if callable(getter):
+        try:
+            value = " ".join(str(getter() or "").split())
+        except Exception:
+            value = ""
+        if value:
+            return value[:40]
+    group = getattr(getattr(event, "message_obj", None), "group", None)
+    for attr in ("group_name", "name"):
+        value = " ".join(str(getattr(group, attr, "") or "").split())
+        if value:
+            return value[:40]
+    return ""
+
+
 def _mention_note(event: Any) -> str:
     """这条消息 @ 了谁——包括"@ 了她自己"。
 
@@ -137,6 +187,7 @@ def _mention_note(event: Any) -> str:
     self_id = str(getattr(event, "get_self_id", lambda: "")() or "")
     message_obj = getattr(event, "message_obj", None)
     targets: list[str] = []
+    others: list[str] = []
     for component in list(getattr(message_obj, "message", []) or []):
         if type(component).__name__ not in ("At", "AtAll"):
             continue
@@ -150,10 +201,16 @@ def _mention_note(event: Any) -> str:
             continue
         if qq and self_id and qq == self_id:
             label = f"你（{label}）"
+        elif qq or name:
+            # @ 的是别人：这段不能让她以为是在叫她
+            others.append(label)
         targets.append(label)
     if not targets:
         return ""
-    return f"这条消息 @ 了：{'、'.join(dict.fromkeys(targets))}"
+    note = f"这条消息 @ 了：{'、'.join(dict.fromkeys(targets))}"
+    if others:
+        note += f"（其中 {'、'.join(dict.fromkeys(others))} 是别人，不是在 @ 你）"
+    return note
 
 
 def _is_command(text: str) -> bool:
@@ -163,8 +220,31 @@ def _is_command(text: str) -> bool:
     return bool(stripped) and stripped[0] in "/!！.。"
 
 
+_IMAGE_COMPONENT_NAMES = (
+    "Image",
+    "MarketFace",
+    "Marketface",
+    "Mface",
+    "Sticker",
+    "CustomFace",  # 协议端自定义表情：有的会带 url/file，能当图片读
+)
+"""会被当成"图"处理的组件：普通图片 + QQ 商城表情 / 表情包。
+
+QQ 的表情包（大表情）在协议端不是 ``Image``：它常常只有一个 ``summary``（那句文案）、
+``emoji_id`` 和一个拿不到的 ``key``，所以以前"这张图"就整个丢了——识图模型收到空地址，
+只能回一句"未提供图片"。这里把它一起收进来，取不到图时至少把文案当文字用。
+"""
+
+_FACE_COMPONENT_NAMES = ("Face", "FaceEmoji", "MarketFace", "Marketface", "Mface")
+"""系统小黄脸 / 表情包：没有图可读时，用它的名字或文案当文字描述。"""
+
+
 def _component_named(component: Any, name: str) -> bool:
     return type(component).__name__ == name
+
+
+def _is_image_component(component: Any) -> bool:
+    return type(component).__name__ in _IMAGE_COMPONENT_NAMES
 
 
 def _image_components(event: Any) -> list[Any]:
@@ -177,12 +257,12 @@ def _image_components(event: Any) -> list[Any]:
     message_obj = getattr(event, "message_obj", None)
     found: list[Any] = []
     for component in list(getattr(message_obj, "message", []) or []):
-        if _component_named(component, "Image"):
+        if _is_image_component(component):
             found.append(component)
             continue
         if _component_named(component, "Reply"):
             for inner in list(getattr(component, "chain", None) or []):
-                if _component_named(inner, "Image"):
+                if _is_image_component(inner):
                     found.append(inner)
     return found
 
@@ -190,7 +270,7 @@ def _image_components(event: Any) -> list[Any]:
 def _raw_image_ref(component: Any) -> str:
     """组件里现成的地址：优先 http(s)，其次文件 URI / 本地路径。"""
 
-    for attr in ("url", "file", "path"):
+    for attr in ("url", "file", "path", "url_image", "image_url", "emoji_url"):
         value = str(getattr(component, attr, "") or "").strip()
         if not value:
             continue
@@ -216,6 +296,26 @@ def _is_usable_image_ref(ref: str) -> bool:
         return bool(is_supported_image_ref(ref))
     except Exception:
         return False
+
+
+MAX_SENT_IMAGES = 9
+"""一条消息里最多贴几张结果图（和引擎那边的上限对齐，防刷屏）。"""
+
+
+def _sendable_images(images: list[str] | None) -> list[str]:
+    """挑出能真正发出去的图片地址：去重、限量、丢掉取不到的。"""
+
+    picked: list[str] = []
+    for item in list(images or []):
+        ref = str(item or "").strip()
+        if not ref or ref in picked:
+            continue
+        if not _is_usable_image_ref(ref):
+            continue
+        picked.append(ref)
+        if len(picked) >= MAX_SENT_IMAGES:
+            break
+    return picked
 
 
 async def _resolve_image_ref(component: Any) -> str:
@@ -246,9 +346,67 @@ async def _image_sources(event: Any) -> list[str]:
     sources: list[str] = []
     for component in _image_components(event):
         ref = await _resolve_image_ref(component)
-        if ref and ref not in sources:
+        # 只交"真的能取到"的地址：拿不到时留给 _face_note / 注解去说清，
+        # 不然识图模型会收到一个取不到的名字，回一句"未提供图片"（等于白花一次调用）
+        if ref and _is_usable_image_ref(ref) and ref not in sources:
             sources.append(ref)
     return sources
+
+
+def _sticker_note(event: Any) -> str:
+    """QQ 表情 / 表情包：没有图可读时，用它的名字或文案写成一句人话。
+
+    ``Face`` 是系统小黄脸（只有 id / 名字），``MarketFace`` 是商城表情包
+    （通常带一句 ``summary``，例如「笑死」）。这些以前直接丢失，她只看到空气。
+    """
+
+    message_obj = getattr(event, "message_obj", None)
+    parts: list[str] = []
+    for component in list(getattr(message_obj, "message", []) or []):
+        if not _component_named_any(component, _FACE_COMPONENT_NAMES):
+            continue
+        summary = " ".join(
+            str(
+                getattr(component, "summary", "")
+                or getattr(component, "name", "")
+                or getattr(component, "text", "")
+                or ""
+            ).split()
+        )
+        face_id = str(
+            getattr(component, "face_id", "")
+            or getattr(component, "id", "")
+            or getattr(component, "emoji_id", "")
+            or ""
+        ).strip()
+        kind = "表情包" if _component_named(component, "MarketFace") else "表情"
+        label = summary or (f"{kind} {face_id}" if face_id else kind)
+        parts.append(f"对方发了个{kind}：{label}" if summary else f"对方发了个{kind}（{label}）")
+    if not parts:
+        return ""
+    return "；".join(dict.fromkeys(parts))
+
+
+def _component_named_any(component: Any, names: tuple[str, ...]) -> bool:
+    return type(component).__name__ in names
+
+
+def _provider_supports_images(provider: Any) -> bool | None:
+    """这个 Provider 勾选的模态里有没有「图像」。
+
+    AstrBot 把勾选结果记在 ``provider_config['modalities']``：空列表是"没配"
+    （按老版本行为当作支持），没有这一项就读不到——那就交给配置里的开关决定。
+    """
+
+    config = getattr(provider, "provider_config", None)
+    if not isinstance(config, dict):
+        return None
+    modalities = config.get("modalities", None)
+    if modalities == []:
+        return True
+    if isinstance(modalities, list):
+        return "image" in modalities
+    return None
 
 
 def _image_components_debug(event: Any) -> str:
@@ -271,23 +429,398 @@ def _is_forwarded(event: Any) -> bool:
     for component in list(getattr(message_obj, "message", []) or []):
         if type(component).__name__ in ("Forward", "Node", "Nodes"):
             return True
+        if type(component).__name__ == "Json" and _multimsg_text(component):
+            return True
     text = str(getattr(message_obj, "message_str", "") or "")
     return "[合并转发]" in text or "[聊天记录]" in text
 
 
-def _quoted_text(event: Any) -> str:
-    """这条消息引用了谁说的什么（引用消息的文本）。"""
+# ---------------- 合并转发：读内容 → 交给多模态模型压成摘要 ----------------
+
+MAX_FORWARD_NODES = 60
+"""一条转发最多读多少条消息（再多也没人在意，摘要也放不下）。"""
+
+MAX_FORWARD_IMAGES = 6
+"""转发里的图最多送几张给多模态模型。"""
+
+MAX_FORWARD_TEXT_CHARS = 1500
+"""送进摘要提示词的原文上限（防一条转发把上下文撑爆）。"""
+
+_FORWARD_PLACEHOLDER_RE = re.compile(
+    r"[\[【(（]\s*(?:合并转发|转发消息|转发|聊天记录|message\s*record|forward(?:\s*message)?)\s*[\]】)）]",
+    re.IGNORECASE,
+)
+"""渲染出来的转发占位符：摘要替换正文时要把这些清掉。"""
+
+
+def _multimsg_text(component: Any) -> str:
+    """QQ 的「合并转发」有时是一个 multimsg JSON：把里面的条目读成文本。"""
+
+    data = getattr(component, "data", None)
+    if isinstance(data, str):
+        try:
+            data = json.loads(data.replace("&#44;", ","))
+        except Exception:
+            return ""
+    return _multimsg_text_from(data)
+
+
+def _multimsg_text_from(data: Any) -> str:
+    """multimsg 的 JSON 负载（dict）→ 里面的条目文本。"""
+
+    if not isinstance(data, dict):
+        return ""
+    if str(data.get("app") or "") != "com.tencent.multimsg":
+        return ""
+    meta = data.get("meta")
+    detail = meta.get("detail") if isinstance(meta, dict) else None
+    news = detail.get("news") if isinstance(detail, dict) else None
+    if not isinstance(news, list):
+        return ""
+    lines: list[str] = []
+    for item in news:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").replace("[图片]", "").strip()
+        if text:
+            lines.append(text)
+    return "\n".join(lines).strip()
+
+
+def _strip_forward_placeholders(text: str) -> str:
+    """去掉正文里的「[转发消息]」这类占位符，剩下的才是对方自己写的话。"""
+
+    cleaned = _FORWARD_PLACEHOLDER_RE.sub(" ", str(text or ""))
+    return " ".join(cleaned.split()).strip()
+
+
+def _component_to_segment(component: Any) -> dict[str, Any] | None:
+    """AstrBot 的消息组件 → OneBot 那样的 ``{"type":…, "data":…}``。
+
+    转发内容的两种来源（协议端拉回来的 JSON、AstrBot 已经解析好的组件）
+    归一成同一种写法，后面只需要一套走法。
+    """
+
+    if isinstance(component, dict):
+        return component
+    name = type(component).__name__
+    if name == "Plain":
+        return {"type": "text", "data": {"text": str(getattr(component, "text", "") or "")}}
+    if name == "Image":
+        ref = _raw_image_ref(component)
+        return {"type": "image", "data": {"file": ref, "url": ref}}
+    if name == "At":
+        return {
+            "type": "at",
+            "data": {
+                "name": str(getattr(component, "name", "") or ""),
+                "qq": str(getattr(component, "qq", "") or ""),
+            },
+        }
+    if name == "Face":
+        return {"type": "face", "data": {}}
+    if name == "File":
+        return {"type": "file", "data": {"name": str(getattr(component, "name", "") or "")}}
+    if name == "Json":
+        return {"type": "json", "data": {"data": getattr(component, "data", "")}}
+    if name:
+        return {"type": name.lower(), "data": {}}
+    return None
+
+
+def _as_node(item: Any) -> dict[str, Any]:
+    """AstrBot 的 Node 组件 / OneBot 的节点字典 → 统一的节点字典。"""
+
+    if isinstance(item, dict):
+        return item
+    name = type(item).__name__
+    if name == "Node":
+        sender = str(getattr(item, "name", "") or getattr(item, "uin", "") or "").strip()
+        content = list(getattr(item, "content", None) or [])
+        return {
+            "sender": {"nickname": sender},
+            "content": [
+                segment for segment in (_component_to_segment(c) for c in content)
+                if segment is not None
+            ],
+        }
+    return {}
+
+
+def _node_list(value: Any) -> list[dict[str, Any]]:
+    """把各种形态的转发内容归一成节点列表。"""
+
+    if isinstance(value, dict):
+        data = value.get("data") if isinstance(value.get("data"), dict) else value
+        nodes = (
+            data.get("messages")
+            or data.get("message")
+            or data.get("nodes")
+            or data.get("nodeList")
+        )
+        if isinstance(nodes, list):
+            return [_as_node(item) for item in nodes if _as_node(item)]
+        return [_as_node(value)] if _as_node(value) else []
+    if isinstance(value, (list, tuple)):
+        return [_as_node(item) for item in value if _as_node(item)]
+    return []
+
+
+def _node_segments(node: dict[str, Any]) -> list[dict[str, Any]]:
+    """节点的内容（可能是段列表，也可能是一段 JSON 文本）。"""
+
+    raw = node.get("message") or node.get("content") or []
+    if isinstance(raw, str):
+        body = raw.strip()
+        if not body:
+            return []
+        try:
+            parsed = json.loads(body)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, list):
+            raw = parsed
+        else:
+            raw = [{"type": "text", "data": {"text": body}}]
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _collect_forward(
+    nodes: list[dict[str, Any]],
+    *,
+    out_text: list[str],
+    out_images: list[str],
+    out_ids: list[str],
+    depth: int = 0,
+) -> None:
+    """把节点列表摊成「谁说了什么」+ 图片地址（嵌套转发只记 id，等着再去拉）。"""
+
+    if depth > 3:
+        return
+    for node in nodes:
+        if len(out_text) >= MAX_FORWARD_NODES:
+            return
+        sender = node.get("sender") if isinstance(node.get("sender"), dict) else {}
+        who = str(
+            sender.get("nickname")
+            or sender.get("card")
+            or sender.get("user_id")
+            or node.get("name")
+            or node.get("uin")
+            or ""
+        ).strip()
+        parts: list[str] = []
+        for segment in _node_segments(node):
+            kind = str(segment.get("type") or "").lower()
+            data = segment.get("data") if isinstance(segment.get("data"), dict) else {}
+            if kind in ("text", "plain"):
+                parts.append(str(data.get("text") or ""))
+            elif kind == "image":
+                ref = str(data.get("url") or data.get("file") or "").strip()
+                if ref:
+                    out_images.append(ref)
+                    parts.append(f"［图片{len(out_images)}］")
+                else:
+                    parts.append("［图片］")
+            elif kind == "at":
+                parts.append(f"@{str(data.get('name') or data.get('qq') or '').strip()}")
+            elif kind == "file":
+                parts.append(f"［文件:{str(data.get('name') or data.get('file') or '').strip()}］")
+            elif kind == "face":
+                parts.append("［表情］")
+            elif kind == "video":
+                parts.append("［视频］")
+            elif kind == "record":
+                parts.append("［语音］")
+            elif kind in ("forward", "forward_msg"):
+                fid = data.get("id") or data.get("message_id")
+                if fid:
+                    out_ids.append(str(fid))
+                    parts.append("［里面还有一条转发］")
+                else:
+                    _collect_forward(
+                        _node_list(data.get("content")),
+                        out_text=out_text,
+                        out_images=out_images,
+                        out_ids=out_ids,
+                        depth=depth + 1,
+                    )
+            elif kind == "json":
+                nested = _multimsg_text_from(data.get("data"))
+                if nested:
+                    parts.append(nested)
+            elif kind == "nodes":
+                _collect_forward(
+                    _node_list(data.get("content")),
+                    out_text=out_text,
+                    out_images=out_images,
+                    out_ids=out_ids,
+                    depth=depth + 1,
+                )
+        body = "".join(parts).strip()
+        if body:
+            out_text.append(f"{who}：{body}" if who else body)
+
+
+async def _fetch_forward(event: Any, forward_id: str) -> dict[str, Any] | None:
+    """去协议端把一条转发拉回来（拿不到就返回 None，调用方保持原样）。"""
+
+    bot = getattr(event, "bot", None)
+    api = getattr(bot, "api", None)
+    call_action = getattr(api, "call_action", None)
+    if not callable(call_action):
+        return None
+    candidates: list[dict[str, Any]] = [{"message_id": forward_id}, {"id": forward_id}]
+    if str(forward_id).isdigit():
+        candidates.extend([{"message_id": int(forward_id)}, {"id": int(forward_id)}])
+    for params in candidates:
+        try:
+            result = await call_action("get_forward_msg", **params)
+        except Exception:
+            continue
+        if isinstance(result, dict):
+            return result
+    return None
+
+
+async def _forward_digest(event: Any) -> tuple[str, list[str], list[str]]:
+    """这条消息里的合并转发 → (原文摘要, 图片地址, 转发 id)。
+
+    三种形态都认：自带内容的 Node/Nodes、只给了 id 的 Forward（去协议端拉一次）、
+    QQ 的 multimsg JSON。读不出来就返回空串，调用方保持原来的那句提示。
+    """
+
+    forward_ids: list[str] = []
+    nodes: list[dict[str, Any]] = []
+    multimsg: list[str] = []
+    message_obj = getattr(event, "message_obj", None)
+    for component in list(getattr(message_obj, "message", []) or []):
+        name = type(component).__name__
+        if name == "Forward":
+            fid = str(getattr(component, "id", "") or "").strip()
+            if fid:
+                forward_ids.append(fid)
+        elif name == "Node":
+            nodes.extend(_node_list(component))
+        elif name == "Nodes":
+            nodes.extend(_node_list(list(getattr(component, "nodes", None) or [])))
+        elif name == "Json":
+            text = _multimsg_text(component)
+            if text:
+                multimsg.append(text)
+    for fid in list(forward_ids):
+        payload = await _fetch_forward(event, fid)
+        if payload is None:
+            continue
+        nodes.extend(_node_list(payload))
+    out_text: list[str] = []
+    out_images: list[str] = []
+    nested_ids: list[str] = []
+    _collect_forward(nodes, out_text=out_text, out_images=out_images, out_ids=nested_ids)
+    for fid in nested_ids:
+        payload = await _fetch_forward(event, fid)
+        if payload is None:
+            continue
+        _collect_forward(
+            _node_list(payload), out_text=out_text, out_images=out_images, out_ids=[]
+        )
+    if not out_text and not out_images and multimsg:
+        out_text = list(multimsg)
+    digest = "\n".join(out_text).strip()[:MAX_FORWARD_TEXT_CHARS]
+    return digest, out_images, forward_ids
+
+
+def _forward_fingerprint(forward_ids: list[str], digest: str, images: list[str]) -> str:
+    """同一条转发的指纹：协议端给了 id 就用 id，否则按内容算。"""
+
+    ids = sorted({str(item).strip() for item in forward_ids if str(item).strip()})
+    key = "|".join(ids) if ids else f"{digest}#{'|'.join(images)}"
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()
+
+
+def _clean_forward_summary(text: str, limit: int) -> str:
+    """转发摘要的收尾：压成一行、去掉模型爱加的「摘要：」开头、按配置截断。"""
+
+    body = " ".join(str(text or "").split()).strip()
+    if not body:
+        return ""
+    for prefix in ("摘要：", "摘要:", "内容摘要：", "内容摘要:", "总结：", "总结:"):
+        if body.startswith(prefix):
+            body = body[len(prefix) :].strip()
+            break
+    body = body.strip("「」“”\"'` ")
+    if not body:
+        return ""
+    if len(body) > limit:
+        body = body[: max(1, limit - 1)].rstrip() + "…"
+    return body
+
+
+def _with_forward_summary(text: str, summary: str) -> str:
+    """把转发摘要拼进正文：清掉占位符，摘要跟在对方自己写的话后面。"""
+
+    base = _strip_forward_placeholders(text)
+    body = f"{FORWARD_SUMMARY_MARK}{summary}"
+    return f"{base}\n{body}" if base else body
+
+
+def _quoted_parts(event: Any) -> tuple[str, str]:
+    """这条消息引用了谁说的什么：返回 ``(谁, 内容)``；没有引用就返回两个空串。
+
+    两件容易漏的事：
+
+    - 引用的那条可能**只有图片**（她刚发的照片），这时 ``message_str`` 是空的，
+      只照着文本读会得到空串——她会完全不知道对方在指什么；
+    - 引用的那条可能就是**她自己**发的：昵称她并不认识，要明确写成「你自己」。
+    """
 
     message_obj = getattr(event, "message_obj", None)
+    self_id = str(getattr(event, "get_self_id", lambda: "")() or "")
     for component in list(getattr(message_obj, "message", []) or []):
         if type(component).__name__ != "Reply":
             continue
         text = " ".join(str(getattr(component, "message_str", "") or "").split())
         if not text:
+            text = _chain_plain_text(component)
+        if not text:
             continue
+        sender_id = str(getattr(component, "sender_id", "") or "").strip()
         who = str(getattr(component, "sender_nickname", "") or "").strip()
-        return f"{who}：{text}" if who else text
-    return ""
+        if self_id and sender_id and sender_id == self_id:
+            who = "你自己"
+        return who, text
+    return "", ""
+
+
+def _quoted_text(event: Any) -> str:
+    """引用消息压成一行（``小明：晚上吃鱼``）：给看图那一步当背景用。"""
+
+    who, text = _quoted_parts(event)
+    if not text:
+        return ""
+    return f"{who}：{text}" if who else text
+
+
+def _chain_plain_text(component: Any) -> str:
+    """把被引用消息的消息链压成一行（图片写［图片］，表情写［表情］）。"""
+
+    parts: list[str] = []
+    for inner in list(getattr(component, "chain", None) or []):
+        if _component_named(inner, "Plain"):
+            text = str(getattr(inner, "text", "") or "").strip()
+            if text:
+                parts.append(text)
+        elif _component_named(inner, "Image"):
+            parts.append("［图片］")
+        elif _component_named(inner, "Face"):
+            parts.append("［表情］")
+        elif _component_named(inner, "At"):
+            name = str(getattr(inner, "name", "") or getattr(inner, "qq", "") or "").strip()
+            if name:
+                parts.append(f"@{name}")
+    return " ".join(" ".join(part.split()) for part in parts if part)
 
 
 class AstrBotLLM:
@@ -298,11 +831,20 @@ class AstrBotLLM:
         plugin: "VirtualWorldPlugin",
         provider_id: str = "",
         role: str = "main",
+        sampling: dict[str, float] | None = None,
     ) -> None:
         self.plugin = plugin
         self.provider_id = provider_id
         self.role = role
         """``main`` = 说话用的主模型（它的原始响应要留给别的插件看），其余是辅助模型。"""
+        self.sampling = dict(sampling or {})
+        """采样参数（温度 / top_p / 重复惩罚）。空 = 不覆盖，用 Provider 自己的设置。
+
+        这些参数在最外层适配器上统一加：多轮聊天的复读和"每轮都一个腔调"，
+        一半是采样参数的事，而插件自己的每次调用都不该各写一遍。
+        """
+        self._sampling_rejected = False
+        """Provider 不认这些参数时，退回只传温度，别让主回复跟着挂掉。"""
 
     async def generate(
         self,
@@ -325,6 +867,11 @@ class AstrBotLLM:
         kwargs: dict[str, Any] = {}
         if temperature is not None:
             kwargs["temperature"] = temperature
+        # 采样参数由适配器统一加（配置关掉时 self.sampling 是空的，等于不覆盖）
+        if self.sampling and not self._sampling_rejected:
+            for key in ("temperature", "top_p", "frequency_penalty", "presence_penalty"):
+                if key in self.sampling and (key != "temperature" or temperature is None):
+                    kwargs[key] = self.sampling[key]
         images = [str(item) for item in (image_urls or []) if str(item).strip()]
         token = self.plugin.set_self_initiated()
         try:
@@ -337,6 +884,29 @@ class AstrBotLLM:
                 **kwargs,
             )
         except Exception as exc:
+            # Provider 不认采样参数：退回只传温度，别让主回复跟着挂掉
+            if self.sampling and not self._sampling_rejected and len(kwargs) > 1:
+                self._sampling_rejected = True
+                self.plugin.logger.warning(
+                    f"[virtual_world] Provider 不接受采样参数（{exc}），"
+                    "已退回只用温度；要调就去 Panel 的 Provider 里调"
+                )
+                kwargs = {key: value for key, value in kwargs.items() if key == "temperature"}
+                try:
+                    response = await context.llm_generate(
+                        chat_provider_id=provider_id,
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        contexts=list(contexts) if contexts else None,
+                        image_urls=images or None,
+                        **kwargs,
+                    )
+                    if self.role == "main":
+                        self.plugin.remember_llm_response(session_id, response)
+                    text = getattr(response, "completion_text", "") or ""
+                    return LLMReply(text=text, ok=True)
+                except Exception as retry_exc:
+                    return LLMReply(ok=False, error=f"LLM 调用失败: {retry_exc}")
             # Provider 不支持图片（或图片取不回来）时，退回纯文字再来一次
             if images:
                 try:
@@ -582,6 +1152,103 @@ class AstrBotVision:
             return ""
         looks = await self._look_many(sources, str(prompt or "").strip())
         return "\n".join(text for text in looks if text).strip()
+
+    async def summarize_forward(self, digest: str, images: list[str], *, fingerprint: str) -> str:
+        """把一段合并转发压成摘要（含里面的图）：带缓存，失败返回空串。
+
+        调用方拿到空串时保持原来的做法（只在聊天记录里落一句"这是转发"）。
+        """
+
+        body = " ".join(str(digest or "").split())
+        if not body or not self.enabled:
+            return ""
+        cached = await self._cached_forward(fingerprint)
+        if cached:
+            return cached
+        refs = [
+            str(item).strip()
+            for item in list(images or [])[:MAX_FORWARD_IMAGES]
+            if str(item).strip()
+        ]
+        try:
+            response = await self.plugin.context.llm_generate(
+                chat_provider_id=self.provider_id,
+                system_prompt=self._forward_prompt(),
+                prompt=f"这段转发的内容：\n{body}",
+                image_urls=refs or None,
+            )
+        except Exception as exc:
+            self.plugin.logger.debug(f"[virtual_world] 转发摘要失败：{exc}")
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            return ""
+        text = str(getattr(response, "completion_text", "") or "").strip()
+        if not text:
+            self.last_error = "摘要模型没有返回文字"
+            return ""
+        summary = _clean_forward_summary(text, self._forward_max_chars())
+        if not summary:
+            return ""
+        await self._store_forward(fingerprint, summary)
+        return summary
+
+    def _forward_prompt(self) -> str:
+        """当前生效的转发摘要提示词：设置里填了就用它，没填用内置默认。"""
+
+        try:
+            prompt = str(self.plugin.engine.world.vision.forward_prompt or "").strip()
+        except Exception:
+            prompt = ""
+        return prompt or DEFAULT_FORWARD_PROMPT
+
+    def _forward_max_chars(self) -> int:
+        try:
+            limit = int(self.plugin.engine.world.vision.forward_max_chars or 0)
+        except Exception:
+            limit = 0
+        return max(80, limit or 300)
+
+    async def _cached_forward(self, fingerprint: str) -> str:
+        cache = self._cache_config()
+        if not fingerprint or not bool(cache.get("enabled")):
+            return ""
+        entry = await self._cache_get_forward(fingerprint, float(cache.get("max_age") or 0))
+        if entry is None:
+            return ""
+        self.hits += 1
+        try:
+            await self.plugin.db.call("touch_forward_summary", fingerprint=fingerprint)
+        except Exception:
+            pass
+        return str(entry.get("summary") or "")
+
+    async def _store_forward(self, fingerprint: str, summary: str) -> None:
+        if not fingerprint or not summary:
+            return
+        cache = self._cache_config()
+        try:
+            await self.plugin.db.call(
+                "put_forward_summary",
+                fingerprint=fingerprint,
+                summary=summary,
+                model=self.provider_id,
+            )
+            await self.plugin.db.call(
+                "trim_forward_cache",
+                keep=int(cache.get("max") or 500),
+                max_age_seconds=float(cache.get("max_age") or 0),
+            )
+        except Exception as exc:
+            self.plugin.logger.debug(f"[virtual_world] 写转发缓存失败：{exc}")
+
+    async def _cache_get_forward(
+        self, fingerprint: str, max_age: float
+    ) -> dict[str, Any] | None:
+        try:
+            return await self.plugin.db.call(
+                "get_forward_summary", fingerprint=fingerprint, max_age_seconds=max_age
+            )
+        except Exception:
+            return None
 
     async def _cached_look(self, source: str) -> str:
         """命中缓存就返回"看图结果"（不含关系）。"""
@@ -892,7 +1559,17 @@ class AstrBotCommands:
                     texts.append(body)
                 images.extend(item_images)
         except Exception as exc:
-            return ToolCallResult(ok=False, error=f"{type(exc).__name__}: {exc}", tool=word)
+            # 指令跑挂时把"最后落在哪个文件哪一行"写进日志与返回值：
+            # 报错来自别的插件（例如它拿到的参数类型不对）时，一眼能看出是谁的锅
+            where = _exception_where(exc)
+            detail = f"{type(exc).__name__}: {exc}"
+            if where:
+                detail += f"（{where}）"
+            self.plugin.logger.warning(
+                f"[virtual_world] 指令「{text}」执行失败：{detail}",
+                exc_info=True,
+            )
+            return ToolCallResult(ok=False, error=detail, tool=word)
         finally:
             restore()
         captions, pending_images = await _caption_result_images(
@@ -908,7 +1585,12 @@ class AstrBotCommands:
                 else f"（指令「{word}」执行了，但没有返回内容）"
             )
         return ToolCallResult(
-            ok=True, text=body, tool=word, image_urls=pending_images
+            ok=True,
+            text=body,
+            tool=word,
+            image_urls=pending_images,
+            # 原图另存一份：转述成功时 image_urls 会空，但这张图还是得发出去
+            attachments=list(images),
         )
 
     def _find(self, text: str) -> tuple[Any, Any] | None:
@@ -946,18 +1628,32 @@ class AstrBotCommands:
 
     @staticmethod
     def _params(record: Any, command_filter: Any, text: str) -> dict[str, Any]:
-        """按处理器签名解析参数（和 AstrBot 指令分发同一套转换）。"""
+        """按处理器签名解析参数（和 AstrBot 指令分发同一套转换）。
 
-        signature = inspect.signature(record.handler)
-        param_type: dict[str, Any] = {}
-        for name, parameter in signature.parameters.items():
-            if name in ("self", "event"):
-                continue
-            param_type[name] = (
-                parameter.annotation
-                if parameter.annotation is not inspect.Parameter.empty
-                else parameter.default
-            )
+        参数类型优先取 ``CommandFilter.handler_params``——那是 AstrBot 自己解析好的
+        （它用 ``inspect.signature(..., eval_str=True)``，会把
+        ``from __future__ import annotations`` 留下的**字符串注解**还原成真类型）。
+
+        以前这里是自己再 inspect 一遍、**没有 eval_str**：注解是字符串时，
+        `validate_and_convert_params` 会把它当成"默认值"原样透传，
+        于是需要 ``MessageChain`` 这类对象的指令收到一个 str，接着就报
+        ``'str' object has no attribute 'chain'``。
+        """
+
+        param_type = dict(getattr(command_filter, "handler_params", None) or {})
+        if not param_type:
+            try:
+                signature = inspect.signature(record.handler, eval_str=True)
+            except (TypeError, ValueError):
+                signature = inspect.signature(record.handler)
+            for name, parameter in signature.parameters.items():
+                if name in ("self", "event"):
+                    continue
+                param_type[name] = (
+                    parameter.annotation
+                    if parameter.annotation is not inspect.Parameter.empty
+                    else parameter.default
+                )
         if not param_type:
             return {}
         args = text.split()[1:]
@@ -1080,6 +1776,30 @@ class AstrBotMessenger:
             self.mark_sent(session_id)
         return ok
 
+    async def send_images(self, session_id: str, images: list[str]) -> bool:
+        """把工具 / 指令生成出来的图片发到会话里。
+
+        多张图放**同一条消息**：群里显示成一组，不会被拆成刷屏的连发。
+        地址可以是 http、file://、base64://，AstrBot 发送时会自己转成平台要的格式。
+        """
+
+        refs = _sendable_images(images)
+        if not refs:
+            return False
+        if self.blocked(session_id):
+            return False  # 刚失败过：连同图片一起放弃这一批
+        chain = [Image(file=ref) for ref in refs]
+        try:
+            result = await self.plugin.context.send_message(
+                session_id, MessageChain(chain=chain)
+            )
+        except Exception as exc:
+            self.mark_failed(session_id, exc)
+            return False
+        if result:
+            self.mark_sent(session_id)
+        return bool(result)
+
     async def set_group_card(self, session_id: str, card: str) -> CardResult:
         """设置群名片。只有 aiocqhttp（OneBot）这类支持 call_action 的平台才生效。"""
 
@@ -1141,11 +1861,17 @@ class AstrBotMessenger:
         return str(info.get("card") or info.get("nickname") or "").strip()
 
     async def poke(self, session_id: str, user_id: str) -> PokeResult:
-        """戳一戳某个群友。
+        """戳一戳某个人。
 
-        两条路依次试：AstrBot 的 ``Poke`` 消息段，以及协议端自己的 ``send_poke``
-        接口（NapCat / go-cqhttp 系都支持）。两条都失败就把原因带回去——她会
-        退化成一句话说，而日志里要能看出究竟是为什么。
+        群聊和私聊走的是**两条不同的路**：
+
+        - **群聊**：先发 OneBot 的 ``poke`` 消息段（群里的标准做法），不通再退到
+          ``send_poke`` / ``group_poke`` 接口；
+        - **私聊**：``poke`` 消息段是给群聊用的，私聊里发出去客户端会显示成一个认不出的
+          占位（红叉破图），所以这里**不试消息段**，直接调 ``friend_poke``。
+
+        每次都会把"走了哪条路"记进 ``PokeResult.route``：两条都不通就把原因带回去，
+        她会退化成一句话说，而日志里要能看出究竟是为什么。
         """
 
         target = str(user_id or "").strip()
@@ -1158,17 +1884,18 @@ class AstrBotMessenger:
         if len(parts) >= 3 and "group" in parts[1].lower():
             group_id = parts[-1]
         errors: list[str] = []
-        # 路线一：消息段（新版适配器会把它转成协议端的 poke 段）
-        try:
-            from astrbot.api.message_components import Poke
+        # 路线一：消息段。**只在群聊用**——私聊里这个段协议端不认。
+        if group_id:
+            try:
+                from astrbot.api.message_components import Poke
 
-            await self.plugin.context.send_message(
-                session_id, MessageChain(chain=[Poke(id=target)])
-            )
-            return PokeResult(True)
-        except Exception as exc:
-            errors.append(f"消息段：{type(exc).__name__}: {exc}")
-        # 路线二：直接调协议端接口
+                await self.plugin.context.send_message(
+                    session_id, MessageChain(chain=[Poke(id=target)])
+                )
+                return PokeResult(True, route="poke 消息段")
+            except Exception as exc:
+                errors.append(f"消息段：{type(exc).__name__}: {exc}")
+        # 路线二：直接调协议端接口（私聊只有这一条：friend_poke）
         event = getattr(self.plugin, "_last_events", {}).get(session_id)
         bot = getattr(event, "bot", None)
         if bot is not None:
@@ -1180,14 +1907,16 @@ class AstrBotMessenger:
             names = (
                 ("send_poke", "group_poke")
                 if group_id
-                else ("send_poke", "friend_poke")
+                else ("friend_poke", "send_poke")
             )
             for name in names:
                 try:
                     await bot.call_action(name, **payload)
-                    return PokeResult(True)
+                    return PokeResult(True, route=name)
                 except Exception as exc:
                     errors.append(f"{name}：{type(exc).__name__}: {exc}")
+        else:
+            errors.append("拿不到协议端连接（这条会话还没收到过消息）")
         return PokeResult(False, "；".join(errors) or "没有可用的戳一戳通道")
 
 
@@ -1356,6 +2085,8 @@ class AstrBotTools:
             tool=name,
             params=call_params,
             image_urls=pending_images,
+            # 原图另存一份：转述成功时 image_urls 会空，但这张图还是得发到群里
+            attachments=list(images),
         )
 
     def _filter_params(
@@ -1389,7 +2120,14 @@ class AstrBotPersona:
     def __init__(self, plugin: "VirtualWorldPlugin") -> None:
         self.plugin = plugin
 
-    async def get_persona_text(self, session_id: str) -> str:
+    def _config(self):
+        engine = getattr(self.plugin, "engine", None)
+        world = getattr(engine, "world", None) if engine is not None else None
+        return getattr(world, "persona", None)
+
+    async def astrbot_persona_text(self, session_id: str) -> str:
+        """AstrBot 给这个会话选的那份人格（按会话 / 配置文件解析）。"""
+
         manager = getattr(self.plugin.context, "persona_manager", None)
         if manager is None:
             return ""
@@ -1412,6 +2150,20 @@ class AstrBotPersona:
                 if isinstance(value, str) and value.strip():
                     return value
         return ""
+
+    async def get_persona_text(self, session_id: str) -> str:
+        """实际交给她的人设：按配置里的模式决定用哪一份。"""
+
+        config = self._config()
+        mode = str(getattr(config, "mode", "astrbot") or "astrbot")
+        own = str(getattr(config, "text", "") or "").strip()
+        if mode == "plugin" and own:
+            return own
+        base = await self.astrbot_persona_text(session_id)
+        if mode == "append" and own:
+            return f"{base}\n\n{own}".strip() if base.strip() else own
+        # astrbot 模式，或者 plugin 模式但没填：都用 AstrBot 那份
+        return base
 
 
 def _stringify(value: Any) -> str:
@@ -1496,6 +2248,21 @@ async def _chain_text_and_images(value: Any) -> tuple[str, list[str]] | None:
             if name:
                 texts.append(f"［{name}］")
     return "".join(texts).strip(), images
+
+
+def _exception_where(exc: BaseException) -> str:
+    """异常最后落在哪个文件:行（哪个函数）：给别人看的"这是谁的锅"。"""
+
+    tb = exc.__traceback__
+    last = None
+    while tb is not None:
+        last = tb
+        tb = tb.tb_next
+    if last is None:
+        return ""
+    frame = last.tb_frame
+    name = os.path.basename(str(frame.f_code.co_filename or ""))
+    return f"{name}:{last.tb_lineno} {frame.f_code.co_name}"
 
 
 async def _result_text(value: Any) -> tuple[str, list[str]]:
@@ -1731,8 +2498,27 @@ class VirtualWorldPlugin(Star):
             or str(config.get("context_provider_id") or "").strip()
         )
         self.utility_provider_id = self.helper_provider_id
+        # 判断模型：只接"挑一个 / 打分 / 抽字段"这类纯判断。留空跟随打杂模型。
+        self.judge_provider_id = (
+            str(config.get("judge_provider_id") or "").strip() or self.helper_provider_id
+        )
+        self.consolidate_provider_id = (
+            str(config.get("consolidate_provider_id") or "").strip()
+            or self.utility_provider_id
+        )
+        # 事件模型：写"这件事的结果"那个模型。留空跟随打杂模型。
+        self.event_provider_id = (
+            str(config.get("event_provider_id") or "").strip() or self.utility_provider_id
+        )
         # 内容生成模型：只在编辑器里"批量生成动作 / 地点"时用，留空回落到主模型
         self.creator_provider_id = str(config.get("creator_provider_id") or "").strip()
+        self._sampling_config = {
+            "enabled": _cfg_bool(config.get("sampling_enabled"), False),
+            "temperature": config.get("sampling_temperature"),
+            "top_p": config.get("sampling_top_p"),
+            "frequency_penalty": config.get("sampling_frequency_penalty"),
+            "presence_penalty": config.get("sampling_presence_penalty"),
+        }
         self.tick_interval = max(5, _cfg_int(config.get("tick_interval"), 60))
         self.decider_interval = max(
             self.tick_interval, _cfg_int(config.get("decider_interval"), 300)
@@ -1758,23 +2544,31 @@ class VirtualWorldPlugin(Star):
         self._self_initiated_untracked = 0
         self._reply_locks: dict[str, asyncio.Lock] = {}
         """每个会话一条：同一条会话的接管排队执行，避免两条回复互相不知道对方。"""
+        self._live_say_tail: dict[str, str] = {}
+        """刚即时发出去的那一句：连着说下一句时按它的字数停一下，保持打字的节奏。"""
         # 发送方持有「失败冷却」，所以自己留一份（回退响应路径也要用它判断）
         self.messenger = AstrBotMessenger(self)
         # 看图（多模态）：图片转述、天气工具返回的图都走它
         self.vision = AstrBotVision(self, self.vision_provider_id)
+        # 人设：默认沿用 AstrBot 给这个会话选的那份，也可以在「全局设置 → 她是谁」里
+        # 换成插件自己的一份（跟着预设走，不再随会话组漂移）
+        self.persona_port = AstrBotPersona(self)
 
         self.engine = VirtualWorldEngine(
             store=self.store,
             db=self.db,
-            llm=AstrBotLLM(self),
-            helper_llm=AstrBotLLM(self, self.helper_provider_id),
-            context_llm=AstrBotLLM(self, self.utility_provider_id),
-            creator_llm=AstrBotLLM(self, self.creator_provider_id),
+            llm=AstrBotLLM(self, sampling=self.sampling_params()),
+            helper_llm=AstrBotLLM(self, self.helper_provider_id, sampling=self.sampling_params()),
+            judge_llm=AstrBotLLM(self, self.judge_provider_id, sampling=self.sampling_params()),
+            context_llm=AstrBotLLM(self, self.utility_provider_id, sampling=self.sampling_params()),
+            creator_llm=AstrBotLLM(self, self.creator_provider_id, sampling=self.sampling_params()),
+            event_llm=AstrBotLLM(self, self.event_provider_id, sampling=self.sampling_params()),
+            consolidate_llm=AstrBotLLM(self, self.consolidate_provider_id, sampling=self.sampling_params()),
             describer=self.vision,
             messenger=self.messenger,
             tools=AstrBotTools(self),
             commands=AstrBotCommands(self),
-            persona=AstrBotPersona(self),
+            persona=self.persona_port,
             clock=None,
             tick_seconds=float(self.tick_interval),
             decider_interval=float(self.decider_interval),
@@ -1784,6 +2578,11 @@ class VirtualWorldPlugin(Star):
         # 调试回显实时发：工具/指令调用在发生的那一下就走这条通道，
         # 不再等整轮动作跑完才一起推给群里
         self.engine.debug_sink = self._send_debug_live
+        # 即时发言：慢动作（联网检索、生图、录视频这类）开始之前她已经说出口的那几句，
+        # 当场发出去，不再等整段流水线跑完才一起冒出来
+        self.engine.say_sink = self._send_live_say
+        # 正在处理「推进 tick」的会话：连点时只认第一次，别攒成一串 tick
+        self._advancing: set[str] = set()
 
         self._register_web_apis()
 
@@ -1868,6 +2667,20 @@ class VirtualWorldPlugin(Star):
 
     def last_event(self, session_id: str) -> AstrMessageEvent | None:
         return self._last_events.get(session_id)
+
+    async def pending_intervention(self, session_id: str) -> float:
+        """联动接口：她正在等群友拿主意吗？返回等待截止时间戳（0 = 不在等）。
+
+        「意图路由」在等待期间会把这个会话的消息**合并放行、跳过回复冷却**，
+        让群友的回应尽快交到她手里；查不到或出错一律返回 0，路由照旧工作。
+        """
+
+        if not session_id:
+            return 0.0
+        try:
+            return float(await self.engine.pending_intervention(session_id))
+        except Exception:
+            return 0.0
 
     def last_event_any(self) -> AstrMessageEvent | None:
         """最近一次见过的消息事件（拿不到会话 id 时给工具调用兜底）。"""
@@ -1968,21 +2781,119 @@ class VirtualWorldPlugin(Star):
         while len(self._last_events) > 200:
             self._last_events.popitem(last=False)
 
-    async def _annotate_message(self, event: AstrMessageEvent, text: str) -> str:
-        """给消息补上模型看不到的部分：图片里有什么、这是不是一条转发。"""
+    async def _annotate_message(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        *,
+        sources: list[str] | None = None,
+        summarize_forward: bool = False,
+    ) -> str:
+        """给消息补上模型看不到的部分：图片里有什么、这是不是一条转发。
+
+        ``sources``：图片地址已经取过了就传进来，省得同一个组件解析两遍
+        （NapCat 这类协议端解析一次可能要真去取图）。
+
+        ``summarize_forward``：这条转发值得读一遍时（她要处理的 @ / 私聊 / 唤醒），
+        用多模态模型把转发内容（含里面的图）压成摘要替换正文；关掉或读不出来
+        就退回原来那句「这是一条转发的聊天记录」。
+        """
 
         notes: list[str] = []
         if _is_forwarded(event):
-            notes.append("这是一条转发的聊天记录，不是当前群里正在说的话")
+            summary = await self._forward_summary_text(event) if summarize_forward else ""
+            if summary:
+                text = _with_forward_summary(text, summary)
+                notes.append(
+                    "这是一条转发消息，上面那段是它的内容摘要，不是当前群里正在说的话"
+                )
+            else:
+                notes.append("这是一条转发的聊天记录，不是当前群里正在说的话")
         mention = _mention_note(event)
         if mention:
             notes.append(mention)
-        notes.extend(await self._annotate_images(event, text))
+        quoted = await self._quoted_note(event)
+        if quoted:
+            notes.append(quoted)
+        sticker = _sticker_note(event)
+        if sticker:
+            notes.append(sticker)
+        notes.extend(await self._annotate_images(event, text, sources=sources))
         if not notes:
             return text
         return f"{text}\n［{'；'.join(notes)}］".strip()
 
-    async def _annotate_images(self, event: AstrMessageEvent, text: str) -> list[str]:
+    async def _quoted_note(self, event: AstrMessageEvent) -> str:
+        """他引用了哪一条：聊天记录里还看得到就给个开头，看不到才写原文。
+
+        引用内容本来完全没进正文（只喂给了看图那一步），于是「如何评价」这种
+        靠引用才有意义的话，她只能对着聊天记录里被掐成半句的旧消息猜。
+        """
+
+        who, text = _quoted_parts(event)
+        body = " ".join(str(text or "").split())
+        if not body:
+            return ""
+        someone = who or "有人"
+        context = self.engine.world.context
+        line_limit = max(40, int(getattr(context, "chat_line_chars", 500) or 500))
+        found = await self.engine.quote_in_records(event.unified_msg_origin, body)
+        # 记录里就有**而且那一行没被截断**时，只点出开头让她自己往上对照；
+        # 那条本身已经被截断（或者干脆不在留档里）时，还是把原文写全——
+        # 否则她对着"还有 N 字没显示"的那半句，根本不知道被引用的是哪一段。
+        if found and len(body) <= line_limit:
+            head = body[:40] + ("…" if len(body) > 40 else "")
+            return (
+                f"他引用的是上面聊天记录里的那条（{someone}：「{head}」）"
+                "——照上面那条看，这不是他这次打的字"
+            )
+        limit = max(0, int(getattr(context, "quote_chars", 1000) or 0))
+        if limit <= 0:
+            return f"他引用了一条更早的消息（{someone}），那条已经不在聊天记录里了"
+        shown = body if len(body) <= limit else clip_line(body, limit)
+        where = "上面聊天记录里那条太长，只显示了开头" if found else "聊天记录里已经没有了"
+        return (
+            f"他引用了一条更早的消息（{someone}），{where}，"
+            f"原文：「{shown}」——这是引用，不是他这次打的字"
+        )
+
+    async def _forward_summary_text(self, event: AstrMessageEvent) -> str:
+        """把这条转发读成摘要：关掉、没配多模态模型、读不出来都返回空串。"""
+
+        vision = getattr(self, "vision", None)
+        if vision is None or not vision.enabled:
+            return ""
+        try:
+            settings = self.engine.world.vision
+            if not bool(getattr(settings, "forward_summary", True)):
+                return ""
+            digest, images, forward_ids = await _forward_digest(event)
+            if not digest.strip() and not images:
+                return ""
+            summary = await vision.summarize_forward(
+                digest,
+                images,
+                fingerprint=_forward_fingerprint(forward_ids, digest, images),
+            )
+            if summary:
+                await self.engine.note_vision(
+                    event.unified_msg_origin,
+                    ok=True,
+                    images=len(images),
+                    detail=f"转发聊天记录已压成摘要（{len(summary)} 字）",
+                )
+            return summary
+        except Exception as exc:
+            self.logger.debug(f"[virtual_world] 转发摘要失败：{exc}")
+            return ""
+
+    async def _annotate_images(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        *,
+        sources: list[str] | None = None,
+    ) -> list[str]:
         """图片这一段的处理：转了述就写描述，没配转述模型就交给多模态主模型。
 
         图片本来在消息里是看不见的，出了任何岔子都要留下一条日志——
@@ -1990,10 +2901,15 @@ class VirtualWorldPlugin(Star):
         """
 
         components = _image_components(event)
-        if not components:
+        resolved = (
+            [str(item) for item in sources if str(item).strip()]
+            if sources is not None
+            else await _image_sources(event)
+        )
+        if not components and not resolved:
             return []
         session_id = event.unified_msg_origin
-        sources = await _image_sources(event)
+        sources = resolved
         vision = getattr(self, "vision", None)
         if not sources:
             detail = "收到图片但拿不到可用地址"
@@ -2003,39 +2919,236 @@ class VirtualWorldPlugin(Star):
             await self.engine.note_vision(
                 session_id, ok=False, images=len(components), detail=detail
             )
+            # QQ 表情包（大表情）几乎都取不到图：别让她以为"什么都没收到"，
+            # 后面 _sticker_note 会把它的文案写进消息里。
+            if components and all(
+                _component_named_any(item, _FACE_COMPONENT_NAMES)
+                for item in components
+            ):
+                return ["对方发的是 QQ 表情 / 表情包，插件取不到图（已记进日志）"]
             return ["对方发了一张图片，但插件没能取到图片地址（已记进日志）"]
 
         captions: list[str] = []
-        if vision is not None and vision.enabled:
-            try:
-                captions = await vision.describe(
-                    sources,
-                    question=text,
-                    quoted=_quoted_text(event),
-                    context_lines=await self._recent_chat_lines(event),
-                )
-            except Exception as exc:
-                self.logger.debug(f"[virtual_world] 图片转述异常：{exc}")
-                captions = []
-        described = [
-            f"图片{index + 1}：{caption}"
-            for index, caption in enumerate(captions or [])
-            if caption
-        ]
-        if described:
-            # 转述结果同时进日志与调试输出：成功就显示描述
-            await self.engine.note_vision(
-                session_id, ok=True, images=len(sources), detail="；".join(described)
+        if vision is None or not vision.enabled:
+            return [f"这条消息带了 {len(sources)} 张图片，图片会一起发给你"]
+        # 收到的图**现在就**看看是不是已经超过「一次带几张」的上限了：
+        # 超出的那几张（先来的）立刻转成文字，不等调主模型那一刻。
+        notes = await self._caption_overflow(event, sources)
+        head = f"这条消息带了 {len(sources)} 张图片，会一起发给你"
+        return [head, *notes]
+
+    async def _caption_overflow(
+        self, event: AstrMessageEvent, sources: list[str]
+    ) -> list[str]:
+        """收到的图已经超过「一次带几张」：把更早、还没转述的那几张先转成文字。
+
+        上限之内那几张会随这次请求交给主模型看，不必转述（同一张图只看一遍）；
+        超出的那几张反正不会被带上，趁**收到图的时候**就转掉——等调主模型那一刻
+        再转，她已经在等回复了。返回要写进这条消息注解的那几句。
+        """
+
+        session_id = event.unified_msg_origin
+        cap = max(1, int(self.engine.world.context.image_max))
+        history = await self.engine.chat_images_for_reply(session_id, PENDING_IMAGE_KEEP)
+        candidates = list(
+            dict.fromkeys(
+                [
+                    *[
+                        str(item.get("url") or "").strip()
+                        for item in history
+                        if str(item.get("url") or "").strip()
+                    ],
+                    *[str(item).strip() for item in sources if str(item).strip()],
+                ]
             )
-            return described
-        if vision is not None and vision.enabled:
+        )
+        keep = set(candidates[-cap:])
+        older = [url for url in candidates if url not in keep]
+        if not older:
+            return []
+        return await self._caption_old_images(event, older, sources=sources)
+
+    async def _reply_images(
+        self, event: AstrMessageEvent, sources: list[str]
+    ) -> tuple[list[str], dict[str, str], list[str]]:
+        """这一轮直接交给模型看的图、聊天记录里那几张图的编号，以及要转成文字的那几张。
+
+        转述只在这里做，而且只转"不会随这次请求交给主模型"的那几张：
+
+        - 主模型能吃图：最多带 ``image_max`` 张过去，**超出的旧图**（先来的那几张）
+          打包转述一次，描述挂回它们各自那条聊天记录；
+        - 主模型看不见图：这一轮该给她看的图全部打包转述一次（一条消息一次 →
+          一整轮一次），转完只交文字，不再附图；
+        - 没配转述模型：这条消息自己的图 + 「自上次回复以来收到的图」都发过去。
+
+        三种情况下"转述"都只发生一次：图片本来就要交给主模型看时再转述一遍，
+        等于同一张图看两遍（白花钱），连发几张还会连着调好几次。
+        """
+
+        session_id = event.unified_msg_origin
+        context = self.engine.world.context
+        cap = max(1, int(context.image_max))
+        vision = getattr(self, "vision", None)
+        captioned = bool(vision is not None and vision.enabled)
+        inline = await self._chat_images_inline(session_id)
+        pending = await self.engine.take_pending_images(session_id)
+        # 按时间排好（先来的在前）：被搭话的那几条消息里的图排前面，最新那张在最后
+        own = list(
+            dict.fromkeys(
+                [str(ref).strip() for ref in [*pending, *sources] if str(ref).strip()]
+            )
+        )
+        # 这一轮"看得到"的全部图（旧的在前、最新那张在最后）：
+        # 留档里更早的图也算，它们同样占"这一轮看了几张"的账
+        history = await self.engine.chat_images_for_reply(session_id, PENDING_IMAGE_KEEP)
+        all_urls = list(
+            dict.fromkeys(
+                [
+                    *[
+                        str(item.get("url") or "").strip()
+                        for item in history
+                        if str(item.get("url") or "").strip()
+                    ],
+                    *own,
+                ]
+            )
+        )
+        # 会被交给主模型的那几张：这一轮被搭话的那几张优先，剩下的名额给留档里更早的图
+        own_refs = own[-cap:]
+        room = max(0, cap - len(own_refs))
+        # 留档里的图另有上限（``chat_image_max``）：附太多旧图会把她这次要看的东西冲淡
+        want = min(max(1, int(context.chat_image_max)), room)
+        picks = history[-want:] if (inline and want) else []
+        refs: list[str] = []
+        marks: dict[str, str] = {}
+        for item in picks:
+            url = str(item.get("url") or "").strip()
+            if url and url not in refs:
+                refs.append(url)
+                marks[url] = f"图{len(marks) + 1}"
+        for ref in own_refs:
+            if ref not in refs:
+                refs.append(ref)
+        refs = refs[:cap]
+        marks = {url: label for url, label in marks.items() if url in refs}
+        if captioned and not inline:
+            # 主模型看不见图：这一轮的所有图都转成文字（一次打包），也就不附图了
+            refs, marks = [], {}
+        notes: list[str] = []
+        if captioned:
+            dropped = [
+                url for url in all_urls if url and url not in set(refs)
+            ]
+            notes = await self._caption_old_images(event, dropped, sources=sources)
+        if not refs:
+            return [], {}, notes
+        detail = f"把 {len(refs)} 张图交给多模态主模型"
+        if marks:
+            detail += f"（聊天记录里的 {len(marks)} 张已编号）"
+        await self.engine.note_vision(
+            session_id, ok=True, images=len(refs), detail=detail
+        )
+        return refs, marks, notes
+
+    async def _caption_old_images(
+        self,
+        event: AstrMessageEvent,
+        urls: list[str],
+        *,
+        sources: list[str] | None = None,
+    ) -> list[str]:
+        """把这几张图打包转述一次，返回要写进这条消息注解的那几句。
+
+        挂在哪：属于**这条消息**的图（她正看着的那几张）写进这条消息的注解；
+        更早的图把描述挂回它们原来那条聊天记录上——不然描述会串到别人头上，
+        下一轮她也对不上"哪张图是什么"。
+        """
+
+        session_id = event.unified_msg_origin
+        vision = getattr(self, "vision", None)
+        # 已经转述过的（同一张图在群里发两遍、或者上一轮转过了）不再转第二遍
+        targets = self.engine.uncaptioned_images(
+            [str(url).strip() for url in urls if str(url).strip()]
+        )
+        if vision is None or not vision.enabled or not targets:
+            return []
+        try:
+            captions = await vision.describe(
+                targets,
+                question=str(event.get_message_str() or ""),
+                quoted=_quoted_text(event),
+                context_lines=await self._recent_chat_lines(event),
+            )
+        except Exception as exc:
+            self.logger.debug(f"[virtual_world] 图片转述异常：{exc}")
+            captions = []
+        pairs = [
+            (url, str(caption).strip())
+            for url, caption in zip(targets, captions or [])
+            if str(caption or "").strip()
+        ]
+        if not pairs:
             reason = str(getattr(vision, "last_error", "") or "转述没有返回内容")
             await self.engine.note_vision(
-                session_id, ok=False, images=len(sources), detail=reason
+                session_id, ok=False, images=len(targets), detail=reason
             )
-            return ["对方发了图片，转述模型没能给出内容（已记进日志）"]
-        # 没配转述模型：图片会随这次请求一起交给多模态主模型（见 on_llm_request）
-        return [f"这条消息带了 {len(sources)} 张图片，图片会一起发给你"]
+            return ["有几张图没能转述成功，只当看过了（已记进日志）"]
+        here = {str(item).strip() for item in (sources or [])}
+        notes: list[str] = []
+        elsewhere: dict[str, str] = {}
+        for url, caption in pairs:
+            if url in here:
+                notes.append(caption)
+            else:
+                elsewhere[url] = caption
+        attached = await self.engine.attach_image_captions(session_id, elsewhere)
+        self.engine.mark_images_captioned([url for url, _text in pairs])
+        notes = [
+            f"图片{index + 1}：{text}" for index, text in enumerate(notes) if text
+        ]
+        await self.engine.note_vision(
+            session_id,
+            ok=True,
+            images=len(pairs),
+            detail=(
+                f"转述了 {len(pairs)} 张（没随这次请求交给主模型的那几张）"
+                + (f"，其中 {attached} 张挂回了它们原来那条消息" if attached else "")
+                + "："
+                + "；".join(text for _url, text in pairs)
+            ),
+        )
+        return notes
+
+    async def _chat_images_inline(self, session_id: str) -> bool:
+        """聊天记录里的图要不要直接发给主模型（配置 + Provider 勾选的模态）。"""
+
+        mode = str(
+            getattr(self.engine.world.context, "chat_image_inline", "auto") or "auto"
+        ).lower()
+        if mode == "never":
+            return False
+        if mode == "always":
+            return True
+        return bool(await self._main_model_sees_images(session_id))
+
+    async def _main_model_sees_images(self, session_id: str) -> bool | None:
+        """主模型能不能吃图：读 AstrBot 里这个 Provider 勾选的模态。
+
+        读不到（老版本、没有这个字段、不是 AstrBot 的 Provider）返回 ``None``——
+        调用方按"不能"处理，用户可以把它改成 ``always`` 强制打开。
+        """
+
+        try:
+            provider_id = (getattr(self, "llm_provider_id", "") or "").strip()
+            if not provider_id:
+                provider_id = await self.context.get_current_chat_provider_id(session_id)
+            if not provider_id:
+                return None
+            provider = self.context.get_provider_by_id(provider_id)
+            return _provider_supports_images(provider)
+        except Exception as exc:
+            self.logger.debug(f"[virtual_world] 读主模型的模态失败：{exc}")
+            return None
 
     async def _recent_chat_lines(self, event: AstrMessageEvent) -> list[str]:
         """最近几句群聊，用来给图片转述提供话题背景。"""
@@ -2095,8 +3208,25 @@ class VirtualWorldPlugin(Star):
             return self._self_initiated_depth > 0
         return task in self._self_initiated_tasks
 
+    def _should_expect_reply(self, event: Any) -> bool:
+        """这条消息"看起来会走到回复"吗（用来提前登记连发合并）。
+
+        只有会被回复的消息才登记：群里没点名她的闲聊不登记，
+        否则群一直有人说话，她的安静期就永远刷新不完。
+        """
+
+        text = str(event.get_message_str() or "")
+        if _is_command(text):
+            return False
+        return bool(
+            event.is_wake_up() or _is_at_bot(event) or event.is_private_chat()
+        )
+
     def _reply_lock(self, session_id: str) -> asyncio.Lock:
-        lock = self._reply_locks.get(session_id)
+        # 锁按"她"分（会话组的代表）：同一个她的两个会话不能同时开两条回复管线，
+        # 否则两边会轮流改同一份状态，计划和动作互相踩
+        key = self.engine.merge_scope(session_id) if self.engine else session_id
+        lock = self._reply_locks.get(key)
         if lock is not None:
             return lock
         if len(self._reply_locks) > 128:
@@ -2108,7 +3238,7 @@ class VirtualWorldPlugin(Star):
             ]:
                 self._reply_locks.pop(key, None)
         lock = asyncio.Lock()
-        self._reply_locks[session_id] = lock
+        self._reply_locks[key] = lock
         return lock
 
     @contextlib.asynccontextmanager
@@ -2175,23 +3305,13 @@ class VirtualWorldPlugin(Star):
         user_text = (getattr(req, "prompt", "") or "").strip() or (
             event.get_message_str() or ""
         )
-        user_text = await self._annotate_message(event, user_text)
-        image_urls: list[str] = []
-        if not (getattr(self, "vision", None) is not None and self.vision.enabled):
-            # 没配转述模型时，直接把图片交给多模态主模型：
-            # 「自上次回复以来收到的图片」+ 这条消息自己的图，按配置的上限截断。
-            pending = await self.engine.take_pending_images(session_id)
-            current = await _image_sources(event)
-            limit = max(1, int(self.engine.world.context.image_max))
-            merged = list(dict.fromkeys([*pending, *current]))[-limit:]
-            if merged:
-                image_urls = merged
-                await self.engine.note_vision(
-                    session_id,
-                    ok=True,
-                    images=len(merged),
-                    detail=f"没配转述模型，直接把 {len(merged)} 张图交给多模态主模型",
-                )
+        sources = await _image_sources(event)
+        user_text = await self._annotate_message(
+            event, user_text, sources=sources, summarize_forward=True
+        )
+        image_urls, image_marks, image_notes = await self._reply_images(event, sources)
+        if image_notes:
+            user_text = f"{user_text}\n［{'；'.join(image_notes)}］".strip()
         ctx = MessageContext(
             session_id=session_id,
             user_id=event.get_sender_id(),
@@ -2199,11 +3319,15 @@ class VirtualWorldPlugin(Star):
             text=user_text,
             is_wake=bool(event.is_wake_up()),
             is_mentioned=_is_at_bot(event) or bool(event.is_private_chat()),
+            is_soft_wake=_is_soft_wake(event),
             is_private=bool(event.is_private_chat()),
+            group_name=_group_name(event),
             persona_id=_event_persona_id(event),
             # 其他插件（上下文理解、图片转文字、记忆…）写进 system_prompt 的内容原样带过去
             other_context=(getattr(req, "system_prompt", "") or "").strip(),
             image_urls=image_urls,
+            chat_images=sources,
+            image_marks=image_marks,
         )
 
         # 睡觉时的门禁：没被明确叫醒就只回固定文案（或保持安静），
@@ -2212,7 +3336,10 @@ class VirtualWorldPlugin(Star):
         if sleep_reply is not None:
             echo = self.engine.take_pending_echo(session_id)
             if sleep_reply.messages or echo:
-                await self._send_reply(event, list(sleep_reply.messages) + echo)
+                # 睡觉时的固定文案也是在回这条消息，同样按开关带引用
+                await self._send_reply(
+                    event, list(sleep_reply.messages) + echo, quote=True
+                )
                 await self._fire_hook(event, "OnAfterMessageSentEvent")
             if self.debug:
                 self.logger.info(
@@ -2235,39 +3362,130 @@ class VirtualWorldPlugin(Star):
                 return
             # 同一条会话同一时间只跑一条接管：连发的第二条会排队，
             # 等前一条说完再开口，这样它能看到对方刚说过什么
+            # 排队期间如果前一条还在调模型、而且这条来得够快，会被**并进那一次回复**，
+            # 那就轮到自己时直接跳过（不能同一句话答两遍）
+            # 「收到消息」那一刻就登记过了（见 on_any_message）：这里只取回来，
+            # 拿不到（老事件 / 被别的插件重建过）就补登记一条
+            incoming = event.get_extra(VW_INCOMING_EXTRA, None)
+            if not isinstance(incoming, dict):
+                incoming = self.engine.register_incoming(session_id, ctx.text)
             async with self._reply_turn(session_id):
+                if self.engine.was_absorbed(incoming):
+                    if self.debug:
+                        self.logger.info(
+                            f"[virtual_world] 这条被合并进上一次回复了，不单独回 session={session_id}"
+                        )
+                    event.stop_event()
+                    return
                 outcome = await self.engine.handle_reply(
                     ctx, history=list(getattr(req, "contexts", None) or [])
                 )
                 echo = list(getattr(outcome, "debug_messages", []) or [])
-                if outcome.ok and outcome.messages:
+                # 这一轮工具 / 指令生成出来的图（生图动作走的就是这里）
+                made_images = list(getattr(outcome, "images", []) or [])
+                # 她这一轮要说的话：当前会话一份，另外可能还有"只说给别处"的
+                routed = {
+                    str(key): list(value)
+                    for key, value in (getattr(outcome, "routed", {}) or {}).items()
+                    if list(value)
+                }
+                routed_images = {
+                    str(key): list(value)
+                    for key, value in (getattr(outcome, "routed_images", {}) or {}).items()
+                    if list(value)
+                }
+                # 慢动作之前她已经说的那几句已经当场发出去了（见 _send_live_say）：
+                # 这一轮算成立，但只发"还没发出去的部分"
+                live_lines = [
+                    str(item)
+                    for item in (getattr(outcome, "live_messages", []) or [])
+                    if str(item).strip()
+                ]
+                pending_lines = [
+                    str(item) for item in (outcome.messages or []) if str(item).strip()
+                ]
+                if outcome.ok and (pending_lines or live_lines or routed or routed_images):
                     # 先让别的插件的回复钩子过一遍（它们可能在回复里读写标记）
+                    # 钩子看的是她这一轮说过的**全部**话（含已经发出去的那几句），
+                    # 不然"等我两分钟"之后再接结果时，靠标记工作的插件会少读到前半句
+                    heard = live_lines + pending_lines
                     bridged = await self._bridge_reply_hooks(
                         event,
-                        list(outcome.messages),
+                        heard,
                         str(getattr(outcome, "tail", "") or ""),
                     )
+                    if len(bridged) == len(heard):
+                        bridged = bridged[len(live_lines) :]
+                    else:
+                        # 钩子改了条数：位置对不上，就用原样的"还没发的部分"
+                        bridged = list(pending_lines)
                     # 再按换行拆段：一段一条消息，别把好几句挤成一坨；
                     # 调试回显按它实际发生的位置插进去（先调工具、再说话，群里也是这个顺序）
-                    await self._send_reply(
-                        event, self._merge_with_echo(bridged, outcome, echo)
-                    )
+                    payload = self._merge_with_echo(bridged, outcome, echo)
+                    if payload or made_images:
+                        await self._send_reply(
+                            event,
+                            payload,
+                            # 前面已经即时说过话时，这一条是接着往下讲，不再引用触发她的那条
+                            quote=not live_lines,
+                            quote_mode_hint=str(getattr(outcome, "quote_hint", "") or ""),
+                            images=made_images,
+                        )
+                    # 说给别处的那些：逐条投到那个会话（不带引用——那条消息不在这里）
+                    for target, texts in routed.items():
+                        try:
+                            await self.messenger.send_text(target, list(texts))
+                        except Exception as exc:
+                            self.logger.debug(
+                                f"[virtual_world] 发到 {target} 失败：{exc}"
+                            )
+                    for target, refs in routed_images.items():
+                        try:
+                            await self.messenger.send_images(target, list(refs))
+                        except Exception as exc:
+                            self.logger.debug(
+                                f"[virtual_world] 发图到 {target} 失败：{exc}"
+                            )
+                    # 真发出去了才算"回过这批消息"（水位线在这里推进）
+                    try:
+                        await self.engine.mark_chat_replied_by_session(session_id)
+                        # 别处那几句也一样：她在那边也算回应过了
+                        for target in list(routed) + list(routed_images):
+                            await self.engine.mark_chat_replied_by_session(target)
+                    except Exception as exc:
+                        self.logger.debug(f"[virtual_world] 推进水位线失败：{exc}")
                     # 「发完了」也要补一遍：靠它摘掉"处理中"标记的插件才不会一直挂着
                     await self._fire_hook(event, "OnAfterMessageSentEvent")
                     if self.debug:
                         self.logger.info(
                             f"[virtual_world] 接管回复 {session_id}："
-                            f"reasoning={outcome.reasoning} messages={outcome.messages}"
+                            f"reasoning={outcome.reasoning} "
+                            f"messages={live_lines + pending_lines}"
                         )
                     event.stop_event()
                     return
-                # 接管没成功、会交回主人格：调试信息照样发出去，不然就看不到了
-                if echo:
-                    await self._send_reply(event, echo)
+                if str(getattr(outcome, "error", "")) == REPLY_INTERRUPTED:
+                    # 这一轮被新消息打断：作废，不补一句也不交给主人格——
+                    # 新那条自己的回复管线马上会接手（它能看到刚才这几条）。
+                    if echo:
+                        await self._send_reply(event, echo)
+                    event.stop_event()
+                    return
+                if str(getattr(outcome, "error", "")) == REPLY_MUTED:
+                    # 本小时被动回复触顶：接管但静默（连调试回显也不发）
+                    event.stop_event()
+                    return
+                # 接管没成功：**这一条就不回了**（不交回主人格——那是另一个人设，
+                # 顶下来的话用户会看到"她"突然换了个说法）。调试回显照样发，
+                # 原因写进日志页，方便排查到底是模型挂了还是没给出动作。
+                if echo or made_images:
+                    await self._send_reply(event, echo, images=made_images)
                     await self._fire_hook(event, "OnAfterMessageSentEvent")
-                self._log_takeover_fallback(session_id, outcome)
+                await self._note_takeover_fallback(session_id, outcome)
+                event.stop_event()
+                return
 
-        # ---- 注入模式（也是接管失败后的兜底）----
+        # ---- 注入模式：只把世界认知写进主人格的提示词，不接管回复 ----
         try:
             req.system_prompt = (req.system_prompt or "") + injection
         except Exception as exc:
@@ -2313,21 +3531,65 @@ class VirtualWorldPlugin(Star):
             self.logger.debug(f"[virtual_world] 调试回显发送失败：{exc}")
             return False
 
-    async def _send_reply(self, event: AstrMessageEvent, messages: list[str]) -> None:
+    async def _send_live_say(self, session_id: str, message: str) -> bool:
+        """把她说出口的这一句立刻发出去（引擎在慢动作开始前调它）。
+
+        检索、生图、录视频这类要花一会儿的动作排在后面时，「坐好等我两分钟～」先到群里，
+        群里才是"她说了一句 → 过一会儿带着结果回来"，而不是半天不出声、然后一口气说三句。
+        发失败返回 False：引擎会把这几句留到收尾按原顺序一起发，不会丢内容。
+        """
+
+        body = str(message or "").strip()
+        if not body:
+            return False
+        # 连着的两句之间按字数停一下：和收尾发送时的节奏保持一致，
+        # 免得"先说的这一句"排成一串同一瞬间冒出来
+        previous = self._live_say_tail.get(session_id, "")
+        if previous:
+            delay = self.typing_delay_for(previous)
+            if delay > 0:
+                await asyncio.sleep(delay)
+        try:
+            sent = bool(await self.messenger.send_text(session_id, [body]))
+        except Exception as exc:
+            self.logger.debug(f"[virtual_world] 即时发言发送失败：{exc}")
+            sent = False
+        self._live_say_tail[session_id] = body if sent else ""
+        return sent
+
+    async def _send_reply(
+        self,
+        event: AstrMessageEvent,
+        messages: list[str],
+        *,
+        quote: bool = False,
+        quote_mode_hint: str = "",
+        images: list[str] | None = None,
+    ) -> None:
         """把接管产生的消息发回当前会话（逐条发送 = 天然分段回复）。
 
         分段之间按上一条的字数停一下：群里看起来就像她在一条条打字，
         而不是一整坨同时冒出来。停顿有上限，长句子不会等到天荒地老。
+        ``quote=True`` 时第一条引用触发她的那条消息（能不能引用见 ``_quote_target``）。
+        ``images`` 是这一轮工具 / 指令生成出来的图：说完再贴上去（一次一条消息，多张放一起）。
         """
 
         session_id = event.unified_msg_origin
         pending = [str(item).strip() for item in messages if str(item).strip()]
+        refs = _sendable_images(images)
+        if not pending and not refs:
+            return
+        quote_id = self._quote_target(event, quote_mode_hint) if quote else ""
         for index, content in enumerate(pending):
             if self.messenger.blocked(session_id):
                 # 刚发送失败过：不再往下试，免得把队列越堆越长
                 break
+            chain: list[Any] = [Plain(text=content)]
+            if quote_id and index == 0:
+                # 引用段必须排在前面，平台才认得出"这条是在回哪一句"
+                chain.insert(0, Reply(id=quote_id))
             try:
-                await event.send(MessageChain([Plain(text=content)]))
+                await event.send(MessageChain(chain))
                 self.messenger.mark_sent(session_id)
             except Exception as exc:
                 # 失败就失败：以前这里会立刻换一条通道再发一次，遇到"超时但其实发出去了"
@@ -2339,6 +3601,72 @@ class VirtualWorldPlugin(Star):
             delay = self.typing_delay_for(content)
             if delay > 0:
                 await asyncio.sleep(delay)
+
+        if refs and not self.messenger.blocked(session_id):
+            # 只在"她什么都没说、只发了图"时，让图片这条去引用（第一条才引用）
+            await self._send_images(
+                event,
+                refs,
+                quote=quote and not pending,
+                quote_mode_hint=quote_mode_hint,
+            )
+
+    async def _send_images(
+        self,
+        event: AstrMessageEvent,
+        images: list[str],
+        *,
+        quote: bool = False,
+        quote_mode_hint: str = "",
+    ) -> bool:
+        """把结果图贴到群里（多张放同一条消息，不会拆成连发刷屏）。"""
+
+        refs = _sendable_images(images)
+        if not refs:
+            return False
+        session_id = event.unified_msg_origin
+        if self.messenger.blocked(session_id):
+            return False
+        chain: list[Any] = [Image(file=ref) for ref in refs]
+        quote_id = self._quote_target(event, quote_mode_hint) if quote else ""
+        if quote_id:
+            chain.insert(0, Reply(id=quote_id))
+        try:
+            await event.send(MessageChain(chain))
+            self.messenger.mark_sent(session_id)
+            return True
+        except Exception as exc:
+            # 和文字一样：失败就失败，不换通道重发（重发容易变成两条）
+            self.messenger.mark_failed(session_id, exc)
+            return False
+
+    def _quote_target(self, event: AstrMessageEvent, mode_hint: str = "") -> str:
+        """这条回复要引用哪条消息：触发她的那一条（用不了就返回空串）。
+
+        档位在「说话节奏」里：关闭 / 总是 / 智能（默认）。智能档由引擎判断——
+        "这一轮回的是一串消息"才引用，单独一句对答不顶引用；``mode_hint`` 就是那个判断。
+        引用是 QQ / OneBot（aiocqhttp）这类平台才有的段，别的平台不认，
+        硬塞过去只会让这条发失败——所以这里先按平台名挡一道。
+        """
+
+        style = getattr(self.engine.world, "reply_style", None)
+        mode = str(getattr(style, "quote_mode", "smart") or "smart")
+        if mode not in ("always", "smart"):
+            return ""
+        # 智能档由调用方判断（"这一轮回的是一串消息"才引用），这里只认 always
+        if mode == "smart" and mode_hint != "always":
+            return ""
+        platform = ""
+        getter = getattr(event, "get_platform_name", None)
+        if callable(getter):
+            try:
+                platform = str(getter() or "").lower()
+            except Exception:
+                platform = ""
+        if "cqhttp" not in platform and "onebot" not in platform:
+            return ""
+        message_obj = getattr(event, "message_obj", None)
+        return str(getattr(message_obj, "message_id", "") or "").strip()
 
     def typing_delay_for(self, text: str) -> float:
         """按字数算这一次的「打字」停顿（秒）。0 表示不等待。"""
@@ -2524,13 +3852,29 @@ class VirtualWorldPlugin(Star):
             self.logger.warning(f"[virtual_world] 钩子 {name} 执行出错：{exc}")
             return False
 
-    def _log_takeover_fallback(self, session_id: str, outcome) -> None:
-        if not self.debug:
-            return
-        self.logger.info(
-            f"[virtual_world] 接管未生效（{outcome.error or '没有对外输出'}），"
-            f"改用注入模式 session={session_id}"
+    async def _note_takeover_fallback(self, session_id: str, outcome) -> None:
+        """接管没生效：这一条她不说话，但**必须留下痕迹**。
+
+        以前只在开着调试时打一行 stdout，日志页里什么都没有——用户只看到
+        "她没回"，完全猜不到是模型挂了、还是模型没给出能执行的动作。
+        """
+
+        reason = str(getattr(outcome, "error", "") or "没有对外输出")
+        warnings = [str(item) for item in (getattr(outcome, "warnings", None) or [])]
+        self.logger.warning(
+            f"[virtual_world] 接管没生效（{reason}），这一条保持安静 "
+            f"session={session_id}"
         )
+        detail = {"reason": reason}
+        if warnings:
+            detail["warnings"] = warnings[:4]
+        if getattr(outcome, "tail", ""):
+            detail["model_tail"] = str(outcome.tail)[:200]
+        try:
+            async with self.engine.session_state(session_id) as state:
+                await self.engine._log_event(state, "takeover_failed", detail)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug(f"[virtual_world] 写接管失败日志失败：{exc}")
 
     # ================= 旁观记录（不产生 LLM 调用） =================
 
@@ -2558,6 +3902,12 @@ class VirtualWorldPlugin(Star):
         text = event.get_message_str() or ""
         if _is_command(text):
             return  # 指令照常走（/vw status、/vw 叫醒 这些要能用）
+        sources = await _image_sources(event)
+        if _is_forwarded(event) and self._should_expect_reply(event):
+            # 这条转发是冲她来的：先把内容压成摘要，她醒来看到的才是"事情"而不是占位符
+            summary = await self._forward_summary_text(event)
+            if summary:
+                text = _with_forward_summary(text, summary)
         if _image_components(event):
             # 她在睡觉：这里不额外调转述模型（醒来后那条消息会照常转述），
             # 但留档里要能看出"有人发了张图"，否则这条消息会是空的。
@@ -2571,7 +3921,8 @@ class VirtualWorldPlugin(Star):
             is_mentioned=_is_at_bot(event) or bool(event.is_private_chat()),
             is_private=bool(event.is_private_chat()),
             # 记下这条消息带的图片，等下次回复时一起给多模态主模型
-            image_urls=await _image_sources(event),
+            image_urls=list(sources),
+            chat_images=list(sources),
         )
         if not await self.engine.should_block_sleep(ctx):
             return
@@ -2591,8 +3942,25 @@ class VirtualWorldPlugin(Star):
             return
         if event.get_sender_id() and event.get_sender_id() == event.get_self_id():
             return
+        # 「连发合并」要在这里就登记：落到 on_llm_request 那一钩时，同一会话的
+        # 上一条回复可能还占着管线（AstrBot 里那条管线是串行的），等她登记时
+        # 早就过了安静期，两条消息就各回一次了。
+        if self._should_expect_reply(event):
+            try:
+                event.set_extra(
+                    VW_INCOMING_EXTRA,
+                    self.engine.register_incoming(session_id, event.get_message_str() or ""),
+                )
+            except Exception as exc:
+                self.logger.debug(f"[virtual_world] 登记待回消息失败：{exc}")
         self._remember_event(event)
-        text = await self._annotate_message(event, event.get_message_str() or "")
+        sources = await _image_sources(event)
+        text = await self._annotate_message(
+            event,
+            event.get_message_str() or "",
+            sources=sources,
+            summarize_forward=self._should_expect_reply(event),
+        )
         await self.engine.note_presence(
             MessageContext(
                 session_id=session_id,
@@ -2601,6 +3969,8 @@ class VirtualWorldPlugin(Star):
                 text=text,
                 is_wake=bool(event.is_wake_up()),
                 is_private=bool(event.is_private_chat()),
+                group_name=_group_name(event),
+                chat_images=list(sources),
             )
         )
 
@@ -2776,7 +4146,101 @@ class VirtualWorldPlugin(Star):
             yield event.plain_result("已恢复默认配置：" + "、".join(restored))
             return
 
+        if action in ("event", "事件"):
+            # 成功时**不回话**：她自己会在群里说这件事，指令再回一句就是噪音
+            text = await self._cmd_event(event, rest)
+            if text:
+                yield event.plain_result(text)
+            return
+
+        if action in ("ability", "能力", "能力值"):
+            # 能力值不公开：只有管理员能看（群友要看只能翻日志页）
+            if not self._can_admin(event):
+                yield event.plain_result("这项不公开，只有管理员可以看。")
+                return
+            yield event.plain_result(await self._cmd_ability(event))
+            return
+
+        if action in ("thread", "线索", "未了"):
+            if not self._can_admin(event):
+                yield event.plain_result("这项只有管理员可以看。")
+                return
+            yield event.plain_result(await self._cmd_thread(event))
+            return
+
         yield event.plain_result(f"未知指令：{action}\n\n{_help_text(self._pronoun())}")
+
+    async def _cmd_event(self, event: AstrMessageEvent, rest: list[str]) -> str:
+        """`/vw event [要发生的事]`：用户直接给她安排一件事。"""
+
+        if not self._can_deliver_event(event):
+            return "只有管理员可以投递事件（可以在全局设置里改成所有人）。"
+        session_id = event.unified_msg_origin
+        sub = (rest[0] if rest else "").lower()
+        if sub in ("list", "列表"):
+            overview = await self.engine.event_overview(session_id)
+            lines = ["最近的事件线索："]
+            rows = [item for item in (overview.get("threads") or []) if item.get("steps")]
+            if not rows:
+                lines.append("· 还没有发生过什么")
+            for item in rows:
+                mark = "进行中" if str(item.get("status")) == "open" else "已结束"
+                lines.append(f"· [{mark}] {item.get('title') or '一件事'}")
+                for step in list(item.get("steps") or [])[:4]:
+                    lines.append(f"   - {step}")
+            return "\n".join(lines)
+        if sub in ("help", "用法", "?"):
+            return (
+                "/vw event <一句话>\n"
+                "　给她安排一件「会发生的事」，她会自己决定怎么处理。\n"
+                "　例子：/vw event 出门忘了带伞\n"
+                "　/vw event list  看最近的事件线索"
+            )
+        text = " ".join(rest)
+        note = await self.engine.submit_event(session_id, text)
+        # 成功（note 为空）时不回话：她马上就会在群里说这件事
+        return note
+
+    def _can_deliver_event(self, event: AstrMessageEvent) -> bool:
+        """谁能用 `/vw event` 投递事件（默认只有管理员）。"""
+
+        if self._can_admin(event):
+            return True
+        return str(getattr(self.engine.world.events, "event_actor", "admin") or "admin") == "all"
+
+    async def _cmd_ability(self, event: AstrMessageEvent) -> str:
+        overview = await self.engine.event_overview(event.unified_msg_origin)
+        rows = overview.get("abilities") or {}
+        if not rows:
+            return "能力值没有启用。"
+        detail = "、".join(
+            f"{item.get('label')}{item.get('hint')}" for item in rows.values()
+        )
+        spent = overview.get("ability_spent_today") or {}
+        if spent:
+            detail += "\n今天已经变化：" + "、".join(
+                f"{key} {value:+.3f}" for key, value in spent.items()
+            )
+        return f"她现在的本事：{detail}"
+
+    async def _cmd_thread(self, event: AstrMessageEvent) -> str:
+        overview = await self.engine.event_overview(event.unified_msg_origin)
+        pending = overview.get("pending_help") or {}
+        lines: list[str] = []
+        if str(pending.get("state") or "") == "active":
+            lines.append(f"她正在等群友拿主意：{pending.get('title') or '一件事'}")
+        elif str(pending.get("state") or "") == "idle":
+            lines.append(f"这件事还没解决，她没再提：{pending.get('title') or '一件事'}")
+        rows = [item for item in (overview.get("threads") or []) if str(item.get("status")) == "open"]
+        if not rows and not lines:
+            return "她手头没有没完的事。"
+        for item in rows:
+            lines.append(f"· {item.get('title') or '一件事'}")
+            for step in list(item.get("steps") or [])[:5]:
+                lines.append(f"   - {step}")
+            if item.get("pending_followup"):
+                lines.append(f"   → 还有下一步：{item.get('pending_followup')}")
+        return "\n".join(lines)
 
     # ---------------- 给主人格 / 别的插件用的日程工具 ----------------
 
@@ -3010,11 +4474,22 @@ class VirtualWorldPlugin(Star):
             sessions = self.engine.sessions.sessions if self.engine.sessions else []
             if not sessions:
                 return "白名单为空。"
-            return "会话白名单：\n" + "\n".join(
+            lines = [
                 f"{'✅' if item.enabled else '⛔'} {item.session_id} ({item.type})"
                 + (f" - {item.note}" if item.note else "")
                 for item in sessions
-            )
+            ]
+            groups = list(getattr(self.engine.sessions, "groups", None) or [])
+            if groups:
+                lines.append("")
+                lines.append("会话组（同一个她，共享状态 / 记忆 / 上下文）：")
+                lines.extend(
+                    f"🔗 {group.name or group.id}："
+                    + "、".join(group.sessions or [])
+                    + (f"（代表：{group.main_session}）" if group.main_session else "")
+                    for group in groups
+                )
+            return "会话白名单：\n" + "\n".join(lines)
         if sub in ("add", "添加"):
             target = rest[1] if len(rest) > 1 else event.unified_msg_origin
             session_type = "private" if event.is_private_chat() and target == event.unified_msg_origin else (
@@ -3039,6 +4514,21 @@ class VirtualWorldPlugin(Star):
         return "用法：/vw session list|add [ID]|remove <ID>|enable|disable <ID>"
 
     # ================= Web API =================
+
+    def sampling_params(self) -> dict[str, float]:
+        """给适配器用的采样参数（关着就返回空字典＝不覆盖 Provider 自己的设置）。"""
+
+        config = dict(getattr(self, "_sampling_config", None) or {})
+        if not config.get("enabled"):
+            return {}
+        result: dict[str, float] = {}
+        for key in ("temperature", "top_p", "frequency_penalty", "presence_penalty"):
+            try:
+                number = float(config.get(key))
+            except (TypeError, ValueError):
+                continue
+            result[key] = number
+        return result
 
     def _register_web_apis(self) -> None:
         register = self.context.register_web_api
@@ -3073,15 +4563,731 @@ class VirtualWorldPlugin(Star):
         register(f"/{p}/memories/export", self.api_memory_export, ["GET"], "导出记忆")
         register(f"/{p}/memories/import", self.api_memory_import, ["POST"], "导入记忆")
         register(f"/{p}/prompt", self.api_prompt, ["GET"], "预览提示词")
-        register(f"/{p}/history", self.api_history, ["GET"], "数值历史")
+        # 注意：配置改动历史占用了 /history（还有 /history/item 等子路径），
+        # 数值历史必须另起一条路径，否则两条会互相顶掉。
+        register(f"/{p}/state/history", self.api_state_history, ["GET"], "数值历史")
         register(f"/{p}/defaults", self.api_defaults, ["GET"], "内置默认文案")
         register(f"/{p}/backup", self.api_backup, ["POST"], "备份配置")
         register(f"/{p}/presets", self.api_presets, ["GET"], "预设列表")
         register(f"/{p}/presets/save", self.api_preset_save, ["POST"], "把当前配置存成预设")
+        register(f"/{p}/presets/new-default", self.api_preset_new_default, ["POST"], "用内置默认世界新建预设")
         register(f"/{p}/presets/apply", self.api_preset_apply, ["POST"], "应用预设")
         register(f"/{p}/presets/delete", self.api_preset_delete, ["POST"], "删除预设")
         register(f"/{p}/presets/rename", self.api_preset_rename, ["POST"], "重命名预设")
         register(f"/{p}/presets/json", self.api_preset_json, ["GET", "POST"], "读写预设 JSON")
+        register(f"/{p}/history", self.api_history, ["GET"], "配置改动历史")
+        register(f"/{p}/history/item", self.api_history_item, ["GET"], "看一条历史")
+        register(f"/{p}/history/restore", self.api_history_restore, ["POST"], "恢复到这个版本")
+        register(f"/{p}/history/delete", self.api_history_delete, ["POST"], "删除一条历史")
+        register(f"/{p}/history/clear", self.api_history_clear, ["POST"], "清空历史")
+        register(f"/{p}/events", self.api_events, ["GET"], "事件线索与能力值")
+        register(f"/{p}/persona-brief", self.api_persona_brief, ["GET", "POST"], "简易人设")
+        register(f"/{p}/voice-samples", self.api_voice_samples, ["GET"], "声音样例")
+        register(
+            f"/{p}/voice-samples/generate",
+            self.api_voice_samples_generate,
+            ["POST"],
+            "生成声音样例候选",
+        )
+        register(
+            f"/{p}/voice-samples/from-chat",
+            self.api_voice_samples_from_chat,
+            ["POST"],
+            "从近期聊天里挑样例候选",
+        )
+        register(
+            f"/{p}/voice-samples/save",
+            self.api_voice_samples_save,
+            ["POST"],
+            "保存挑中的声音样例",
+        )
+        register(f"/{p}/persona/review", self.api_persona_review, ["POST"], "体检人设")
+        register(
+            f"/{p}/persona/apply", self.api_persona_apply, ["POST"], "应用挑中的改动"
+        )
+        register(
+            f"/{p}/eval-script", self.api_eval_script, ["POST"], "生成测评剧本"
+        )
+        register(f"/{p}/eval-run", self.api_eval_run, ["POST"], "跑测评（并发）")
+        register(f"/{p}/persona-source", self.api_persona_source, ["GET"], "读 AstrBot 当前给这个会话的人设")
+        register(f"/{p}/profile/people", self.api_profile_people, ["GET"], "通讯录：认识的人")
+        register(f"/{p}/profile/person", self.api_profile_person, ["GET", "POST"], "通讯录：一个人的画像")
+        register(f"/{p}/profile/fact", self.api_profile_fact, ["POST"], "通讯录：改事实")
+        register(f"/{p}/profile/bond", self.api_profile_bond, ["POST"], "通讯录：改关系")
+        register(f"/{p}/profile/affinity", self.api_profile_affinity, ["POST"], "通讯录：改好感度")
+        register(
+            f"/{p}/profile/grudge",
+            self.api_profile_grudge,
+            ["POST"],
+            "通讯录：她记着的一笔账",
+        )
+        register(f"/{p}/profile/forget", self.api_profile_forget, ["POST"], "通讯录：忘掉一个人")
+        register(f"/{p}/profile/consolidate", self.api_profile_consolidate, ["POST"], "立刻整理一次（记忆 + 画像）")
+
+    # ---------------- 通讯录（用户画像）----------------
+
+    def _profile_scope(self, value: Any) -> str:
+        return self._scope(value)
+
+    async def _profile_person_payload(self, session_id: str, user_id: str) -> dict[str, Any]:
+        """一个人的完整画像：字段 + 事实 + 关系（含历史与"他自称"）+ 好感日志。"""
+
+        store = getattr(self.engine, "profiles", None)
+        payload: dict[str, Any] = {"session": session_id, "user_id": user_id}
+        if store is None:
+            return payload
+        payload["person"] = self.engine.person_payload(session_id, user_id)
+        payload["facts"] = store.facts(session_id, user_id, statuses=["active", "candidate", "past"])
+        # 垫底的"陌生人"和同类里被顶掉的旧关系都不往外露（老数据靠这一层收干净）
+        bonds = store.visible_bonds(session_id, user_id)
+        for item in bonds:
+            item["since_text"] = self.engine._date_text(item.get("since"))
+            item["until_text"] = self.engine._date_text(item.get("until"))
+        payload["bonds"] = bonds
+        payload["affinity_logs"] = store.affinity_logs(session_id, user_id, limit=50)
+        # 「她想不想这个人」：通讯录里一眼能看到，不用去状态页翻
+        state = await self.engine.load_state(session_id, cold_start=False)
+        # 「她记着他一笔账」：记的账是分人的，这里只回这个人的那条
+        grudge = self.engine.grudge_for(state, user_id)
+        payload["grudge"] = (
+            {
+                **grudge,
+                "at_text": self.engine._date_text(grudge.get("at")),
+                "until_text": self.engine._date_text(grudge.get("until")),
+                "days": max(
+                    0.0,
+                    (self.engine._now() - float(grudge.get("at") or 0.0)) / 86400.0,
+                ),
+            }
+            if grudge
+            else None
+        )
+        # 「她自己记着的事」：只列跟这个人相关的（没写对谁的就是她自己的打算）
+        payload["own_topics"] = [
+            dict(item)
+            for item in (state.own_topics or [])
+            if isinstance(item, dict)
+            and str(item.get("who") or "") in ("", user_id)
+        ]
+        overview = self.engine.miss_overview(state)
+        payload["miss"] = next(
+            (item for item in overview.get("people", []) if item.get("user_id") == user_id),
+            {
+                "user_id": user_id,
+                "value": 0.0,
+                "waiting": False,
+                "ready_in_minutes": 0,
+                "will_reach_out": False,
+            },
+        )
+        payload["miss_threshold"] = overview.get("threshold")
+        config = self.engine.world.profile
+        payload["bonds_config"] = [
+            {
+                "name": bond.name,
+                "slot": bond.slot,
+                "group": bond.group,
+                "cap": bond.cap,
+                "unique": bool(bond.unique),
+                "negative": bool(bond.negative),
+                "aliases": list(bond.aliases or []),
+            }
+            for bond in config.bonds
+        ]
+        payload["levels_config"] = [
+            {
+                "name": level.name,
+                "min_affinity": level.min_affinity,
+                "max_affinity": level.max_affinity,
+                "deny": [store.action_label(item) for item in (level.deny or [])],
+                "prompt": level.prompt,
+            }
+            for level in config.levels
+        ]
+        return payload
+
+    async def api_profile_people(self):
+        """通讯录列表：这个人叫啥、什么关系、好感多少、最近说过话没有。"""
+
+        guard = self._guard()
+        if guard is not None:
+            return guard
+        session_id = self._profile_scope(request.query.get("session", ""))
+        if not session_id:
+            return error_response("缺少 session 参数")
+        store = getattr(self.engine, "profiles", None)
+        if store is None:
+            return json_response({"people": [], "enabled": False})
+        people: list[dict[str, Any]] = []
+        for row in store.list_people(session_id, limit=200):
+            user_id = str(row.get("user_id") or "")
+            view = store.view(session_id, user_id)
+            if view is None:
+                continue
+            people.append(
+                {
+                    "user_id": user_id,
+                    "name": view.name,
+                    "qq_name": view.qq_name,
+                    "affinity": view.affinity,
+                    "level": view.level.name,
+                    "bonds": list(view.affinities),
+                    "claims": [str(item.get("type") or "") for item in view.claims],
+                    "digest": row.get("digest") or "",
+                    "message_count": int(row.get("message_count") or 0),
+                    "last_seen_at": float(row.get("last_seen_at") or 0.0),
+                    "first_seen_at": float(row.get("first_seen_at") or 0.0),
+                    "days": len(
+                        [
+                            item
+                            for item in ((row.get("payload") or {}).get("days") or [])
+                            if str(item)
+                        ]
+                    ),
+                }
+            )
+        return json_response(
+            {
+                "people": people,
+                "enabled": bool(self.engine.world.profile.enabled),
+                "consolidate_enabled": bool(
+                    self.engine.world.profile.consolidate_enabled
+                ),
+                "digest_limit": int(self.engine.world.profile.digest_limit),
+            }
+        )
+
+    async def api_profile_person(self):
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        session_id = self._profile_scope(
+            payload.get("session") or request.query.get("session", "")
+        )
+        user_id = str(payload.get("user_id") or request.query.get("user_id", "") or "")
+        if not session_id or not user_id:
+            return error_response("缺少 session 或 user_id 参数")
+        store = getattr(self.engine, "profiles", None)
+        if store is None:
+            return error_response("画像功能还没就绪")
+        method = str(getattr(request, "method", "") or "").upper()
+        if method == "POST" or str(request.query.get("_method", "")).upper() == "POST":
+            if "note" in payload:
+                store.set_note(session_id, user_id, str(payload.get("note") or ""))
+            call_me = str(payload.get("call_me") or "").strip()
+            call_him = str(payload.get("call_him") or "").strip()
+            if call_me or call_him:
+                result = store.set_call_names(
+                    session_id,
+                    user_id,
+                    call_me=call_me,
+                    call_him=call_him,
+                    explicit=True,
+                )
+                if result.get("rejected"):
+                    reason = result["rejected"][0].get("reason") or "这个称呼不能用"
+                    return error_response(reason)
+            if "digest" in payload:
+                store.set_digest(session_id, user_id, str(payload.get("digest") or ""))
+        return json_response(await self._profile_person_payload(session_id, user_id))
+
+    async def api_profile_fact(self):
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        session_id = self._profile_scope(payload.get("session"))
+        user_id = str(payload.get("user_id") or "")
+        action = str(payload.get("action") or "add")
+        store = getattr(self.engine, "profiles", None)
+        if store is None or not session_id or not user_id:
+            return error_response("缺少参数")
+        db = store.db
+        group_id = store.group_key(session_id)
+        if action == "add":
+            result = store.note_fact(
+                session_id,
+                user_id,
+                text=str(payload.get("text") or ""),
+                kind=str(payload.get("kind") or "other"),
+                evidence=str(payload.get("evidence") or "主人手动加的"),
+                context=str(payload.get("context") or ""),
+                confidence=1.0,
+                status=str(payload.get("status") or "active"),
+                pinned=bool(payload.get("pinned")),
+            )
+            if not result.get("ok"):
+                return error_response(str(result.get("reason") or "没记下来"))
+        elif action == "update":
+            fact_id = int(payload.get("id") or 0)
+            if not fact_id:
+                return error_response("缺少 id")
+            db.update_user_fact(
+                fact_id=fact_id,
+                text=str(payload.get("text")) if "text" in payload else None,
+                kind=str(payload.get("kind")) if "kind" in payload else None,
+                status=str(payload.get("status")) if "status" in payload else None,
+                pinned=bool(payload["pinned"]) if "pinned" in payload else None,
+            )
+        elif action == "delete":
+            db.delete_user_fact(fact_id=int(payload.get("id") or 0))
+        else:
+            return error_response("不认识的操作")
+        return json_response(
+            {
+                "ok": True,
+                "facts": db.list_user_facts(group_id=group_id, user_id=user_id),
+                "person": self.engine.person_payload(session_id, user_id),
+            }
+        )
+
+    async def api_profile_bond(self):
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        session_id = self._profile_scope(payload.get("session"))
+        user_id = str(payload.get("user_id") or "")
+        action = str(payload.get("action") or "note")
+        store = getattr(self.engine, "profiles", None)
+        if store is None or not session_id or not user_id:
+            return error_response("缺少参数")
+        if action == "note":
+            result = store.note_bond(
+                session_id,
+                user_id,
+                type=str(payload.get("type") or ""),
+                evidence=str(payload.get("evidence") or "主人手动设的"),
+                confidence=1.0,
+                asserted_by=str(payload.get("asserted_by") or "她的判断"),
+                policy=str(payload.get("policy") or ""),
+            )
+            if not result.get("ok"):
+                return error_response(str(result.get("reason") or "没记下来"))
+        elif action == "close":
+            store.close_bond(session_id, user_id, bond_id=int(payload.get("id") or 0))
+        elif action == "accept":
+            result = store.accept_claim(
+                session_id,
+                user_id,
+                bond_id=int(payload.get("id") or 0),
+                policy=str(payload.get("policy") or ""),
+            )
+            if not result.get("ok"):
+                return error_response(str(result.get("reason") or "认不下来"))
+        elif action == "delete":
+            store.db.delete_user_bond(bond_id=int(payload.get("id") or 0))
+        else:
+            return error_response("不认识的操作")
+        return json_response(
+            {
+                "ok": True,
+                "person": self.engine.person_payload(session_id, user_id),
+            }
+        )
+
+    async def api_profile_affinity(self):
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        session_id = self._profile_scope(payload.get("session"))
+        user_id = str(payload.get("user_id") or "")
+        store = getattr(self.engine, "profiles", None)
+        if store is None or not session_id or not user_id:
+            return error_response("缺少参数")
+        if "value" in payload:
+            row = store.profile(session_id, user_id)
+            before = float((row or {}).get("affinity") or 0.0)
+            delta = float(payload.get("value") or 0.0) - before
+        else:
+            delta = float(payload.get("delta") or 0.0)
+        result = store.adjust_affinity(
+            session_id,
+            user_id,
+            delta,
+            reason=str(payload.get("reason") or "主人调的"),
+            source="manual",
+        )
+        if not result.get("ok"):
+            return error_response(str(result.get("reason") or "没改成"))
+        return json_response(
+            {
+                "ok": True,
+                "affinity": result.get("value"),
+                "person": self.engine.person_payload(session_id, user_id),
+            }
+        )
+
+    async def api_profile_grudge(self):
+        """通讯录里手动管她记着的账：加一笔 / 算了 / 删掉。"""
+
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        session_id = self._profile_scope(payload.get("session"))
+        user_id = str(payload.get("user_id") or "")
+        action = str(payload.get("action") or "add")
+        if not session_id or not user_id:
+            return error_response("缺少参数")
+        async with self.engine.session_state(session_id) as state:
+            if action == "add":
+                reason = str(payload.get("reason") or payload.get("text") or "").strip()
+                if not reason:
+                    return error_response("写一句她记着的事")
+                ok = self.engine.note_grudge(
+                    state,
+                    reason,
+                    user_id=user_id,
+                    session_id=session_id,
+                    # 手动加的不吃"每天最多一笔"那道闸（那是拦模型的）
+                    force=True,
+                )
+                if not ok:
+                    return error_response("这笔账没能记下来（记仇关着吗？）")
+            elif action == "resolve":
+                self.engine.resolve_grudge(state, user_id=user_id)
+            elif action == "delete":
+                state.grudges = [
+                    item
+                    for item in (state.grudges or [])
+                    if not (
+                        isinstance(item, dict)
+                        and str(item.get("user_id") or "") == user_id
+                    )
+                ]
+            else:
+                return error_response("不认识的操作")
+        return json_response(await self._profile_person_payload(session_id, user_id))
+
+    async def api_profile_forget(self):
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        session_id = self._profile_scope(payload.get("session"))
+        user_id = str(payload.get("user_id") or "")
+        store = getattr(self.engine, "profiles", None)
+        if store is None or not session_id or not user_id:
+            return error_response("缺少参数")
+        removed = store.db.delete_user_profile(
+            group_id=store.group_key(session_id), user_id=user_id
+        )
+        return json_response({"ok": True, "removed": removed})
+
+    async def api_profile_consolidate(self):
+        """立刻整理一次（编辑器上的"现在整理一次"）：消化这段时间的经历。"""
+
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        session_id = self._profile_scope(payload.get("session"))
+        if not session_id:
+            return error_response("缺少 session 参数")
+        mode = str(payload.get("mode") or "full")
+        dry_run = bool(payload.get("dry_run"))
+        state_key = self.engine.state_key(session_id)
+        async with self.engine.session_state(state_key) as state:
+            result = await self.engine.consolidate_now(
+                state, mode=mode, dry_run=dry_run
+            )
+        if result is None:
+            return error_response("整理没跑起来：先确认「睡眠整理模型」可用")
+        if not result.get("ok"):
+            return json_response({"ok": False, "note": result.get("note") or "没整理出东西"})
+        return json_response(result)
+
+    async def api_events(self):
+        """事件系统概览：能力值、未了的事、最近的线索。"""
+
+        guard = self._guard()
+        if guard is not None:
+            return guard
+        session_id = str(request.query.get("session", "") or "")
+        if not session_id:
+            return error_response("缺少 session 参数")
+        session_id = self._scope(session_id)
+        overview = await self.engine.event_overview(session_id)
+        return json_response(overview)
+
+    async def api_persona_source(self):
+        """编辑器「从 AstrBot 导入」用：把 AstrBot 给这个会话的人设读出来。
+
+        插件默认就是用它（``world.persona.mode = astrbot``）；这里只是给个入口，
+        让用户能把手上那份人格一键抄进配置里，从此跟着预设走。
+        """
+
+        guard = self._guard()
+        if guard is not None:
+            return guard
+        session_id = self._scope(request.query.get("session", ""))
+        persona = getattr(self, "persona_port", None)
+        if persona is None or not hasattr(persona, "astrbot_persona_text"):
+            return error_response("人设通道还没就绪")
+        text = await persona.astrbot_persona_text(session_id)
+        return json_response(
+            {
+                "session": session_id,
+                "text": text,
+                "chars": len(text),
+                "mode": str(getattr(self.engine.world.persona, "mode", "astrbot")),
+            }
+        )
+
+    async def api_persona_brief(self):
+        """简易人设：按人格缓存。POST 时 ``generate=true`` 表示用模型从主人设生成。"""
+
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        session_id = str(
+            payload.get("session") or request.query.get("session", "") or ""
+        )
+        if not session_id:
+            return error_response("缺少 session 参数")
+        if request.method == "POST" or str(request.query.get("_method", "")).upper() == "POST":
+            if payload.get("generate"):
+                # 编辑器刚改过、还没保存的角色卡优先：向导里写完人设就点生成时，
+                # 读配置只会拿到旧那份。
+                brief = await self.engine.generate_persona_brief(
+                    session_id, persona_text=str(payload.get("persona") or "")
+                )
+                if not brief:
+                    return error_response(
+                        "生成失败：先确认「生成器模型」可用，而且这个会话能读到人设"
+                    )
+            else:
+                await self.engine.save_persona_brief(
+                    session_id, str(payload.get("brief") or "")
+                )
+            state = await self.engine.persona_brief_state(session_id)
+            return json_response({"ok": True, "persona_brief": state})
+        return json_response({"persona_brief": await self.engine.persona_brief_state(session_id)})
+
+    def _voice_sample_payload(self) -> dict[str, Any]:
+        persona = self.engine.world.persona
+        return {
+            "samples": self.engine.persona_samples(),
+            "candidates": [
+                dict(item)
+                for item in list(getattr(persona, "sample_candidates", None) or [])
+                if isinstance(item, dict) and str(item.get("text") or "").strip()
+            ],
+            "scenes": [
+                {"id": key, "label": label}
+                for key, label in self.engine.prompts.VOICE_SCENES
+            ],
+            "per_turn": int(getattr(persona, "samples_per_turn", 3) or 3),
+            "max": int(getattr(persona, "samples_max", 12) or 12),
+            "candidates_max": int(getattr(persona, "candidates_max", 80) or 80),
+        }
+
+    async def api_voice_samples(self):
+        """看样例库 + 可用的场景清单。"""
+
+        guard = self._guard()
+        if guard is not None:
+            return guard
+        return json_response(self._voice_sample_payload())
+
+    async def api_voice_samples_generate(self):
+        """让内容生成模型按场景出候选（草稿，不落库）。"""
+
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        session_id = self._scope(payload.get("session"))
+        if not session_id:
+            return error_response("缺少 session（要拿它的角色卡去生成）")
+        scenes = payload.get("scenes")
+        picked = [str(item) for item in scenes] if isinstance(scenes, list) else None
+        result = await self.engine.generate_voice_samples(
+            session_id, picked, persona_text=str(payload.get("persona") or "")
+        )
+        if not result.get("ok"):
+            return error_response(str(result.get("reason") or "生成失败"))
+        return json_response({**result, **{"scenes_meta": self._voice_sample_payload()["scenes"]}})
+
+    async def api_voice_samples_from_chat(self):
+        """从近期聊天留档里挑她说过、而且被接住了的话，当样例候选（不落库）。"""
+
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        session_id = self._scope(payload.get("session"))
+        if not session_id:
+            return error_response("缺少 session")
+        try:
+            limit = max(1, min(40, int(payload.get("limit") or 12)))
+        except (TypeError, ValueError):
+            limit = 12
+        async with self.engine.session_state(session_id) as state:
+            found = self.engine.voice_sample_candidates_from_chat(state, limit=limit)
+        return json_response(
+            {"ok": True, "candidates": found, "note": "" if found else "这段时间没挑出合适的"}
+        )
+
+    async def api_voice_samples_save(self):
+        """把挑中的样例写进世界配置（落库前先留一份历史）。"""
+
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        raw_samples = payload.get("samples")
+        if not isinstance(raw_samples, list):
+            return error_response("samples 必须是数组")
+        persona = self.engine.world.persona
+        limit = max(1, int(getattr(persona, "samples_max", 12) or 12))
+        candidates_limit = max(1, int(getattr(persona, "candidates_max", 80) or 80))
+        cleaned: list[dict[str, Any]] = []
+        for index, item in enumerate(raw_samples):
+            if not isinstance(item, dict):
+                continue
+            text = " ".join(str(item.get("text") or "").split())
+            if not text:
+                continue
+            cleaned.append(
+                {
+                    "id": str(item.get("id") or f"s{index + 1}"),
+                    "scene": str(item.get("scene") or ""),
+                    "label": str(item.get("label") or ""),
+                    "move": " ".join(str(item.get("move") or "").split())[:20],
+                    "text": text[:120],
+                    "source": str(item.get("source") or "model"),
+                }
+            )
+        if len(cleaned) > limit:
+            return error_response(f"最多留 {limit} 条，先删掉几条再存")
+        # 候选池：可选一起存。攒着不动，只有「采用」才会挪进上面的样例库
+        raw_candidates = payload.get("candidates")
+        candidates: list[dict[str, Any]] | None = None
+        if isinstance(raw_candidates, list):
+            candidates = []
+            for index, item in enumerate(raw_candidates):
+                if not isinstance(item, dict):
+                    continue
+                text = " ".join(str(item.get("text") or "").split())
+                if not text:
+                    continue
+                candidates.append(
+                    {
+                        "id": str(item.get("id") or f"c{index + 1}"),
+                        "scene": str(item.get("scene") or ""),
+                        "label": str(item.get("label") or ""),
+                        "move": " ".join(str(item.get("move") or "").split())[:20],
+                        "text": text[:120],
+                        "context": " ".join(str(item.get("context") or "").split())[:60],
+                        "source": str(item.get("source") or "model"),
+                    }
+                )
+            candidates = candidates[-candidates_limit:]
+        world = self.store.raw_world()
+        persona_raw = dict(world.get("persona") or {})
+        persona_raw["samples"] = cleaned
+        if candidates is not None:
+            persona_raw["sample_candidates"] = candidates
+        if payload.get("per_turn") is not None:
+            try:
+                persona_raw["samples_per_turn"] = max(1, min(6, int(payload["per_turn"])))
+            except (TypeError, ValueError):
+                pass
+        world["persona"] = persona_raw
+        warnings = self.store.save_world(world, reason="改动声音样例")
+        self.engine.reload_config()
+        return json_response({"ok": True, "warnings": warnings, **self._voice_sample_payload()})
+
+    async def api_eval_run(self):
+        """把剧本并发跑一遍：带着完整提示词，收集她的真实回复（不写任何状态）。"""
+
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        session_id = self._scope(payload.get("session"))
+        if not session_id:
+            return error_response("缺少 session")
+        rounds = payload.get("rounds")
+        if not isinstance(rounds, list) or not rounds:
+            return error_response("缺少 rounds（要按剧本跑的问题）")
+        if len(rounds) > 30:
+            return error_response("一次最多跑 30 轮")
+        try:
+            concurrency = int(payload.get("concurrency") or 3)
+        except (TypeError, ValueError):
+            concurrency = 3
+        provider_id = str(payload.get("provider_id") or "").strip()
+        llm = AstrBotLLM(self, provider_id or self.llm_provider_id, sampling=self.sampling_params())
+        director_id = str(payload.get("director_provider_id") or "").strip()
+        result = await self.engine.run_eval(
+            session_id,
+            [dict(item) for item in rounds if isinstance(item, dict)],
+            llm=llm,
+            concurrency=concurrency,
+            variant=str(payload.get("variant") or "full"),
+            director_llm=AstrBotLLM(
+                self,
+                director_id or self.judge_provider_id,
+                sampling=self.sampling_params(),
+            ),
+        )
+        if not result.get("ok"):
+            return error_response(str(result.get("reason") or "跑失败"))
+        return json_response(result)
+
+    async def api_eval_script(self):
+        """生成测评剧本：同一个剧本拿去跑不同模型，比"谁更像她"。"""
+
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        session_id = self._scope(payload.get("session"))
+        if not session_id:
+            return error_response("缺少 session")
+        try:
+            rounds = int(payload.get("rounds") or 20)
+        except (TypeError, ValueError):
+            rounds = 20
+        result = await self.engine.generate_eval_script(session_id, rounds)
+        if not result.get("ok"):
+            return error_response(str(result.get("reason") or "生成失败"))
+        return json_response(result)
+
+    async def api_persona_review(self):
+        """体检人设：返回问题清单 + 可逐条采纳的改动（**不落库**）。"""
+
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        session_id = self._scope(payload.get("session"))
+        if not session_id:
+            return error_response("缺少 session")
+        result = await self.engine.review_persona(session_id)
+        if not result.get("ok"):
+            return error_response(str(result.get("reason") or "体检失败"))
+        return json_response(result)
+
+    async def api_persona_apply(self):
+        """把挑中的改动写进角色卡（写前自动留一份历史）。"""
+
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        rewrites = payload.get("rewrite") if isinstance(payload.get("rewrite"), list) else []
+        adds = payload.get("add") if isinstance(payload.get("add"), list) else []
+        result = self.engine.apply_persona_changes(rewrites, adds)
+        if not result.get("ok"):
+            return error_response(str(result.get("reason") or "应用失败"))
+        return json_response(result)
 
     def _guard(self, payload: dict[str, Any] | None = None) -> Any:
         """统一鉴权：返回错误响应或 None。"""
@@ -3092,6 +5298,39 @@ class VirtualWorldPlugin(Star):
         if self.auth.check(token):
             return None
         return error_response("需要先登录编辑器", status_code=401)
+
+    def _scope(self, value: Any) -> str:
+        """编辑器里选的可能是会话，也可能是会话组。
+
+        会话组要落到它的代表会话上（她的状态、日志、日程都挂在那儿）。
+        """
+
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return text
+        try:
+            return engine.scope_session(text)
+        except Exception:
+            return text
+
+    def _memory_sessions(self, value: Any) -> list[str]:
+        """记忆按会话各存一份；查的时候把同组的会话一起当条件。
+
+        编辑器里可能选的是会话组：那就展开成组里的所有会话。
+        """
+
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            text = str(value or "").strip()
+            return [text] if text else []
+        try:
+            return engine.group_sessions(self._scope(value))
+        except Exception:
+            text = str(value or "").strip()
+            return [text] if text else []
 
     async def api_auth_status(self):
         return json_response(
@@ -3169,12 +5408,34 @@ class VirtualWorldPlugin(Star):
                 "schedules": schedules,
                 "sessions": sessions,
                 "warnings": self.engine.load_warnings,
+                # 模型槽位当前用的是哪个（向导里做"模型配了吗"的检查用；只有 id，没有 key）
+                "providers": self._provider_slots(),
                 # 图片转述缓存的使用情况（编辑器里显示"省了多少次识别"）
                 "vision_cache": await self._vision_cache_stats(),
                 # 当前天气：地图页顶部横幅直接用它
                 "weather": await self.engine.weather_payload(),
             }
         )
+
+    def _provider_slots(self) -> dict[str, str]:
+        """六个模型槽位现在指向哪个 Provider（只给 id，不含 key）。
+
+        向导里要能一眼看出"哪个槽位还没配"——这些槽位在 AstrBot 的插件配置里，
+        编辑器本身改不了，所以只做展示 + 告诉用户去哪配。
+        """
+
+        def show(value: str) -> str:
+            return str(value or "").strip()
+
+        return {
+            "llm": show(self.llm_provider_id) or "（跟会话默认）",
+            "helper": show(self.helper_provider_id) or "（跟看图模型）",
+            "judge": show(self.judge_provider_id) or "（跟打杂模型）",
+            "vision": show(self.vision_provider_id) or "（不转述图片）",
+            "creator": show(self.creator_provider_id) or "（跟插件用模型）",
+            "event": show(self.event_provider_id) or "（跟打杂模型）",
+            "consolidate": show(self.consolidate_provider_id) or "（跟打杂模型）",
+        }
 
     async def _vision_cache_stats(self) -> dict[str, Any]:
         try:
@@ -3193,7 +5454,10 @@ class VirtualWorldPlugin(Star):
         world = payload.get("world")
         if not isinstance(world, dict):
             return error_response("world 必须是对象")
-        warnings = self.store.save_world(world)
+        try:
+            warnings = self.store.save_world(world)
+        except ValidationError as exc:
+            return self._save_error("世界配置", exc)
         self.engine.reload_config()
         return json_response({"ok": True, "warnings": warnings})
 
@@ -3208,7 +5472,10 @@ class VirtualWorldPlugin(Star):
         # 工具 / 指令型步骤缺「想干什么」时，让内容生成模型补一句写进配置：
         # 运行时就不用再猜，也不会因为缺意图被跳过。
         schedules, filled = await self.engine.fill_schedule_intents(schedules)
-        warnings = self.store.save_schedules(schedules)
+        try:
+            warnings = self.store.save_schedules(schedules)
+        except ValidationError as exc:
+            return self._save_error("日程", exc)
         self.engine.reload_config()
         return json_response(
             {"ok": True, "warnings": warnings, "filled": filled, "schedules": schedules}
@@ -3222,9 +5489,30 @@ class VirtualWorldPlugin(Star):
         sessions = payload.get("sessions")
         if not isinstance(sessions, dict):
             return error_response("sessions 必须是对象")
-        warnings = self.store.save_sessions(sessions)
+        try:
+            warnings = self.store.save_sessions(sessions)
+        except ValidationError as exc:
+            return self._save_error("会话列表", exc)
         self.engine.reload_config()
         return json_response({"ok": True, "warnings": warnings})
+
+    @staticmethod
+    def _save_error(label: str, exc: Exception):
+        """保存没过校验：给一句人话 + 具体是哪一项，别把英文校验串直接丢给用户。"""
+
+        problems: list[str] = []
+        try:
+            for item in exc.errors():  # type: ignore[attr-defined]
+                where = " / ".join(str(part) for part in (item.get("loc") or []))
+                message = str(item.get("msg") or "").strip()
+                problems.append(f"{where}：{message}" if where else message)
+        except Exception:
+            problems = []
+        detail = "；".join(part for part in problems if part)[:500]
+        return error_response(
+            f"{label}没通过校验，这次没有保存（改动还在编辑器里，改完再存一次）。"
+            + (f"\n{detail}" if detail else f"\n{exc}")
+        )
 
     async def api_generate_actions(self):
         """批量生成动作草稿（只返回草稿，用户在编辑器里勾选后才保存）。
@@ -3311,7 +5599,7 @@ class VirtualWorldPlugin(Star):
         guard = self._guard()
         if guard is not None:
             return guard
-        session_id = request.query.get("session", "") or ""
+        session_id = self._scope(request.query.get("session", ""))
         if not session_id:
             return error_response("缺少 session 参数")
         snapshot = await self.engine.snapshot(session_id)
@@ -3329,7 +5617,7 @@ class VirtualWorldPlugin(Star):
             # 天气本身不分会话，但「查天气」配成指令型时要借一条真实消息当上下文，
             # 所以前端选中的那条会话优先，没带就按白名单第一条
             note = await self.engine.maybe_refresh_weather(
-                force=True, session_id=str(payload.get("session") or "")
+                force=True, session_id=self._scope(payload.get("session"))
             )
             return json_response(
                 {
@@ -3338,7 +5626,7 @@ class VirtualWorldPlugin(Star):
                     "weather": await self.engine.weather_payload(),
                 }
             )
-        session_id = str(payload.get("session", "") or "")
+        session_id = self._scope(payload.get("session"))
         if not session_id:
             return error_response("缺少 session")
         if action == "wake":
@@ -3367,24 +5655,84 @@ class VirtualWorldPlugin(Star):
             name = str(payload.get("tool") or "").strip()
             cleared = self.engine.reset_tool_breakers(name)
             return json_response({"ok": True, "cleared": cleared})
-        if action == "tick":
-            # 她正忙（检索/动作/模型调用占着会话）时**直接跳过这一次**：
-            # 不能排队——不然连点几下，等她忙完会一口气推进好几个 tick
+        if action == "event":
+            # 编辑器上「给她来件事」：等于用户投递一个事件
+            note = await self.engine.submit_event(
+                session_id, str(payload.get("text") or "")
+            )
+            return json_response(
+                {
+                    "ok": True,
+                    "note": note,
+                    "events": await self.engine.event_overview(session_id),
+                }
+            )
+        if action in ("advance_event", "close_event"):
+            # 编辑器上「立即推进一幕」/「立刻完结」：手动改事件节奏
             if self.engine.is_busy(session_id):
                 return json_response(
-                    {
-                        "ok": False,
-                        "note": "她正在忙（动作或检索还没结束），这次推进已跳过",
-                    }
+                    {"ok": False, "note": "她正在忙（动作或检索还没结束），等这一轮跑完再点"}
                 )
+            thread_id = str(payload.get("thread") or "")
+            handler = (
+                self.engine.advance_thread
+                if action == "advance_event"
+                else self.engine.close_thread
+            )
             try:
-                outcomes = await asyncio.wait_for(
-                    self.engine.tick(), timeout=STATE_ACTION_TIMEOUT
+                note = await asyncio.wait_for(
+                    handler(session_id, thread_id), timeout=STATE_ACTION_TIMEOUT
                 )
             except asyncio.TimeoutError:
                 return json_response(
-                    {"ok": False, "note": "她正在检索或调模型，稍等一下再点"}
+                    {"ok": False, "note": "这件事还在演（模型还没回），稍等一下再看"}
                 )
+            return json_response(
+                {
+                    "ok": True,
+                    "note": note,
+                    "events": await self.engine.event_overview(session_id),
+                }
+            )
+        if action == "tick":
+            # 连点几下不能攒成一串 tick：同一会话同一时刻只放行一次推进，
+            # 后来的这几次直接忽略（前端也有同样的防护，这里是兜底）。
+            # 推进是**全局**的（一次 tick 走所有会话），所以别按会话判重。
+            if self._advancing:
+                return json_response(
+                    {"ok": False, "note": "上一次推进还在跑，这次点击已忽略"}
+                )
+            self._advancing.add(session_id)
+            tick_task = asyncio.ensure_future(self.engine.tick())
+
+            def _tick_done(task: asyncio.Task) -> None:
+                self._advancing.discard(session_id)
+                if task.cancelled():
+                    return
+                error = task.exception()
+                if error is not None:
+                    self.logger.warning(f"[virtual_world] 推进 tick 失败：{error}")
+
+            tick_task.add_done_callback(_tick_done)
+            try:
+                # 她正在调模型（例如刚走到新地点要就地决定）时不会直接失败，
+                # 而是等这一轮跑完再推进——这段时间本来就该发生一个 tick。
+                # 用 shield：等不到就把它留在后台跑完，**不中途取消**
+                # （取消会把这一轮砍在半路，日志和状态都会变得莫名其妙）。
+                await asyncio.wait_for(
+                    asyncio.shield(tick_task), timeout=STATE_TICK_WAIT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                return json_response(
+                    {
+                        "ok": False,
+                        "note": "这一轮还在跑（她在调模型或检索），没有打断它；"
+                        "过几秒刷新状态页就能看到结果",
+                    }
+                )
+            except Exception as exc:
+                return json_response({"ok": False, "note": f"推进失败：{exc}"})
+            outcomes = tick_task.result()
             return json_response(
                 {
                     "ok": True,
@@ -3495,7 +5843,7 @@ class VirtualWorldPlugin(Star):
         guard = self._guard()
         if guard is not None:
             return guard
-        session_id = request.query.get("session", "") or ""
+        session_id = self._scope(request.query.get("session", ""))
         limit = min(1000, max(1, request.query.get("limit", 200, type=int) or 200))
         event_type = request.query.get("type", "") or ""
         keyword = request.query.get("q", "") or ""
@@ -3521,7 +5869,7 @@ class VirtualWorldPlugin(Star):
         guard = self._guard()
         if guard is not None:
             return guard
-        session_id = request.query.get("session", "") or ""
+        session_id = self._scope(request.query.get("session", ""))
         limit = min(5000, max(1, request.query.get("limit", 2000, type=int) or 2000))
         events = await self.db.call(
             "query_events", session_id=session_id or None, limit=limit
@@ -3542,14 +5890,15 @@ class VirtualWorldPlugin(Star):
         guard = self._guard()
         if guard is not None:
             return guard
-        session_id = request.query.get("session", "") or None
+        # 记忆按会话各存一份，但会话组要一起看（组里几个群共用同一段经历）
+        session_ids = self._memory_sessions(request.query.get("session", ""))
         node_id = request.query.get("node_id", "") or None
         memory_type = request.query.get("type", "") or None
         scope = request.query.get("scope", "") or None
         keyword = request.query.get("q", "") or ""
         rows = await self.db.call(
             "query_memories",
-            session_id=session_id,
+            session_ids=session_ids or None,
             node_id=node_id,
             memory_type=memory_type,
             scope=scope,
@@ -3564,7 +5913,7 @@ class VirtualWorldPlugin(Star):
         guard = self._guard(payload)
         if guard is not None:
             return guard
-        session_id = str(payload.get("session_id", "") or "")
+        session_id = self._scope(payload.get("session_id"))
         content = str(payload.get("content", "") or "").strip()
         if not session_id or not content:
             return error_response("缺少 session_id 或 content")
@@ -3631,8 +5980,14 @@ class VirtualWorldPlugin(Star):
         guard = self._guard(payload)
         if guard is not None:
             return guard
-        session_id = str(payload.get("session", "") or "")
-        removed = await self.db.call("clear_memories", session_id or None)
+        # 记忆按会话各存一份：选了会话组就把组里每个会话的都清掉
+        sessions = self._memory_sessions(payload.get("session"))
+        if sessions:
+            removed = 0
+            for item in sessions:
+                removed += int(await self.db.call("clear_memories", item) or 0)
+        else:
+            removed = int(await self.db.call("clear_memories", None) or 0)
         return json_response({"ok": True, "removed": removed})
 
     async def api_logs_delete_batch(self):
@@ -3653,7 +6008,7 @@ class VirtualWorldPlugin(Star):
         guard = self._guard(payload)
         if guard is not None:
             return guard
-        session_id = str(payload.get("session", "") or "")
+        session_id = self._scope(payload.get("session"))
         removed = await self.db.call("clear_events", session_id or None)
         return json_response({"ok": True, "removed": removed})
 
@@ -3662,7 +6017,10 @@ class VirtualWorldPlugin(Star):
         if guard is not None:
             return guard
         session_id = request.query.get("session", "") or None
-        stats = await self.db.call("memory_stats", session_id)
+        stats = await self.db.call(
+            "memory_stats",
+            session_ids=self._memory_sessions(session_id) or None,
+        )
         return json_response(stats)
 
     async def api_memory_export(self):
@@ -3712,6 +6070,7 @@ class VirtualWorldPlugin(Star):
         mode = request.query.get("mode", "inject") or "inject"
         if not session_id:
             return error_response("缺少 session 参数")
+        session_id = self._scope(session_id)
         if mode == "autonomous":
             text = await self.engine.preview_autonomous_prompt(session_id)
         else:
@@ -3722,12 +6081,16 @@ class VirtualWorldPlugin(Star):
                 "chars": len(text),
                 # 分段索引：编辑器里直接显示，避免"某一段是不是没进去"只能靠肉眼找
                 "sections": prompt_section_index(text),
+                # 状态槽：调试页要能看出"槽里有东西但没进提示词"（过期了）这种情形
+                "state_slots": await self.engine.preview_state_slots(session_id),
+                # 这一轮抽到哪几条声音样例：提示词两万字，不点出来根本找不着
+                "voice_samples": await self.engine.preview_voice_samples(session_id),
             }
         )
 
     # ---------------- 预设：成套的世界配置 ----------------
 
-    async def api_history(self):
+    async def api_state_history(self):
         """数值历史：给编辑器画「她最近过得怎么样」。"""
 
         guard = self._guard()
@@ -3736,6 +6099,7 @@ class VirtualWorldPlugin(Star):
         session_id = request.query.get("session", "") or ""
         if not session_id:
             return error_response("缺少 session 参数")
+        session_id = self._scope(session_id)
         try:
             hours = int(request.query.get("hours", 24) or 24)
         except (TypeError, ValueError):
@@ -3764,9 +6128,13 @@ class VirtualWorldPlugin(Star):
         return json_response(
             {
                 "actions": actions,
+                # 配置字段的中文说明：滑块明细和旧默认值提醒都用它，
+                # 免得同一份字段名要在前端再抄一遍。
+                "field_labels": dict(FIELD_LABELS),
                 "captions": {
                     "look": DEFAULT_CAPTION_PROMPT,
                     "relation": DEFAULT_CAPTION_RELATION_PROMPT,
+                    "forward": DEFAULT_FORWARD_PROMPT,
                 },
             }
         )
@@ -3791,15 +6159,32 @@ class VirtualWorldPlugin(Star):
         if not preset_id:
             return error_response("预设 id 不能为空")
         try:
-            path = self.store.save_preset(
+            path, warnings = self.store.save_preset(
                 preset_id,
                 name=str(payload.get("name") or "").strip(),
                 note=str(payload.get("note") or "").strip(),
             )
         except Exception as exc:
             return error_response(f"保存预设失败：{exc}")
-        self.store.set_active_preset(path.stem)
-        return json_response({"ok": True, "id": path.stem})
+        return json_response({"ok": True, "id": path.stem, "warnings": warnings})
+
+    async def api_preset_new_default(self):
+        """用内置的默认世界新建一份预设（不动当前配置）。"""
+
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        preset_id = str(payload.get("id") or "").strip() or "default_world"
+        try:
+            clean, warnings = self.store.new_default_preset(
+                preset_id,
+                name=str(payload.get("name") or "").strip(),
+                note=str(payload.get("note") or "").strip(),
+            )
+        except Exception as exc:
+            return error_response(str(exc))
+        return json_response({"ok": True, "id": clean, "warnings": warnings})
 
     async def api_preset_apply(self):
         payload = await request.json(default={}) or {}
@@ -3809,19 +6194,31 @@ class VirtualWorldPlugin(Star):
         preset_id = str(payload.get("id") or "").strip()
         if not preset_id:
             return error_response("缺少预设 id")
-        clear_state = bool(payload.get("clear_state", True))
+        blocks = payload.get("blocks")
+        if blocks is not None and not isinstance(blocks, list):
+            return error_response("blocks 必须是数组")
+        # 默认**不清状态**：切预设本来只想换世界，上下文留着更符合直觉
+        clear_state = bool(payload.get("clear_state", False))
         try:
-            result = self.store.apply_preset(preset_id)
+            result = self.store.apply_preset(preset_id, blocks=blocks)
         except Exception as exc:
             return error_response(f"应用预设失败：{exc}")
         warnings = list(result.get("warnings") or [])
         warnings.extend(self.engine.reload_config())
-        cleared = await self.engine.clear_all_states() if clear_state else 0
+        repairs: list[str] = []
+        if clear_state:
+            cleared = await self.engine.clear_all_states()
+        else:
+            cleared = 0
+            # 不清状态就得把状态修一遍：地图/动作换过之后，旧的地点与计划可能已经不存在
+            repairs = await self.engine.repair_states_after_config_change()
         return json_response(
             {
                 "ok": True,
                 "id": preset_id,
+                "blocks": list(result.get("blocks") or []),
                 "cleared_sessions": cleared,
+                "repairs": repairs,
                 "warnings": warnings,
             }
         )
@@ -3893,6 +6290,71 @@ class VirtualWorldPlugin(Star):
         path = self.store.backup(str(payload.get("tag", "") or ""))
         return json_response({"ok": True, "file": path.name})
 
+    # ---------------- 改动历史 ----------------
+
+    async def api_history(self):
+        """改动历史列表（新的在前）。"""
+
+        guard = self._guard()
+        if guard is not None:
+            return guard
+        return json_response(
+            {
+                "items": self.store.list_history(),
+                "keep": HISTORY_KEEP,
+            }
+        )
+
+    async def api_history_item(self):
+        """一条历史：快照内容 + 当前配置 + 逐块差异（前端据此画左右对比）。"""
+
+        guard = self._guard()
+        if guard is not None:
+            return guard
+        snapshot_id = request.query.get("id", "") or ""
+        if not snapshot_id:
+            return error_response("缺少 id")
+        try:
+            return json_response(self.store.read_history(snapshot_id))
+        except Exception as exc:
+            return error_response(str(exc))
+
+    async def api_history_restore(self):
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        snapshot_id = str(payload.get("id") or "").strip()
+        if not snapshot_id:
+            return error_response("缺少 id")
+        blocks = payload.get("blocks")
+        picked = (
+            [str(item) for item in blocks] if isinstance(blocks, list) else None
+        )
+        try:
+            result = self.store.restore_history(snapshot_id, blocks=picked)
+        except Exception as exc:
+            return error_response(f"恢复失败：{exc}")
+        self.engine.reload_config()
+        return json_response({"ok": True, **result})
+
+    async def api_history_delete(self):
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        snapshot_id = str(payload.get("id") or "").strip()
+        if not snapshot_id:
+            return error_response("缺少 id")
+        return json_response({"ok": self.store.delete_history(snapshot_id)})
+
+    async def api_history_clear(self):
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        return json_response({"ok": True, "removed": self.store.clear_history()})
+
 
 # ======================================================================
 # 小工具
@@ -3908,6 +6370,10 @@ def _help_text(pronoun: str = "她") -> str:
         f"· /vw recall <话题>     让{pronoun}回忆某个话题\n"
         f"· /vw memory            看看{pronoun}记得你什么\n"
         f"· /vw forget me [话题]  让{pronoun}忘记关于你的记忆\n"
+        f"· /vw event <一句话>   给她安排一件会发生的事（看她怎么处理）\n"
+        f"· /vw event list       看最近的事件线索\n"
+        f"· /vw ability          看{pronoun}的本事（能力值，管理员）\n"
+        f"· /vw thread           看{pronoun}手头没完的事（管理员）\n"
         "· /vw schedule          查看日程\n"
         "· /vw schedule run <id> 立刻跑一遍某条日程（管理员）\n"
         "· /vw map               查看地图\n"

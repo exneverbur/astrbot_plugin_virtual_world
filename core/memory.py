@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .db import Database
@@ -43,6 +43,14 @@ _INTENSE_WORDS: dict[str, float] = {
     "重要": 0.12, "第一次": 0.12, "约定": 0.12, "承诺": 0.14, "对不起": 0.14,
     "谢谢": 0.10, "安慰": 0.14, "陪我": 0.14, "别走": 0.22, "秘密": 0.16,
 }
+
+def _one_line(value: Any, limit: int = 120) -> str:
+    """压成一行（提示词里不能出现换行）。"""
+
+    text = " ".join(str(value or "").split())
+    limit = max(1, int(limit))
+    return text if len(text) <= limit else text[:limit] + "…"
+
 
 def emotional_weight(
     base: float,
@@ -97,20 +105,55 @@ class RecalledMemory:
     created_at: float = 0.0
     """写入时间（unix 秒）。提示词里会带上日期，所以它必须跟着召回结果一起走。"""
 
+    tier: str = "raw"
+    """``raw`` = 原始片段；``gist`` = 睡眠整理压出来的要点。"""
+
+    context: str = ""
+    """当时的原话片段（折叠之后正文只剩要点，靠它保留"她当时是怎么说的"）。"""
+
+    participants: list[str] = field(default_factory=list)
+    """这件事有谁在场（含说话人；一条记忆可以有多个人）。"""
+
     def render(self, *, stamp: str = "") -> str:
         """渲染成提示词里的一行；``stamp`` 是日期标签，例如 ``09-11``。"""
 
         prefix = f"[{stamp}] " if stamp else ""
         suffix = f"（{self.emotion}）" if self.emotion else ""
-        return f"- {prefix}{self.content}{suffix}"
+        detail = ""
+        if self.tier == "gist" and self.context:
+            # 要点 + 当时那句原话：她记得住结论，也说得清细节
+            detail = f"｜当时：{_one_line(self.context, 80)}"
+        return f"- {prefix}{self.content}{suffix}{detail}"
 
 
 class MemoryEngine:
     """记忆的创建、召回、衰减与用户控制。"""
 
-    def __init__(self, db: Database, world: WorldConfig | None = None) -> None:
+    def __init__(
+        self,
+        db: Database,
+        world: WorldConfig | None = None,
+        *,
+        sessions_of: Any = None,
+    ) -> None:
         self.db = db
         self.world = world
+        # 「查的时候看哪些会话」的换算：记忆**按会话各存一份**（这样以后改组
+        # 也不会把记忆挂在错的地方），但召回时把同组的会话一起当条件。
+        self._sessions_of = sessions_of
+
+    def sessions(self, session_id: str) -> list[str]:
+        """召回时要一起看的会话（会话组 = 组里所有会话）。"""
+
+        text = str(session_id or "")
+        if callable(self._sessions_of):
+            try:
+                items = [str(item) for item in (self._sessions_of(text) or []) if str(item)]
+            except Exception:
+                items = []
+            if items:
+                return items
+        return [text] if text else []
 
     def set_world(self, world: WorldConfig) -> None:
         self.world = world
@@ -133,6 +176,12 @@ class MemoryEngine:
         conflict_policy: str | None = None,
         affect: float = 0.0,
         valence: float = 0.5,
+        tier: str = "raw",
+        context: str = "",
+        participants: list[str] | None = None,
+        keywords: list[str] | None = None,
+        next_review_at: float = 0.0,
+        pinned: bool = False,
     ) -> int | None:
         """写入一条记忆。返回记忆 id；因冲突被跳过时返回 None。
 
@@ -178,6 +227,12 @@ class MemoryEngine:
             emotion=emotion,
             weight=max(0.0, min(1.0, float(weight))),
             source=source,
+            tier=str(tier or "raw"),
+            context=str(context or ""),
+            participants=[str(item) for item in (participants or related_users or [])],
+            keywords=[str(item) for item in (keywords or [])],
+            next_review_at=float(next_review_at or 0.0),
+            pinned=bool(pinned),
         )
 
     def _find_conflict(
@@ -236,6 +291,7 @@ class MemoryEngine:
 
         mode = mode or (self.world.memory_scope_mode if self.world else SCOPE_GROUP_PERSONA)
         now = now if now is not None else time.time()
+        wanted_sessions = self.sessions(session_id)
         wanted_nodes = [str(item) for item in (nodes or []) if str(item)]
         if node_id and node_id not in wanted_nodes:
             wanted_nodes.append(node_id)
@@ -246,6 +302,7 @@ class MemoryEngine:
             node_id,
             nodes=wanted_nodes,
             memory_type=memory_type,
+            session_ids=wanted_sessions,
         )
         # 降级策略只用于「人格未知」（persona_id 为空）的旧数据兼容：
         # 此时把本会话的所有记忆拉进来，但绝不跨会话取 group 级记忆，避免隐私泄露。
@@ -257,6 +314,7 @@ class MemoryEngine:
                 node_id,
                 nodes=wanted_nodes,
                 memory_type=memory_type,
+                session_ids=wanted_sessions,
             )
 
         scored: list[tuple[float, dict[str, Any]]] = []
@@ -288,6 +346,7 @@ class MemoryEngine:
         *,
         nodes: list[str] | None = None,
         memory_type: str = "",
+        session_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """按作用域模式取候选记忆。
 
@@ -303,12 +362,13 @@ class MemoryEngine:
         wanted_nodes = [str(item) for item in (nodes or []) if str(item)]
         if node_id and node_id not in wanted_nodes:
             wanted_nodes.append(node_id)
+        scoped = list(session_ids or ([session_id] if session_id else []))
         rows: list[dict[str, Any]] = []
         for where in wanted_nodes:
             # 节点专属记忆只属于「这个会话的这个地点」，必须按会话过滤，
             # 否则 A 群的房间记忆会漏进 B 群（真实环境实测到的 bug）。
             node_rows = self.db.query_memories(
-                session_id=session_id if session_id else None,
+                session_ids=scoped or None,
                 node_id=where,
                 scope=SCOPE_NODE,
                 memory_type=memory_type or None,
@@ -326,11 +386,11 @@ class MemoryEngine:
                 rows.extend(self.db.query_memories(scope=scope, limit=500))
             return _dedupe(rows)
 
-        if mode in (SCOPE_GROUP, SCOPE_GROUP_PERSONA) and session_id:
+        if mode in (SCOPE_GROUP, SCOPE_GROUP_PERSONA) and scoped:
             rows.extend(
                 item
                 for item in self.db.query_memories(
-                    session_id=session_id, memory_type=memory_type or None, limit=500
+                    session_ids=scoped, memory_type=memory_type or None, limit=500
                 )
                 if item.get("scope") in (SCOPE_GROUP, SCOPE_GROUP_PERSONA)
             )
@@ -414,6 +474,9 @@ class MemoryEngine:
             score=round(score, 4),
             related_users=[str(u) for u in item.get("related_users") or []],
             created_at=float(item.get("created_at") or 0.0),
+            tier=str(item.get("tier") or "raw"),
+            context=str(item.get("context") or ""),
+            participants=[str(u) for u in (item.get("participants") or [])],
         )
 
     # ---------------- 衰减 ----------------
@@ -422,6 +485,33 @@ class MemoryEngine:
         return self.db.decay_memories(
             session_id=session_id, half_life_days=half_life_days
         )
+
+    def fold(self, memory_id: int, *, text: str = "", when: float | None = None) -> None:
+        """折叠一条记忆（raw → gist）：原文进 ``context``，正文换成要点。
+
+        遗忘只做到这一步，**不删除**——人类忘的是细节，不是那件事。
+        """
+
+        self.db.fold_memory(int(memory_id), text=text, when=when)
+
+    def due_reviews(
+        self, *, session_ids: list[str], now: float | None = None, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        """到点该"想起来一次"的记忆（间隔重复的回访队列）。"""
+
+        stamp = float(now if now is not None else time.time())
+        rows = self.db.query_memories(
+            session_ids=[str(item) for item in (session_ids or []) if str(item)],
+            due_review_before=stamp,
+            limit=max(1, int(limit)),
+            order="next_review_at ASC",
+        )
+        return rows
+
+    def schedule_review(self, memory_id: int, *, next_at: float) -> None:
+        """排下一次回访（1 天 / 3 天 / 7 天 / 30 天……由整理那一步决定）。"""
+
+        self.db.update_memory(int(memory_id), next_review_at=float(next_at))
 
     # ---------------- 用户控制 ----------------
 
@@ -468,7 +558,10 @@ class MemoryEngine:
         return changed
 
     def stats(self, session_id: str | None = None) -> dict[str, Any]:
-        return self.db.memory_stats(session_id)
+        if not session_id:
+            return self.db.memory_stats()
+        # 会话组：把组里几个会话的记忆合起来看
+        return self.db.memory_stats(session_ids=self.sessions(str(session_id)))
 
 
 def _normalize(text: str) -> str:

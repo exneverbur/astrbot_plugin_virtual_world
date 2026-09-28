@@ -28,6 +28,7 @@ def create_plan(
     valid_for: int = 1800,
     reason: str = "",
     source: str = "rule",
+    send_to: str = "",
 ) -> dict[str, Any] | None:
     """构造计划对象。steps 为空时返回 None。"""
 
@@ -52,6 +53,8 @@ def create_plan(
                 "messages": list(step.get("messages") or []),
                 "params": dict(step.get("params") or {}),
                 "interject": bool(step.get("interject", False)),
+                # 这一步说给哪个会话听（空 = 跟着计划 / 这一轮的落点）
+                "send_to": str(step.get("send_to", "") or ""),
                 "status": "pending",
             }
         )
@@ -64,6 +67,8 @@ def create_plan(
         "valid_until": world_time + max(60, int(valid_for)),
         "reason": reason,
         "source": source,
+        # 她想把这些话说给谁（会话组里的哪个群 / 私聊）；空 = 落点默认
+        "send_to": str(send_to or ""),
     }
 
 

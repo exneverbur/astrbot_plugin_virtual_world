@@ -14,6 +14,7 @@ from core.decider import SEARCH_COOLDOWN_MINUTES, Decider  # noqa: E402
 from core.defaults import default_world  # noqa: E402
 from core.engagement import EngagementTracker  # noqa: E402
 from core.json_actions import (  # noqa: E402
+    MAX_SAY_LINES_HARD,
     extract_json_object,
     parse_action_payload,
     parse_cancel,
@@ -21,7 +22,7 @@ from core.json_actions import (  # noqa: E402
     strip_reasoning,
 )
 from core.memory import emotional_weight  # noqa: E402
-from core.mood import cell_for, mood_label, style_block  # noqa: E402
+from core.mood import cause_text, cell_for, mood_label, style_block  # noqa: E402
 from core.search import (  # noqa: E402
     merge_evidence,
     parse_search_results,
@@ -38,13 +39,20 @@ from core.weather import (  # noqa: E402
 from core.models import (  # noqa: E402
     DEFAULT_ECHO_TYPES,
     ECHO_EVENT_TYPES,
+    StateDynamics as DynamicsConfig,
+    parse_schedules,
+    parse_sessions,
     parse_world,
 )
 from core.nickname import compute_nickname, should_update  # noqa: E402
 from core.pathfinding import find_path, path_ticks, travel_cost  # noqa: E402
 from core.planner import create_plan  # noqa: E402
 from core.prompt import PromptBuilder  # noqa: E402
-from core.state import WorldState  # noqa: E402
+from core.state import (  # noqa: E402
+    FORWARD_SUMMARY_MARK,
+    WorldState,
+    group_chat_items,
+)
 from core.state_dynamics import StateDynamics  # noqa: E402
 from core.tool_policy import is_self_send_tool  # noqa: E402
 from core.tool_policy import allowed_tools, node_tool_names, tool_name_matches  # noqa: E402
@@ -118,12 +126,54 @@ class TestSearchEvidence(unittest.TestCase):
         self.assertNotIn("摘要片段", text)
         self.assertIn("来源：https://x.example/a", text)
 
+    def test_snippet_after_the_url_line_is_kept(self):
+        """搜索结果的正文写在 URL 的下一行：必须接上（以前只留了个「**URL**」）。"""
+
+        raw = (
+            "## Search Results (5 results, 869ms)\n"
+            "### 1. Google 新闻\n"
+            "- **URL**: https://news.google.com/home?hl=zh-CN\n"
+            "- 中国伊朗利用开源AI展开大规模影响力行动 · 《纽约时报》：…\n"
+            "\n"
+            "### 2. 科技新闻与评论\n"
+            "- **URL**: https://cn.wsj.com/zh-hans/news/technology\n"
+            "- 今日要闻：半导体出口新规落地，多家厂商回应\n"
+        )
+        items = parse_search_results(raw)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0].title, "Google 新闻")
+        self.assertIn("中国伊朗利用开源AI", items[0].snippet)
+        self.assertNotIn("**URL**", items[0].snippet)
+        self.assertIn("半导体出口新规", items[1].snippet)
+
+    def test_nav_pages_and_failed_extracts_are_not_materials(self):
+        """抓到导航页 / extract_failed 时，材料要退回搜索摘要——不能一起丢掉。"""
+
+        from core.search import evidence_text, failed_text, looks_like_nav
+
+        nav = (
+            "[新闻](https://news.cctv.com/)\n\n[国内](https://news.cctv.com/china/)\n\n"
+            "[国际](https://news.cctv.com/world/)\n\n[经济](https://jingji.cctv.com/)\n\n"
+            "[社会](https://news.cctv.com/society/)"
+        )
+        self.assertTrue(looks_like_nav(nav))
+        self.assertFalse(looks_like_nav("今天下午三点，团队把方案改完了。她看了看，觉得还行。"))
+        self.assertTrue(failed_text("extract_failed\nUnable to extract content from the URL."))
+
+        item = parse_search_results(
+            "### 某栏目\n- **URL**: https://news.cctv.com/tech/index.shtml\n- 今日要闻：核电新机组并网\n"
+        )[0]
+        item.passage = nav  # 读回来的其实是导航页
+        self.assertEqual(evidence_text(item), "今日要闻：核电新机组并网")
+        item.passage = "这是一篇真正的正文，讲了很多细节。"
+        self.assertEqual(evidence_text(item), "这是一篇真正的正文，讲了很多细节。")
+
 
 class TestSearchSourcePicking(unittest.TestCase):
     """搜索结果的"选页"判断：首页 / 栏目页不算正文，读了也是白读。"""
 
     def test_homepages_are_recognised(self):
-        from core.engine import _looks_like_homepage
+        from core.search import looks_like_homepage
 
         for url in (
             "https://news.google.com/home?hl=zh-CN&gl=CN&ceid=CN%3Azh-Hans",
@@ -132,17 +182,17 @@ class TestSearchSourcePicking(unittest.TestCase):
             "https://cn.wsj.com/",
             "https://example.com",
         ):
-            self.assertTrue(_looks_like_homepage(url), url)
+            self.assertTrue(looks_like_homepage(url), url)
 
     def test_article_urls_are_not_homepages(self):
-        from core.engine import _looks_like_homepage
+        from core.search import looks_like_homepage
 
         for url in (
             "https://nte.perfectworld.com/cn/article/news/gamebroad/20260602/262481.html",
             "https://zh.wikipedia.org/wiki/%E4%B9%9D%E4%B8%80%E5%85%AB%E4%BA%8B%E8%AE%8A",
             "https://www.ithome.com/0/790/123.htm",
         ):
-            self.assertFalse(_looks_like_homepage(url), url)
+            self.assertFalse(looks_like_homepage(url), url)
 
     def test_old_search_defaults_are_raised_once(self):
         """读几篇 / 补查几轮还是旧默认值（2 / 1）时上调一次；用户改过的值不动。"""
@@ -162,6 +212,118 @@ class TestSearchSourcePicking(unittest.TestCase):
         search = world.action_map()["search_web"]
         self.assertEqual(search.search_max_reads, 1)
         self.assertEqual(search.search_rounds, 0)
+
+
+class TestBondGroupMigration(unittest.TestCase):
+    """老世界配置里的关系表没有 group：读盘时按内置表补齐，显式空串照旧生效。"""
+
+    def _legacy_world(self) -> dict:
+        data = default_world()
+        for item in data["profile"]["bonds"]:
+            item.pop("group", None)
+        return data
+
+    def test_group_is_filled_from_the_builtin_table(self):
+        world, _warnings = parse_world(self._legacy_world())
+        groups = {bond.name: bond.group for bond in world.profile.bonds}
+        self.assertEqual(groups["朋友"], "close")
+        self.assertEqual(groups["男友"], "close")
+        self.assertEqual(groups["群友"], "close")
+        self.assertEqual(groups["主人"], "")
+        self.assertEqual(groups["家人"], "")
+
+    def test_explicit_empty_group_is_left_alone(self):
+        data = self._legacy_world()
+        for item in data["profile"]["bonds"]:
+            if item["name"] == "男友":
+                item["group"] = ""
+        world, _warnings = parse_world(data)
+        groups = {bond.name: bond.group for bond in world.profile.bonds}
+        self.assertEqual(groups["男友"], "")
+        self.assertEqual(groups["朋友"], "close")
+
+
+class TestSearchPayloadCleanup(unittest.TestCase):
+    """检索材料的清理：JSON 外壳要去掉，导航条与重复查询词都别交下去。"""
+
+    def test_json_payload_is_unwrapped(self):
+        import json as _json
+
+        from core.search import unwrap_payload_text
+
+        raw = _json.dumps(
+            {
+                "url": "https://news.example/a",
+                "title": "一条新闻",
+                "content": "[](https://news.example/nav)\n\n正文在这里。",
+            },
+            ensure_ascii=False,
+        )
+        text = unwrap_payload_text(raw)
+        self.assertNotIn('"url"', text)
+        self.assertIn("正文在这里", text)
+
+    def test_truncated_json_payload_is_still_unwrapped(self):
+        from core.search import unwrap_payload_text
+
+        raw = '{"url": "https://news.example/a", "content": "第一段\\n第二段\\n第三段'
+        text = unwrap_payload_text(raw)
+        self.assertIn("第一段", text)
+        self.assertNotIn('"content"', text)
+
+    def test_plain_text_is_untouched(self):
+        from core.search import unwrap_payload_text
+
+        raw = "这是一段普通的正文，没有任何 JSON 外壳。"
+        self.assertEqual(unwrap_payload_text(raw), raw)
+
+    def test_nav_only_lines_are_stripped(self):
+        from core.search import clean_passage
+
+        body = (
+            "[](https://news.example/index.html)\n"
+            "[新闻](https://news.example/news)\n"
+            "# 一条新闻\n"
+            "正文第一句。\n"
+            "正文第二句。"
+        )
+        cleaned = clean_passage(body)
+        self.assertNotIn("news.example/index.html", cleaned)
+        self.assertIn("正文第一句。", cleaned)
+        self.assertIn("一条新闻", cleaned)
+
+    def test_same_question_phrased_differently_is_similar(self):
+        from core.search import queries_too_similar
+
+        self.assertTrue(
+            queries_too_similar(
+                "异环 1.4版本 祷歌为谁而诵 更新公告",
+                "异环 1.4版本 祷歌为谁而诵 更新内容",
+            )
+        )
+        self.assertTrue(queries_too_similar("今日新闻热点", "今日 新闻热点"))
+
+    def test_different_questions_are_not_similar(self):
+        from core.search import queries_too_similar
+
+        self.assertFalse(
+            queries_too_similar(
+                "异环 1.4 新角色 技能", "异环 1.4版本 祷歌为谁而诵 更新公告"
+            )
+        )
+        self.assertFalse(queries_too_similar("异环 新场景", "异环 新角色"))
+
+    def test_social_and_video_homepages_are_not_read(self):
+        from core.search import looks_like_homepage
+
+        for url in (
+            "https://www.facebook.com/nte.iwplay/",
+            "https://x.com/someone/status/123",
+        ):
+            self.assertTrue(looks_like_homepage(url), url)
+        self.assertFalse(
+            looks_like_homepage("https://www.bilibili.com/video/BV1jWej6hET5/")
+        )
 
 
 class TestWeather(unittest.TestCase):
@@ -255,25 +417,30 @@ class TestActionQueries(unittest.TestCase):
 
 
 class TestMoodGrid(unittest.TestCase):
-    """两轴表达格：九种组合各有心情词与风格约束，且两样东西同源。"""
+    """两轴表达格：5×5 共 25 种组合，各有心情词与风格约束，且两样东西同源。"""
 
     def test_every_combination_has_its_own_cell(self):
         keys = set()
-        for arousal in (0.1, 0.5, 0.9):
-            for valence in (0.1, 0.5, 0.9):
+        for arousal in (0.1, 0.3, 0.5, 0.7, 0.9):
+            for valence in (0.1, 0.3, 0.5, 0.7, 0.9):
                 cell = cell_for(arousal, valence)
                 keys.add(cell.key)
                 self.assertTrue(cell.mood)
                 self.assertTrue(cell.style)
                 self.assertGreaterEqual(cell.say_limit, 1)
-        self.assertEqual(len(keys), 9)
+        self.assertEqual(len(keys), 25)
+        # 心情词不重复：25 个格子应该是 25 个不一样的说法
+        words = {cell_for(a, v).mood for a in (0.1, 0.3, 0.5, 0.7, 0.9) for v in (0.1, 0.3, 0.5, 0.7, 0.9)}
+        self.assertEqual(len(words), 25)
 
     def test_boundaries_keep_the_middle_band_wide(self):
-        # 0.36 与 0.64 都算中间档，"正常说话"才是常驻状态
-        self.assertEqual(cell_for(0.36, 0.5).key, "stirred+neutral")
-        self.assertEqual(cell_for(0.64, 0.5).key, "stirred+neutral")
-        self.assertEqual(cell_for(0.2, 0.5).key, "calm+neutral")
-        self.assertEqual(cell_for(0.8, 0.5).key, "excited+neutral")
+        # 0.45~0.62 算中间档，"正常说话"才是常驻状态；两端各两档用来分层
+        self.assertEqual(cell_for(0.5, 0.5).key, "a2v2")
+        self.assertEqual(cell_for(0.61, 0.5).key, "a2v2")
+        self.assertEqual(cell_for(0.2, 0.5).key, "a0v2")
+        self.assertEqual(cell_for(0.3, 0.5).key, "a1v2")
+        self.assertEqual(cell_for(0.7, 0.5).key, "a3v2")
+        self.assertEqual(cell_for(0.9, 0.5).key, "a4v2")
 
     def test_style_block_carries_the_effective_cap(self):
         cell = cell_for(0.2, 0.2)
@@ -286,6 +453,46 @@ class TestMoodGrid(unittest.TestCase):
     def test_energy_is_only_a_modifier(self):
         self.assertEqual(mood_label(0.2, 0.9, energy=0.8), "舒坦")
         self.assertEqual(mood_label(0.2, 0.9, energy=0.1), "困倦 · 舒坦")
+
+    def test_other_dims_show_up_as_modifiers(self):
+        """困、想找人、闲得发慌、心痒都是修饰词，不另开格子。"""
+
+        self.assertEqual(
+            mood_label(0.5, 0.5, energy=0.8, loneliness=0.9, boredom=0.8),
+            "想找人 · 闲得发慌 · 心潮起伏",
+        )
+        self.assertEqual(
+            mood_label(0.5, 0.3, energy=0.8, loneliness=0.8),
+            "有点被晾着 · 心浮",
+        )
+        self.assertEqual(
+            mood_label(0.9, 0.9, energy=0.5, curiosity=0.9),
+            "心痒 · 欢呼雀跃",
+        )
+
+    def test_mood_cause_shows_up_and_expires(self):
+        """心情标签带上"为什么"：来源太旧就不再挂在现在的心情上。"""
+
+        self.assertEqual(
+            mood_label(0.9, 0.7, energy=0.8, cause="被哄了一下"),
+            "兴奋（因为：被哄了一下）",
+        )
+        self.assertEqual(cause_text("被哄了一下", at=1000.0, now=1000.0 + 60), "被哄了一下")
+        self.assertEqual(
+            cause_text("被哄了一下", at=1000.0, now=1000.0 + 3600), ""
+        )
+        self.assertEqual(cause_text("   ", at=1000.0, now=1000.0), "")
+
+    def test_positive_cells_allow_banter(self):
+        """被撩的时候不只是"兴奋"档才接得住：轻快 / 舒坦也要允许开玩笑式回敬。"""
+
+        light = cell_for(0.5, 0.8)
+        self.assertEqual(light.key, "a2v4")
+        self.assertIn("回敬", light.style)
+
+        excited = cell_for(0.9, 0.9)
+        self.assertEqual(excited.key, "a4v4")
+        self.assertIn("撒娇", excited.style)
 
 
 class TestStateDynamics(unittest.TestCase):
@@ -324,17 +531,18 @@ class TestStateDynamics(unittest.TestCase):
         """心情词由情绪两轴派生：心潮管"有多激动"，效价管"激动成什么样"。"""
 
         state = WorldState(session_id="s1", energy=0.5, affect=0.9, valence=0.2)
-        self.assertEqual(self.dynamics.derive_mood(state), "恼火")
-        state.valence = 0.8
+        self.assertEqual(self.dynamics.derive_mood(state), "气炸")
+        state.valence = 0.7
         self.assertEqual(self.dynamics.derive_mood(state), "兴奋")
         state.affect = 0.5
         state.valence = 0.5
-        self.assertEqual(self.dynamics.derive_mood(state), "平静")
-        state.valence = 0.1
-        self.assertEqual(self.dynamics.derive_mood(state), "不痛快")
-        state.affect = 0.2
+        self.assertEqual(self.dynamics.derive_mood(state), "心潮起伏")
+        state.valence = 0.3
+        self.assertEqual(self.dynamics.derive_mood(state), "心浮")
+        state.affect = 0.3
         state.valence = 0.2
         self.assertEqual(self.dynamics.derive_mood(state), "低落")
+        state.affect = 0.2
         state.valence = 0.9
         self.assertEqual(self.dynamics.derive_mood(state), "舒坦")
         # 精力低只是一个修饰，不另开一格
@@ -363,11 +571,91 @@ class TestStateDynamics(unittest.TestCase):
     def test_event_effects(self):
         state = WorldState(session_id="s1", affect=0.5, valence=0.5, loneliness=0.5)
         self.dynamics.apply_event(state, "hug_bot")
-        self.assertAlmostEqual(state.loneliness, 0.3, places=4)
-        # 抱抱把心潮抬高，但有心潮饱和：0.5 时只加 0.15 × (1-0.75×0.5) = 0.09375
-        self.assertAlmostEqual(state.affect, 0.59375, places=4)
+        self.assertAlmostEqual(state.loneliness, 0.34, places=4)
+        # 抱抱把心潮抬高，但有心潮饱和：0.5 时只加 0.08 × (1-0.75×0.5) = 0.05
+        self.assertAlmostEqual(state.affect, 0.55, places=4)
         # 好事会把心情推好一点（效价由基线 + 偏移给出）
         self.assertGreater(state.valence, 0.5)
+
+    def test_playful_lines_do_not_max_her_out(self):
+        """连着几句"撩"不该把她顶到满值：正面脉冲压小了，剩下的交给衰减。"""
+
+        state = WorldState(session_id="s1", energy=0.7, loneliness=0.4, boredom=0.3)
+        state.affect = 0.3
+        state.affect_synced_at = 1_000_000.0
+        self.dynamics.refresh(state, now=1_000_000.0)
+        for index in range(1, 6):
+            now = 1_000_000.0 + index * 60
+            self.dynamics.apply_event(state, "mention_bot", now=now)
+            self.dynamics.apply_event(state, "hug_bot", now=now)
+            self.dynamics.apply_event_delta(state, "valence", 0.06, now=now)
+        self.assertLess(state.affect, 0.8)
+        self.assertLess(state.valence, 0.95)
+
+    def test_praise_fatigues_before_the_reset_window(self):
+        """连着被哄会麻木：同一类好事第二次起推得越来越少，隔一阵才恢复。"""
+
+        state = WorldState(session_id="s1", energy=0.7, loneliness=0.4, boredom=0.3)
+        state.affect = 0.3
+        state.affect_synced_at = 1_000_000.0
+        self.dynamics.refresh(state, now=1_000_000.0)
+        first = 0.0
+        for index in range(1, 4):
+            before = state.affect
+            self.dynamics.apply_event(state, "hug_bot", now=1_000_000.0 + index * 30)
+            step = state.affect - before
+            if index == 1:
+                first = step
+            else:
+                self.assertLess(step, first * 0.7, f"第 {index} 次没有变钝")
+        # 隔了足够久：重新按第一次算
+        self.assertEqual(
+            self.dynamics.repeat_magnitude(state, "hug_bot", now=1_000_000.0 + 3600), 1.0
+        )
+
+    def test_chat_turn_cap_keeps_the_ruler_honest(self):
+        """一句夸奖推不动的，一次真的经历才推得动：单轮上限远小于事件幅度。"""
+
+        config = DynamicsConfig()
+        self.assertLess(config.chat_valence_cap, 0.1)
+        self.assertLessEqual(config.chat_valence_daily_cap, 0.3)
+
+    def test_chat_valence_budget_stops_after_the_daily_cap(self):
+        """聊天推的效价一天就这么多：额度用完之后再怎么聊都不再推高。"""
+
+        base = 1_000_000.0
+        state = WorldState(session_id="s1", energy=0.6, loneliness=0.3, boredom=0.3)
+        state.affect_synced_at = base
+        self.dynamics.refresh(state, now=base)
+        budget = float(DynamicsConfig().chat_valence_daily_cap)
+        for index in range(1, 21):
+            self.dynamics.apply_event_delta(
+                state, "valence", 0.2, now=base + index * 60, chat=True
+            )
+        self.assertGreater(state.chat_valence_spent, 0.0)
+        self.assertLessEqual(state.chat_valence_spent, budget + 1e-6)
+        # 额度用完之后：只有衰减在动，推不上去了
+        offset = state.valence_offset
+        self.dynamics.apply_event_delta(
+            state, "valence", 0.2, now=base + 21 * 60, chat=True
+        )
+        self.assertLess(state.valence_offset, offset + 1e-9)
+
+    def test_keyword_praise_also_counts_toward_the_budget(self):
+        """关键词兜底的"被夸"走同一份额度：不能绕开上限偷偷涨。"""
+
+        base = 1_000_000.0
+        state = WorldState(session_id="s1", energy=0.6, loneliness=0.3, boredom=0.3)
+        state.affect_synced_at = base
+        state.chat_day = datetime.fromtimestamp(base).strftime("%Y-%m-%d")
+        state.chat_valence_spent = 0.0
+        self.dynamics.refresh(state, now=base)
+        self.dynamics.apply_event(state, "positive_words", now=base + 60)
+        self.assertGreater(state.chat_valence_spent, 0.0)
+        # 负面关键词不占额度：难过不该因为"今天已经被骂过"就不算数
+        before = state.chat_valence_spent
+        self.dynamics.apply_event(state, "negative_words", now=base + 120)
+        self.assertAlmostEqual(state.chat_valence_spent, before, places=6)
 
     # ---------------- 效价：基线 / 偏移 / 懒衰减 ----------------
 
@@ -622,6 +910,358 @@ class TestPathfinding(unittest.TestCase):
         self.assertIsNone(find_path(graph, "a", "c"))
 
 
+class TestChatRecordImages(unittest.TestCase):
+    """聊天留档里记住的图片地址：给「把记录里的图交给多模态主模型」用。"""
+
+    def _state(self) -> WorldState:
+        return WorldState(session_id="aiocqhttp:GroupMessage:1")
+
+    def test_images_are_kept_with_the_message(self):
+        state = self._state()
+        state.note_chat(
+            user_id="42",
+            name="小明",
+            text="看这张",
+            now=100.0,
+            images=["https://img/1.jpg"],
+        )
+        self.assertEqual(state.recent_chat[-1]["images"], ["https://img/1.jpg"])
+
+    def test_one_message_keeps_at_most_two_refs(self):
+        state = self._state()
+        state.note_chat(
+            user_id="42",
+            name="小明",
+            text="三张",
+            now=100.0,
+            images=["https://img/1.jpg", "https://img/2.jpg", "https://img/3.jpg"],
+        )
+        self.assertEqual(
+            state.recent_chat[-1]["images"], ["https://img/1.jpg", "https://img/2.jpg"]
+        )
+
+    def test_base64_blobs_do_not_go_into_the_record(self):
+        """超长的 base64 不进留档：状态文件会被撑爆。"""
+
+        state = self._state()
+        blob = "base64://" + "A" * 5000
+        state.note_chat(
+            user_id="42",
+            name="小明",
+            text="大图",
+            now=100.0,
+            images=[blob, "https://img/1.jpg"],
+        )
+        self.assertEqual(state.recent_chat[-1]["images"], ["https://img/1.jpg"])
+
+    def test_message_without_images_has_no_key(self):
+        state = self._state()
+        state.note_chat(user_id="42", name="小明", text="普通消息", now=100.0)
+        self.assertNotIn("images", state.recent_chat[-1])
+
+
+class TestChatGrouping(unittest.TestCase):
+    """聊天记录的分组：同一个人连着说的算一条（渲染和"算几条"共用这套规则）。"""
+
+    def _item(self, user_id: str, text: str, at: float, *, name: str = "小明", origin: str = ""):
+        item = {"user_id": user_id, "name": name, "text": text, "at": at, "is_self": False}
+        if origin:
+            item["origin"] = origin
+        return item
+
+    def test_same_person_consecutive_messages_are_one_group(self):
+        items = [
+            self._item("42", "在吗", 100.0),
+            self._item("42", "我跟你说个事", 101.0),
+            self._item("42", "刚才那个又炸了", 102.0),
+        ]
+        groups = group_chat_items(items)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]), 3)
+
+    def test_the_group_key_is_the_qq_id_not_the_nickname(self):
+        """昵称/群名片会变（还带「在书房」这种后缀），不能按名字分组。"""
+
+        items = [
+            self._item("42", "在吗", 100.0, name="不相疑"),
+            self._item("42", "我跟你说个事", 101.0, name="never"),
+            self._item("42", "刚才那个又炸了", 102.0, name="不相疑 | 在书房"),
+        ]
+        self.assertEqual(len(group_chat_items(items)), 1)
+
+    def test_a_long_gap_starts_a_new_group(self):
+        items = [
+            self._item("42", "在吗", 100.0),
+            self._item("42", "还在吗", 100.0 + 600),
+        ]
+        self.assertEqual(len(group_chat_items(items)), 2)
+
+    def test_different_people_and_sessions_never_merge(self):
+        items = [
+            self._item("42", "在吗", 100.0, origin="group:1"),
+            self._item("42", "在吗", 101.0, origin="private:42"),
+            self._item("7", "在吗", 102.0, origin="group:1"),
+        ]
+        self.assertEqual(len(group_chat_items(items)), 3)
+
+    def test_chat_window_counts_merged_rows_not_raw_messages(self):
+        """一个人连发十条只占一条额度：不该把窗口吃光。"""
+
+        state = WorldState(session_id="aiocqhttp:GroupMessage:1")
+        for index in range(10):
+            state.note_chat(
+                user_id="42", name="小明", text=f"第{index}句", now=100.0 + index
+            )
+        state.note_chat(user_id="7", name="小红", text="我插一句", now=200.0)
+
+        rows = state.chat_window(now=1000.0, seconds=3600, limit=2)
+        groups = group_chat_items(rows)
+        self.assertEqual(len(groups), 2, rows)
+        self.assertEqual(len(groups[0]), 10)
+        self.assertEqual(groups[1][0]["user_id"], "7")
+
+    def test_the_chat_log_is_trimmed_per_session(self):
+        """留档按会话各自留：一个热闹的群不该把私聊的记录挤掉。"""
+
+        state = WorldState(session_id="aiocqhttp:GroupMessage:1001")
+        for index in range(30):
+            state.note_chat(
+                user_id="7",
+                name="小明",
+                text=f"群里第{index}句",
+                now=100.0 + index,
+                keep=10,
+                origin="aiocqhttp:GroupMessage:1001",
+            )
+        state.note_chat(
+            user_id="9",
+            name="主人",
+            text="私聊里的一句",
+            now=200.0,
+            keep=10,
+            origin="aiocqhttp:PrivateMessage:9",
+        )
+
+        here = [item for item in state.recent_chat if item.get("origin", "").endswith("1001")]
+        private = [item for item in state.recent_chat if "PrivateMessage" in str(item.get("origin"))]
+        self.assertEqual(len(here), 10, "群里自己留 10 条")
+        self.assertEqual(len(private), 1, "私聊那一句不该被群挤掉")
+
+    def test_recent_chat_within_uses_the_same_unit(self):
+        """"插话判定 / 工具选型"用的那套视图也得按行算，否则同一个配置两个口径。"""
+
+        state = WorldState(session_id="aiocqhttp:GroupMessage:1")
+        for index in range(10):
+            state.note_chat(
+                user_id="42", name="小明", text=f"第{index}句", now=100.0 + index, keep=200
+            )
+        state.note_chat(user_id="7", name="小红", text="我插一句", now=200.0, keep=200)
+
+        rows = state.recent_chat_within(now=1000.0, seconds=3600, limit=2)
+        self.assertEqual(len(rows), 11, "两行 = 小明那串 + 小红那句")
+        self.assertEqual(rows[0]["user_id"], "42")
+        self.assertEqual(rows[-1]["user_id"], "7")
+
+        only_last = state.recent_chat_within(now=1000.0, seconds=3600, limit=1)
+        self.assertEqual([item["user_id"] for item in only_last], ["7"])
+
+
+class TestDefaultInteractionActions(unittest.TestCase):
+    """默认世界里"能对人做"的互动动作：按亲密度铺开，且都自带模板。"""
+
+    def _actions(self) -> dict:
+        world, warnings = parse_world(default_world())
+        self.assertEqual(warnings, [])
+        return {action.id: action for action in world.actions}
+
+    def test_the_new_interaction_actions_are_there(self):
+        actions = self._actions()
+        for action_id in (
+            "nod",
+            "shake_head",
+            "clap",
+            "head_tilt",
+            "blink",
+            "high_five",
+            "pat_shoulder",
+            "hand_tissue",
+            "give_snack",
+            "ruffle_hair",
+            "tug_sleeve",
+            "bump_shoulder",
+            "pinch_nose",
+            "cold_hands",
+            "bite_shoulder",
+            "bite_wrist",
+            "hold_hands",
+            "lean_on",
+            "nuzzle",
+            "pinch_cheek",
+            "close_eyes",
+            "kiss_forehead",
+            "wipe_tears",
+            "massage",
+            "drape_coat",
+            "interlock",
+            "nestle",
+            "feed_bite",
+            "kiss_lips",
+            "whisper_ear",
+        ):
+            self.assertIn(action_id, actions, action_id)
+
+    def test_they_are_template_actions_that_say_their_own_line(self):
+        """都是"模板 + 带模板文案"：不调模型也得说得出那句话。"""
+
+        actions = self._actions()
+        for action_id in ("nod", "tug_sleeve", "hold_hands", "kiss_lips"):
+            action = actions[action_id]
+            self.assertEqual(action.llm_level, "template", action_id)
+            self.assertTrue(action.template.strip(), action_id)
+            self.assertEqual(action.desc_mode, "brief", action_id)
+        self.assertEqual(actions["kiss_lips"].target_type, "user")
+        self.assertEqual(actions["nod"].target_type, "none")
+
+    def test_intimacy_is_ordered_by_effects(self):
+        """越亲的动作孤独回落越多（顺序别写反了）。"""
+
+        actions = self._actions()
+
+        def lonely(action_id: str) -> float:
+            effects = actions[action_id].on_complete.effects or {}
+            return float(effects.get("loneliness") or 0.0)
+
+        # 孤独回落是负数：越亲掉得越多（值越小）
+        self.assertLess(lonely("hold_hands"), lonely("tug_sleeve"))
+        self.assertLess(lonely("tug_sleeve"), lonely("high_five"))
+        self.assertLess(lonely("kiss_lips"), 0.0)
+        self.assertLess(lonely("kiss_lips"), lonely("hold_hands"))
+
+
+class TestChatLineLimitMigration(unittest.TestCase):
+    """进提示词的聊天记录：默认 20 行，按"合并后的行"算。"""
+
+    def test_default_is_twenty_rows(self):
+        world, _warnings = parse_world(default_world())
+        self.assertEqual(world.context.chat_lines, 20)
+        self.assertEqual(world.context.chat_answered_lines, 30)
+        self.assertEqual(world.context.chat_elsewhere_lines, 12)
+
+    def test_legacy_default_is_upgraded(self):
+        """老配置里这个值还挂在 decider 上（那时按原始条数算）→ 迁到 context.chat_lines。"""
+
+        for legacy in (12, 60):
+            raw = default_world()
+            raw.setdefault("context", {}).pop("chat_lines", None)  # 老存档：context 里还没有这个键
+            raw["decider"] = {"chat_max_messages": legacy}
+            world, _warnings = parse_world(raw)
+            self.assertEqual(world.context.chat_lines, 20, legacy)
+
+    def test_a_value_the_user_chose_is_kept(self):
+        raw = default_world()
+        raw.setdefault("context", {}).pop("chat_lines", None)
+        raw["decider"] = {"chat_max_messages": 35}
+        world, _warnings = parse_world(raw)
+        self.assertEqual(world.context.chat_lines, 35)
+
+    def test_legacy_char_budget_is_raised_too(self):
+        """行数提到 20 之后，4000 字的老预算会把尾巴砍掉，一起升到 8000。"""
+
+        raw = default_world()
+        raw["context"] = {"chat_total_chars": 4000}
+        world, _warnings = parse_world(raw)
+        self.assertEqual(world.context.chat_total_chars, 8000)
+
+        raw["context"] = {"chat_total_chars": 12000}
+        world, _warnings = parse_world(raw)
+        self.assertEqual(world.context.chat_total_chars, 12000)
+
+
+class TestChatRecordDedupe(unittest.TestCase):
+    """同一条消息会经过「旁观监听」和「LLM 请求」两个钩子，只能留一份。
+
+    两个钩子拿到的正文不完全一样：其中一个会带上「［这条消息 @ 了：…］」这种注释。
+    """
+
+    NOTE = "\n［这条消息 @ 了：你（小鲸鱼(10001)）］"
+
+    def _state(self) -> WorldState:
+        return WorldState(session_id="aiocqhttp:GroupMessage:1")
+
+    def test_short_message_is_not_recorded_twice(self):
+        """「亲亲」只有两个字，光靠"内容基本一样"那条规则认不出来。"""
+
+        state = self._state()
+        state.note_chat(user_id="42", name="小明", text="亲亲", now=100.0)
+        state.note_chat(user_id="42", name="小明", text=f"亲亲{self.NOTE}", now=100.2)
+        self.assertEqual(len(state.recent_chat), 1)
+
+    def test_the_annotated_one_first_is_also_deduped(self):
+        state = self._state()
+        state.note_chat(user_id="42", name="小明", text=f"亲亲{self.NOTE}", now=100.0)
+        state.note_chat(user_id="42", name="小明", text="亲亲", now=100.2)
+        self.assertEqual(len(state.recent_chat), 1)
+
+    def test_the_two_hooks_may_be_tens_of_seconds_apart(self):
+        """排队把两个钩子拉开了一分多钟：带注释的那一份照样要认出来。"""
+
+        state = self._state()
+        state.note_chat(user_id="42", name="小明", text="亲亲", now=100.0)
+        state.note_chat(user_id="42", name="小明", text=f"亲亲{self.NOTE}", now=190.0)
+        self.assertEqual(len(state.recent_chat), 1)
+
+    def test_different_short_messages_stay(self):
+        state = self._state()
+        state.note_chat(user_id="42", name="小明", text="亲亲", now=100.0)
+        state.note_chat(user_id="42", name="小明", text="抱抱", now=100.2)
+        self.assertEqual(len(state.recent_chat), 2)
+
+    def test_saying_the_same_thing_twice_later_still_counts(self):
+        """隔了一会儿又说一遍：这是真说了两次，不能并成一条。"""
+
+        state = self._state()
+        state.note_chat(user_id="42", name="小明", text="亲亲", now=100.0)
+        state.note_chat(user_id="42", name="小明", text="亲亲", now=100.0 + 180)
+        self.assertEqual(len(state.recent_chat), 2)
+
+
+class TestDirtyStringLists(unittest.TestCase):
+    """编辑器偶尔会把 null 写进多选框（选项没有 id 时），保存不该因此整份失败。"""
+
+    def test_schedule_sessions_and_days_drop_nulls(self):
+        data = {
+            "schedules": [
+                {
+                    "id": "s1",
+                    "time": "08:00",
+                    "sessions": [None],
+                    "days": ["mon", None, "mon", ""],
+                }
+            ]
+        }
+        config, _warnings = parse_schedules(data)
+        self.assertEqual(config.schedules[0].sessions, [])
+        self.assertEqual(config.schedules[0].days, ["mon"])
+
+    def test_session_groups_drop_nulls(self):
+        data = {
+            "sessions": [{"session_id": "aiocqhttp:GroupMessage:1"}],
+            "groups": [
+                {"id": "g1", "sessions": ["aiocqhttp:GroupMessage:1", None, ""]}
+            ],
+        }
+        config, _warnings = parse_sessions(data)
+        self.assertEqual(config.groups[0].sessions, ["aiocqhttp:GroupMessage:1"])
+
+    def test_world_string_lists_are_cleaned(self):
+        raw = default_world()
+        raw["actions"][0]["tool_names"] = [None, "web_search", "web_search", " "]
+        raw["admin_ids"] = [None, "42"]
+        world, _warnings = parse_world(raw)
+        self.assertEqual(world.actions[0].tool_names, ["web_search"])
+        self.assertEqual(world.admin_ids, ["42"])
+
+
 class TestJsonActions(unittest.TestCase):
     def test_valid_payload(self):
         result = parse_action_payload(
@@ -670,6 +1310,67 @@ class TestJsonActions(unittest.TestCase):
         self.assertEqual(result.actions[0].type, "say")
         self.assertEqual(result.actions[0].messages, ["我今天有点困"])
 
+    def test_actions_written_as_text_is_her_line(self):
+        """模型把 actions 写成字符串时，发的是那句话——reasoning 绝不能进群。"""
+
+        raw = (
+            '{"reasoning": "对方在私聊里哄我起床，语气亲近",'
+            ' "actions": "蓝蓝揉了揉眼睛：“主人，蓝蓝醒啦”"}'
+        )
+        result = parse_action_payload(raw, available_actions={"say"})
+        self.assertTrue(result.fallback_used)
+        self.assertEqual([a.type for a in result.actions], ["say"])
+        self.assertEqual(result.actions[0].messages, ["蓝蓝揉了揉眼睛：“主人，蓝蓝醒啦”"])
+        self.assertNotIn("reasoning", " ".join(result.actions[0].messages))
+        # reasoning 照常解析出来，日志里能看到她的判断
+        self.assertEqual(result.reasoning.get("intent"), "对方在私聊里哄我起床，语气亲近")
+
+    def test_json_without_actions_is_not_sent(self):
+        """只有 reasoning、没有可发的动作：什么都不发，别把整段 JSON 丢进群里。"""
+
+        result = parse_action_payload(
+            '{"reasoning": "还在想怎么回"}', available_actions={"say"}
+        )
+        self.assertEqual(result.actions, [])
+        self.assertTrue(result.fallback_used)
+        self.assertTrue(any("已忽略" in w for w in result.warnings))
+
+    def test_alternate_speak_keys_are_used(self):
+        """模型换了字段名（say / content）时同样能把她的话拎出来。"""
+
+        result = parse_action_payload(
+            '{"reasoning": "x", "say": "在的呀"}', available_actions={"say"}
+        )
+        self.assertEqual(result.actions[0].messages, ["在的呀"])
+
+        nested = parse_action_payload(
+            '{"actions": {"type": "say", "messages": ["单条"]}}',
+            available_actions={"say"},
+        )
+        self.assertEqual([a.type for a in nested.actions], ["say"])
+        self.assertEqual(nested.actions[0].messages, ["单条"])
+
+    def test_reasoning_carries_the_inner_voice(self):
+        """推理草稿多一项「心里想的」，并且能验证它是不是真的写在最开头。"""
+
+        clean = parse_action_payload(
+            '{"reasoning":{"env":"卧室","inner":"才不是想他，是风太大了"},'
+            '"actions":[{"type":"say","messages":["嗯"]}]}',
+            available_actions={"say"},
+        )
+        self.assertEqual(clean.reasoning.get("inner"), "才不是想他，是风太大了")
+        self.assertTrue(clean.head_clean)
+        self.assertEqual(clean.leading_text, "")
+
+        dirty = parse_action_payload(
+            "好的，我这就回复。\n"
+            '{"reasoning":{"env":"卧室"},"actions":[{"type":"say","messages":["嗯"]}]}',
+            available_actions={"say"},
+        )
+        self.assertFalse(dirty.head_clean)
+        self.assertIn("好的", dirty.leading_text)
+        self.assertTrue(any("JSON 之前" in w for w in dirty.warnings))
+
     def test_unavailable_action_is_dropped(self):
         result = parse_action_payload(
             '{"actions":[{"type":"fly","messages":["x"]},{"type":"say","messages":["ok"]}]}',
@@ -678,13 +1379,23 @@ class TestJsonActions(unittest.TestCase):
         self.assertEqual([a.type for a in result.actions], ["say"])
         self.assertTrue(any("不可用" in w for w in result.warnings))
 
-    def test_messages_are_truncated(self):
+    def test_messages_are_kept_and_only_warned(self):
+        """超过"这一轮建议条数"只提醒、不截断；超过防刷屏硬顶才真的砍。"""
+
         result = parse_action_payload(
             '{"actions":[{"type":"say","messages":["1","2","3","4","5"]}]}',
             available_actions={"say"},
             max_messages=2,
         )
-        self.assertEqual(result.actions[0].messages, ["1", "2"])
+        self.assertEqual(result.actions[0].messages, ["1", "2", "3", "4", "5"])
+        self.assertTrue(any("比这一轮建议的" in w for w in result.warnings))
+
+        long_one = parse_action_payload(
+            '{"actions":[{"type":"say","messages":["1","2","3","4","5","6","7"]}]}',
+            available_actions={"say"},
+            max_messages=2,
+        )
+        self.assertEqual(len(long_one.actions[0].messages), MAX_SAY_LINES_HARD)
 
     def test_unknown_target_node_is_dropped(self):
         result = parse_action_payload(
@@ -825,6 +1536,48 @@ class TestCancelParsing(unittest.TestCase):
         self.assertEqual(result.cancel, "now")
         self.assertEqual([item.type for item in result.actions], ["say"])
 
+    def test_plan_mode_maps_onto_cancel(self):
+        """plan_mode 是给人看的选择：interrupt 落成立刻停手，replace 落成手上做完就停。"""
+
+        interrupt = parse_action_payload(
+            '{"plan_mode": "interrupt", "actions": [{"type": "say", "messages": ["急事"]}]}',
+            available_actions={"say"},
+        )
+        self.assertEqual(interrupt.plan_mode, "interrupt")
+        self.assertEqual(interrupt.cancel, "now")
+
+        replace = parse_action_payload(
+            '{"plan_mode": "replace", "actions": [{"type": "say", "messages": ["换个安排"]}]}',
+            available_actions={"say"},
+        )
+        self.assertEqual(replace.plan_mode, "replace")
+        self.assertEqual(replace.cancel, "queue")
+
+    def test_queue_is_the_default_and_does_not_cancel_anything(self):
+        queued = parse_action_payload(
+            '{"plan_mode": "queue", "actions": [{"type": "say", "messages": ["等一下"]}]}',
+            available_actions={"say"},
+        )
+        self.assertEqual(queued.plan_mode, "queue")
+        self.assertEqual(queued.cancel, "")
+
+        default = parse_action_payload(
+            '{"actions": [{"type": "say", "messages": ["等一下"]}]}',
+            available_actions={"say"},
+        )
+        self.assertEqual(default.plan_mode, "")
+        self.assertEqual(default.cancel, "")
+
+    def test_cancel_wins_over_plan_mode(self):
+        """两个都写了时以更明确的 cancel 为准。"""
+
+        result = parse_action_payload(
+            '{"cancel": "now", "plan_mode": "queue",'
+            ' "actions": [{"type": "say", "messages": ["停"]}]}',
+            available_actions={"say"},
+        )
+        self.assertEqual(result.cancel, "now")
+
 
 class TestNickname(unittest.TestCase):
     def setUp(self) -> None:
@@ -863,8 +1616,11 @@ class TestNickname(unittest.TestCase):
         self.assertEqual(compute_nickname(world, state, None), "小鲸鱼 | 发呆中")
 
     def test_plain_name_when_nothing_matches(self):
+        """没有状态、也没给地点时就用原名；地点自己写了文案就带上那一截。"""
+
         state = WorldState(session_id="s1", state="idle", bot_base_nickname="小鲸鱼")
-        self.assertEqual(compute_nickname(self.world, state, self.lobby), "小鲸鱼")
+        self.assertEqual(compute_nickname(self.world, state, None), "小鲸鱼")
+        self.assertEqual(compute_nickname(self.world, state, self.lobby), "小鲸鱼 | 在客厅")
 
     def test_locked_nickname_wins(self):
         state = WorldState(
@@ -921,13 +1677,84 @@ class TestDecider(unittest.TestCase):
         self.world = make_world()
         self.decider = Decider(self.world)
 
-    def test_low_energy_goes_to_bedroom_and_sleeps(self):
+    def test_low_energy_in_the_daytime_takes_a_nap(self):
+        """白天精力低先小睡：一睡八小时的话，醒来正好是半夜。"""
+
+        decider = Decider(self.world, hour_provider=lambda: 15)
         state = WorldState(session_id="s1", node_id="study", energy=0.1, world_time=10)
-        plan = self.decider.rule_plan(state)
+        plan = decider.rule_plan(state)
+        self.assertIsNotNone(plan)
+        actions = [step["action"] for step in plan["steps"]]
+        self.assertIn("walk_to", actions)
+        self.assertIn("nap", actions)
+        self.assertNotIn("sleep", actions)
+        self.assertEqual(plan["source"], "rule")
+
+    def test_low_energy_at_night_goes_to_bed(self):
+        decider = Decider(self.world, hour_provider=lambda: 2)
+        state = WorldState(session_id="s1", node_id="study", energy=0.1, world_time=10)
+        plan = decider.rule_plan(state)
         self.assertIsNotNone(plan)
         actions = [step["action"] for step in plan["steps"]]
         self.assertIn("sleep", actions)
-        self.assertEqual(plan["source"], "rule")
+        self.assertNotIn("nap", actions)
+
+    def test_night_window_is_configurable(self):
+        """夜晚时段可配：几点到几点算晚上由「作息与夜晚」决定。"""
+
+        world = make_world()
+        self.assertTrue(world.is_night_time(23))
+        self.assertTrue(world.is_night_time(3))
+        self.assertFalse(world.is_night_time(12))
+        self.assertTrue(world.sleep_allowed_now(23))
+        self.assertFalse(world.sleep_allowed_now(15))
+
+        data = default_world()
+        data["night"]["start_hour"] = 1
+        data["night"]["end_hour"] = 4
+        narrow, _warnings = parse_world(data)
+        self.assertFalse(narrow.is_night_time(23))
+        self.assertTrue(narrow.is_night_time(2))
+        self.assertFalse(narrow.is_night_time(5))
+        self.assertFalse(narrow.sleep_allowed_now(23))
+        self.assertTrue(narrow.sleep_allowed_now(2))
+
+    def test_no_night_window_disables_the_restrictions(self):
+        """起止小时相同 = 没有夜晚时段：睡觉不限时段，熬夜代价也不生效。"""
+
+        data = default_world()
+        data["night"]["start_hour"] = 0
+        data["night"]["end_hour"] = 0
+        world, _warnings = parse_world(data)
+        self.assertFalse(world.is_night_time(3))
+        self.assertTrue(world.sleep_allowed_now(15))
+
+    def test_decider_night_follows_the_config(self):
+        """规则里"夜里睡整觉 / 白天小睡"的分界同样跟随配置。"""
+
+        data = default_world()
+        data["night"]["start_hour"] = 1
+        data["night"]["end_hour"] = 4
+        world, _warnings = parse_world(data)
+        self.assertTrue(Decider(world, hour_provider=lambda: 2).is_night())
+        self.assertFalse(Decider(world, hour_provider=lambda: 23).is_night())
+
+    def test_nap_length_follows_the_configured_recovery(self):
+        """小睡睡多久按动作自己写的恢复量反推，不是拍脑袋定一个数。"""
+
+        state = WorldState(session_id="s1", node_id="bedroom", energy=0.24, world_time=10)
+        decider = Decider(self.world, hour_provider=lambda: 15)
+        # 默认 +0.0015/分钟：要补到 0.42 得睡 2 小时，卡在动作自己的上限 1 小时
+        self.assertEqual(decider.nap_seconds(state), 60 * 60)
+
+        data = default_world()
+        for action in data["actions"]:
+            if action["id"] == "nap":
+                action["on_complete"]["effects_per_minute"] = {"energy": "+0.005"}
+        world, _warnings = parse_world(data)
+        stronger = Decider(world, hour_provider=lambda: 15)
+        # 恢复快了三倍多，睡 36 分钟就够（(0.42-0.24)/0.005）
+        self.assertEqual(stronger.nap_seconds(state), 36 * 60)
 
     def test_lonely_goes_to_lobby(self):
         state = WorldState(session_id="s1", node_id="bedroom", loneliness=0.9, world_time=10)
@@ -1005,6 +1832,10 @@ class TestDecider(unittest.TestCase):
         plan = self.decider.forced_plan(state, "force_sleep")
         self.assertIsNotNone(plan)
         self.assertEqual(plan["source"], "extreme")
+        # 白天透支先眯一会儿，不直接睡 8 小时（醒来正好是半夜）
+        self.assertEqual(plan["steps"][-1]["action"], "nap")
+        night = Decider(self.world, hour_provider=lambda: 1).forced_plan(state, "force_sleep")
+        self.assertEqual(night["steps"][-1]["action"], "sleep")
 
     def test_needs_plan_false_when_action_running(self):
         state = WorldState(session_id="s1", current_action={"type": "read"})
@@ -1059,6 +1890,34 @@ class TestDecider(unittest.TestCase):
         closed = WorldState(session_id="s1", valence=0.2)
         closed.interject_closed_until = self.decider._now() + 600
         self.assertAlmostEqual(self.decider.interject_threshold(closed), 0.75, places=4)
+
+    def test_good_mood_makes_her_more_willing_to_speak_up(self):
+        """心情好时阈值往下走：高心潮 + 高效价才该是"想找人玩"，而不只是说话更外放。"""
+
+        from core.decider import HAPPY_THRESHOLD_DROP, reply_willingness
+
+        happy = WorldState(session_id="s1", valence=0.9, loneliness=0.57)
+        self.assertAlmostEqual(
+            self.decider.interject_threshold(happy),
+            0.6 - HAPPY_THRESHOLD_DROP,
+            places=4,
+        )
+        # 阈值下浮让"想接一句"更容易成立：同样的孤独感，心情一般时还够不着
+        self.assertTrue(self.decider.interject_motive(happy))
+        plain = WorldState(session_id="s1", valence=0.5, loneliness=0.57)
+        self.assertEqual(self.decider.interject_motive(plain), "")
+
+        sad = WorldState(session_id="s1", valence=0.1, loneliness=0.57)
+        self.assertGreater(self.decider.interject_threshold(sad), 0.6)
+
+        # 意愿也要跟着心情走：同样状态下，心情好的人更容易被抽中去安排计划
+        baseline = WorldState(session_id="s1", valence=0.5, affect=0.3, loneliness=0.4)
+        brighter = WorldState(session_id="s1", valence=0.9, affect=0.3, loneliness=0.4)
+        duller = WorldState(session_id="s1", valence=0.1, affect=0.3, loneliness=0.4)
+        self.assertGreater(
+            reply_willingness(brighter), reply_willingness(baseline)
+        )
+        self.assertLess(reply_willingness(duller), reply_willingness(baseline))
 
     def test_low_mood_lowers_blocks_for_self_care(self):
         """低落时更容易选择"缓一缓"：发呆 / 看书的门槛下调。"""
@@ -1482,7 +2341,9 @@ class TestEchoTypeCatalog(unittest.TestCase):
         raw = default_world()
         raw["echo_actions"] = True
         world, _warnings = parse_world(raw)
-        self.assertEqual(world.echo_types, list(DEFAULT_ECHO_TYPES))
+        self.assertEqual(list(world.echo_modes), list(DEFAULT_ECHO_TYPES))
+        self.assertTrue(all(mode == "full" for mode in world.echo_modes.values()))
+        self.assertEqual(world.echo_types, [])
         self.assertNotIn("echo_actions", world.model_dump())
 
     def test_legacy_switch_off_means_nothing_selected(self):
@@ -1558,12 +2419,13 @@ class TestDefaultTextUpgrade(unittest.TestCase):
                     "打个盹，睡多久由你自己决定（10 分钟到 1 小时），睡得越久精力恢复越多。"
                 )
         world, _warnings = parse_world(raw)
-        self.assertIn("夜里或精力见底时用", world.action_map()["sleep"].description)
+        self.assertIn("夜里或凌晨", world.action_map()["sleep"].description)
+        self.assertIn("别在白天睡整觉", world.action_map()["sleep"].description)
         self.assertIn("白天犯困时", world.action_map()["nap"].description)
 
     def test_shipped_sleep_defaults_say_when_to_use_them(self):
         world = make_world()
-        self.assertIn("夜里或精力见底时用", world.action_map()["sleep"].description)
+        self.assertIn("夜里或凌晨", world.action_map()["sleep"].description)
         self.assertIn("白天犯困时", world.action_map()["nap"].description)
 
 
@@ -1571,6 +2433,24 @@ class TestPromptBuilder(unittest.TestCase):
     def setUp(self) -> None:
         self.world = make_world()
         self.builder = PromptBuilder(self.world)
+
+    def test_boredom_grows_faster_the_longer_she_stays(self):
+        """待得越久无聊涨得越快；换地点（node_since 重置）就回到 1.0。"""
+
+        dynamics = StateDynamics(self.world.state_dynamics)
+        state = WorldState(session_id="s1", node_id="study", world_time=10)
+        state.node_since = 1_700_000_000.0
+        dynamics._now_provider = lambda: 1_700_000_000.0 + 5 * 60
+        self.assertEqual(dynamics.dwell_factor(state), 1.0)
+        dynamics._now_provider = lambda: 1_700_000_000.0 + 20 * 60
+        self.assertEqual(dynamics.dwell_factor(state), 1.3)
+        dynamics._now_provider = lambda: 1_700_000_000.0 + 45 * 60
+        self.assertEqual(dynamics.dwell_factor(state), 1.6)
+        dynamics._now_provider = lambda: 1_700_000_000.0 + 200 * 60
+        self.assertEqual(dynamics.dwell_factor(state), 2.0)
+        # 换地点：node_since 是"刚到"的时间
+        state.node_since = 1_700_000_000.0 + 200 * 60
+        self.assertEqual(dynamics.dwell_factor(state), 1.0)
 
     def test_injection_contains_scene_and_state(self):
         state = WorldState(session_id="s1", node_id="study", energy=0.42, mood="好奇")
@@ -1580,6 +2460,22 @@ class TestPromptBuilder(unittest.TestCase):
         self.assertIn("0~1", text)
         self.assertIn("虚拟世界状态", text)
         self.assertNotIn("actions", text)
+
+    def test_duration_is_asked_for_in_the_actions_that_let_her_choose(self):
+        """「睡多久她自己定」的动作要把范围写在动作那一行，并告诉她写 duration。"""
+
+        nap = next(item for item in self.world.actions if item.id == "nap")
+        line = self.builder._action_line(nap)
+        self.assertIn("时长由你定", line)
+        self.assertIn("10 分钟", line)
+        self.assertIn("duration", line)
+
+        # 固定时长的动作不该被问时长
+        fixed = next(item for item in self.world.actions if item.id == "sleep")
+        self.assertNotIn("时长由你定", self.builder._action_line(fixed))
+
+        contract = self.builder.format_layer(max_messages=2)
+        self.assertIn("duration：标着「时长由你定」的动作必须写它", contract)
 
     def test_autonomous_prompt_has_five_layers_and_json_contract(self):
         state = WorldState(session_id="s1", node_id="study")
@@ -1767,6 +2663,25 @@ class TestPromptBuilder(unittest.TestCase):
         )
         self.assertIn("紧接着把要做的那个动作也写进", scene)
 
+    def test_remote_actions_are_listed_with_ids(self):
+        """别处才能做的动作要给 id + 地点，否则她只写一步 walk_to 就完事。"""
+
+        scene = self.builder.scene_layer(self.world.node_map()["bedroom"], {})
+        hint = [line for line in scene.splitlines() if "别处才能做的动作" in line][0]
+        self.assertIn("search_web（书房）", hint)
+        self.assertIn("walk_to", hint)
+        # 这里就能做的动作不该混进"别处"那一行
+        self.assertNotIn("say（", hint)
+        self.assertNotIn("nap（", hint)
+
+        # 关掉「允许她想去别处做某事」时不再提示
+        self.world.remote_action_travel = False
+        self.assertNotIn(
+            "别处才能做的动作",
+            self.builder.scene_layer(self.world.node_map()["bedroom"], {}),
+        )
+        self.world.remote_action_travel = True
+
     def test_plan_mode_switches_the_format_contract(self):
         state = WorldState(session_id="s1", node_id="study")
         plan_prompt = self.builder.build_autonomous_system_prompt(
@@ -1822,11 +2737,11 @@ class TestPromptBuilder(unittest.TestCase):
             [{"user_id": "42", "name": "小明", "text": "在吗", "is_self": False}],
             "更早的时候大家在聊搬家。",
         )
-        self.assertIn("之前的群聊", blocks[0])
+        self.assertIn("更早的聊天", blocks[0])
         self.assertIn("搬家", blocks[0])
 
-    def test_replied_batch_becomes_history_not_fresh(self):
-        """水位线以内的是"已经回应过"：压成概览进历史块，不原样重复。"""
+    def test_replied_batch_is_shown_verbatim_but_marked_answered(self):
+        """水位线以内的也原样给她看，但标清"这批已经回过了"，别让她重复回应。"""
 
         chat = [
             {"user_id": "42", "name": "小明", "text": "晚饭吃什么", "at": 100.0},
@@ -1839,9 +2754,12 @@ class TestPromptBuilder(unittest.TestCase):
             preview="小明：晚饭吃什么；阿May：吃鱼吧；你：好呀",
             replied_until=115.0,
         )
-        history, fresh = blocks[0], blocks[1]
-        self.assertIn("之前的群聊", history)
-        self.assertIn("晚饭吃什么", history)
+        answered, fresh = blocks[0], blocks[1]
+        # 已经回过的那批：原文在，而且标着"你已经回过话了"
+        self.assertIn("你已经回过话", answered)
+        self.assertIn("晚饭吃什么", answered)
+        self.assertIn("吃鱼吧", answered)
+        self.assertIn("你: 好呀", answered)
         # 还没回应过的那条原样出现在「最近在聊什么」里，并带上时间
         self.assertIn("最近在聊什么", fresh)
         self.assertIn("那就这么定了", fresh)
@@ -1870,6 +2788,130 @@ class TestPromptBuilder(unittest.TestCase):
         joined = "\n".join(blocks)
         self.assertIn("你最近说过的话", joined)
         self.assertIn("都下午三点了呀主人！", joined)
+
+    def test_attached_images_are_marked_with_their_number(self):
+        """发过去的图要在记录里标上编号，她才知道记录和附件怎么对上。"""
+
+        chat = [
+            {"user_id": "42", "name": "小明", "text": "看这个", "at": 100.0,
+             "images": ["https://example.com/1.png"]},
+            {"user_id": "7", "name": "阿May", "text": "还有这张", "at": 160.0,
+             "images": ["https://example.com/2.png"]},
+        ]
+        blocks = self.builder.chat_blocks(
+            chat,
+            image_marks={"https://example.com/1.png": "图1"},
+        )
+        joined = "\n".join(blocks)
+        self.assertIn("看这个（见图1）", joined)
+        # 没附上去的那张只留文字，不编号
+        self.assertIn("还有这张", joined)
+        self.assertNotIn("还有这张（见", joined)
+        self.assertIn("这次一起发给你的图", joined)
+
+    def test_chat_images_are_not_marked_without_marks(self):
+        """主模型不吃图时不写编号，免得她去找根本不存在的附件。"""
+
+        blocks = self.builder.chat_blocks(
+            [{"user_id": "42", "name": "小明", "text": "看这个", "at": 100.0,
+              "images": ["https://example.com/1.png"]}]
+        )
+        joined = "\n".join(blocks)
+        self.assertNotIn("见图", joined)
+        self.assertNotIn("这次一起发给你的图", joined)
+
+    def test_unanswered_chat_lines_get_the_full_budget(self):
+        """还没回过她的那批要给足：300 字的长消息不再被掐成 100 字半句。"""
+
+        long_one = "很" * 300
+        blocks = self.builder.chat_blocks(
+            [{"user_id": "42", "name": "小明", "text": long_one, "at": 100.0}]
+        )
+        joined = "\n".join(blocks)
+        line = [item for item in joined.splitlines() if item.startswith("- [")][0]
+        body = line.split(": ", 1)[1]
+        self.assertEqual(body, long_one)
+        self.assertNotIn("…", body)
+
+    def test_a_cut_line_says_how_much_is_left(self):
+        """真超上限时标明还剩多少字：只留一个「…」她会以为对方话没说完。"""
+
+        long_one = "很" * 900
+        blocks = self.builder.chat_blocks(
+            [{"user_id": "42", "name": "小明", "text": long_one, "at": 100.0}]
+        )
+        line = [
+            item
+            for item in "\n".join(blocks).splitlines()
+            if item.startswith("- [")
+        ][0]
+        body = line.split(": ", 1)[1]
+        self.assertIn("（这条还有", body)
+        self.assertIn("字没显示）", body)
+        self.assertLessEqual(len(body), self.builder.world.context.chat_line_chars + 40)
+
+    def test_answered_lines_keep_the_short_background_limit(self):
+        """已经回过的那批只当背景：仍然按短上限（默认 100 字）处理。"""
+
+        long_one = "很" * 300
+        blocks = self.builder.chat_blocks(
+            [{"user_id": "42", "name": "小明", "text": long_one, "at": 100.0}],
+            replied_until=200.0,
+        )
+        line = [
+            item
+            for item in "\n".join(blocks).splitlines()
+            if item.startswith("- [")
+        ][0]
+        body = line.split(": ", 1)[1]
+        self.assertIn("（这条还有", body)
+        self.assertLess(len(body), self.builder.world.context.chat_line_chars)
+
+    def test_chat_records_respect_the_total_budget(self):
+        """整段聊天记录有总字数预算：超了先丢最早的背景，不丢还没回过的那几条。"""
+
+        context = self.builder.world.context
+        context.chat_total_chars = 250
+        chat = [
+            {
+                # 每条换个人，免得被"同一个人连着说的并成一行"
+                "user_id": str(100 + index),
+                "name": f"群友{index}",
+                "text": f"旧消息{index}" + "啊" * 60,
+                "at": float(10 + index),
+            }
+            for index in range(6)
+        ]
+        chat.append({"user_id": "7", "name": "阿May", "text": "最新的这句", "at": 99.0})
+        blocks = self.builder.chat_blocks(chat, replied_until=15.0)
+        joined = "\n".join(blocks)
+        self.assertIn("最新的这句", joined)
+        self.assertIn("已省略", joined)
+        # 丢的是最早的背景，最新的那条旧消息还在
+        self.assertNotIn("旧消息0", joined)
+        self.assertIn("旧消息5", joined)
+
+    def test_forward_summary_line_keeps_its_own_limit(self):
+        """转发摘要本身是压过的：这一行不该跟着聊天记录掐到 100 字。"""
+
+        summary = "很" * 200
+        blocks = self.builder.chat_blocks(
+            [
+                {
+                    "user_id": "42",
+                    "name": "张三",
+                    "text": f"{FORWARD_SUMMARY_MARK}{summary}",
+                    "at": 100.0,
+                }
+            ]
+        )
+        joined = "\n".join(blocks)
+        line = [item for item in joined.splitlines() if item.startswith("- [")][0]
+        body = line.split(": ", 1)[1]
+        self.assertTrue(body.startswith("（转发："))
+        self.assertTrue(body.endswith("）"))
+        self.assertGreater(len(body), 100)
+        self.assertNotIn("…", body)
 
     def test_chat_blocks_say_whose_conversation_it_is(self):
         """别人在互相说话时要写明"没点名找你"，还要点破「你」不是指她。"""
@@ -1964,6 +3006,52 @@ class TestPromptBuilder(unittest.TestCase):
         self.assertIn("说话", text)
         # 事件也渲染成人话，而不是原始 dict
         self.assertIn("走到了：书房", text)
+
+    def test_in_progress_block_separates_done_from_queued(self):
+        """写进安排不等于做完：排队的要明确标出来，做过的单独一行。"""
+
+        state = WorldState(
+            session_id="s1",
+            node_id="rooftop",
+            current_action={
+                "type": "walk_to",
+                "desc": "正在走去天台",
+                "duration_ticks": 3,
+                "elapsed_ticks": 1,
+            },
+            current_plan={
+                "steps": [
+                    {"action": "walk_to"},
+                    {"action": "walk_to"},
+                    {"action": "take_photo"},
+                ],
+                "current_step": 1,
+                "reason": "去天台拍张照",
+                "source": "llm",
+            },
+        )
+        text = self.builder._in_progress_block(state)
+        self.assertIn("已经做完的", text)
+        self.assertIn("接下来排队", text)
+        self.assertIn("一件都还没做", text)
+        self.assertIn("写进安排 ≠ 已经做完", text)
+        # 手上这件已经在第一行写过，不该在排队那一行重复
+        self.assertEqual(text.count("正在走去天台"), 1)
+
+    def test_soft_wake_prompt_says_nobody_at_her(self):
+        """顺着话题对她说的话：不能写成「有人 @ 你」。"""
+
+        text = self.builder.build_reply_user_prompt(
+            user_name="小红", text="这事你怎么看", addressing="soft"
+        )
+        self.assertIn("没有 @ 你", text)
+        self.assertIn("顺着话题", text)
+
+        plain = self.builder.build_reply_user_prompt(
+            user_name="小红", text="这事你怎么看", addressing="direct"
+        )
+        self.assertIn("小红 对你说", plain)
+        self.assertNotIn("没有 @ 你", plain)
 
     def test_ability_map_lists_nodes(self):
         text = self.builder.ability_map()

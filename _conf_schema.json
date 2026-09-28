@@ -14,12 +14,47 @@
     "default": true
   },
   "llm_provider_id": {
-    "description": "插件用模型（接管回复 + 自主行为）",
-    "hint": "插件自己发起的调用用它：接管回复、自主决策、主动发言、动作续说。留空用会话默认 Provider。\n选型：能稳定输出 JSON 的即可，别用推理型模型（更慢、还等于思考两次）。很在意聊天质量就别用太便宜的档位。",
+    "description": "插件用主模型",
+    "hint": "插件自己发起的调用用它：接管回复、自主决策、主动发言、动作续说。留空用会话默认 Provider。\n选型：能稳定输出 JSON 的即可，当在编辑器页面的设置里开启了推理后, 建议关闭模型自己的推理",
     "_special": "select_provider",
     "obvious_hint": true,
     "type": "string",
     "default": ""
+  },
+  "sampling_enabled": {
+    "description": "接管采样参数",
+    "hint": "关着（默认）＝用 Provider 自己的设置。打开后本插件发起的调用会带上下面几个采样参数——多轮聊天复读、腔调固定，一半是采样参数的事。Provider 不认这些参数时会自动退回只用温度，不会让回复挂掉。",
+    "obvious_hint": false,
+    "type": "bool",
+    "default": false
+  },
+  "sampling_temperature": {
+    "description": "温度",
+    "hint": "越小越稳、越大越发散。角色扮演一般 0.8~1.0；调太高会开始胡言乱语。",
+    "obvious_hint": false,
+    "type": "float",
+    "default": 0.9
+  },
+  "sampling_top_p": {
+    "description": "top_p",
+    "hint": "核采样：只从累积概率前 p 的词里选。一般留 1.0（不裁剪），要收紧可以试 0.9。",
+    "obvious_hint": false,
+    "type": "float",
+    "default": 1.0
+  },
+  "sampling_frequency_penalty": {
+    "description": "重复惩罚（frequency）",
+    "hint": "按出现次数惩罚重复词，治「复读」最直接。0 = 不罚，常用 0.2~0.6；调太高会让话变得别扭。",
+    "obvious_hint": false,
+    "type": "float",
+    "default": 0.3
+  },
+  "sampling_presence_penalty": {
+    "description": "新话题奖励（presence）",
+    "hint": "只要出现过就罚，鼓励说没说过的新内容。0 = 关闭，常用 0~0.3。",
+    "obvious_hint": false,
+    "type": "float",
+    "default": 0.0
   },
   "helper_provider_id": {
     "description": "打杂模型（文本）",
@@ -37,9 +72,33 @@
     "type": "string",
     "default": ""
   },
+  "judge_provider_id": {
+    "description": "判断模型（只做轻决策）",
+    "hint": "专门干不要文笔、只要稳的活，越小越快越省越好（如qwen-flash）。留空＝跟随打杂模型。",
+    "_special": "select_provider",
+    "obvious_hint": false,
+    "type": "string",
+    "default": ""
+  },
   "creator_provider_id": {
-    "description": "内容生成模型（生成动作 / 地点）",
-    "hint": "只在编辑器里点「生成动作 / 生成地点」时调用，平时完全不占 token。它要写的是文案，不建议用打杂模型顶掉；留空跟随插件用模型。",
+    "description": "内容生成模型（编事件 / 生成动作与地点）",
+    "hint": "两件事归它：①她一个人待着时现编一件发生在身边的事；②编辑器里点「生成动作 / 生成地点」。它写的是文案，不建议用低成本模型；留空跟随插件用模型。",
+    "_special": "select_provider",
+    "obvious_hint": false,
+    "type": "string",
+    "default": ""
+  },
+  "consolidate_provider_id": {
+    "description": "睡眠整理模型（记忆 + 用户画像）",
+    "hint": "她睡着时用它把这段时间的经历消化成记忆与画像：合并重复、提取要点、更新关系与缩略版、写梦。调用次数很少, 建议使用能力强的模型",
+    "_special": "select_provider",
+    "obvious_hint": false,
+    "type": "string",
+    "default": ""
+  },
+  "event_provider_id": {
+    "description": "事件模型（事件结算）",
+    "hint": "事件最后怎么样了由它一句话定下场：写的是人话，还带着情绪与能力值的变化。留空跟随打杂模型。",
     "_special": "select_provider",
     "obvious_hint": false,
     "type": "string",

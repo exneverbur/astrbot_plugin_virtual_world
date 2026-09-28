@@ -9,7 +9,27 @@ from .state import WorldState
 # 所以在代码里留一张极小的内置表——这不是给用户配的。
 _BUILTIN_STATUS_TEXT = {
     "awakening": "刚醒",
+    # 睡觉/小睡通常由动作自带文案；这里再兜一层，状态被手动改过时也不会算出"在卧室"
+    "sleeping": "睡觉中",
+    "napping": "小睡中",
 }
+
+
+def event_status_text(state: WorldState) -> str:
+    """她正处理一件事件时对外显示的那一截（「事件中」）。
+
+    睡着的时候不算：那时名片该说「睡觉中」——事件挂起不等于她在忙它。
+    """
+
+    if str(getattr(state, "state", "")) in ("sleeping", "napping"):
+        return ""
+    info = state.pending_help or {}
+    if str(info.get("state") or "") in ("active", "idle"):
+        return "event"
+    for item in list(state.event_threads or []):
+        if isinstance(item, dict) and str(item.get("status") or "open") == "open":
+            return "event"
+    return ""
 
 
 def compute_nickname(
@@ -34,13 +54,20 @@ def compute_nickname(
         return ""
 
     status = ""
+    # 事件优先于"她在做什么动作"：正被跟踪的时候，名片写「事件中」比写「移动中」有意义
+    if event_status_text(state):
+        text = str(getattr(config, "event_text", "") or "").strip()
+        if text:
+            status = text
     # 优先用「她正在做的这个动作」自己写的文案：文案跟着动作走，
     # 换预设（动作跟着预设换）时名片也就配套了，不用再手动维护一份映射。
     current = state.current_action if isinstance(state.current_action, dict) else None
     action_id = str((current or {}).get("type") or "")
     definition = world.action_map().get(action_id) if action_id else None
     action_label = str(getattr(definition, "nickname_text", "") or "").strip()
-    if action_label:
+    if status:
+        pass
+    elif action_label:
         status = action_label
     else:
         # 「她在做什么」优先于「她在哪儿」：睡觉时名片该写「睡觉中」而不是「在卧室」

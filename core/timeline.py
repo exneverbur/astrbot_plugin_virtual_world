@@ -29,6 +29,14 @@ def _clip(text: Any, limit: int = 120) -> str:
     return value if len(value) <= limit else value[:limit] + "…"
 
 
+# 事件是哪来的：日志与调试输出里标一行，一眼能看出这条是不是固定的
+EVENT_SOURCE_LABELS: dict[str, str] = {
+    "llm": "临场生成",
+    "user": "用户投递",
+    "follow": "线索续演",
+}
+
+
 def node_name(node_id: str, world: WorldConfig | None) -> str:
     if world is not None:
         node = world.node_map().get(node_id)
@@ -73,8 +81,29 @@ def render_event(
 
     ``compact`` 是调试输出的精简模式：只留"发生了什么"，去掉参数、返回值、
     模型原话这些需要展开看的细节。
+
     """
 
+    text = _render_body(event, world, compact=compact)
+    where = _place_text(event)
+    return f"{text}　〔在 {where}〕" if where else text
+
+
+def _place_text(event: dict[str, Any]) -> str:
+    """这件事发生在哪个会话（会话组里的几个群 / 私聊共用一册日志，得标出来）。"""
+
+    detail = event.get("detail") or {}
+    if not isinstance(detail, dict):
+        return ""
+    return " ".join(str(detail.get("session") or "").split())
+
+
+def _render_body(
+    event: dict[str, Any],
+    world: WorldConfig | None = None,
+    *,
+    compact: bool = False,
+) -> str:
     kind = str(event.get("event_type") or "")
     detail = event.get("detail") or {}
     if not isinstance(detail, dict):
@@ -97,14 +126,26 @@ def render_event(
         actions = [str(item) for item in (detail.get("actions") or []) if item]
         if actions:
             text += f"　〔动作：{'、'.join(actions)}〕"
+        mode = str(detail.get("plan_mode") or "")
+        if mode == "interrupt":
+            text += "　⏭️ 这一步插队：手上的事让开了"
+        elif mode == "replace":
+            text += "　⏭️ 顶上：没做的那几步不做了"
         for node_id in detail.get("auto_travel") or []:
             text += f"\n　　↪ 她想去别处做这件事，已自动前往「{node_name(str(node_id), world)}」"
+        images = int(detail.get("images") or 0)
+        if images:
+            text += f"　（还贴了 {images} 张图）"
         for warning in detail.get("warnings") or []:
             text += f"\n　　⚠ {warning}"
         return text
 
     if kind == "bot_message":
-        return f"主动发言：{_join(detail.get('messages'), sep='\n　　')}"
+        text = f"主动发言：{_join(detail.get('messages'), sep='\n　　')}"
+        images = int(detail.get("images") or 0)
+        if images:
+            text += f"　（还贴了 {images} 张图）"
+        return text
 
     if kind == "plan":
         steps = detail.get("steps") or []
@@ -351,13 +392,172 @@ def render_event(
     if kind == "engagement":
         return f"进入安静期：{_clip(detail.get('reason'), 80)}"
 
+    if kind == "takeover_failed":
+        # 接管没生效：这一条她没说话（不交回主人格），原因写在这儿供排查
+        reason = _clip(detail.get("reason"), 60) or "没有对外输出"
+        head = f"这条没接上，她没说话：{reason}"
+        if compact:
+            return head
+        warnings = [str(item) for item in (detail.get("warnings") or []) if str(item)]
+        if warnings:
+            head += f"　〔{_clip('；'.join(warnings), 100)}〕"
+        return head
+
     if kind == "bot_spoke":
         return "她说了话，等待回应"
 
+    # ---------------- 事件系统 ----------------
+
+    if kind == "event":
+        title = _clip(detail.get("title"), 40) or "一件小事"
+        where = node_name(str(detail.get("node") or ""), world)
+        head = f"遇到「{title}」"
+        if where:
+            head += f"（{where}）"
+        if detail.get("imagined"):
+            head += "｜虚构场景"
+        if detail.get("need_help"):
+            head += "｜需要协助"
+        source = str(detail.get("source") or "")
+        label = EVENT_SOURCE_LABELS.get(source, source)
+        if label:
+            head += f"｜{label}"
+        if compact:
+            return head
+        return f"{head}：{_clip(detail.get('hook'), 80)}"
+
+    if kind == "event_choice":
+        desc = _clip(detail.get("desc"), 60) or "照原计划"
+        abilities = _clip(detail.get("abilities"), 20)
+        head = f"她选：{desc}"
+        if abilities:
+            head += f"（{abilities}）"
+        if compact:
+            return head
+        reason = _clip(detail.get("reason"), 60)
+        return f"{head}　〔{reason}〕" if reason else head
+
+    if kind == "search_digest":
+        topic = _clip(detail.get("topic"), 30)
+        head = (
+            f"检索整理：{topic}｜材料 {int(detail.get('materials') or 0)} 条 / "
+            f"{int(detail.get('material_chars') or 0)} 字"
+        )
+        if compact:
+            return head
+        preview = _clip(detail.get("preview"), 60)
+        digest = _clip(detail.get("digest"), 120)
+        if preview:
+            head += f"\n　　材料开头：{preview}"
+        if digest:
+            head += f"\n　　压成：{digest}"
+        return head
+
+    if kind == "incoming":
+        who = _clip(detail.get("user") or detail.get("user_id"), 20) or "有人"
+        body = _clip(detail.get("text"), 60)
+        marks = []
+        if detail.get("mentioned"):
+            marks.append("喊了她")
+        elif detail.get("wake"):
+            marks.append("交给了她")
+        if detail.get("private"):
+            marks.append("私聊")
+        if int(detail.get("images") or 0):
+            marks.append(f"{int(detail.get('images'))} 张图")
+        tail = f"（{'、'.join(marks)}）" if marks else ""
+        return f"收到消息：{who}：{body}{tail}"
+
+    if kind == "event_check":
+        ability = _clip(detail.get("ability"), 12)
+        if detail.get("skip"):
+            # 她自己选了「先不做」：没有骰子可掷，别显示成概率 0
+            return f"{ability or '这件事'}：她主动放弃了，不掷骰"
+        value = float(detail.get("ability_value") or 0.0)
+        difficulty = float(detail.get("difficulty") or 0.0)
+        probability = float(detail.get("probability") or 0.0)
+        roll = float(detail.get("roll") or 0.0)
+        tier = _clip(detail.get("tier"), 12)
+        mods = [
+            f"{_clip(item.get('label'), 10)} ×{float(item.get('factor') or 1):.2f}"
+            for item in list(detail.get("modifiers") or [])
+            if isinstance(item, dict)
+        ]
+        head = f"{ability} {value:.2f}"
+        if mods and not compact:
+            head += " × " + " × ".join(mods)
+        # 成功条件写清楚：掷出的点数 ≤ 概率才算成——只给"概率"看不出差多少
+        head += f" × 难度 {difficulty:.2f} = 要掷到 ≤ {probability:.2f}"
+        return f"{head}，掷出 {roll:.2f} → {tier}"
+
+    if kind == "event_result":
+        outcome = _clip(detail.get("outcome"), 90)
+        parts = [f"结果：{outcome}"] if outcome else ["结果"]
+        changes = detail.get("ability_delta") or {}
+        if isinstance(changes, dict) and changes:
+            parts.append(
+                "能力值 "
+                + "、".join(
+                    f"{key} {'+' if float(value) >= 0 else ''}{float(value):.2f}"
+                    for key, value in changes.items()
+                )
+            )
+        if detail.get("followup"):
+            parts.append("还有后续")
+        elif detail.get("closed"):
+            parts.append("这条线索到此为止")
+        return "｜".join(parts)
+
+    if kind == "help":
+        stage = str(detail.get("stage") or "")
+        if stage == "ask":
+            return f"她开口求助：{_clip(detail.get('text'), 60)}"
+        if stage == "reply":
+            body = _clip(detail.get("text"), 80) or _clip(detail.get("digest"), 80)
+            dropped = int(detail.get("dropped") or 0)
+            kept = int(detail.get("kept") or 0)
+            tail = f"（有效 {kept} 条 / 无关 {dropped} 条）" if kept or dropped else ""
+            return f"收到群友回应：{body}{tail}"
+        if stage == "resolve":
+            return f"她把建议听进去了：{_clip(detail.get('note'), 80)}"
+        if stage == "timeout":
+            return f"等不到人，她自己收尾：{_clip(detail.get('note'), 60)}"
+        if stage == "remind":
+            return f"轻提醒一句：{_clip(detail.get('text'), 60)}"
+        return f"求助：{_clip(detail.get('note'), 60)}"
+
+    if kind == "event_idle":
+        stage = str(detail.get("stage") or "")
+        title = _clip(detail.get("title"), 40) or "这件事"
+        if stage == "hold":
+            return f"「{title}」先挂起来，她去做别的了"
+        if stage == "expired":
+            return f"「{title}」放太久，告一段落"
+        if stage == "abandon":
+            return f"「{title}」她自己收尾了（没人搭手）"
+        if stage == "stopped":
+            return f"「{title}」在编辑器里被手动完结了"
+        return f"「{title}」暂时搁下"
+
+    if kind == "context":
+        # 群聊上下文的动作（压缩成摘要 / 留档满了）：日志页要能一眼看懂
+        note = str(detail.get("note") or "").strip() or "上下文有变化"
+        compressed = int(detail.get("compressed") or 0)
+        if compressed:
+            note += f"（{compressed} 条）"
+        hint = str(detail.get("hint") or "").strip()
+        return note + (f"\n　　💡 {hint}" if hint else "")
+
     # 未知类型：把 detail 原样压成一行，至少不丢信息
     if detail:
-        pairs = "，".join(f"{key}={_clip(value, 40)}" for key, value in detail.items())
-        return f"{kind}：{pairs}"
+        # session 由外层统一补在行尾，这里不再重复一份
+        pairs = "，".join(
+            f"{key}={_clip(value, 40)}"
+            for key, value in detail.items()
+            if key != "session"
+        )
+        if pairs:
+            return f"{kind}：{pairs}"
     return kind or "（未知事件）"
 
 

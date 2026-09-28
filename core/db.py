@@ -53,6 +53,71 @@ CREATE TABLE IF NOT EXISTS user_relation (
     PRIMARY KEY (session_id, persona_id, user_id)
 );
 
+-- 用户画像：一人一行（按"她"存，group_id = 会话组代表会话）
+CREATE TABLE IF NOT EXISTS user_profile (
+    group_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    affinity REAL NOT NULL DEFAULT 0,
+    first_seen_at REAL NOT NULL DEFAULT 0,
+    last_seen_at REAL NOT NULL DEFAULT 0,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    digest TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (group_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_profile_seen ON user_profile (group_id, last_seen_at);
+
+-- 关于他的事实（喜好 / 约定 / 习惯…），每条都留着"他说的原话"
+CREATE TABLE IF NOT EXISTS user_fact (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'other',
+    text TEXT NOT NULL,
+    evidence TEXT NOT NULL DEFAULT '',
+    context TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 0.6,
+    status TEXT NOT NULL DEFAULT 'active',
+    source_session TEXT NOT NULL DEFAULT '',
+    pinned INTEGER NOT NULL DEFAULT 0,
+    mentions TEXT NOT NULL DEFAULT '[]',
+    first_at REAL NOT NULL,
+    last_confirmed_at REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fact_user ON user_fact (group_id, user_id, status);
+
+-- 关系（一个人可以有多条：既是主人也是男友；解除后保留成 past）
+CREATE TABLE IF NOT EXISTS user_bond (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    slot TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'current',
+    since REAL NOT NULL DEFAULT 0,
+    until REAL NOT NULL DEFAULT 0,
+    evidence TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 0.6,
+    asserted_by TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bond_user ON user_bond (group_id, user_id, status);
+
+-- 好感度变化日志（可见、可解释）
+CREATE TABLE IF NOT EXISTS affinity_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    at REAL NOT NULL,
+    delta REAL NOT NULL DEFAULT 0,
+    value_after REAL NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_affinity_user ON affinity_log (group_id, user_id, at);
+
 CREATE TABLE IF NOT EXISTS event_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL DEFAULT '',
@@ -102,6 +167,15 @@ CREATE TABLE IF NOT EXISTS schedule_fire (
     fired_at REAL NOT NULL,
     PRIMARY KEY (session_id, schedule_id, day_key, slot)
 );
+
+CREATE TABLE IF NOT EXISTS forward_cache (
+    fingerprint TEXT PRIMARY KEY,
+    summary TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    hits INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    last_used_at REAL NOT NULL
+);
 """
 
 # 旧版本建的 schedule_fire 没有 slot 列（主键是 会话+日程+日期），
@@ -120,6 +194,35 @@ INSERT OR IGNORE INTO schedule_fire (session_id, schedule_id, day_key, slot, fir
     SELECT session_id, schedule_id, day_key, '', fired_at FROM schedule_fire_legacy;
 DROP TABLE schedule_fire_legacy;
 """
+
+
+def _json_list(value: Any) -> list[Any]:
+    """把库里存的 JSON 数组读回来（坏了就当空列表）。"""
+
+    try:
+        data = json.loads(value or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return list(data) if isinstance(data, list) else []
+
+
+def _profile_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    try:
+        payload = json.loads(item.get("payload") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = {}
+    item["payload"] = payload if isinstance(payload, dict) else {}
+    item["affinity"] = float(item.get("affinity") or 0.0)
+    return item
+
+
+def _fact_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["mentions"] = _json_list(item.get("mentions"))
+    item["pinned"] = bool(item.get("pinned"))
+    item["confidence"] = float(item.get("confidence") or 0.0)
+    return item
 
 
 class Database:
@@ -149,6 +252,37 @@ class Database:
         if columns and "slot" not in columns:
             conn.executescript(_MIGRATE_SCHEDULE_FIRE)
             conn.commit()
+        # 记忆分层：raw（原始片段）→ gist（要点）；外加"当时原话"、参与者、回访时间
+        memory_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(node_memory)")
+        }
+        for name, ddl in (
+            ("tier", "ALTER TABLE node_memory ADD COLUMN tier TEXT NOT NULL DEFAULT 'raw'"),
+            ("context", "ALTER TABLE node_memory ADD COLUMN context TEXT NOT NULL DEFAULT ''"),
+            (
+                "participants",
+                "ALTER TABLE node_memory ADD COLUMN participants TEXT NOT NULL DEFAULT '[]'",
+            ),
+            (
+                "keywords",
+                "ALTER TABLE node_memory ADD COLUMN keywords TEXT NOT NULL DEFAULT '[]'",
+            ),
+            (
+                "next_review_at",
+                "ALTER TABLE node_memory ADD COLUMN next_review_at REAL NOT NULL DEFAULT 0",
+            ),
+            (
+                "pinned",
+                "ALTER TABLE node_memory ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "folded_at",
+                "ALTER TABLE node_memory ADD COLUMN folded_at REAL NOT NULL DEFAULT 0",
+            ),
+        ):
+            if memory_columns and name not in memory_columns:
+                conn.execute(ddl)
+        conn.commit()
 
     def close(self) -> None:
         with self._lock:
@@ -259,11 +393,18 @@ class Database:
         weight: float = 0.5,
         source: str = "runtime",
         created_at: float | None = None,
+        tier: str = "raw",
+        context: str = "",
+        participants: list[str] | None = None,
+        keywords: list[str] | None = None,
+        next_review_at: float = 0.0,
+        pinned: bool = False,
     ) -> int:
         cursor = self._execute(
             "INSERT INTO node_memory (session_id, persona_id, scope, node_id, content, "
-            "type, related_users, emotion, weight, created_at, last_recalled, recall_count, source) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)",
+            "type, related_users, emotion, weight, created_at, last_recalled, recall_count, source, "
+            "tier, context, participants, keywords, next_review_at, pinned, folded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, 0)",
             (
                 session_id,
                 persona_id,
@@ -276,6 +417,12 @@ class Database:
                 float(weight),
                 created_at if created_at is not None else time.time(),
                 source,
+                str(tier or "raw"),
+                str(context or ""),
+                json.dumps(list(participants or []), ensure_ascii=False),
+                json.dumps(list(keywords or []), ensure_ascii=False),
+                float(next_review_at or 0.0),
+                1 if pinned else 0,
             ),
         )
         return int(cursor.lastrowid or 0)
@@ -284,11 +431,15 @@ class Database:
         self,
         *,
         session_id: str | None = None,
+        session_ids: list[str] | None = None,
         persona_id: str | None = None,
         node_id: str | None = None,
         scope: str | None = None,
         memory_type: str | None = None,
         min_weight: float | None = None,
+        tiers: list[str] | None = None,
+        participants: list[str] | None = None,
+        due_review_before: float | None = None,
         limit: int = 200,
         order: str = "created_at DESC",
     ) -> list[dict[str, Any]]:
@@ -297,6 +448,11 @@ class Database:
         if session_id is not None:
             sql += " AND session_id = ?"
             params.append(session_id)
+        if session_ids:
+            # 会话组的召回：组里几个会话的记忆一起看（记忆本身还是各存各的）
+            marks = ",".join("?" for _ in session_ids)
+            sql += f" AND session_id IN ({marks})"
+            params.extend([str(item) for item in session_ids])
         if persona_id is not None:
             sql += " AND persona_id = ?"
             params.append(persona_id)
@@ -312,9 +468,28 @@ class Database:
         if min_weight is not None:
             sql += " AND weight >= ?"
             params.append(float(min_weight))
+        if tiers:
+            marks = ",".join("?" for _ in tiers)
+            sql += f" AND tier IN ({marks})"
+            params.extend([str(item) for item in tiers])
+        if due_review_before is not None:
+            sql += " AND next_review_at > 0 AND next_review_at <= ?"
+            params.append(float(due_review_before))
         sql += f" ORDER BY {order} LIMIT ?"
         params.append(int(limit))
-        return [self._memory_row(row) for row in self._query(sql, params)]
+        rows = [self._memory_row(row) for row in self._query(sql, params)]
+        wanted = [str(item) for item in (participants or []) if str(item)]
+        if wanted:
+            rows = [
+                row
+                for row in rows
+                if any(
+                    user in [str(entry) for entry in (row.get("participants") or [])]
+                    or user in [str(entry) for entry in (row.get("related_users") or [])]
+                    for user in wanted
+                )
+            ]
+        return rows
 
     @staticmethod
     def _memory_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -323,6 +498,13 @@ class Database:
             item["related_users"] = json.loads(item.get("related_users") or "[]")
         except json.JSONDecodeError:
             item["related_users"] = []
+        for key in ("participants", "keywords"):
+            try:
+                item[key] = json.loads(item.get(key) or "[]")
+            except json.JSONDecodeError:
+                item[key] = []
+        item["pinned"] = bool(item.get("pinned"))
+        item["tier"] = str(item.get("tier") or "raw")
         return item
 
     def update_memory(self, memory_id: int, **fields: Any) -> None:
@@ -341,16 +523,44 @@ class Database:
         )
 
     def mark_recalled(self, ids: list[int], when: float | None = None) -> None:
+        """召回 = 提取练习：被想起来的记忆**加强**一点（同时记下时间）。"""
+
         if not ids:
             return
         stamp = when if when is not None else time.time()
         with self._lock:
             self._conn.executemany(
-                "UPDATE node_memory SET last_recalled = ?, recall_count = recall_count + 1 "
+                "UPDATE node_memory SET last_recalled = ?, recall_count = recall_count + 1, "
+                "weight = MIN(1.0, weight + 0.02) "
                 "WHERE id = ?",
                 [(stamp, int(i)) for i in ids],
             )
             self._conn.commit()
+
+    def fold_memory(self, memory_id: int, *, text: str = "", when: float | None = None) -> None:
+        """把一条记忆"折叠"成要点：原文进 ``context``，正文换成更短的要点的。
+
+        遗忘只做这一步，**不删**：她还能看到当时那句话，只是不再占着大段原文。
+        """
+
+        row = None
+        rows = self._query("SELECT * FROM node_memory WHERE id = ?", (int(memory_id),))
+        if rows:
+            row = dict(rows[0])
+        if row is None:
+            return
+        stamp = float(when if when is not None else time.time())
+        body = " ".join(str(text or "").split()) or str(row.get("content") or "")
+        context = str(row.get("context") or "").strip()
+        if not context:
+            context = str(row.get("content") or "")
+        self.update_memory(
+            int(memory_id),
+            content=body[:200],
+            context=context[:600],
+            tier="gist",
+            folded_at=stamp,
+        )
 
     def delete_memories(
         self,
@@ -434,9 +644,21 @@ class Database:
             cursor = self._execute("DELETE FROM event_log")
         return int(cursor.rowcount or 0)
 
-    def memory_stats(self, session_id: str | None = None) -> dict[str, Any]:
-        where = "WHERE session_id = ?" if session_id else ""
-        params: tuple[Any, ...] = (session_id,) if session_id else ()
+    def memory_stats(
+        self, session_id: str | None = None, session_ids: list[str] | None = None
+    ) -> dict[str, Any]:
+        # 会话组：把组里几个会话的记忆合起来统计
+        wanted = [str(item) for item in (session_ids or []) if str(item)]
+        if wanted:
+            marks = ",".join("?" for _ in wanted)
+            where = f"WHERE session_id IN ({marks})"
+            params: tuple[Any, ...] = tuple(wanted)
+        elif session_id:
+            where = "WHERE session_id = ?"
+            params = (session_id,)
+        else:
+            where = ""
+            params = ()
         total = self._query(f"SELECT COUNT(*) AS c FROM node_memory {where}", params)[0]["c"]
         by_type = {
             row["type"]: row["c"]
@@ -554,6 +776,298 @@ class Database:
             item["memories"] = []
         return item
 
+    # ---------------- 用户画像 ----------------
+
+    def get_user_profile(self, *, group_id: str, user_id: str) -> dict[str, Any] | None:
+        rows = self._query(
+            "SELECT * FROM user_profile WHERE group_id = ? AND user_id = ?",
+            (group_id, user_id),
+        )
+        return _profile_row(rows[0]) if rows else None
+
+    def list_user_profiles(self, *, group_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        """这个组里认识的人，最近说过话的排前面（编辑器与"缩略版画像"用）。"""
+
+        rows = self._query(
+            "SELECT * FROM user_profile WHERE group_id = ? "
+            "ORDER BY last_seen_at DESC LIMIT ?",
+            (group_id, max(1, int(limit))),
+        )
+        return [_profile_row(row) for row in rows]
+
+    def upsert_user_profile(
+        self,
+        *,
+        group_id: str,
+        user_id: str,
+        payload: dict[str, Any],
+        affinity: float,
+        first_seen_at: float,
+        last_seen_at: float,
+        message_count: int,
+        digest: str,
+    ) -> None:
+        self._execute(
+            "INSERT INTO user_profile (group_id, user_id, payload, affinity, first_seen_at, "
+            "last_seen_at, message_count, digest, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(group_id, user_id) DO UPDATE SET payload = excluded.payload, "
+            "affinity = excluded.affinity, first_seen_at = excluded.first_seen_at, "
+            "last_seen_at = excluded.last_seen_at, message_count = excluded.message_count, "
+            "digest = excluded.digest, updated_at = excluded.updated_at",
+            (
+                group_id,
+                user_id,
+                json.dumps(payload or {}, ensure_ascii=False),
+                float(affinity),
+                float(first_seen_at or 0.0),
+                float(last_seen_at or 0.0),
+                int(message_count or 0),
+                str(digest or ""),
+                time.time(),
+            ),
+        )
+
+    def delete_user_profile(self, *, group_id: str, user_id: str) -> int:
+        """把一个人整个忘掉（画像 + 事实 + 关系 + 好感日志）。"""
+
+        removed = 0
+        for table in ("user_profile", "user_fact", "user_bond", "affinity_log"):
+            cursor = self._execute(
+                f"DELETE FROM {table} WHERE group_id = ? AND user_id = ?",
+                (group_id, user_id),
+            )
+            removed += int(cursor.rowcount or 0)
+        return removed
+
+    # ---------------- 关于他的事实 ----------------
+
+    def add_user_fact(
+        self,
+        *,
+        group_id: str,
+        user_id: str,
+        kind: str = "other",
+        text: str,
+        evidence: str = "",
+        context: str = "",
+        confidence: float = 0.6,
+        status: str = "active",
+        source_session: str = "",
+        pinned: bool = False,
+        mentions: list[str] | None = None,
+        first_at: float | None = None,
+    ) -> int:
+        now = time.time()
+        cursor = self._execute(
+            "INSERT INTO user_fact (group_id, user_id, kind, text, evidence, context, "
+            "confidence, status, source_session, pinned, mentions, first_at, last_confirmed_at, "
+            "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                group_id,
+                user_id,
+                str(kind or "other"),
+                str(text or "").strip(),
+                str(evidence or ""),
+                str(context or ""),
+                float(confidence),
+                str(status or "active"),
+                str(source_session or ""),
+                1 if pinned else 0,
+                json.dumps(list(mentions or []), ensure_ascii=False),
+                float(first_at if first_at is not None else now),
+                now if status == "active" else 0.0,
+                now,
+            ),
+        )
+        return int(cursor.lastrowid or 0)
+
+    def list_user_facts(
+        self, *, group_id: str, user_id: str, statuses: list[str] | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        wanted = [str(item) for item in (statuses or ["active", "candidate"]) if str(item)]
+        marks = ",".join("?" for _ in wanted) or "?"
+        params: list[Any] = [group_id, user_id, *wanted]
+        rows = self._query(
+            "SELECT * FROM user_fact WHERE group_id = ? AND user_id = ? "
+            f"AND status IN ({marks}) ORDER BY pinned DESC, last_confirmed_at DESC, id DESC LIMIT ?",
+            (*params, max(1, int(limit))),
+        )
+        return [_fact_row(row) for row in rows]
+
+    def list_group_facts(
+        self, *, group_id: str, user_ids: list[str], limit: int = 120
+    ) -> list[dict[str, Any]]:
+        """这一轮涉及的几个人的事实一起取（提示词注入用）。"""
+
+        wanted = [str(item) for item in (user_ids or []) if str(item)]
+        if not wanted:
+            return []
+        marks = ",".join("?" for _ in wanted)
+        rows = self._query(
+            "SELECT * FROM user_fact WHERE group_id = ? AND user_id IN "
+            f"({marks}) AND status = 'active' "
+            "ORDER BY pinned DESC, last_confirmed_at DESC, id DESC LIMIT ?",
+            (group_id, *wanted, max(1, int(limit))),
+        )
+        return [_fact_row(row) for row in rows]
+
+    def update_user_fact(
+        self,
+        *,
+        fact_id: int,
+        text: str | None = None,
+        kind: str | None = None,
+        status: str | None = None,
+        pinned: bool | None = None,
+        confidence: float | None = None,
+        last_confirmed_at: float | None = None,
+    ) -> bool:
+        sets: list[str] = []
+        params: list[Any] = []
+        if text is not None:
+            sets.append("text = ?")
+            params.append(str(text))
+        if kind is not None:
+            sets.append("kind = ?")
+            params.append(str(kind))
+        if status is not None:
+            sets.append("status = ?")
+            params.append(str(status))
+        if pinned is not None:
+            sets.append("pinned = ?")
+            params.append(1 if pinned else 0)
+        if confidence is not None:
+            sets.append("confidence = ?")
+            params.append(float(confidence))
+        if last_confirmed_at is not None:
+            sets.append("last_confirmed_at = ?")
+            params.append(float(last_confirmed_at))
+        if not sets:
+            return False
+        sets.append("updated_at = ?")
+        params.append(time.time())
+        cursor = self._execute(
+            f"UPDATE user_fact SET {', '.join(sets)} WHERE id = ?",
+            (*params, int(fact_id)),
+        )
+        return bool(cursor.rowcount)
+
+    def delete_user_fact(self, *, fact_id: int) -> bool:
+        cursor = self._execute("DELETE FROM user_fact WHERE id = ?", (int(fact_id),))
+        return bool(cursor.rowcount)
+
+    # ---------------- 关系 ----------------
+
+    def add_user_bond(
+        self,
+        *,
+        group_id: str,
+        user_id: str,
+        type: str,
+        slot: str = "",
+        status: str = "current",
+        since: float = 0.0,
+        evidence: str = "",
+        confidence: float = 0.6,
+        asserted_by: str = "",
+    ) -> int:
+        cursor = self._execute(
+            "INSERT INTO user_bond (group_id, user_id, type, slot, status, since, until, "
+            "evidence, confidence, asserted_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
+            (
+                group_id,
+                user_id,
+                str(type),
+                str(slot or ""),
+                str(status or "current"),
+                float(since or time.time()),
+                str(evidence or ""),
+                float(confidence),
+                str(asserted_by or ""),
+                time.time(),
+            ),
+        )
+        return int(cursor.lastrowid or 0)
+
+    def list_user_bonds(
+        self,
+        *,
+        group_id: str,
+        user_id: str = "",
+        statuses: list[str] | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        where = ["group_id = ?"]
+        params: list[Any] = [group_id]
+        if user_id:
+            where.append("user_id = ?")
+            params.append(user_id)
+        wanted = [str(item) for item in (statuses or []) if str(item)]
+        if wanted:
+            marks = ",".join("?" for _ in wanted)
+            where.append(f"status IN ({marks})")
+            params.extend(wanted)
+        rows = self._query(
+            f"SELECT * FROM user_bond WHERE {' AND '.join(where)} "
+            "ORDER BY status = 'current' DESC, since DESC, id DESC LIMIT ?",
+            (*params, max(1, int(limit))),
+        )
+        return [dict(row) for row in rows]
+
+    def get_user_bond(self, *, bond_id: int) -> dict[str, Any] | None:
+        rows = self._query("SELECT * FROM user_bond WHERE id = ?", (int(bond_id),))
+        return dict(rows[0]) if rows else None
+
+    def close_user_bond(self, *, bond_id: int, until: float | None = None, status: str = "past") -> bool:
+        cursor = self._execute(
+            "UPDATE user_bond SET status = ?, until = ?, updated_at = ? WHERE id = ?",
+            (str(status), float(until or time.time()), time.time(), int(bond_id)),
+        )
+        return bool(cursor.rowcount)
+
+    def delete_user_bond(self, *, bond_id: int) -> bool:
+        cursor = self._execute("DELETE FROM user_bond WHERE id = ?", (int(bond_id),))
+        return bool(cursor.rowcount)
+
+    # ---------------- 好感度日志 ----------------
+
+    def add_affinity_log(
+        self,
+        *,
+        group_id: str,
+        user_id: str,
+        delta: float,
+        value_after: float,
+        reason: str = "",
+        source: str = "",
+        at: float | None = None,
+    ) -> int:
+        cursor = self._execute(
+            "INSERT INTO affinity_log (group_id, user_id, at, delta, value_after, reason, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                group_id,
+                user_id,
+                float(at if at is not None else time.time()),
+                float(delta),
+                float(value_after),
+                str(reason or ""),
+                str(source or ""),
+            ),
+        )
+        return int(cursor.lastrowid or 0)
+
+    def list_affinity_logs(
+        self, *, group_id: str, user_id: str, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT * FROM affinity_log WHERE group_id = ? AND user_id = ? "
+            "ORDER BY at DESC, id DESC LIMIT ?",
+            (group_id, user_id, max(1, int(limit))),
+        )
+        return [dict(row) for row in rows]
+
     # ---------------- 事件日志 ----------------
 
     def add_event(
@@ -656,6 +1170,63 @@ class Database:
         if not rows:
             return {"entries": 0, "hits": 0}
         return {"entries": int(rows[0]["entries"] or 0), "hits": int(rows[0]["hits"] or 0)}
+
+    # ---------------- 合并转发摘要缓存 ----------------
+    #
+    # 一条转发往往几十条消息，摘要是这里最贵的一次调用；同一条转发
+    # （别人转来转去、她反复被人 @ 同一张转发）按内容指纹复用。
+
+    def get_forward_summary(
+        self, *, fingerprint: str, max_age_seconds: float = 0.0
+    ) -> dict[str, Any] | None:
+        rows = self._query(
+            "SELECT summary, model, hits, created_at, last_used_at"
+            " FROM forward_cache WHERE fingerprint = ?",
+            (str(fingerprint or ""),),
+        )
+        if not rows:
+            return None
+        row = dict(rows[0])
+        if max_age_seconds > 0 and time.time() - float(row.get("created_at") or 0) > float(
+            max_age_seconds
+        ):
+            return None
+        return row
+
+    def put_forward_summary(
+        self, *, fingerprint: str, summary: str, model: str = ""
+    ) -> None:
+        now = time.time()
+        self._execute(
+            "INSERT INTO forward_cache (fingerprint, summary, model, hits, created_at,"
+            " last_used_at) VALUES (?, ?, ?, 0, ?, ?)"
+            " ON CONFLICT(fingerprint) DO UPDATE SET summary = excluded.summary,"
+            " model = excluded.model, created_at = excluded.created_at",
+            (str(fingerprint or ""), str(summary or ""), str(model or ""), now, now),
+        )
+
+    def touch_forward_summary(self, *, fingerprint: str) -> None:
+        """命中一次：计数 +1，并刷新使用时间（用来做 LRU）。"""
+
+        self._execute(
+            "UPDATE forward_cache SET hits = hits + 1, last_used_at = ?"
+            " WHERE fingerprint = ?",
+            (time.time(), str(fingerprint or "")),
+        )
+
+    def trim_forward_cache(self, *, keep: int, max_age_seconds: float = 0.0) -> int:
+        limit = max(1, int(keep))
+        if max_age_seconds > 0:
+            self._execute(
+                "DELETE FROM forward_cache WHERE created_at < ?",
+                (time.time() - float(max_age_seconds),),
+            )
+        cursor = self._execute(
+            "DELETE FROM forward_cache WHERE fingerprint NOT IN ("
+            " SELECT fingerprint FROM forward_cache ORDER BY last_used_at DESC LIMIT ?)",
+            (limit,),
+        )
+        return int(cursor.rowcount or 0)
 
     def add_state_history(
         self,

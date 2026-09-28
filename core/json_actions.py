@@ -21,6 +21,9 @@ _THINK_FENCE = re.compile(
 _THINK_CLOSE = re.compile(rf"</\s*{_THINK_NAME}\s*>", re.IGNORECASE)
 _THINK_OPEN = re.compile(rf"<\s*{_THINK_NAME}\s*>", re.IGNORECASE)
 
+MAX_SAY_LINES_HARD = 6
+"""一次发言的防刷屏硬顶：比它多才真的截断，其余只提醒（提示词负责收敛）。"""
+
 
 def strip_reasoning(text: str) -> str:
     """把模型可能吐出来的思考段剥掉，只留它真正要对外的内容。
@@ -118,6 +121,9 @@ class PlannedAction:
 
     raw: dict[str, Any] = field(default_factory=dict)
 
+    send_to: str = ""
+    """这句话说给哪个会话听（会话组里的群 / 私聊）。空 = 跟着这一轮的落点走。"""
+
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {"type": self.type}
         if self.messages:
@@ -140,6 +146,8 @@ class PlannedAction:
             data["search_depth"] = self.search_depth
         if self.read_pages >= 0:
             data["read_pages"] = self.read_pages
+        if self.send_to:
+            data["send_to"] = self.send_to
         return data
 
 
@@ -161,11 +169,68 @@ class ParseResult:
     cancel: str = ""
     """模型是否要求取消她手头的安排：``now`` = 立刻停手并放弃剩下的，``queue`` = 只清掉还没开始的。"""
 
+    plan_mode: str = ""
+    """模型给这一轮新安排的定位：``queue``（排队）/ ``interrupt``（插队）/ ``replace``（顶掉没做的）。
+
+    它是给人看的选择结果；实际生效的仍是 :attr:`cancel`。
+    """
+
+    head_clean: bool = True
+    """输出是不是**从 `{` 开始**的：推理草稿真的写在最前面时才算干净。"""
+
+    leading_text: str = ""
+    """`{` 之前多出来的内容（有它说明模型先说了别的，草稿被挤到后面）。"""
+
     chat_note: str = ""
     """一句话交代「刚才这段在聊什么」，下一轮当背景用，避免重复回应老话题。"""
 
+    open_topic: str = ""
+    """他有一件**还没聊完**的事（他去体检、他在纠结换工作…）。空 = 这轮没有。
+
+    和 ``chat_note`` 的区别：chat_note 是"刚才在聊什么"（会过期、只防重复），
+    这条是"这话题没说完、之后可以接着问"。
+    """
+
+    heart_knot: str = ""
+    """她**心里搁着的一件事**（"他上次那句话让我到现在还别扭"）。空 = 这轮没添新的。
+
+    和 ``open_topic`` 的区别：open_topic 是"别人的事、等着接着问"，
+    这条是**她自己的事**——不推进、不解决，只是挂着，会自己淡掉。
+    """
+
+    grudge: str = ""
+    """她在跟前的这个人身上**记一笔账**（"他答应的事又没做"）。空 = 这轮没记。
+
+    和 ``heart_knot`` 的区别：心事是"她自己的心情"，记仇是**冲这个人**的——
+    会让她对他冷一档，而且只在跟他说话时拿出来。
+    """
+
+    forgive: bool = False
+    """他刚道歉 / 补上了 / 解释清楚了 → 之前记着的那笔账可以算了。"""
+
+    own_topic: str = ""
+    """**她自己**打算做、或者答应过别人的事（"答应给他看照片"）。空 = 这轮没添新的。"""
+
+    own_topic_done: bool = False
+    """上面记着的那件事**刚做完了** → 划掉它。"""
+
+    tone: str = ""
+    """这一轮**对方对她是什么口吻**：``praise``（夸她）/ ``hug``（哄她、亲昵动作）/
+    ``attack``（怼她、阴阳、冒犯）/ ``normal``（普通）／空 = 没判。
+
+    以前这一步是拿关键词表猜的（"你可真行"会被当成夸奖），现在由主模型判——
+    它反正要看这一整句话，多输出一个词不花钱。
+    """
+
     valence_delta: float = 0.0
     """这一轮的心情变化（模型给的 -1~1，正=变好、负=变差）。缺失当 0。"""
+
+    affinity_delta: float = 0.0
+    """这一轮对**当前说话人**的好感变化（-1~1，正=更亲近）。缺失当 0。
+
+    真正落库前还会被代码再削一次（每轮上限 + 每人每天总额度，见 ``ProfileConfig``），
+    所以模型写过头也不会把好感刷满。
+    """
 
     tail: str = ""
     """JSON 之后残留下来的短尾巴（例如别的插件要求模型追加的 `[好感度 持平]`）。
@@ -174,7 +239,11 @@ class ParseResult:
     """
 
 
-REASONING_KEYS = ("env", "state", "mood", "who", "intent")
+REASONING_KEYS = ("env", "state", "mood", "who", "inner", "intent")
+"""推理草稿的字段顺序，也是提示词里要求的顺序。
+
+``inner`` 是"心里想的"：第一人称的一两句心理活动（只给自己看，不进群）。
+"""
 
 # 只有这两档：「立刻停手」和「别按原计划走（手上这件做完）」
 CANCEL_MODES = ("now", "queue")
@@ -205,6 +274,40 @@ def parse_cancel(payload: Any) -> str:
     else:
         text = str(payload).strip()
     return _CANCEL_ALIASES.get(text.lower(), _CANCEL_ALIASES.get(text, ""))
+
+
+# 新安排相对「手上这件事」的位置：排队 / 插队 / 顶掉没做的那几步
+PLAN_MODES = ("queue", "interrupt", "replace")
+_PLAN_MODE_ALIASES = {
+    "queue": "queue",
+    "later": "queue",
+    "after": "queue",
+    "排队": "queue",
+    "排在后面": "queue",
+    "interrupt": "interrupt",
+    "now": "interrupt",
+    "插队": "interrupt",
+    "打断": "interrupt",
+    "立刻": "interrupt",
+    "replace": "replace",
+    "clear": "replace",
+    "顶掉": "replace",
+    "替换": "replace",
+}
+# plan_mode 最终落到 cancel 上：interrupt 就是「立刻停手」，replace 就是「手上这件做完就停」
+_PLAN_MODE_TO_CANCEL = {"interrupt": "now", "replace": "queue"}
+
+
+def parse_plan_mode(payload: Any) -> str:
+    """解析模型给出的 ``plan_mode``（认不出来当没写）。"""
+
+    if payload is None:
+        return ""
+    if isinstance(payload, dict):
+        text = str(payload.get("mode") or payload.get("plan_mode") or "").strip()
+    else:
+        text = str(payload).strip()
+    return _PLAN_MODE_ALIASES.get(text.lower(), _PLAN_MODE_ALIASES.get(text, ""))
 
 
 def parse_reasoning(payload: Any) -> dict[str, str]:
@@ -291,6 +394,15 @@ def parse_action_payload(
 
     warnings: list[str] = []
     raw = text or ""
+    # 推理草稿有没有真的写在最开头：`{` 之前冒出来的东西都算"先说了别的"
+    leading_text = ""
+    head_clean = True
+    brace = str(raw).find("{")
+    if brace > 0:
+        leading_text = " ".join(str(raw)[:brace].split())[:80]
+        head_clean = not leading_text
+    elif brace < 0:
+        head_clean = False
     # 思考段先剥掉：既不能让"她其实在思考"的内容被当成发言发出去，
     # 也不能让它挡着后面的 JSON。
     cleaned_text = strip_reasoning(raw)
@@ -299,11 +411,26 @@ def parse_action_payload(
         return _fallback_result(cleaned_text, raw)
 
     items = payload.get("actions")
+    if isinstance(items, dict):
+        # 只写了一个动作对象、没包成数组：当成一条动作处理
+        items = [items]
     if not isinstance(items, list):
-        cleaned = cleaned_text.strip().strip("`").strip()
+        # actions 写成了字符串（模型偶尔这么干），或者干脆没写：
+        # 只从 JSON 里抠出「她真要说的话」——**绝不能**把 reasoning 或整个 JSON 发到群里。
+        spoken = speakable_messages(payload)
+        reasoning = parse_reasoning(payload.get("reasoning"))
+        if spoken:
+            return ParseResult(
+                actions=[PlannedAction(type="say", messages=spoken)],
+                reasoning=reasoning,
+                warnings=["模型把 actions 写成了一段文本，已按发言处理"],
+                fallback_used=True,
+                raw_text=raw,
+            )
         return ParseResult(
-            actions=[PlannedAction(type="say", messages=[cleaned])] if cleaned else [],
-            warnings=["模型输出缺少 actions 字段，已降级为直接发言"],
+            actions=[],
+            reasoning=reasoning,
+            warnings=["模型输出缺少 actions 字段，已忽略（没有发到群里）"],
             fallback_used=True,
             raw_text=raw,
         )
@@ -318,7 +445,11 @@ def parse_action_payload(
             warnings.append("动作缺少 type，已丢弃")
             continue
         if available_actions and action_type not in available_actions:
-            warnings.append(f"动作 {action_type} 在当前场景不可用，已丢弃")
+            hints = "、".join(sorted(available_actions)[:8])
+            warnings.append(
+                f"动作 {action_type} 在当前场景不可用，已丢弃"
+                + (f"（这里能用：{hints}）" if hints else "")
+            )
             continue
 
         action = PlannedAction(type=action_type, raw=item)
@@ -327,9 +458,17 @@ def parse_action_payload(
             messages = [messages]
         if isinstance(messages, list):
             cleaned = [str(m).strip() for m in messages if str(m).strip()]
-            action.messages = cleaned[:max_messages]
+            # 条数只提醒、不砍（她多说了两句就让它说）：真正的兜底是防刷屏的硬顶。
+            action.messages = cleaned[:MAX_SAY_LINES_HARD]
             if len(cleaned) > max_messages:
-                warnings.append(f"{action_type} 的消息超过 {max_messages} 条，已截断")
+                warnings.append(
+                    f"{action_type} 说了 {len(cleaned)} 句，比这一轮建议的 "
+                    f"{max_messages} 句多（照发，提示词里会提醒收敛）"
+                )
+            if len(cleaned) > MAX_SAY_LINES_HARD:
+                warnings.append(
+                    f"{action_type} 的消息超过防刷屏硬顶 {MAX_SAY_LINES_HARD} 条，已截断"
+                )
         elif action_type == "say":
             warnings.append("say 动作没有 messages，已丢弃")
             continue
@@ -350,6 +489,7 @@ def parse_action_payload(
         action.intent = str(
             item.get("intent", item.get("goal", item.get("purpose", ""))) or ""
         ).strip()[:200]
+        action.send_to = _clean_send_to(item.get("send_to"))
 
         params = item.get("params")
         if isinstance(params, dict):
@@ -380,21 +520,77 @@ def parse_action_payload(
     actions.sort(key=lambda item: 0 if item.type == "think" else 1)
 
     reasoning = parse_reasoning(payload.get("reasoning"))
+    if not head_clean and leading_text:
+        warnings.append(f"模型在 JSON 之前先写了别的内容：{leading_text}")
+    cancel = parse_cancel(payload.get("cancel"))
+    plan_mode = parse_plan_mode(payload.get("plan_mode"))
+    if not cancel and plan_mode:
+        cancel = _PLAN_MODE_TO_CANCEL.get(plan_mode, "")
     return ParseResult(
         actions=actions,
         reasoning=reasoning,
         warnings=warnings,
         raw_text=raw,
+        head_clean=head_clean,
+        leading_text=leading_text,
         memory=parse_memory(payload.get("memory")),
-        cancel=parse_cancel(payload.get("cancel")),
+        cancel=cancel,
+        plan_mode=plan_mode,
         chat_note=_clean_note(payload.get("chat_note")),
+        open_topic=_clean_note(payload.get("open_topic")),
+        heart_knot=_clean_note(payload.get("heart_knot")),
+        grudge=_clean_note(payload.get("grudge")),
+        forgive=_as_bool(payload.get("forgive")),
+        own_topic=_clean_note(payload.get("own_topic")),
+        own_topic_done=_as_bool(payload.get("own_topic_done")),
+        tone=_parse_tone(payload.get("tone")),
         valence_delta=_parse_valence_delta(payload.get("valence_delta")),
+        affinity_delta=_parse_affinity_delta(payload.get("affinity_delta")),
         tail=_json_tail(cleaned_text),
     )
 
 
+TONES = ("praise", "hug", "attack", "normal")
+"""对方口吻的合法取值。``normal`` 与空字符串都表示"不加情绪脉冲"。"""
+
+
+def _parse_tone(value: Any) -> str:
+    """模型判的口吻：只认白名单，其余当没判（交给兜底）。"""
+
+    text = str(value or "").strip().lower()
+    aliases = {
+        "夸奖": "praise",
+        "夸": "praise",
+        "亲昵": "hug",
+        "哄": "hug",
+        "怼": "attack",
+        "阴阳": "attack",
+        "攻击": "attack",
+        "普通": "normal",
+    }
+    text = aliases.get(text, text)
+    return text if text in TONES else ""
+
+
 def _parse_valence_delta(value: Any) -> float:
     """模型给的心情变化：-1 ~ 1，缺失或写坏都当 0（不影响这一轮）。"""
+
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if number != number:  # NaN
+        return 0.0
+    return max(-1.0, min(1.0, number))
+
+
+def _parse_affinity_delta(value: Any) -> float:
+    """模型给的好感变化：-1 ~ 1（正=更亲近），缺失或写坏都当 0。
+
+    这里只做范围校验；"每轮最多多少、每天最多多少"由 ``ProfileStore`` 那层再削一次。
+    """
 
     if isinstance(value, bool):
         return 0.0
@@ -472,6 +668,68 @@ def _clean_note(payload: Any) -> str:
 # （模型偶尔会把整段思考当成回复，把它发到群里比什么都不说糟得多。）
 _FALLBACK_MAX_CHARS = 160
 
+# 模型把「要说什么」写在别的字段名下时按这个顺序去找（都没有就什么都不发）
+_SPEAK_KEYS = (
+    "actions",
+    "action",
+    "say",
+    "speech",
+    "message",
+    "messages",
+    "content",
+    "reply",
+    "text",
+)
+
+# 一眼就能看出是 JSON / 思考残留的记号：带这些的一律不当发言
+_JSON_SMELL = ("{", "}", "```", '"actions"', '"reasoning"', '"type"')
+
+
+def _clean_speakable(value: Any) -> str:
+    """一句话能不能发出去：短的、不带 JSON / 思考残留的才算话。"""
+
+    body = str(value or "").strip().strip("`").strip()
+    if not body or len(body) > _FALLBACK_MAX_CHARS:
+        return ""
+    if any(mark in body for mark in _JSON_SMELL):
+        return ""
+    return body
+
+
+def speakable_messages(payload: dict[str, Any]) -> list[str]:
+    """从模型给出的 JSON 里抠出「她要说的话」（抠不到就返回空列表）。
+
+    只认明确的文本字段：``actions`` 写成字符串、或者换了 ``say`` / ``content``
+    这类名字时，都按"她想说这一句"处理；``reasoning`` 从来不在这里。
+    """
+
+    for key in _SPEAK_KEYS:
+        value = payload.get(key)
+        lines: list[str] = []
+        if isinstance(value, str):
+            lines = [value]
+        elif isinstance(value, list):
+            for entry in value:
+                if isinstance(entry, str):
+                    lines.append(entry)
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                for sub in ("messages", "message", "content", "text", "say"):
+                    inner = entry.get(sub)
+                    if isinstance(inner, str):
+                        lines.append(inner)
+                        break
+                    if isinstance(inner, list):
+                        lines.extend(str(item) for item in inner)
+                        break
+        else:
+            continue
+        cleaned = [item for item in (_clean_speakable(text) for text in lines) if item]
+        if cleaned:
+            return cleaned[:MAX_SAY_LINES_HARD]
+    return []
+
 
 def _fallback_result(cleaned: str, raw: str) -> ParseResult:
     """模型没给出 JSON 时的兜底。
@@ -481,14 +739,7 @@ def _fallback_result(cleaned: str, raw: str) -> ParseResult:
     """
 
     body = str(cleaned or "").strip().strip("`").strip()
-    looks_like_reasoning = (
-        len(body) > _FALLBACK_MAX_CHARS
-        or "{" in body
-        or "}" in body
-        or '"actions"' in body
-        or "```" in body
-    )
-    if not body or looks_like_reasoning:
+    if not _clean_speakable(body):
         return ParseResult(
             actions=[],
             warnings=["模型输出既不是 JSON 也不是一句话，已忽略（没有发到群里）"],
@@ -501,12 +752,6 @@ def _fallback_result(cleaned: str, raw: str) -> ParseResult:
         fallback_used=True,
         raw_text=raw,
     )
-    """群聊背景句：只取一句话，太长就截断。"""
-
-    if payload is None:
-        return ""
-    text = " ".join(str(payload).split())
-    return text[:80]
 
 
 def parse_memory(payload: Any) -> str:
@@ -565,6 +810,8 @@ def parse_plan_payload(
                 "messages": step.get("messages") if isinstance(step.get("messages"), list) else [],
                 "params": step.get("params") if isinstance(step.get("params"), dict) else {},
                 "queries": _parse_queries(step.get("queries")),
+                # 计划里每一步可以自己挑说话的地方：群里应付一句、私聊里再吐槽一句
+                "send_to": _clean_send_to(step.get("send_to")),
                 "status": "pending",
             }
         )
@@ -582,9 +829,25 @@ def parse_plan_payload(
         "current_step": 0,
         "valid_for": max(60, valid_for),
         "reason": str(payload.get("reason", "") or ""),
+        # 她想把这些话说给谁：会话组里的哪个群 / 私聊（留空 = 落点默认）
+        "send_to": _clean_send_to(payload.get("send_to")),
         "source": "llm",
     }
     return plan, warnings
+
+
+def _clean_send_to(value: Any) -> str:
+    """模型写的落点：可能是会话 id、群号、昵称，也可能是个小对象。"""
+
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        for key in ("session", "id", "session_id", "to", "name", "target"):
+            item = value.get(key)
+            if item:
+                return " ".join(str(item).split())[:60]
+        return ""
+    return " ".join(str(value).split())[:60]
 
 
 def _to_int(value: Any, default: int = 0) -> int:
@@ -592,3 +855,18 @@ def _to_int(value: Any, default: int = 0) -> int:
         return max(0, int(value))
     except (TypeError, ValueError):
         return default
+
+
+def _as_bool(value: Any) -> bool:
+    """模型给的布尔值：真布尔、字符串 "true"/"是"/"对"、数字 1 都算真。
+
+    它经常把 true 写成 "true" 或者 "是"，直接 bool() 会把 "false" 也当成真。
+    """
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value or "").strip().lower()
+    return text in ("1", "true", "yes", "y", "是", "对", "真的", "算")
+

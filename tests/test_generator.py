@@ -150,6 +150,15 @@ class TestParseGeneratedNodes(unittest.TestCase):
         self.assertEqual(len(nodes), 5)
         self.assertTrue(any("上限" in item for item in problems), problems)
 
+    def test_node_gets_a_nickname_text_even_without_the_model(self):
+        text = '[{"id": "balcony", "name": "阳台"}, ' \
+               '{"id": "roof", "name": "商场顶楼天台花园"}, ' \
+               '{"id": "cellar", "name": "地窖", "nickname_text": "在地窖里"}]'
+        nodes, _problems = parse_generated_nodes(text)
+        self.assertEqual(nodes[0]["nickname_text"], "在阳台")
+        self.assertEqual(nodes[1]["nickname_text"], "在商场顶楼")
+        self.assertEqual(nodes[2]["nickname_text"], "在地窖里")
+
 
 class TestGeneratedTools(unittest.TestCase):
     """工具型动作：多个工具要保留，没注册的工具要剔掉并说明。"""
