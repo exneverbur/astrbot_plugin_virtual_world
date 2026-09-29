@@ -1185,7 +1185,7 @@ class DeciderConfig(Permissive):
     interject_threshold: float = 0.6
     """孤独感高于这个值（且群里正在聊天、插话开关打开）时，她会想插一句。"""
 
-    chat_window_minutes: int = 60
+    chat_window_minutes: int = 180
     """多久之内的消息算「群里正在聊天」。"""
 
     chat_max_messages: int = 20
@@ -1226,13 +1226,13 @@ class DeciderConfig(Permissive):
 class ContextConfig(Permissive):
     """群聊上下文怎么存、怎么带进提示词。"""
 
-    chat_history_max: int = 200
+    chat_history_max: int = 300
     """原始群聊留档条数（持久化，重启后仍在）。超出后按下面策略处理。"""
 
     chat_overflow: Literal["discard", "compress"] = "compress"
     """留档超出上限时怎么办：直接丢弃最早的，或用压缩模型压成摘要。"""
 
-    chat_compress_threshold: int = 30
+    chat_compress_threshold: int = 200
     """留档达到多少条才触发一次压缩。"""
 
     chat_keep_after_compress: int = 30
@@ -1265,14 +1265,14 @@ class ContextConfig(Permissive):
     open_topic_per_person: int = 2
     """同一个人身上同时最多挂几件没聊完的事。"""
 
-    chat_lines: int = 20
+    chat_lines: int = 40
     """**每个会话**「还没回过」的聊天最多带几行进提示词。
 
     同一个人连着说的几句算一行。别处的会话各算各的额度，不会互相挤。
     （老配置里这个值在 ``decider.chat_max_messages``，读取时自动迁过来。）
     """
 
-    chat_answered_lines: int = 30
+    chat_answered_lines: int = 40
     """「这里刚聊过的（你已经回过话了）」最多带几行（不受时间窗限制）。"""
 
     chat_elsewhere_lines: int = 12
@@ -1285,10 +1285,10 @@ class ContextConfig(Permissive):
     （以前统一按 100 字截，长一点的更新公告、群公告都只剩半句）。
     """
 
-    chat_answered_line_chars: int = 100
+    chat_answered_line_chars: int = 200
     """她已经回过话的那批、以及别处同时听到的：每条最多写多少字（只当背景）。"""
 
-    chat_total_chars: int = 8000
+    chat_total_chars: int = 16000
     """整段聊天记录（这里 + 已回过 + 别处）最多多少字。
 
     超了先丢最早的背景（已回过的 → 别处的），还没回过的那批最后才动。
@@ -2425,8 +2425,7 @@ def normalize_legacy_keys(data: dict[str, Any]) -> dict[str, Any]:
             result = {**result, "profile": cleaned}
     decider = result.get("decider")
     if isinstance(decider, dict) and "chat_lines" not in context:
-        # 「带几行聊天记录」以前挂在 decider 上、按原始条数算：迁到 context.chat_lines，
-        # 还是旧默认值的（12 / 60）直接升到新的 20 行。
+        # 「带几行聊天记录」以前挂在 decider 上、按原始条数算：迁到 context.chat_lines。
         legacy_lines = decider.get("chat_max_messages")
         try:
             legacy_value = int(legacy_lines) if legacy_lines is not None else 0
@@ -2435,23 +2434,31 @@ def normalize_legacy_keys(data: dict[str, Any]) -> dict[str, Any]:
         if legacy_value > 0:
             result = {
                 **result,
-                "context": {
-                    **context,
-                    "chat_lines": 20 if legacy_value in (12, 60) else legacy_value,
-                },
+                "context": {**context, "chat_lines": legacy_value},
             }
-    # 聊天记录的字数预算：行数从 12 提到 20 之后，4000 字的老默认值会把尾巴砍掉
-    context = result.get("context")
-    if isinstance(context, dict):
+    # 聊天记录那几项**默认值调大**了（一行/一次的窗口太小，群里别人的话还没读到就被裁掉）：
+    # 只有还停在**老默认值**上的才跟着升，自己调过的数字一律不动。
+    # (配置节里的键, 老默认值, 新默认值)
+    bumps: tuple[tuple[str, str, tuple[int, ...], int], ...] = (
+        ("context", "chat_lines", (12, 20, 60), 40),
+        ("context", "chat_total_chars", (4000, 8000), 16000),
+        ("context", "chat_answered_lines", (30,), 40),
+        ("context", "chat_answered_line_chars", (100,), 200),
+        ("context", "chat_history_max", (200,), 300),
+        # 30 是「记忆勤奋度」滑块上线后的默认，80 是更早的默认
+        ("context", "chat_compress_threshold", (30, 80), 200),
+        ("decider", "chat_window_minutes", (60,), 180),
+    )
+    for section, key, old_values, new_value in bumps:
+        block = result.get(section)
+        if not isinstance(block, dict) or key not in block:
+            continue
         try:
-            budget = int(context.get("chat_total_chars") or 0)
+            current = int(block[key])
         except (TypeError, ValueError):
-            budget = 0
-        if budget == 4000:
-            result = {
-                **result,
-                "context": {**context, "chat_total_chars": 8000},
-            }
+            continue
+        if current in old_values:
+            result = {**result, section: {**block, key: new_value}}
     # 区域：老配置没有 zones 时，建一个默认区域，把已有节点全放进去
     zones = result.get("zones")
     if not isinstance(zones, list) or not zones:

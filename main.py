@@ -997,6 +997,21 @@ def _caption_prefix(caption: str) -> str:
     return prefix or text
 
 
+def _strip_image_index(text: str) -> str:
+    """剥掉模型自己加的「图1：」「图 1：」「1.」这类编号前缀。"""
+
+    body = str(text or "").strip()
+    for _ in range(2):
+        match = re.match(
+            r"^(?:图\s*[0-9一二三四五六七八九十]+|[0-9]+|[一二三四五六七八九十]+)\s*[：:.、)）]\s*",
+            body,
+        )
+        if not match:
+            break
+        body = body[match.end() :].strip()
+    return body
+
+
 def _image_fingerprint(source: str) -> str:
     """一张图的稳定指纹：同一个文件换链接也能认出来。
 
@@ -1086,7 +1101,12 @@ class AstrBotVision:
         """
 
         scene = self._scene_text(question=question, quoted=quoted, context_lines=context_lines)
-        looks = await self._look_many(image_sources, scene)
+        # **看图那一步不带话题上下文**：把"最近群里在聊什么"塞给它，弱一点的模型
+        # 会照着话题脑补画面（实测：一张"口蘑"表情包被描述成"群聊截图、两个人在
+        # 争论蘑菇是不是植物"）。提示词里本来就写着"不要写这张图和话题的关系——
+        # 那部分由另一段提示词单独生成"，把上下文提前给它等于自相矛盾。
+        # 话题相关性交给下一步「关系」——它本来就是为这个准备的，而且不带图。
+        looks = await self._look_many(image_sources, "")
         if self._relation_enabled() and any(item for item in looks):
             relations = await self._relate(looks, scene)
         else:
@@ -1104,10 +1124,15 @@ class AstrBotVision:
         extra = " ".join(str(relation or "").split())
         if not text:
             return ""
+        # 关系那一步经常顺手带上「图1：」（提示词里给了编号的样例），
+        # 先剥掉编号再判断，免得拼出「与话题的关系：图1：与话题的关系：…」
+        extra = _strip_image_index(extra)
         if not extra:
             return text
-        if extra.startswith("与话题的关系"):
-            return f"{text}｜{extra}"
+        for marker in _CAPTION_RELATION_MARKERS:
+            if extra.startswith(marker):
+                body = extra[len(marker) :].lstrip("：: ｜|")
+                return f"{text}｜与话题的关系：{body}" if body else text
         return f"{text}｜与话题的关系：{extra}"
 
     async def _look_many(self, image_sources: list[str], scene: str) -> list[str]:
@@ -1322,7 +1347,9 @@ class AstrBotVision:
         if not text:
             return ["" for _ in looks]
         if len(lines) == 1:
-            return [text if len(looks) == 1 else "" for _ in looks]
+            # 只有一张图时它也可能顺手写「图1：」——剥掉，免得拼出双份标签
+            single = _strip_image_index(text)
+            return [single if len(looks) == 1 else "" for _ in looks]
         parts = _split_multi_caption(text, len(looks))
         if not parts:
             return ["" for _ in looks]
@@ -2479,7 +2506,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "exneverbur",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v1.4.4",
+    "v2.0.1",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:

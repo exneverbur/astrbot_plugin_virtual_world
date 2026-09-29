@@ -1139,23 +1139,35 @@ class TestDefaultInteractionActions(unittest.TestCase):
 
 
 class TestChatLineLimitMigration(unittest.TestCase):
-    """进提示词的聊天记录：默认 20 行，按"合并后的行"算。"""
+    """进提示词的聊天记录：默认 40 行，按"合并后的行"算。"""
 
-    def test_default_is_twenty_rows(self):
+    def test_default_row_limits(self):
         world, _warnings = parse_world(default_world())
-        self.assertEqual(world.context.chat_lines, 20)
-        self.assertEqual(world.context.chat_answered_lines, 30)
+        self.assertEqual(world.context.chat_lines, 40)
+        self.assertEqual(world.context.chat_answered_lines, 40)
         self.assertEqual(world.context.chat_elsewhere_lines, 12)
+        # 时间窗：群里一小时前说的话也该带上（以前只看 60 分钟）
+        self.assertEqual(world.decider.chat_window_minutes, 180)
 
     def test_legacy_default_is_upgraded(self):
-        """老配置里这个值还挂在 decider 上（那时按原始条数算）→ 迁到 context.chat_lines。"""
+        """老配置里这个值还挂在 decider 上（那时按原始条数算）→ 迁到 context.chat_lines。
 
-        for legacy in (12, 60):
+        12 / 60 是更早的默认值，20 是搬过来那一次写下的默认值：都算"没自己调过"，
+        一起升到现在的 40。自己填过的数字（例如 35）不动。
+        """
+
+        for legacy in (12, 20, 60):
             raw = default_world()
             raw.setdefault("context", {}).pop("chat_lines", None)  # 老存档：context 里还没有这个键
             raw["decider"] = {"chat_max_messages": legacy}
             world, _warnings = parse_world(raw)
-            self.assertEqual(world.context.chat_lines, 20, legacy)
+            self.assertEqual(world.context.chat_lines, 40, legacy)
+
+        # context 里已经存着 20（上一次迁移写下的）也要跟上
+        raw = default_world()
+        raw["context"] = {"chat_lines": 20}
+        world, _warnings = parse_world(raw)
+        self.assertEqual(world.context.chat_lines, 40)
 
     def test_a_value_the_user_chose_is_kept(self):
         raw = default_world()
@@ -1165,12 +1177,16 @@ class TestChatLineLimitMigration(unittest.TestCase):
         self.assertEqual(world.context.chat_lines, 35)
 
     def test_legacy_char_budget_is_raised_too(self):
-        """行数提到 20 之后，4000 字的老预算会把尾巴砍掉，一起升到 8000。"""
+        """行数调大之后，老的字数预算（4000 / 8000）会把尾巴砍掉，一起升到 16000。"""
 
         raw = default_world()
         raw["context"] = {"chat_total_chars": 4000}
         world, _warnings = parse_world(raw)
-        self.assertEqual(world.context.chat_total_chars, 8000)
+        self.assertEqual(world.context.chat_total_chars, 16000)
+
+        raw["context"] = {"chat_total_chars": 8000}
+        world, _warnings = parse_world(raw)
+        self.assertEqual(world.context.chat_total_chars, 16000)
 
         raw["context"] = {"chat_total_chars": 12000}
         world, _warnings = parse_world(raw)

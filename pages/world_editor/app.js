@@ -1096,20 +1096,20 @@ const KNOBS = [
     hint: "她记你记得多细、整理得多勤。调高留下的画像与记忆更完整（也更容易花 token）。",
     levels: [
       { "profile.digest_chars": 40, "profile.digest_limit": 3,
-        "context.chat_compress_threshold": 60, "context.summary_refresh_minutes": 30,
-        "context.chat_answered_lines": 20 },
-      { "profile.digest_chars": 50, "profile.digest_limit": 4,
-        "context.chat_compress_threshold": 45, "context.summary_refresh_minutes": 20,
+        "context.chat_compress_threshold": 400, "context.summary_refresh_minutes": 30,
         "context.chat_answered_lines": 25 },
+      { "profile.digest_chars": 50, "profile.digest_limit": 4,
+        "context.chat_compress_threshold": 300, "context.summary_refresh_minutes": 20,
+        "context.chat_answered_lines": 32 },
       { "profile.digest_chars": 60, "profile.digest_limit": 5,
-        "context.chat_compress_threshold": 30, "context.summary_refresh_minutes": 10,
-        "context.chat_answered_lines": 30 },
-      { "profile.digest_chars": 80, "profile.digest_limit": 7,
-        "context.chat_compress_threshold": 20, "context.summary_refresh_minutes": 6,
+        "context.chat_compress_threshold": 200, "context.summary_refresh_minutes": 10,
         "context.chat_answered_lines": 40 },
-      { "profile.digest_chars": 100, "profile.digest_limit": 10,
-        "context.chat_compress_threshold": 12, "context.summary_refresh_minutes": 3,
+      { "profile.digest_chars": 80, "profile.digest_limit": 7,
+        "context.chat_compress_threshold": 100, "context.summary_refresh_minutes": 6,
         "context.chat_answered_lines": 50 },
+      { "profile.digest_chars": 100, "profile.digest_limit": 10,
+        "context.chat_compress_threshold": 60, "context.summary_refresh_minutes": 3,
+        "context.chat_answered_lines": 60 },
     ],
   },
 ];
@@ -11502,8 +11502,8 @@ function renderSettings() {
   interject._fields.appendChild(
     inputField(
       "多久内算「正在聊」（分钟）",
-      num(world.decider.chat_window_minutes, 20),
-      (value) => (world.decider.chat_window_minutes = num(value, 20)),
+      num(world.decider.chat_window_minutes, 180),
+      (value) => (world.decider.chat_window_minutes = num(value, 180)),
       { hint: "这个时间窗内有人说话，才算群里在聊天。", type: "number" },
     ),
   );
@@ -12305,8 +12305,8 @@ function renderSettings() {
   contextSection._fields.appendChild(
     inputField(
       "多久内算「还热乎」",
-      num(world.decider.chat_window_minutes, 20),
-      (value) => (world.decider.chat_window_minutes = num(value, 20)),
+      num(world.decider.chat_window_minutes, 180),
+      (value) => (world.decider.chat_window_minutes = num(value, 180)),
       {
         hint: "超过这个时间的聊天不会被带进提示词（也还是留在留档里）。单位：分钟。",
         type: "number",
@@ -12317,8 +12317,8 @@ function renderSettings() {
   contextSection._fields.appendChild(
     inputField(
       "留档保留多少条",
-      num(world.context.chat_history_max, 200),
-      (value) => (world.context.chat_history_max = num(value, 200)),
+      num(world.context.chat_history_max, 300),
+      (value) => (world.context.chat_history_max = num(value, 300)),
       {
         hint: "保存在数据库里的原始群聊条数，重启后可以恢复。带进提示词的只有上面那一小份。",
         type: "number",
@@ -12329,9 +12329,9 @@ function renderSettings() {
   contextSection._fields.appendChild(
     inputField(
       "每个会话带多少行（还没回过的）",
-      num(world.context.chat_lines, 20),
+      num(world.context.chat_lines, 40),
       (value) => {
-        world.context.chat_lines = Math.max(1, Math.round(num(value, 20)));
+        world.context.chat_lines = Math.max(1, Math.round(num(value, 40)));
       },
       {
         hint: "同一个人连着说的几句算一行；每个会话各算各的，私聊聊得多不会挤掉群里的。",
@@ -12343,9 +12343,9 @@ function renderSettings() {
   contextSection._fields.appendChild(
     inputField(
       "已回过的那批带多少行",
-      num(world.context.chat_answered_lines, 30),
+      num(world.context.chat_answered_lines, 40),
       (value) => {
-        world.context.chat_answered_lines = Math.max(1, Math.round(num(value, 30)));
+        world.context.chat_answered_lines = Math.max(1, Math.round(num(value, 40)));
       },
       {
         hint: "「这里刚聊过的（你已经回过话了）」最多带几行，不受那 60 分钟时间窗限制。",
@@ -12383,8 +12383,8 @@ function renderSettings() {
   contextSection._fields.appendChild(
     inputField(
       "已经回过的那批每条最多多少字",
-      num(world.context.chat_answered_line_chars, 100),
-      (value) => (world.context.chat_answered_line_chars = num(value, 100)),
+      num(world.context.chat_answered_line_chars, 200),
+      (value) => (world.context.chat_answered_line_chars = num(value, 200)),
       {
         hint: "已经回过话的那批、以及别处同时听到的：只当背景，短一点省 token。",
         type: "number",
@@ -12395,8 +12395,8 @@ function renderSettings() {
   contextSection._fields.appendChild(
     inputField(
       "聊天记录总字数上限",
-      num(world.context.chat_total_chars, 8000),
-      (value) => (world.context.chat_total_chars = num(value, 8000)),
+      num(world.context.chat_total_chars, 16000),
+      (value) => (world.context.chat_total_chars = num(value, 16000)),
       {
         hint: "整段聊天记录（这里 + 已回过 + 别处）的字数预算：超了先丢最早的背景。",
         type: "number",
@@ -12457,8 +12457,8 @@ function renderSettings() {
     contextSection._fields.appendChild(
       inputField(
         "攒到多少条开始压缩",
-        num(world.context.chat_compress_threshold, 80),
-        (value) => (world.context.chat_compress_threshold = num(value, 80)),
+        num(world.context.chat_compress_threshold, 200),
+        (value) => (world.context.chat_compress_threshold = num(value, 200)),
         { hint: "留档达到这个条数才会触发一次压缩。", type: "number", min: 10 },
       ),
     );
@@ -12473,8 +12473,8 @@ function renderSettings() {
     contextSection._fields.appendChild(
       inputField(
         "两次压缩至少间隔（分钟）",
-        num(world.context.summary_refresh_minutes, 60),
-        (value) => (world.context.summary_refresh_minutes = num(value, 60)),
+        num(world.context.summary_refresh_minutes, 10),
+        (value) => (world.context.summary_refresh_minutes = num(value, 10)),
         { hint: "避免攒够一次就压一次，模型调用会太频繁。", type: "number", min: 1 },
       ),
     );

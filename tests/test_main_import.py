@@ -2655,7 +2655,17 @@ class TestCaptionPrompt(unittest.TestCase):
         self.assertIn("60~80", DEFAULT_CAPTION_PROMPT)
         # 看图这段**不写**关系：关系由另一段纯文本提示词负责
         self.assertIn("不要写这张图和话题的关系", DEFAULT_CAPTION_PROMPT)
+        # 只写真的看到的：不许按话题脑补画面，也不许把梗图说成截图
+        self.assertIn("只写你在图里真的看到的东西", DEFAULT_CAPTION_PROMPT)
+        self.assertIn("表情包 / 梗图", DEFAULT_CAPTION_PROMPT)
+        self.assertIn("才是「截图」", DEFAULT_CAPTION_PROMPT)
+        # 「文字」那栏只照抄图上的字，不许写场景想象
+        self.assertIn("只照抄图上看得见的字", DEFAULT_CAPTION_PROMPT)
+        self.assertIn("别在「文字」里写画面描述", DEFAULT_CAPTION_PROMPT)
+        # 关系那一步：一张图不要「图1：」，多张图不要重复标签
         self.assertIn("与话题的关系", DEFAULT_CAPTION_RELATION_PROMPT)
+        self.assertIn("不要写「图1：」", DEFAULT_CAPTION_RELATION_PROMPT)
+        self.assertIn("不要再写一次「与话题的关系」", DEFAULT_CAPTION_RELATION_PROMPT)
 
     def test_custom_prompt_wins(self):
         plugin = TestMainImport._plugin(self)
@@ -2741,6 +2751,58 @@ class TestCaptionPrompt(unittest.TestCase):
             self.assertEqual(stats["hits"], 1)
         finally:
             plugin.db.raw.close()
+
+    def test_the_look_call_never_gets_the_topic_context(self):
+        """看图那一步不许带话题上下文。
+
+        带上它，弱一点的多模态模型会照着话题脑补画面——实测一张"口蘑"表情包被
+        描述成"群聊截图、两个人在争论蘑菇是不是植物"，而关系那一步本来就是干这个的。
+        """
+
+        plugin, calls = self._vision_plugin()
+        source = "base64://dG9waWMtY29udGV4dA"
+        try:
+            asyncio.run(
+                plugin.vision.describe(
+                    [source],
+                    question="这图什么意思",
+                    quoted="引用的话",
+                    context_lines=["在聊蘑菇是不是植物", "口蘑说话了"],
+                )
+            )
+            image_calls = self._image_calls(calls)
+            self.assertEqual(len(image_calls), 1)
+            prompt = str(image_calls[0].get("prompt") or "")
+            for leaked in ("蘑菇", "口蘑", "这图什么意思", "引用的话"):
+                self.assertNotIn(leaked, prompt)
+            # 关系那一步照样拿得到上下文（它才是判断"跟话题什么关系"的地方）
+            text_calls = [item for item in calls if not item.get("image_urls")]
+            self.assertTrue(text_calls)
+            self.assertIn("蘑菇", str(text_calls[-1].get("prompt") or ""))
+        finally:
+            plugin.db.raw.close()
+
+    def test_relation_label_is_not_written_twice(self):
+        """模型自己带了「图1：」和「与话题的关系」时，拼出来也不能有两份。"""
+
+        vision = load_plugin_module().AstrBotVision
+        look = "熊猫头，摆烂｜表情包｜文字：今天也想躺平"
+        combined = vision._combine(look, "图1：与话题的关系：在附和想躺平")
+        self.assertEqual(combined.count("与话题的关系"), 1)
+        self.assertNotIn("图1：", combined)
+        self.assertIn("在附和想躺平", combined)
+        # 各种写法都收敛成同一份
+        for extra in ("与话题的关系：在附和", "图 2：在附和", "2. 在附和", "在附和"):
+            text = vision._combine(look, extra)
+            self.assertEqual(text.count("与话题的关系"), 1, extra)
+            self.assertIn("在附和", text)
+
+    def test_image_index_prefix_is_stripped(self):
+        """「图1：」「图 1：」「1.」「一、」这类编号前缀都要剥掉。"""
+
+        module = load_plugin_module()
+        for raw in ("图1：回应", "图 2：回应", "1. 回应", "2）回应", "一、回应", "回应"):
+            self.assertEqual(module._strip_image_index(raw), "回应", raw)
 
     def test_multi_images_are_looked_at_in_one_call(self):
         """一条消息里的多张图合并成一次多模态调用。"""
