@@ -1664,6 +1664,50 @@ async def _caption_result_images(
     return described, []
 
 
+def _swap_event_session(event: Any, session_id: str):
+    """临时把事件的会话换成真正要跑的那条，返回还原用的回调。
+
+    指令处理器和工具（出图、发语音这类）常常按事件的会话把结果直接发出去。
+    借来的事件如果还挂在别的会话上，结果就会跑错地方——私聊里让她拍照、
+    图却发到群里就是这么来的。借同组事件时把它指到真正的落点上再跑，
+    跑完立刻还原（事件还连着 AstrBot 的分发，不能一直留着改动）。
+    """
+
+    wanted = str(session_id or "").strip()
+    previous = getattr(event, "session", None)
+    previous_new = getattr(event, "new_session", None)
+    try:
+        current = str(getattr(event, "unified_msg_origin", "") or "")
+    except Exception:
+        current = ""
+    if not wanted or current == wanted:
+        return lambda: None
+
+    def restore() -> None:
+        # 真实事件里 ``unified_msg_origin`` 是从 ``session`` 算出来的，换回
+        # session 就够了；有的实现（以及测试替身）只是个普通属性，所以两边
+        # 都还原一次，哪种都不会留下改过的会话。
+        try:
+            event.session = previous
+        except Exception:
+            pass
+        try:
+            event.new_session = previous_new
+        except Exception:
+            pass
+        try:
+            if str(getattr(event, "unified_msg_origin", "") or "") != current:
+                event.unified_msg_origin = current
+        except Exception:
+            pass
+
+    try:
+        event.unified_msg_origin = wanted
+    except Exception:
+        return lambda: None
+    return restore
+
+
 class AstrBotCommands:
     """把「指令触发」型动作转成真正的指令，交给别的插件执行。
 
@@ -1702,7 +1746,10 @@ class AstrBotCommands:
         if matched is None:
             return ToolCallResult(ok=False, error=f"没找到指令「{word}」")
         record, command_filter = matched
-        real_event = event or self.plugin.last_event(session_id) or self.plugin.last_event_any()
+        # 借别的会话的事件会让指令**在别人的会话里**跑：出图、发语音这类
+        # 处理器常按事件的会话把结果直接发出去，于是私聊里让她拍照、图却
+        # 出现在群里。``nearby_event`` 只借同一个会话组里的，找不到就宁可不跑。
+        real_event = event or self.plugin.nearby_event(session_id)
         if real_event is None:
             return ToolCallResult(
                 ok=False, error="还没有收到过这个会话的消息，指令没有上下文可用"
@@ -1712,6 +1759,7 @@ class AstrBotCommands:
         except Exception as exc:
             return ToolCallResult(ok=False, error=str(exc))
         restore = self._swap_text(real_event, text)
+        restore_session = _swap_event_session(real_event, session_id)
         try:
             result = record.handler(real_event, **params)
             texts: list[str] = []
@@ -1745,6 +1793,7 @@ class AstrBotCommands:
             )
             return ToolCallResult(ok=False, error=detail, tool=word)
         finally:
+            restore_session()
             restore()
         captions, pending_images = await _caption_result_images(
             self.plugin, images, scene=text
@@ -1871,7 +1920,6 @@ class AstrBotCommands:
                         pass
 
         return restore
-
 
 class AstrBotMessenger:
     """MessagePort 实现。"""
@@ -2183,11 +2231,9 @@ class AstrBotTools:
                     break
         if tool is None:
             return ToolCallResult(ok=False, error=f"工具「{name}」没有注册", tool=name)
-        event = self.plugin.last_event(session_id)
-        if event is None:
-            # 拿不到这个会话的事件时用最近一次见过的兜底：工具大多只需要
-            # 「谁在什么群说的」，没有事件的话连 call() 都进不去。
-            event = self.plugin.last_event_any()
+        # 借同组事件兜底：工具大多只需要「谁在什么群说的」，没有事件连 call()
+        # 都进不去。但绝不借别的会话组的——出图这类工具会按事件的会话发结果。
+        event = self.plugin.nearby_event(session_id)
         if event is None:
             # 插件刚启动 / 刚重载、群里还没人说话时，一个真实事件都没有。
             # 这时候硬调只会让工具内部炸出「'NoneType' object has no attribute ...」，
@@ -2209,6 +2255,8 @@ class AstrBotTools:
             return ToolCallResult(
                 ok=False, error=f"工具「{name}」没有可调用的 handler", tool=name
             )
+        # 借来的事件要指到这个会话上再调：工具可能自己往事件的会话发东西
+        restore_session = _swap_event_session(event, session_id)
         try:
             # 工具前后也补一遍钩子：有些插件靠它们显示"正在用工具 / 用完了"
             await self.plugin._fire_hook(
@@ -2241,6 +2289,8 @@ class AstrBotTools:
             return ToolCallResult(
                 ok=False, error=f"调用出错：{exc}{hint}", tool=name, params=call_params
             )
+        finally:
+            restore_session()
         captions, pending_images = await _caption_result_images(
             self.plugin, images, scene=str(name)
         )
@@ -2653,7 +2703,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "exneverbur",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v2.1.1",
+    "v2.1.2",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -2868,6 +2918,34 @@ class VirtualWorldPlugin(Star):
         if not self._last_events:
             return None
         return next(reversed(self._last_events.values()))
+
+    def nearby_event(self, session_id: str) -> AstrMessageEvent | None:
+        """同一个会话组里最近收到过的一条事件（这个会话自己的优先）。
+
+        指令和工具都是拿着一条真实事件跑的，出图 / 发语音这类插件常按事件的
+        会话来决定结果发到哪儿。借**别的会话组**的事件就会让结果跑错地方
+        （私聊里让她拍照、图却出现在群里），所以这里只在这一组里找替身；
+        组里一条都没有就返回 None，让调用方自己决定跳过还是报错。
+        """
+
+        exact = self.last_event(session_id)
+        if exact is not None:
+            return exact
+        if not str(session_id or "").strip():
+            # 调用方没说要发到哪儿（例如编辑器里试调工具）：最近一条就行，
+            # 没有"指到哪个会话"的问题，也就没有跑错地方的风险。
+            return self.last_event_any()
+        try:
+            siblings = {str(item) for item in self.engine.group_sessions(session_id)}
+        except Exception:
+            siblings = {str(session_id)}
+        for candidate in reversed(list(self._last_events)):
+            if str(candidate) in siblings:
+                self.logger.debug(
+                    f"[virtual_world] 借用了同组会话 {candidate} 的事件上下文"
+                )
+                return self._last_events[candidate]
+        return None
 
     def remember_llm_response(self, session_id: str, response: Any) -> None:
         """记下主模型的原始响应（回复钩子要拿它给别的插件看）。"""

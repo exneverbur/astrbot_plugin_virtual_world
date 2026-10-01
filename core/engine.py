@@ -12170,7 +12170,12 @@ class VirtualWorldEngine:
         name = str(tool_name or "").strip()
         if not name:
             return ""
-        if not self._tool_exists(name) or is_self_send_tool(name):
+        if not self._tool_exists(name):
+            return ""
+        if is_self_send_tool(name):
+            # 别静默跳过：被挡下来的如果是出图这类工具，图只能等别的路径补发，
+            # 落点就跟正文分家了——至少留一条日志，排查时有迹可循
+            self._log("debug", f"工具「{name}」是直发消息类，插件不调用它")
             return ""
         if self.tool_unavailable_reason(name):
             # 刚连续失败过：退避期内不再用它（到点会自动放行试探）
@@ -12562,16 +12567,18 @@ class VirtualWorldEngine:
                 outcome=self._echo_into(outcome, state),
             )
             # 指令在"她现在说话的地方"触发：私聊里让她拍照，指令就带着私聊的上下文跑
-            call = await self.commands.trigger(outcome.home(), line)
+            # 落点当场定下来，图和正文都用它——不然私聊里起的动作会把图发到群里
+            landing = self._image_home(outcome, action)
+            call = await self.commands.trigger(landing, line)
             images = list(getattr(call, "image_urls", None) or [])
-            # 指令生成出来的图（多张也算）直接贴到群里，别只交回给她自己看
+            # 指令生成出来的图（多张也算）贴着正文一起发，别只交回给她自己看
             attachments = list(getattr(call, "attachments", None) or [])
-            self._attach_images(outcome, attachments)
+            self._attach_images(outcome, attachments, session_id=landing)
             if attachments:
                 self._note_own_image(
                     state,
                     intent or definition.name or definition.id,
-                    outcome.home() if outcome else "",
+                    landing,
                 )
             await self._log_event(
                 state,
@@ -12685,6 +12692,9 @@ class VirtualWorldEngine:
             command=base,
             hint=str(definition.trigger_hint or ""),
             intent=intent,
+            # 出图类指令的参数就是一段画面描述：得让她知道此刻在哪儿、穿着什么，
+            # 缺的那几项才能按现状补齐（而不是留空或者瞎编）
+            state_text=self._compose_state_text(state),
         )
         reply = await self._ask_judge(state.session_id, system_prompt, prompt)
         self._count_tool_param(state)
@@ -12700,6 +12710,44 @@ class VirtualWorldEngine:
             )
             return base
         return text if text.startswith("/") else f"/{text}"
+
+    def _compose_state_text(self, state: WorldState) -> str:
+        """拼指令参数时给她「此刻是什么样」：地点、手头的事、心情、状态槽。
+
+        出图 / 出视频这类指令的参数就是一段画面描述，光有意图写不出完整画面
+        （服装、环境、光线都在她当前的状态里）。这里只给事实，不替她编。
+        """
+
+        lines: list[str] = []
+        node = self.node(state.node_id) or self.node(self.default_node_id())
+        if node is not None:
+            scene = " ".join(str(getattr(node, "prompt", "") or "").split())
+            line = f"- 地点：{node.name or node.id}"
+            if scene:
+                line += f"——{_clip_text(scene, 90)}"
+            lines.append(line)
+        current = state.current_action if isinstance(state.current_action, dict) else None
+        current_type = str((current or {}).get("type") or "")
+        if current_type:
+            lines.append(f"- 手头的事：{self.prompts.action_label(current_type)}")
+        if str(state.mood or "").strip():
+            lines.append(f"- 心情：{state.mood}")
+        now = self._now()
+        for slot, info in dict(getattr(state, "external_state", None) or {}).items():
+            if not isinstance(info, dict):
+                continue
+            text = " ".join(str(info.get("text") or "").split())
+            if not text:
+                continue
+            try:
+                expires = float(info.get("expires_at") or 0.0)
+            except (TypeError, ValueError):
+                expires = 0.0
+            if expires and now > expires:
+                continue
+            label = str(info.get("label") or slot).strip()
+            lines.append(f"- {label}：{_clip_text(text, 140)}")
+        return "\n".join(lines)
 
     SCHEDULE_ACTION_IDS = ("schedule_list", "schedule_add", "schedule_remove")
 
@@ -13455,14 +13503,16 @@ class VirtualWorldEngine:
                 elif not call.ok:
                     failed.append(f"{call.tool or name}：{call.error or '没有返回结果'}")
                 images.extend(getattr(call, "image_urls", None) or [])
-                # 结果里带回来的图要发到群里（生图这类动作的意义就在这里）
+                # 结果里带回来的图要发出去（生图这类动作的意义就在这里）：
+                # 落点跟着这一步的正文走，别一律塞回这一拍的会话
                 attachments = list(getattr(call, "attachments", None) or [])
-                self._attach_images(outcome, attachments)
+                landing = self._image_home(outcome, action)
+                self._attach_images(outcome, attachments, session_id=landing)
                 if attachments:
                     self._note_own_image(
                         state,
                         str(action.get("intent") or action.get("content") or definition.name),
-                        outcome.session_id if outcome else "",
+                        landing,
                     )
                 await self._log_tool_outcome(
                     state, definition, name, call, outcome=outcome
@@ -14610,12 +14660,13 @@ class VirtualWorldEngine:
                 failed.append(f"{call.tool or picked}：{call.error or '没有返回结果'}")
             images.extend(getattr(call, "image_urls", None) or [])
             attachments = list(getattr(call, "attachments", None) or [])
-            self._attach_images(outcome, attachments)
+            landing = self._image_home(outcome, action)
+            self._attach_images(outcome, attachments, session_id=landing)
             if attachments:
                 self._note_own_image(
                     state,
                     str(action.get("intent") or action.get("content") or definition.name),
-                    outcome.session_id if outcome else "",
+                    landing,
                 )
             await self._log_tool_outcome(
                 state, definition, picked, call, outcome=outcome
@@ -16907,18 +16958,71 @@ class VirtualWorldEngine:
         except Exception:
             return False
 
-    def _attach_images(self, outcome: TickOutcome | None, images: list[Any] | None) -> None:
+    def _image_home(self, outcome: TickOutcome | None, action: Any = None) -> str:
+        """这一步生成的图该落在哪个会话。
+
+        和同一步的正文必须是**同一个落点**：正文走 ``add_speech(text, 落点)``，
+        图以前一律挂在 ``outcome.session_id`` 上，于是私聊里起的动作会把图
+        发到群里（正文私聊、图片群聊）。
+
+        优先级：计划里冻结的落点（``speech_home``）→ 这一步自己带的落点 →
+        这一轮的会话（兜底）。兜底意味着"没定下落点"，多会话时很容易发错地方，
+        所以补一条警告日志。
+        """
+
+        if outcome is None:
+            return ""
+        frozen = str(getattr(outcome, "speech_home", "") or "").strip()
+        if frozen:
+            return frozen
+        stepped = str(self._act_get(action, "session", "") or "").strip() if action is not None else ""
+        if stepped:
+            return stepped
+        session_id = str(getattr(outcome, "session_id", "") or "").strip()
+        place = str(getattr(outcome, "place", "") or "").strip()
+        if place:
+            # 有人跟她说话、或者规则决策刚敲定：这一轮发生在哪儿是确定的，
+            # 图落在那儿本来就对，没什么可警告的
+            return session_id
+        if len(self.group_sessions(session_id)) > 1:
+            # 单会话时"没定落点"是正常事，不用吵；多会话才是真隐患
+            # （老计划里的步骤没写 session 就会走到这儿）
+            self._log(
+                "warning",
+                f"这一轮没定下落点，图片按当前会话发：{session_id}",
+            )
+            outcome.notes.append("这一轮没定下落点，图片按当前会话发")
+        return session_id
+
+    def _attach_images(
+        self,
+        outcome: TickOutcome | None,
+        images: list[Any] | None,
+        *,
+        session_id: str = "",
+    ) -> None:
         """把工具 / 指令返回的图片挂到这一轮的结果上（去重、限量）。
 
         只挂在"这一轮的结果"上，不写进动作状态——生图工具给的常常是 base64，
         落进 state 里会把存档撑得很丑。
+
+        ``session_id`` 是这些图要落在哪个会话：留空 = 这一轮的会话；
+        给了别的会话（私聊里起的动作，而这一拍推的是群里）就投到那个会话去，
+        ``_deliver`` 会照着分开发。图和正文分家就是这么来的，所以这里必须收落点。
         """
 
         if outcome is None or not images:
             return
-        for item in images:
-            ref = str(item or "").strip()
-            if ref and ref not in outcome.images:
+        target = str(session_id or "").strip() or str(outcome.session_id or "")
+        refs = [str(item or "").strip() for item in images]
+        refs = [item for item in refs if item]
+        if not refs:
+            return
+        if target and target != str(outcome.session_id or ""):
+            outcome.add_images(refs, target)
+            return
+        for ref in refs:
+            if ref not in outcome.images:
                 outcome.images.append(ref)
         if len(outcome.images) > MAX_GROUP_IMAGES:
             outcome.notes.append(

@@ -2705,6 +2705,101 @@ class TestCommandResultParsing(unittest.TestCase):
         self.assertNotIn("voice.silk", text)
 
 
+class _BorrowEventStub:
+    """够用的消息事件替身：认得出会话，也能换会话。"""
+
+    def __init__(self, origin: str) -> None:
+        self.unified_msg_origin = origin
+        self.session = origin
+        self.new_session = origin
+
+
+class TestCommandEventBorrowing(unittest.TestCase):
+    """指令借事件上下文：只能借同一个会话组里的，而且得改成真正的落点。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.module = load_plugin_module()
+
+    GROUP = "aiocqhttp:GroupMessage:1001"
+    PRIVATE = "aiocqhttp:PrivateMessage:2692047521"
+    ELSEWHERE = "aiocqhttp:GroupMessage:9999"
+
+    def plugin(self, sessions: list[str]):
+        """一个真实的插件实例，外加上面几个会话（编成一组）。"""
+
+        plugin = self.module.VirtualWorldPlugin(
+            self.module.Context(),
+            self.module.AstrBotConfig({"enabled": True, "tick_interval": 60}),
+        )
+        for item in sessions:
+            plugin.store.add_session(
+                item,
+                session_type="private" if "Private" in item else "group",
+                platform=item.split(":", 1)[0],
+            )
+        raw = plugin.store.raw_sessions()
+        raw["groups"] = [
+            {
+                "id": "team",
+                "name": "team",
+                "sessions": list(sessions),
+                "main_session": sessions[0],
+            }
+        ]
+        plugin.store.save_sessions(raw)
+        plugin.engine.reload_config()
+        return plugin
+
+    def test_event_from_other_chats_is_not_borrowed(self):
+        """别的会话组的事件宁可不借：出图插件会照着事件的会话把图发出去。"""
+
+        plugin = self.plugin([self.GROUP, self.PRIVATE])
+        plugin._last_events[self.ELSEWHERE] = _BorrowEventStub(self.ELSEWHERE)
+        try:
+            self.assertIsNone(plugin.nearby_event(self.PRIVATE))
+        finally:
+            plugin.db.raw.close()
+
+    def test_event_from_the_same_group_is_repointed(self):
+        """同组的事件可以借，但跑之前要把它指到真正的落点上，跑完还原。"""
+
+        plugin = self.plugin([self.GROUP, self.PRIVATE])
+        event = _BorrowEventStub(self.GROUP)
+        plugin._last_events[self.GROUP] = event
+        try:
+            borrowed = plugin.nearby_event(self.PRIVATE)
+            self.assertIs(borrowed, event)
+
+            restore = self.module._swap_event_session(borrowed, self.PRIVATE)
+            self.assertEqual(borrowed.unified_msg_origin, self.PRIVATE)
+            restore()
+            self.assertEqual(borrowed.unified_msg_origin, self.GROUP)
+        finally:
+            plugin.db.raw.close()
+
+    def test_event_of_this_chat_comes_first(self):
+        """这个会话自己有过消息就用它，不必去借同组别人的。"""
+
+        plugin = self.plugin([self.GROUP, self.PRIVATE])
+        mine = _BorrowEventStub(self.PRIVATE)
+        plugin._last_events[self.GROUP] = _BorrowEventStub(self.GROUP)
+        plugin._last_events[self.PRIVATE] = mine
+        try:
+            self.assertIs(plugin.nearby_event(self.PRIVATE), mine)
+        finally:
+            plugin.db.raw.close()
+
+    def test_same_session_needs_no_swap(self):
+        """事件本来就属于这个会话：什么都不用改。"""
+
+        event = _BorrowEventStub(self.PRIVATE)
+        restore = self.module._swap_event_session(event, self.PRIVATE)
+        self.assertEqual(event.unified_msg_origin, self.PRIVATE)
+        restore()
+        self.assertEqual(event.unified_msg_origin, self.PRIVATE)
+
+
 class TestScheduleRunCommand(unittest.TestCase):
     """`/vw schedule run <id>`：管理员立刻跑一遍日程。"""
 

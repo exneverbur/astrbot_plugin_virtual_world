@@ -20,9 +20,53 @@ SELF_SEND_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+# 名字里带这些词的，一看就是**产出内容**的工具（图 / 视频 / 语音 / 文件…）。
+# 它们有可能恰好也叫 ``send_xxx``（"生成完顺手发出去"那种），但绝不该被
+# 当成"直发消息"挡掉：出图工具被误判后，图只能等别的路径补发，
+# 图和正文的落点就会分家（文字进私聊、图发到群里）。
+CONTENT_TOOL_MARKS: tuple[str, ...] = (
+    "image",
+    "img",
+    "picture",
+    "photo",
+    "selfie",
+    "avatar",
+    "video",
+    "movie",
+    "audio",
+    "voice",
+    "tts",
+    "music",
+    "song",
+    "draw",
+    "paint",
+    "render",
+    "generate",
+    "t2i",
+    "i2i",
+    "file",
+    "upload",
+    "download",
+)
+
 
 def is_self_send_tool(name: str) -> bool:
-    return str(name or "").strip().lower() in SELF_SEND_TOOLS
+    """这个名字是不是「整件事就是把消息发出去」的工具。
+
+    判定收得很紧：名字（去掉插件名前缀之后）必须**整个**对上已知的直发消息工具，
+    多一个词都不算——``send_image`` / ``image_send_message`` 这种一律放行。而且不许带
+    「产出内容」的词（图 / 视频 / 语音…）。这条例外是给正常出图工具留的：
+    它一旦被当成直发消息挡掉，生成的图就只能等别的路径补发，落点会跑偏。
+    """
+
+    full = " ".join(str(name or "").split()).strip().lower()
+    if not full:
+        return False
+    if any(mark in full for mark in CONTENT_TOOL_MARKS):
+        return False
+    # 有些工具带命名空间（``某插件.send_message``）：只看最后一段
+    key = full.replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[-1].strip()
+    return key in SELF_SEND_TOOLS
 
 
 def global_tool_names(world: WorldConfig) -> set[str]:

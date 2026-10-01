@@ -58,34 +58,6 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return result
 
 
-TOOL_KEYS = ("tool_name", "tool_names", "tool_fallbacks", "tool_mode", "tool_flow")
-"""只有"工具型"动作才该有的字段。"""
-
-
-def _drop_tool_fields_for_commands(data: dict[str, Any]) -> int:
-    """把"类型是指令、却还挂着工具绑定"的动作清干净，返回清掉几个。
-
-    界面上把类型切回「指令」时不会自动抹掉 `tool_name` 这些字段，于是保存之后
-    它仍然按工具动作走 —— 用户看到的就是"改不回指令"。
-    """
-
-    actions = data.get("actions")
-    if not isinstance(actions, list):
-        return 0
-    dropped = 0
-    for item in actions:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("llm_level") or "") != "command":
-            continue
-        if not any(item.get(key) for key in TOOL_KEYS):
-            continue
-        for key in TOOL_KEYS:
-            item.pop(key, None)
-        dropped += 1
-    return dropped
-
-
 class ConfigStore:
     """配置与数据的统一入口。"""
 
@@ -215,15 +187,10 @@ class ConfigStore:
         world, warnings = parse_world(data)
         if snapshot:
             self.snapshot_before(reason)
-        clean = data if isinstance(data, dict) else {}
-        dropped = _drop_tool_fields_for_commands(clean)
-        if dropped:
-            warnings = [
-                *(warnings or []),
-                f"{dropped} 个动作的类型是「指令」，已清掉它们身上残留的工具绑定"
-                "（不清的话保存之后还会被当成工具动作）。",
-            ]
-        self._write_json(self.world_path, clean)
+        # 注意：**不要**在这里按类型去清 `tool_*` 字段。
+        # 「指令 + 工具」是主插件里合法（而且必要）的组合——自拍 / 拍照那几条就是
+        # 用指令触发一次工具调用；清掉 `tool_names` / `tool_mode` 之后图就出不来了。
+        self._write_json(self.world_path, data if isinstance(data, dict) else {})
         self._world = world
         return warnings
 

@@ -5757,6 +5757,59 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
             line = await self.engine._compose_command(state, definition, "天气", "查天气")
         self.assertEqual(line, "/天气 武汉")
 
+    async def test_command_composer_asks_for_a_full_picture_description(self):
+        """出图类指令：参数说明里点名的字段要逐项写满，缺的按现状补。"""
+
+        self.add_command_action(
+            trigger_command="自拍",
+            trigger_hint="按「主体 + 动作 + 服装 + 场景 + 镜头 + 光线 + 风格」写成一整行。",
+            description="拍一张自己的照片发出来。",
+        )
+        self.llm.replies = ["/自拍 在书房比耶"]
+        definition = self.engine.world.action_map()["ask_weather"]
+        async with self.engine.session_state(SESSION) as state:
+            state.external_state = {
+                "outfit": {
+                    "label": "今日穿搭",
+                    "text": "米白针织衫配牛仔裤",
+                    "at": self.clock.now(),
+                    "expires_at": 0.0,
+                }
+            }
+            await self.engine._compose_command(
+                state, definition, "自拍", "拍一张今天的自拍给他"
+            )
+
+        prompt = self.llm.calls[-1]["prompt"]
+        self.assertIn("她此刻的状态", prompt)
+        # 缺的信息（穿什么）得能从状态槽里补，而不是留空或者瞎编
+        self.assertIn("米白针织衫配牛仔裤", prompt)
+        # 「不许只写一句带过」这条要求必须在提示词里
+        self.assertIn("不许留空", prompt)
+        self.assertIn("画面主体", prompt)
+
+    async def test_command_composer_state_text_skips_expired_slots(self):
+        """状态槽过期了就不该再拿来当"她此刻的样子"。"""
+
+        async with self.engine.session_state(SESSION) as state:
+            state.external_state = {
+                "outfit": {
+                    "label": "今日穿搭",
+                    "text": "过期的旧衣服",
+                    "at": self.clock.now(),
+                    "expires_at": self.clock.now() - 60,
+                },
+                "bag": {
+                    "label": "背包",
+                    "text": "帆布包里有本书",
+                    "at": self.clock.now(),
+                    "expires_at": 0.0,
+                },
+            }
+            text = self.engine._compose_state_text(state)
+        self.assertIn("帆布包里有本书", text)
+        self.assertNotIn("过期的旧衣服", text)
+
     async def test_command_result_images_reach_the_main_model(self):
         """指令返回图片时，图片要跟着续说那次调用一起发给多模态主模型。"""
 
@@ -5851,6 +5904,153 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.messenger.flat_images, ["https://img/1.png", "https://img/2.png"]
         )
+
+    async def test_step_images_follow_the_step_landing_point(self):
+        """计划里排下的私聊拍照：图必须跟着那一步的落点走，不能留在群里。
+
+        图片原来一律挂在 ``outcome.session_id`` 上（这一拍在推哪个会话就发哪儿），
+        正文却走这一步冻结的落点（``speech_home``）——两者不同就成了
+        「文字进私聊、图发到群里」。
+        """
+
+        from core import planner as planner_module
+        from core.ports import ToolCallResult
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION], main=SESSION)
+        self.stub_commands(
+            ToolCallResult(
+                ok=True,
+                text="拍好了",
+                tool="拍照",
+                attachments=["https://img/selfie.png"],
+            )
+        )
+        self.add_command_action()
+        definition = self.engine.world.action_map()["ask_weather"]
+        self.llm.replies = ["/天气 北京", SAY_REPLY]
+
+        async with self.engine.session_state(SESSION) as state:
+            # ``session`` 是 ``_freeze_plan_target`` 后来写上的（生成计划时还没有），
+            # 这里照着真实存档的样子补进去
+            plan = planner_module.create_plan(
+                steps=[
+                    {
+                        "action": "ask_weather",
+                        "intent": "拍一张照片",
+                        "session": PRIVATE_SESSION,
+                        "send_to": PRIVATE_SESSION,
+                        "status": "pending",
+                    }
+                ],
+                world_time=state.world_time,
+                valid_for=3600,
+                reason="测试",
+                source="pending",
+            )
+            assert plan is not None
+            plan["steps"][0]["session"] = PRIVATE_SESSION
+            plan["send_to"] = PRIVATE_SESSION
+            state.current_plan = plan
+            node = self.engine.node(state.node_id) or self.engine.node(
+                self.engine.default_node_id()
+            )
+            outcome = TickOutcome(session_id=SESSION)
+            outcome.speech_home = SESSION
+            await self.engine._tick_plan(state, node, outcome, depth=0)
+
+        self.assertEqual(outcome.routed_images.get(PRIVATE_SESSION), ["https://img/selfie.png"])
+        self.assertEqual(outcome.images, [])
+        await self.engine._deliver(outcome)
+        self.assertEqual(
+            self.messenger.sent_images, [(PRIVATE_SESSION, ["https://img/selfie.png"])]
+        )
+        self.assertNotIn(SESSION, [item[0] for item in self.messenger.sent_images])
+
+    async def test_step_images_stay_in_the_chat_that_started_them(self):
+        """群里起的动作：图还是发群里（别为了修私聊把群这条弄丢）。"""
+
+        from core import planner as planner_module
+        from core.ports import ToolCallResult
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION], main=SESSION)
+        self.stub_commands(
+            ToolCallResult(
+                ok=True,
+                text="拍好了",
+                tool="拍照",
+                attachments=["https://img/selfie.png"],
+            )
+        )
+        self.add_command_action()
+        self.llm.replies = ["/天气 北京", SAY_REPLY]
+
+        async with self.engine.session_state(SESSION) as state:
+            plan = planner_module.create_plan(
+                steps=[
+                    {
+                        "action": "ask_weather",
+                        "intent": "拍一张照片",
+                        "session": SESSION,
+                        "send_to": SESSION,
+                        "status": "pending",
+                    }
+                ],
+                world_time=state.world_time,
+                valid_for=3600,
+                reason="测试",
+                source="pending",
+            )
+            assert plan is not None
+            plan["steps"][0]["session"] = SESSION
+            plan["send_to"] = SESSION
+            state.current_plan = plan
+            node = self.engine.node(state.node_id) or self.engine.node(
+                self.engine.default_node_id()
+            )
+            outcome = TickOutcome(session_id=SESSION)
+            outcome.speech_home = SESSION
+            await self.engine._tick_plan(state, node, outcome, depth=0)
+
+        self.assertEqual(outcome.images, ["https://img/selfie.png"])
+        await self.engine._deliver(outcome)
+        self.assertEqual(
+            self.messenger.sent_images, [(SESSION, ["https://img/selfie.png"])]
+        )
+
+    async def test_images_without_a_landing_point_warn_and_use_the_current_chat(self):
+        """多会话里没定下落点：按当前会话发，但要留一条警告（图和正文分家的起点）。"""
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION], main=SESSION)
+        outcome = TickOutcome(session_id=SESSION)
+        # 落点没定（speech_home 空、这一步也没带 session）：退回这一轮的会话
+        self.assertEqual(self.engine._image_home(outcome), SESSION)
+        self.engine._attach_images(
+            outcome, ["https://img/x.png"], session_id=SESSION
+        )
+        self.assertEqual(outcome.images, ["https://img/x.png"])
+        self.assertEqual(outcome.routed_images, {})
+        joined = "\n".join(outcome.notes)
+        self.assertIn("落点", joined)
+
+    async def test_single_session_setups_stay_quiet_about_the_landing_point(self):
+        """单会话时"没定落点"是常态：图照样发，日志里别刷警告。"""
+
+        outcome = TickOutcome(session_id=SESSION)
+        self.assertEqual(self.engine._image_home(outcome), SESSION)
+        self.engine._attach_images(
+            outcome, ["https://img/x.png"], session_id=SESSION
+        )
+        self.assertEqual(outcome.images, ["https://img/x.png"])
+        self.assertEqual(outcome.notes, [])
+
+    async def test_reply_rounds_do_not_warn_about_the_landing_point(self):
+        """有人搭话那一轮：落点就是事发的那条会话，明确得很，别记警告刷屏。"""
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION], main=SESSION)
+        outcome = TickOutcome(session_id=PRIVATE_SESSION)
+        outcome.place = PRIVATE_SESSION
+        self.assertEqual(self.engine._image_home(outcome), PRIVATE_SESSION)
+        self.assertEqual(outcome.notes, [])
 
     async def test_continuous_image_action_posts_picture_before_it_finishes(self):
         """持续型生图动作：指令一开跑就把图发出去，剩下的时间只是占位。"""

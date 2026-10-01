@@ -2664,6 +2664,29 @@ class TestSelfSendToolPolicy(unittest.TestCase):
         self.assertFalse(is_self_send_tool(""))
         self.assertFalse(is_self_send_tool(None))
 
+    def test_tools_that_make_something_are_never_self_send(self):
+        """名字里带「产出内容」的一律不算直发消息：出图工具被挡掉，图就只能补发。"""
+
+        for name in (
+            "send_image",
+            "image_send_message",
+            "send_photo_to_user",
+            "generate_and_send",
+            "selfie_send",
+            "send_video",
+            "tts_send_message",
+            # 名字里带出图的词，就算最后一段正好对上直发消息工具也不挡
+            "image_plugin.send_message",
+            "my_plugin/send_picture",
+        ):
+            self.assertFalse(is_self_send_tool(name), name)
+
+    def test_namespaced_senders_are_still_recognized(self):
+        """带插件名前缀的直发消息工具照样要认出来（这类名字很常见）。"""
+
+        for name in ("helper.send_message", "某插件/reply_message", "ns.send_msg"):
+            self.assertTrue(is_self_send_tool(name), name)
+
 
 class TestToolSourceLabel(unittest.TestCase):
     """官方内置工具在编辑器里要带「官方」前缀，别的工具不加。"""
