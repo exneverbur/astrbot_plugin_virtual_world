@@ -50,7 +50,9 @@ from .core.engine import (
     MessageContext,
     VirtualWorldEngine,
 )
+from .core.extensions import ExtensionHost, ExtensionSpec
 from .core.models import (
+    DEFAULT_INTIMACY,
     FIELD_LABELS,
     normalize_edge_keys,
     normalize_legacy_keys,
@@ -77,6 +79,10 @@ LLM_HOOK_PRIORITY = -100
 # 睡觉门禁要抢在「意图路由」这类消息级插件前面：它们通常注册在 100 左右，
 # 取值比它们高才会先执行；一旦这里 stop_event()，后面的处理器都不会跑。
 SLEEP_GUARD_PRIORITY = 200
+# 「旁观记录」也要抢在它们前面。意图路由会把消息**先吞下去再挑一部分重投**，
+# 被吞掉的那几条如果排在它后面才记录，就永远记不到——她看到的聊天记录会缺一大段。
+# 排在门禁之后（门禁要第一个拦睡眠）、路由之前。
+PRESENCE_PRIORITY = 190
 # 同一条会话的前一条回复最多让后一条等这么久；超时就不再排队（宁可多说一句，也别一直不说话）
 REPLY_TURN_WAIT_SECONDS = 25.0
 # 事件上挂的「这条消息已经在待回队列里了」标记（连发合并用）
@@ -182,35 +188,176 @@ def _mention_note(event: Any) -> str:
 
     她不知道自己的 QQ 号，所以别人 @ 她的时候，光看文本里的 ``@昵称`` 她分不清
     那是不是在叫她。这里把 id 一起写出来，并且把她自己标成「你」。
+
+    两个坑必须在这儿说清，否则她会误会：
+
+    - **正文里可能看不到那个 @ 她自己**：AstrBot 会把"开头的 @ 机器人自己"从
+      ``message_str`` 里去掉（组件里还在）。于是正文看着像只 @ 了别人，
+      实际上是"先 @ 她、再 @ 另一个人"。
+    - **@ 了别人**时要说清那不是在叫她，别把别人的话揽到自己身上。
+
+    第三个坑：**意图路由补的那个 @ 是假的**（它只是为了让消息重新走通管道）。
+    照着它写"这条消息 @ 了你"，她会以为对方真的点了她——而用户看到的是一句
+    平白多出来的"@ 了你"。这种消息只留一句"是顺着话题说到你的"。
     """
 
     self_id = str(getattr(event, "get_self_id", lambda: "")() or "")
+    soft = _is_soft_wake(event)
     message_obj = getattr(event, "message_obj", None)
-    targets: list[str] = []
     others: list[str] = []
+    mine = False
+    everyone = False
     for component in list(getattr(message_obj, "message", []) or []):
         if type(component).__name__ not in ("At", "AtAll"):
             continue
         qq = str(getattr(component, "qq", "") or "").strip()
+        if soft and qq == self_id:
+            # 路由补的假 @：不算"点了她"，也别写进记录
+            continue
         name = str(getattr(component, "name", "") or "").strip()
         if qq == "all":
-            targets.append("所有人")
+            everyone = True
             continue
-        label = f"{name}({qq})" if name and qq else (name or qq)
+        label = _at_label(name, qq)
         if not label:
             continue
         if qq and self_id and qq == self_id:
-            label = f"你（{label}）"
-        elif qq or name:
-            # @ 的是别人：这段不能让她以为是在叫她
-            others.append(label)
-        targets.append(label)
-    if not targets:
+            mine = True
+            continue
+        # @ 的是别人：这段不能让她以为是在叫她
+        others.append(label)
+    if soft and not others and not everyone:
+        return "这段没 @ 你，是顺着上面的话题说到你的"
+    if not mine and not others and not everyone:
         return ""
-    note = f"这条消息 @ 了：{'、'.join(dict.fromkeys(targets))}"
-    if others:
-        note += f"（其中 {'、'.join(dict.fromkeys(others))} 是别人，不是在 @ 你）"
+    picked = [
+        *(["你（" + self_id + "）"] if mine else []),
+        *(["所有人"] if everyone else []),
+        *others,
+    ]
+    note = f"这条消息 @ 了：{'、'.join(dict.fromkeys(picked))}"
+    later = [*(["所有人"] if everyone else []), *others]
+    unique_later = "、".join(dict.fromkeys(later))
+    if later and mine:
+        note += f"；其中 {unique_later} 不是在 @ 你（那是在叫别人）"
+    elif later:
+        note += "；**这些都不是在 @ 你**（那是在叫别人）"
+    if mine:
+        note += (
+            "；这条消息里确实 @ 了你（你说的这段正文里可能看不到那一下，"
+            "平台把开头的 @ 自己省掉了）——别把它当成是冲别人说的"
+        )
     return note
+
+
+INJECT_STUB = (
+    "\n\n# 你自己的世界（由「虚拟世界」提供）\n"
+    "你按它给的时间、地点和状态说话；不要向用户解释地图、规则、数值或任何系统设定，"
+    "也不要复述这段说明。\n"
+)
+"""注入模式留在 system prompt 里的那几句：**每轮一字不差**，才不打断前缀缓存。
+
+真正每轮都变的世界状态走 ``extra_user_content_parts``（见 ``_inject_world_state``）。
+"""
+
+
+def _text_part(text: str):
+    """一个 text 内容块：新版本 AstrBot 用 ``TextPart``，拿不到就退回纯 dict。"""
+
+    try:
+        from astrbot.core.agent.message import TextPart
+
+        return TextPart(text=text)
+    except Exception:
+        return {"type": "text", "text": text}
+
+
+def _at_label(name: str, qq: str) -> str:
+    """@ 目标的标签：名字和号码尽量都给，但别写成 ``2829449702(2829449702)``。"""
+
+    clean_name = " ".join(str(name or "").split())
+    clean_qq = str(qq or "").strip()
+    if not clean_name:
+        return clean_qq
+    if not clean_qq or clean_name == clean_qq:
+        return clean_name
+    return f"{clean_name}({clean_qq})"
+
+
+def _at_targets(event: Any) -> list[dict]:
+    """这条消息 @ 了谁（含她自己），结构化一份。
+
+    意图路由为了让消息重新走通管道，会往消息链里**补一个假的 @ 她自己**
+    （见 `_is_soft_wake`）。那个 @ 不是用户打的，必须剔掉——否则她的记录里
+    会出现"这条消息 @ 了你"，而她明明只是顺着话题被叫起来。
+    """
+
+    self_id = str(getattr(event, "get_self_id", lambda: "")() or "")
+    soft = _is_soft_wake(event)
+    message_obj = getattr(event, "message_obj", None)
+    targets: list[dict] = []
+    for component in list(getattr(message_obj, "message", []) or []):
+        if type(component).__name__ not in ("At", "AtAll"):
+            continue
+        qq = str(getattr(component, "qq", "") or "").strip()
+        if soft and qq == self_id:
+            continue
+        name = " ".join(str(getattr(component, "name", "") or "").split())
+        if qq == "all":
+            targets.append({"id": "all", "name": "所有人", "self": False})
+            continue
+        if not qq and not name:
+            continue
+        targets.append(
+            {
+                "id": qq,
+                "name": name or qq,
+                "self": bool(qq and self_id and qq == self_id),
+            }
+        )
+    return targets
+
+
+def _reply_target(event: Any) -> dict:
+    """这条消息引用 / 回复的是谁（拿不到就是空的）。"""
+
+    message_obj = getattr(event, "message_obj", None)
+    for component in list(getattr(message_obj, "message", []) or []):
+        if type(component).__name__ != "Reply":
+            continue
+        uid = str(
+            getattr(component, "sender_id", "") or getattr(component, "qq", "") or ""
+        ).strip()
+        name = " ".join(
+            str(
+                getattr(component, "sender_nickname", "")
+                or getattr(component, "sender_name", "")
+                or ""
+            ).split()
+        )
+        if uid or name:
+            return {"id": uid, "name": name or uid}
+    return {}
+
+
+def _addressing_kind(
+    targets: list[dict], reply_to: dict, self_id: str
+) -> str:
+    """这句是冲谁说的：``me``（点了她）/ ``others``（在叫别人）/ ``""``（看不出来）。
+
+    只用来标注，不参与"要不要回复"的判定——那个还是走 ``ctx.is_mentioned`` 那一套。
+    """
+
+    mine = any(item.get("self") for item in targets or [])
+    if str((reply_to or {}).get("id") or "") and str((reply_to or {}).get("id")) == str(
+        self_id or ""
+    ):
+        mine = True
+    if mine:
+        return "me"
+    if targets or reply_to:
+        return "others"
+    return ""
 
 
 def _is_command(text: str) -> bool:
@@ -2506,7 +2653,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "exneverbur",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v2.0.1",
+    "v2.1",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -2557,6 +2704,8 @@ class VirtualWorldPlugin(Star):
 
         data_dir = _resolve_data_dir(os.path.dirname(os.path.abspath(__file__)))
         self.store = ConfigStore(data_dir)
+        # 扩展挂载点：独立插件（如果装了）会通过 `star_cls.extension_host` 找到它
+        self.extension_host = ExtensionHost(self)
         created = self.store.ensure_files()
         self.db = AsyncDatabase(self.store.db_path)
         self.auth = EditorAuth(self, str(config.get("web_password") or ""))
@@ -2601,6 +2750,8 @@ class VirtualWorldPlugin(Star):
             decider_interval=float(self.decider_interval),
             debug=self.debug,
             logger=self.logger,
+            # 扩展挂载点：扩展包（独立插件）拿到这个实例后自己 register
+            extensions=self.extension_host,
         )
         # 调试回显实时发：工具/指令调用在发生的那一下就走这条通道，
         # 不再等整轮动作跑完才一起推给群里
@@ -2683,7 +2834,9 @@ class VirtualWorldPlugin(Star):
                             f"{'; '.join(outcome.notes)} "
                             f"messages={outcome.messages}"
                         )
-                for session_id in self.engine.enabled_session_ids():
+                # 一个会话组只催一次决策：按"会话"逐个催的话，同一个她会被催好几遍，
+                # 而且第二次很可能挂在别的会话名下决定（落点就跟着跑了）
+                for session_id in self.engine.tick_session_ids():
                     await self.engine.maybe_decide(session_id)
             except asyncio.CancelledError:
                 raise
@@ -3355,6 +3508,11 @@ class VirtualWorldPlugin(Star):
             image_urls=image_urls,
             chat_images=sources,
             image_marks=image_marks,
+            at_targets=_at_targets(event),
+            reply_to=_reply_target(event),
+            addressing=_addressing_kind(
+                _at_targets(event), _reply_target(event), str(event.get_self_id() or "")
+            ),
         )
 
         # 睡觉时的门禁：没被明确叫醒就只回固定文案（或保持安静），
@@ -3513,8 +3671,23 @@ class VirtualWorldPlugin(Star):
                 return
 
         # ---- 注入模式：只把世界认知写进主人格的提示词，不接管回复 ----
+        if self.extension_host.installed():
+            try:
+                state = await self.engine.load_state(session_id, cold_start=False)
+                layer = self.engine._extension_prompt(state, session_id)
+                if layer:
+                    injection = f"{injection}\n\n{layer}"
+            except Exception as exc:
+                self.logger.debug(f"[virtual_world] 扩展提示词没加上：{exc}")
         try:
-            req.system_prompt = (req.system_prompt or "") + injection
+            where = self._inject_world_state(req, injection)
+            if self.debug:
+                head = str(getattr(req, "system_prompt", "") or "")
+                self.logger.info(
+                    f"[virtual_world] 注入 {session_id}（{where}，状态 {len(injection)} 字）"
+                    f"｜system_prompt 指纹 {hashlib.sha1(head.encode('utf-8')).hexdigest()[:10]}"
+                    f"（{len(head)} 字，跨轮应保持不变）：\n{injection}"
+                )
         except Exception as exc:
             self.logger.warning(f"[virtual_world] 注入提示词失败：{exc}")
         # 注入模式下主人格会替她说话，同样算"已经回应过这批群聊"
@@ -3526,9 +3699,36 @@ class VirtualWorldPlugin(Star):
         echo = self.engine.take_pending_echo(session_id)
         if echo:
             await self._send_reply(event, echo)
-        if self.debug:
-            self.logger.info(f"[virtual_world] 注入 {session_id}：\n{injection}")
         await self._trim_tools(session_id, req)
+
+    def _inject_world_state(self, req, injection: str) -> str:
+        """把世界状态挂到**这一轮的用户消息**上，而不是 system prompt 的尾巴。
+
+        前缀缓存按 token 前缀命中。世界状态里带着时间、位置、心情、日程、聊天记录，
+        每轮都不一样；追加到 system prompt 末尾等于把分叉点钉在那里——它后面的
+        **整段历史**都再也命中不了缓存（历史越长，浪费越大）。
+        AstrBot 的 ``extra_user_content_parts`` 会被拼进最后那条 user 消息
+        （它自己就是这么放引用消息和图片说明的），system 与历史因此保持一字不变。
+
+        返回"注到哪儿了"，方便日志里核对（``user`` = 走的新路，``system`` = 老版本兜底）。
+        """
+
+        current = str(getattr(req, "system_prompt", "") or "")
+        if INJECT_STUB.strip() and INJECT_STUB.strip() not in current:
+            req.system_prompt = current + INJECT_STUB
+        parts = getattr(req, "extra_user_content_parts", None)
+        if parts is None:
+            # 老版本 AstrBot 没这个字段：退回原来的写法（牺牲缓存，但不丢功能）
+            req.system_prompt = str(getattr(req, "system_prompt", "") or "") + injection
+            return "system"
+        for part in list(parts):
+            dumped = part if isinstance(part, dict) else getattr(part, "text", "")
+            if isinstance(dumped, dict):
+                dumped = dumped.get("text")
+            if str(dumped or "") == injection:
+                return "user（已在）"
+        parts.append(_text_part(injection))
+        return "user"
 
     async def _trim_tools(self, session_id: str, req) -> None:
         """按当前区域裁剪 req.func_tool。"""
@@ -3960,7 +4160,9 @@ class VirtualWorldPlugin(Star):
             )
         event.stop_event()
 
-    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.event_message_type(
+        filter.EventMessageType.ALL, priority=PRESENCE_PRIORITY
+    )
     async def on_any_message(self, event: AstrMessageEvent) -> None:
         if not self.enabled or self.retired:
             return
@@ -3998,6 +4200,13 @@ class VirtualWorldPlugin(Star):
                 is_private=bool(event.is_private_chat()),
                 group_name=_group_name(event),
                 chat_images=list(sources),
+                at_targets=_at_targets(event),
+                reply_to=_reply_target(event),
+                addressing=_addressing_kind(
+                    _at_targets(event),
+                    _reply_target(event),
+                    str(event.get_self_id() or ""),
+                ),
             )
         )
 
@@ -4224,6 +4433,10 @@ class VirtualWorldPlugin(Star):
                 "　/vw event list  看最近的事件线索"
             )
         text = " ".join(rest)
+        # 先问一句扩展：有没有谁认领这条（例如「/vw event h」交给扩展起它自己的一段流程）
+        handled = await self.extension_host.command_event(session_id, text)
+        if handled is not None:
+            return handled
         note = await self.engine.submit_event(session_id, text)
         # 成功（note 为空）时不回话：她马上就会在群里说这件事
         return note
@@ -4650,6 +4863,7 @@ class VirtualWorldPlugin(Star):
         )
         register(f"/{p}/profile/forget", self.api_profile_forget, ["POST"], "通讯录：忘掉一个人")
         register(f"/{p}/profile/consolidate", self.api_profile_consolidate, ["POST"], "立刻整理一次（记忆 + 画像）")
+        register(f"/{p}/extensions", self.api_extensions, ["GET", "POST"], "扩展包：设置与数据")
 
     # ---------------- 通讯录（用户画像）----------------
 
@@ -5400,6 +5614,28 @@ class VirtualWorldPlugin(Star):
         self.auth.set_password(new_password)
         return json_response({"ok": True, "password_required": self.auth.has_password()})
 
+    async def api_extensions(self):
+        """扩展包：读设置与数据 / 保存设置。
+
+        插件自己不认识任何扩展；这里只是把挂上来的扩展的字段定义和值原样交给设置页。
+        """
+
+        guard = self._guard()
+        if guard is not None:
+            return guard
+        if request.method.upper() == "POST":
+            payload = await request.json(default={}) or {}
+            saved = self.extension_host.save_settings(dict(payload.get("values") or {}))
+            return json_response({"ok": True, "saved": saved})
+        session_id = self._scope(request.query.get("session", ""))
+        state = None
+        if session_id:
+            try:
+                state = await self.engine.load_state(session_id, cold_start=False)
+            except Exception:
+                state = None
+        return json_response(self.extension_host.snapshot(state))
+
     async def api_get_config(self):
         guard = self._guard()
         if guard is not None:
@@ -5429,6 +5665,23 @@ class VirtualWorldPlugin(Star):
                 **sessions,
                 **self.engine.sessions.model_dump(mode="json", by_alias=True),
             }
+        # 动作的「亲密程度」留空 = 按内置对照表算。编辑器里要能看见**实际会用多少**，
+        # 不然用户填了空白，永远不知道这一步到底会不会满足欲求。
+        for action in world.get("actions") or []:
+            if not isinstance(action, dict):
+                continue
+            explicit = action.get("intimacy")
+            if explicit in (None, ""):
+                action["intimacy_effective"] = round(
+                    float(DEFAULT_INTIMACY.get(str(action.get("id") or ""), 0.0)), 3
+                )
+            else:
+                try:
+                    action["intimacy_effective"] = round(
+                        max(0.0, min(1.0, float(explicit))), 3
+                    )
+                except (TypeError, ValueError):
+                    action["intimacy_effective"] = 0.0
         return json_response(
             {
                 "world": world,
@@ -5441,6 +5694,8 @@ class VirtualWorldPlugin(Star):
                 "vision_cache": await self._vision_cache_stats(),
                 # 当前天气：地图页顶部横幅直接用它
                 "weather": await self.engine.weather_payload(),
+                # 动作库里"哪些动作是扩展带来的"：编辑器按它把动作库分成两半
+                "extension_actions": self.extension_host.action_groups(),
             }
         )
 
@@ -5481,12 +5736,33 @@ class VirtualWorldPlugin(Star):
         world = payload.get("world")
         if not isinstance(world, dict):
             return error_response("world 必须是对象")
+        world = self._without_extension_actions(world)
         try:
             warnings = self.store.save_world(world)
         except ValidationError as exc:
             return self._save_error("世界配置", exc)
         self.engine.reload_config()
         return json_response({"ok": True, "warnings": warnings})
+
+    def _without_extension_actions(self, world: dict[str, Any]) -> dict[str, Any]:
+        """存世界配置前把扩展带来的动作摘掉。
+
+        这些动作是扩展在加载时提供的，不属于用户的配置：留着的话，
+        扩展一旦停用 / 卸载，它们就会变成一堆没人认领、也删不干净的动作。
+        """
+
+        owned = self.extension_host.owned_actions()
+        actions = world.get("actions")
+        if not owned or not isinstance(actions, list):
+            return world
+        kept = [
+            item
+            for item in actions
+            if not (isinstance(item, dict) and str(item.get("id") or "") in owned)
+        ]
+        if len(kept) == len(actions):
+            return world
+        return {**world, "actions": kept}
 
     async def api_put_schedules(self):
         payload = await request.json(default={}) or {}
@@ -6460,7 +6736,7 @@ def _render_status(snapshot: dict[str, Any], pronoun: str = "她") -> str:
         "数值："
         f"精力 {values.get('energy', 0):.2f}　孤独 {values.get('loneliness', 0):.2f}　"
         f"好奇 {values.get('curiosity', 0):.2f}　心潮 {values.get('affect', 0):.2f}　"
-        f"无聊 {values.get('boredom', 0):.2f}",
+        f"无聊 {values.get('boredom', 0):.2f}　欲求 {values.get('desire', 0):.2f}",
         f"世界时间：{snapshot.get('world_time')} tick"
         f"（1 tick = {int(snapshot.get('tick_seconds', 60))} 秒）",
     ]

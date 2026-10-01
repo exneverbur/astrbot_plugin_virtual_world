@@ -24,12 +24,16 @@ from typing import Any
 
 from .memory import RecalledMemory
 from .models import NodeDef, WorldConfig, pronoun_for
+from .mood import day_mood_info, desire_text
+from .extensions import JsonField, normalize_json_field
 from .state import (
+    ANNOTATION_KEEP_CHARS,
     FORWARD_SUMMARY_MARK,
     WorldState,
     chat_core_text,
     chat_item_is_fresh,
     group_chat_items,
+    split_annotation,
     take_last_chat_groups,
 )
 from .pathfinding import travel_cost
@@ -188,20 +192,66 @@ def clip_line(value: Any, limit: int) -> str:
 
     只留一个光秃秃的「…」会让她以为对方话说到一半（"你倒是说完啊"），
     所以截断时把还剩多少字一并写出来，而且尽量切在句末。
+
+    ``［…］`` 那段注释（@ 了谁、引用了什么）**不跟着正文掐**：
+    它是"这句到底冲谁说的"的关键，掐掉半句（"（其中 老普机器人… 还有 12 字没显示"）
+    反而会让她把别人的话当成在叫自己。
     """
 
     text = " ".join(str(value or "").split())
     limit = max(1, int(limit or 0))
-    if len(text) <= limit:
-        return text
-    cut = text[:limit]
+    body, note = split_annotation(text)
+    kept_note = note[:ANNOTATION_KEEP_CHARS]
+    if len(body) <= limit:
+        return f"{body}{kept_note}"
+    cut = body[:limit]
     for tail in _SENTENCE_TAILS:
         position = cut.rfind(tail)
         # 别为了断句砍掉太多：至少留一半
         if position >= limit // 2:
             cut = cut[: position + 1]
             break
-    return f"{cut}…（这条还有 {len(text) - len(cut)} 字没显示）"
+    return f"{cut}…（这条还有 {len(body) - len(cut)} 字没显示）{kept_note}"
+
+
+def _addressing_labels(item: dict[str, Any]) -> str:
+    """这一条是冲谁说的：@ 名单 + 引用对象（看不清就留空，不猜）。
+
+    群里问一句「你倒是说啊」，不写清楚很容易被她当成在问自己。
+    ``at`` / ``reply_to`` 是收到消息时就结构化存下的，所以这里不用再猜。
+    """
+
+    targeted = [
+        entry for entry in (item.get("at_targets") or []) if isinstance(entry, dict)
+    ]
+    reply = item.get("reply_to") if isinstance(item.get("reply_to"), dict) else {}
+    labels: list[str] = []
+    for entry in targeted:
+        if entry.get("self"):
+            labels.append("你")
+            continue
+        if str(entry.get("id") or "") == "all":
+            labels.append("所有人")
+            continue
+        name = " ".join(str(entry.get("name") or entry.get("id") or "").split())
+        if name:
+            labels.append(f"@{name}")
+    if reply:
+        who = " ".join(str(reply.get("name") or reply.get("id") or "").split())
+        if who:
+            labels.append(f"引用 {who}")
+    return "、".join(dict.fromkeys(labels))
+
+
+def _addressing_hint(item: dict[str, Any]) -> str:
+    """确定不是在跟她说话时，替她点一句——省得她把别人的话揽到自己身上。"""
+
+    kind = str(item.get("addressing") or "")
+    if kind == "me":
+        return ""
+    if kind == "others":
+        return "　（这句是冲别人说的，不是在问你）"
+    return ""
 
 
 def _field(obj: Any, name: str, default: Any = None) -> Any:
@@ -535,11 +585,21 @@ class PromptBuilder:
             for item in self.world.actions_in(node.id)
             if self._action_usable_now(item) and item.id not in hidden
         ]
-        action_lines = "\n".join(
-            self._action_line(a) for a in actions if a.id != "walk_to"
-        )
+        # 分两块：她自己的本事（内置动作，到哪儿都有、内容基本不变）
+        # 与"这个地方能做的事"（按地点变）。内置那块放前面：
+        # 一是它稳定，二是这些动作（回想 / 记住 / 说话 / 移动 / 日程）最该被想起来。
+        innate = [
+            a for a in actions if bool(getattr(a, "builtin", False))
+        ]
+        local = [
+            a
+            for a in actions
+            if a.id != "walk_to" and not bool(getattr(a, "builtin", False))
+        ]
+        innate_lines = "\n".join(self._action_line(a) for a in innate)
+        local_lines = "\n".join(self._action_line(a) for a in local)
         # 能写的 type 是随地点变化的，所以放在这一层（而不是固定的「输出格式」层）
-        usable = [a.id for a in actions if a.id != "walk_to"]
+        usable = [a.id for a in [*innate, *local]]
         type_line = "、".join(usable) if usable else "say"
         if "walk_to" not in usable:
             type_line += "、walk_to"
@@ -549,8 +609,8 @@ class PromptBuilder:
         zone_note = f"\n{_one_line(zone.note, 40)}" if zone is not None and zone.note else ""
         exclusive = [
             a.name or a.id
-            for a in actions
-            if a.id != "walk_to" and getattr(a, "scope", "global") == "node"
+            for a in local
+            if getattr(a, "scope", "global") == "node"
         ]
         exclusive_line = (
             "这里有几件别处做不了的事："
@@ -566,9 +626,12 @@ class PromptBuilder:
             f"{node.prompt}{zone_note}\n\n"
             f"这里的氛围：{node.atmosphere.describe()}\n\n"
             f"这一轮你能写的 type 只有：{type_line}\n\n"
+            "# 你自己的本事（这些一直在，跟地点无关）\n"
+            f"{innate_lines or '（这一轮没有额外可用的内置动作）'}\n\n"
+            "# 这个地方能做的事（按地点变）\n"
             f"{exclusive_line}"
-            f"你可以执行的动作（工具型动作只要说明想做什么，具体参数由系统转交）：\n"
-            f"{action_lines}\n\n"
+            f"{local_lines or '（这儿没什么特别的，发呆就行）'}\n"
+            "（工具型动作只要说明想做什么，具体参数由系统转交）\n\n"
             f"{tool_lines}\n\n"
             f"{search_hint}"
             "想做只有别处能做的事（比如在书房上网）：**先写一步 walk_to，紧接着把要做的那个动作也写进\n"
@@ -854,6 +917,9 @@ class PromptBuilder:
         # 风格段放在最后：近因效应最强，而且是"这一轮这么说话"的直接指令
         if style_block:
             blocks.append(style_block)
+        digest = self._event_digest_block(state)
+        if digest:
+            blocks.append(digest)
         return "\n\n".join(blocks)
 
     # ---------------- 第 4 层的分段构件 ----------------
@@ -909,6 +975,16 @@ class PromptBuilder:
         lines = [
             "你的状态（每个数值都是 0~1，越大越强）：",
             f"- 心情：{state.mood}",
+        ]
+        # 今天的基调：一天一次，掷出来的。说清它是"今天曲线走得快慢"而不是
+        # "她变了个人"——不然模型会把它演成性格转变。
+        today = day_mood_info(getattr(state, "day_mood", ""))
+        if today is not None and today.id != "calm":
+            lines.append(
+                f"- 今天的基调：{today.label}——{today.hint}"
+                "（这是今天一整天的底子，不用刻意说破，让它自然渗进你的反应和选择里）"
+            )
+        lines.extend([
             f"- 精力 {state.energy:.2f}：低于 0.25 会明显犯困——白天先小睡一会儿（10~60 分钟）就能缓过来，"
             "睡整觉留给夜里和凌晨；高于 0.8 很有精神",
             f"- 孤独感 {state.loneliness:.2f}：超过 0.7 会很想找人说话，低于 0.3 觉得一个人也挺好",
@@ -921,8 +997,12 @@ class PromptBuilder:
             "它管的是情绪朝哪个方向，和心潮一起决定你这一轮的表达形态——"
             "两者都只是内部感受，不要报数字。",
             f"- 无聊 {state.boredom:.2f}：超过 0.8 待不住，想换个地方；超过 0.45 想找点事做",
+            f"- 欲求 {float(getattr(state, 'desire', 0.0) or 0.0):.2f}："
+            f"现在是「{desire_text(getattr(state, 'desire', 0.0))}」；"
+            "它要的是**实实在在的接触**——被摸摸头、被抱住、被亲一下会落下去，"
+            "没人碰就一直慢慢涨；跟孤独感不是一回事（那是想有人说话）。",
             "这些是你的内部感受，不要报数字，但语气、动作和用词要能体现出来。",
-        ]
+        ])
         if dwell_minutes > 0:
             # 她得知道自己"在这儿待了多久"：久待无聊涨得更快，也是换地方的理由
             lines.append(
@@ -1260,7 +1340,16 @@ class PromptBuilder:
             # 同一个人 + 同一个会话 + 间隔不超过 5 分钟 → 并成一行
             for group in group_chat_items([item for item, _text in rendered]):
                 item = group[-1]
-                body = " / ".join(texts.get(id(one), "") for one in group)
+                pieces: list[str] = []
+                for one in group:
+                    piece = texts.get(id(one), "")
+                    labels = _addressing_labels(one)
+                    if labels:
+                        # 一条消息里可能有好几句（同一个人连发），箭头要跟着自己那一句
+                        piece = f"→ {labels}：{piece}"
+                    piece += _addressing_hint(one)
+                    pieces.append(piece)
+                body = " / ".join(pieces)
                 name = str(item.get("name") or item.get("user_id") or "").strip()
                 if item.get("internal"):
                     # 插件写的"她身上发生的事"：标出来，免得被当成群里谁说的话
@@ -1520,6 +1609,24 @@ class PromptBuilder:
 
     # ---------------- 第 3 层 ----------------
 
+    def render_json_fields(self, fields: Any) -> str:
+        """扩展声明的字段 → 拼进「输出格式」的那几行。
+
+        和主插件自己那几个字段一个写法，也**同样是静态文本**：声明什么样就写成什么样，
+        不掺任何随时间变化的内容，所以加了字段也能继续吃前缀缓存。
+        声明认不出来（名字不合规 / 撞了主插件的键）就跳过——那是扩展写错了，不该影响提示词。
+        """
+
+        lines: list[str] = []
+        seen: set[str] = set()
+        for raw in tuple(fields or ()):
+            field_item = normalize_json_field(raw)
+            if field_item is None or field_item.name in seen:
+                continue
+            seen.add(field_item.name)
+            lines.append(field_item.render())
+        return "".join(lines)
+
     def format_layer(
         self,
         *,
@@ -1527,11 +1634,20 @@ class PromptBuilder:
         reasoning: bool = True,
         mode: str = "actions",
         multi_session: bool = False,
+        wants_touch: bool = False,
+        json_fields: Any = (),
     ) -> str:
         """输出格式约束。
 
         整段不依赖当前地点与状态，所以可以放在提示词前部当固定前缀用。
         能写哪些 type 由「当前场景」那一层给，这里只讲结构和字段规则。
+
+        ``wants_touch``：有没有扩展声明要"他这一轮碰了她哪儿"。
+        **没人要这一项时整段提示词跟以前一模一样**（多写一个字段等于白花钱）。
+
+        ``json_fields``：扩展自己声明的字段（``ExtensionSpec.json_fields``）。
+        它们也拼在这一段里——**全是静态文本**（不随时间/地点/心情变化），
+        所以加了字段也不会每一轮都变、不会砸掉前缀缓存。
         """
 
         reasoning_block = ""
@@ -1549,7 +1665,8 @@ class PromptBuilder:
                 '    "inner": "用第一人称写下你此刻心里冒出的一两句（30 字以内，心里话，不是台词）",\n'
                 '    "intent": "你打算怎么回应（20 字以内）"\n'
                 "  },\n"
-                '  "memory": "这次对话值得记住的一句话（20 字以内，以你的视角）",\n'
+                '  "memory": "这一轮你自己会记住的一句话（20 字以内，以你的视角）。'
+                '注意这只是你的回忆：关于他的事要用 remember 动作写进通讯录",\n'
                 '  "chat_note": "刚才你们在聊什么（20 字以内，只在这条消息带群聊背景时才写）",\n'
                 '  "open_topic": "他有一件还没说完、之后你能接着问的事（20 字以内，'
                 '时间写成具体日期，例如「9 月 29 号要去体检」；别写明天/下周；没有就留空）",\n'
@@ -1560,8 +1677,19 @@ class PromptBuilder:
                 '  "own_topic": "你自己打算做、或者答应过别人的一件事（20 字以内，'
                 '写清对谁；没有就留空）",\n'
                 '  "own_topic_done": false,\n'
-                '  "tone": "对方这一轮对你是什么口吻：praise | hug | attack | normal",\n'
-                '  "valence_delta": 0,\n'
+                '  "tone": "对方这一轮对你是什么口吻：'
+                'praise | hug | comfort | attack | refuse | normal",\n'
+                '  "addressing": "这句是在跟谁说话：me（对你说）| others（在跟别人说）| '
+                'unclear（看不出来）",\n'
+                + (
+                    '  "touch": [他这一轮碰到你身上哪些地方，写名词就行'
+                    "（例如 腰、耳后、手）；他没碰到你、或者只是你单方面在做动作，"
+                    "就留空数组]\n"
+                    if wants_touch
+                    else ""
+                )
+                + self.render_json_fields(json_fields)
+                + '  "valence_delta": 0,\n'
                 + (
                     '  "affinity_delta": 0.1,\n'
                     if bool(getattr(self.world.profile, "enabled", True))
@@ -1615,12 +1743,26 @@ class PromptBuilder:
                 "- 别人的事用 open_topic，**别写在这儿**；\n"
                 "- 同时最多留两件，没有就留空。\n\n"
                 "关于 tone：\n"
-                "- 它记的是**对方这一轮对你是什么口吻**，四选一：\n"
+                "- 它记的是**对方这一轮对你是什么口吻**，六选一：\n"
                 "  praise＝夸你、认真接你的话；hug＝哄你、撒娇、亲昵的小动作；\n"
-                "  attack＝怼你、阴阳怪气、拿你开玩笑；normal＝普通聊天。\n"
+                "  comfort＝他在安慰你、接住了你刚才说的难受（只有你真露出情绪时才算，"
+                "随手一句「我懂你」不算）；\n"
+                "  attack＝怼你、阴阳怪气、拿你开玩笑；\n"
+                "  refuse＝他**明确叫停 / 拒绝**——「停下」「别这样」「不要」「我不想要」"
+                "「今天不想」，或者你刚伸手就被他挡回来；\n"
+                "  normal＝普通聊天。\n"
+                "- refuse 只记**明说的那种**：他说了不要就是不要，别当成欲拒还迎；"
+                "这一条会让她接下来一段时间收着手，所以判错代价比漏判大。\n"
                 "- 看**真实意思**，不要被字面骗：「你可真行啊」是 attack 不是 praise；\n"
                 "  「大肥鱼」这种熟人式的逗你是 attack；单纯问事情就是 normal。\n"
                 "- 拿不准就写 normal。\n\n"
+                "关于 addressing：\n"
+                "- 它记的是**这一句到底在跟谁说话**，三选一：\n"
+                "  me＝在跟你说（点了你、回你、叫你的名字）；others＝在跟别人说"
+                "（@ 的是别人、或者接着别人的话往下说）；unclear＝真看不出来。\n"
+                "- 群聊里别人之间说话时，句子里的「你」指的是**另一个人**——"
+                "这时候写 others，别揽到自己身上；\n"
+                "- 拿不准就写 unclear，不要为了讨好写成 me。\n\n"
                 "关于 valence_delta：\n"
                 "- 它是**这次互动把你的心情推了多少**，取 -1 ~ 1，**默认 0**——"
                 "绝大多数轮次本来就该是 0，不写这一项也等于 0；\n"
@@ -2028,14 +2170,18 @@ class PromptBuilder:
         abilities_line: str = "",
         pending_event: str = "",
         event_journal: str = "",
+        hidden_actions: set[str] | None = None,
         current_session: str = "",
         session_labels: dict[str, str] | None = None,
         profile_text: str = "",
         samples: list[dict[str, Any]] | None = None,
     ) -> str:
-        """注入模式：给主人格的一层「世界认知」。"""
+        """注入模式：给主人格的一层「世界认知」。
 
-        scene = self.scene_compact(node)
+        ``hidden_actions``：这一轮连名字都不该出现的动作（扩展要求藏起来的 + 配额用尽的）。
+        """
+
+        scene = self.scene_compact(node, hidden=hidden_actions)
         runtime = self.runtime_layer(
             state,
             node=node,
@@ -2063,14 +2209,22 @@ class PromptBuilder:
             "自然地把它融进你的反应里（比如刚睡醒、正在忙、心情如何），"
             "但不要向用户解释这套设定、不要复述状态数值。\n\n"
         )
-        if sample_text:
-            head += f"{sample_text}\n\n"
-        return head + f"{scene}\n\n{runtime}\n# ===== 虚拟世界状态结束 ====="
+        # 声音样例放最后（理由同 build_autonomous_system_prompt：它每轮都换，
+        # 放前面会毁掉缓存前缀；放最后还能吃近因效应）
+        tail = f"\n\n{sample_text}" if sample_text else ""
+        return f"{head}{scene}\n\n{runtime}{tail}\n# ===== 虚拟世界状态结束 ====="
 
-    def scene_compact(self, node: NodeDef | None) -> str:
+    def scene_compact(self, node: NodeDef | None, *, hidden: set[str] | None = None) -> str:
+        """紧凑版场景说明（注入模式用）。``hidden`` 里的动作连名字都不出现。"""
+
         if node is None:
             return "你当前不在任何已知地点。"
-        actions = [a.id for a in self.world.actions_in(node.id) if a.id != "walk_to"]
+        skip = {str(item) for item in (hidden or set())}
+        actions = [
+            a.id
+            for a in self.world.actions_in(node.id)
+            if a.id != "walk_to" and a.id not in skip
+        ]
         return (
             f"你在【{node.name or node.id}】（id：{node.id}）：{node.prompt}\n"
             f"氛围：{node.atmosphere.describe()}\n"
@@ -2099,13 +2253,15 @@ class PromptBuilder:
         abilities_line: str = "",
         pending_event: str = "",
         event_journal: str = "",
-        hidden_actions: set[str] | None = None,
         session_directory: str = "",
         current_session: str = "",
         session_labels: dict[str, str] | None = None,
         chat_images: dict[str, str] | None = None,
         profile_text: str = "",
+        hidden_actions: set[str] | None = None,
         samples: list[dict[str, Any]] | None = None,
+        wants_touch: bool = False,
+        json_fields: Any = (),
     ) -> str:
         """接管模式：完整五层，含 JSON 输出约束。
 
@@ -2113,18 +2269,18 @@ class PromptBuilder:
         所以计划决策和回复决策能吃到同一段前缀缓存。
 
         ``chat_images``：这一轮附给主模型的聊天记录图片（``地址 -> 图N``）。
+
+        ``wants_touch``：有扩展声明要"他这一轮碰了她哪儿"时才加那个字段；
+        没人声明时这一层与以前**逐字相同**（不留任何痕迹、也不多花 token）。
+
+        ``json_fields``：扩展自己声明的字段（``ExtensionSpec.json_fields``），
+        一起写在第 3 层里；没人声明时这一层同样逐字不变。
         """
 
         layers = []
         persona = self.persona_layer(persona_text)
         if persona:
             layers.append(f"# ========== 第 1 层：你是谁 ==========\n{persona}")
-        # 声音样例接在第 1 层末尾：它是"她怎么说话"，和角色卡是同一层的事
-        sample_text = self.samples_layer(
-            samples, pronoun=pronoun_for(getattr(self.world, "gender", "female"))
-        )
-        if sample_text:
-            layers.append(sample_text)
         layers.append(f"# ========== 第 2 层：世界规则 ==========\n{self.world_layer()}")
         layers.append(
             "# ========== 第 3 层：输出格式 ==========\n"
@@ -2133,6 +2289,8 @@ class PromptBuilder:
                 reasoning=reasoning,
                 mode=mode,
                 multi_session=bool(session_directory),
+                wants_touch=wants_touch,
+                json_fields=json_fields,
             )
         )
         layers.append(
@@ -2167,6 +2325,15 @@ class PromptBuilder:
         layers.append(
             self.reminder_layer(mode, multi_session=bool(session_directory))
         )
+        # 声音样例放在**最后**：
+        # - 它是每轮轮换的（按口吻挑不同的样例），放在前面会把后面所有内容
+        #   （世界规则、动作清单、状态、聊天记录）一起踢出缓存前缀；
+        # - 放最后正好吃"近因效应"——越靠近这一轮的输出，越影响她怎么说话。
+        sample_text = self.samples_layer(
+            samples, pronoun=pronoun_for(getattr(self.world, "gender", "female"))
+        )
+        if sample_text:
+            layers.append(sample_text)
         return "\n\n".join(layers)
 
     def build_reply_user_prompt(
@@ -2253,6 +2420,28 @@ class PromptBuilder:
     )
     """自己开口（不是被搭话）时的通用分寸：自主发言和插话共用同一份。"""
 
+    def _event_digest_block(self, state: WorldState) -> str:
+        """她自己最近经历的事（含日程的描述与**整条动作链**）。
+
+        ``state.event_digest`` 里是"到点了：这是你之前专门排的一件事——<描述>"、
+        "这条日程要做的事（按顺序）：A → B → C"、"按日程做完了：…"这类一行一条的记录。
+        带进提示词，她说话时才有背景（不然只知道自己"正在做某个动作"，
+        不知道为什么做、后面还有哪几步）。没有就返回空串。
+        """
+
+        rows = [
+            " ".join(str(item).split())
+            for item in list(getattr(state, "event_digest", None) or [])
+            if str(item).strip()
+        ]
+        if not rows:
+            return ""
+        return (
+            "# 你最近自己经历的事\n"
+            "（想说就顺口带一句，不想提就算了；不要当成任务逐条汇报）\n"
+            + "\n".join(f"- {row}" for row in rows[-6:])
+        )
+
     def build_reply_followup_prompt(
         self,
         hint: str,
@@ -2338,7 +2527,10 @@ class PromptBuilder:
             "3. 不要写「说话」「分享」这类通用动作，也不要写需要联网或工具才能完成的事（除非用了上面列出的工具）；\n"
             "4. 效果幅度要小：属性只允许 energy / loneliness / curiosity / affect / boredom，"
             "写成 +0.05、-0.05、=0.5 这类；心情写成 mood:满足；\n"
-            "5. 持续动作给 duration_mode=llm 和 duration_min / duration_max（秒）。\n\n"
+            "5. 持续动作给 duration_mode=llm 和 duration_min / duration_max（秒）；\n"
+            "6. 只有**主动去碰某个人**的动作（抱、亲、摸头、拉手、靠着、蹭这类）才写 "
+            "intimacy（0~1，贴得越近越大：搂一下 0.8、摸摸头 0.7、拉手 0.6、拍肩 0.2）；"
+            "不是身体接触的一律写 0。\n\n"
             "# 输出格式（只输出这个 JSON）\n"
             "{\n"
             '  "actions": [\n'
@@ -2354,6 +2546,7 @@ class PromptBuilder:
             '      "duration_mode": "llm",\n'
             '      "duration_min": 300,\n'
             '      "duration_max": 1800,\n'
+            '      "intimacy": 0,\n'
             '      "template": "只有 template 才填，例如 （{bot}给花浇了点水）",\n'
             '      "on_complete": {\n'
             '        "trigger": "llm_followup",\n'
@@ -2455,11 +2648,16 @@ class PromptBuilder:
         chat_note: str,
         persona: str = "",
         steps: list[dict[str, Any]],
+        schedule_note: str = "",
+        chain_labels: list[str] | None = None,
     ) -> tuple[str, str]:
         """智能日程：只让模型给这几步写「这一步想干什么」。
 
         刻意只给最少的信息（人设、几点、在哪、什么状态、一句话题背景 + 要补的这几步），
         不给她平时的那套提示词：动作链本身是固定的，模型只需要按她的身份把意图说清楚。
+
+        ``schedule_note`` / ``chain_labels``：这条日程**是干什么的**，以及完整的动作链。
+        有了它，补出来的意图才对得上这条日程本来想做的事（不然它只看得到"这一步是什么动作"）。
         """
 
         system = (
@@ -2473,6 +2671,12 @@ class PromptBuilder:
                 "不要写成对群里说的话）：\n" + persona_text
             )
         lines = [f"现在是 {when}。" if when else ""]
+        note_text = " ".join(str(schedule_note or "").split())
+        if note_text:
+            lines.append(f"这条日程是：{note_text}")
+        labels = [str(item) for item in (chain_labels or []) if str(item)]
+        if labels:
+            lines.append("整条日程的动作链（按顺序）：" + " → ".join(labels))
         if where:
             lines.append(f"她这会儿在{where}。")
         if state_hint:

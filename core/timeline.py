@@ -131,6 +131,10 @@ def _render_body(
             text += "　⏭️ 这一步插队：手上的事让开了"
         elif mode == "replace":
             text += "　⏭️ 顶上：没做的那几步不做了"
+        # 她判出来"这句其实是在跟别人说话"时标一下：群里那种没 @ 的「你倒是说啊」
+        # 最容易被她当成在问自己，日志里能直接核对
+        if str(detail.get("addressing") or "") == "others":
+            text += "　🙉 她判断这句是在跟别人说话"
         for node_id in detail.get("auto_travel") or []:
             text += f"\n　　↪ 她想去别处做这件事，已自动前往「{node_name(str(node_id), world)}」"
         images = int(detail.get("images") or 0)
@@ -160,6 +164,10 @@ def _render_body(
             str(detail.get("source") or ""), str(detail.get("source") or "")
         )
         text = f"决定：{' → '.join(names) or '（空计划）'}"
+        where = " ".join(str(detail.get("send_to") or "").split())
+        if where:
+            # 这些话准备在哪儿说：和末尾的〔在 …〕（决定发生在哪）分开看
+            text += f"（说给 {where}）"
         if reason:
             text += f"　〔原因：{reason}"
             text += f"；来源：{source}〕" if source else "〕"
@@ -309,6 +317,37 @@ def _render_body(
         return (
             f"心情低落太久了，她自己缓了缓（效价回到 {float(detail.get('valence') or 0):.2f}）"
         )
+
+    if kind == "day_mood":
+        label = _clip(detail.get("label") or detail.get("day_mood"), 12)
+        hint = _clip(detail.get("hint"), 60)
+        return f"今天的调子：{label}——{hint}" if hint else f"今天的调子：{label}"
+
+    if kind == "desire_push":
+        who = "、".join(
+            str(item) for item in (detail.get("people") or []) if str(item)
+        )
+        reason = _clip(detail.get("reason"), 60)
+        head = "想被人碰一碰"
+        if who:
+            head += f"（能找的人：{_clip(who, 40)}）"
+        return f"{head}：{reason}" if reason else head
+
+    if kind == "touch":
+        who = _clip(detail.get("by"), 20)
+        parts = "、".join(
+            _clip(item, 12) for item in (detail.get("parts") or []) if str(item)
+        )
+        head = f"{who} 碰到了她：{parts}" if parts else f"{who} 碰了她"
+        return head
+
+    if kind == "ext_fields":
+        # 扩展自己声明的字段（主插件不解释内容，只记下"模型标了什么"）
+        pairs = "、".join(
+            f"{key}={_clip(value, 30) if not isinstance(value, list) else '/'.join(_clip(item, 12) for item in value)}"
+            for key, value in (detail.get("fields") or {}).items()
+        )
+        return f"记下了扩展要的信息：{pairs}" if pairs else "记下了扩展要的信息"
 
     if kind == "poke":
         who = _clip(detail.get("name") or detail.get("target") or "对方", 20)
@@ -547,6 +586,35 @@ def _render_body(
             note += f"（{compressed} 条）"
         hint = str(detail.get("hint") or "").strip()
         return note + (f"\n　　💡 {hint}" if hint else "")
+
+    if kind == "remember":
+        # 她当场用「记住」动作写进通讯录的东西（不是睡前整理补的）
+        written = [str(item) for item in (detail.get("written") or []) if str(item)]
+        skipped = [str(item) for item in (detail.get("skipped") or []) if str(item)]
+        head = "；".join(written) if written else "这一条没记下什么"
+        text = f"她主动记进了通讯录：{head}"
+        if skipped:
+            text += f"　〔{'；'.join(skipped)}〕"
+        return text
+
+    if kind == "soothed":
+        cause = _clip(detail.get("cause") or "被安抚了一会儿", 40)
+        value = detail.get("valence")
+        tail = f"（效价 {float(value):.2f}）" if isinstance(value, (int, float)) else ""
+        return f"心情缓过来一点：{cause}{tail}"
+
+    if kind == "drowsy":
+        return str(detail.get("note") or "困了，先进临睡期")
+
+    if kind == "goodnight":
+        if bool(detail.get("said")):
+            return "睡前说了晚安（说给谁由她自己定）"
+        return "睡前没说话，安静地睡了"
+
+    if kind == "goodmorning":
+        if bool(detail.get("said")):
+            return "睡醒说了句早安"
+        return "睡醒了，没吭声"
 
     # 未知类型：把 detail 原样压成一行，至少不丢信息
     if detail:

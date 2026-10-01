@@ -68,6 +68,24 @@ class TestParseGeneratedActions(unittest.TestCase):
         self.assertEqual(first["on_complete"]["effects"]["affect"], "+0.06")
         self.assertEqual(first["on_complete"]["effects"]["mood"], "mood:满足")
 
+    def test_intimacy_is_kept_only_when_the_model_means_it(self):
+        """生成动作时带上「亲密程度」：写 0 / 不写都当"没提"，交给对照表和分类去判。"""
+
+        text = (
+            '[{"id": "hold_hands", "node_id": "balcony", "name": "牵手", '
+            '"target_type": "user", "intimacy": 0.6},'
+            ' {"id": "water", "node_id": "balcony", "name": "浇水", "intimacy": 0},'
+            ' {"id": "lean", "node_id": "balcony", "name": "靠着", "intimacy": "1.4"}]'
+        )
+        actions, _problems = parse_generated_actions(
+            text, node_ids=["balcony"], tool_names=set()
+        )
+        by_id = {item["id"]: item for item in actions}
+        self.assertEqual(by_id["hold_hands"]["intimacy"], 0.6)
+        self.assertNotIn("intimacy", by_id["water"])
+        # 超出范围的夹回 0~1
+        self.assertEqual(by_id["lean"]["intimacy"], 1.0)
+
     def test_bad_id_is_skipped_with_a_reason(self):
         actions, problems = parse_generated_actions(
             ACTIONS_JSON, node_ids=["balcony"], tool_names=set()

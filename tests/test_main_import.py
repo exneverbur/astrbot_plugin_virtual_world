@@ -258,11 +258,79 @@ class TestMainImport(unittest.TestCase):
                 return "10001"
 
         note = self.module._mention_note(_Ev([At("10001", "小鲸鱼"), At("42", "小明")]))
-        self.assertIn("你（小鲸鱼(10001)）", note)
+        self.assertIn("你（10001）", note)
         self.assertIn("小明(42)", note)
         # @ 的是别人：得写清楚"不是在 @ 你"，不然她会当成在叫她
         self.assertIn("不是在 @ 你", note)
+        # 正文里那一下可能被平台省掉，得提醒她这条确实点到了自己
+        self.assertIn("确实 @ 了你", note)
         self.assertEqual(self.module._mention_note(_Ev([])), "")
+
+    def test_mention_note_does_not_repeat_a_numeric_name(self):
+        """协议端没解析出名字时 name 就是号码：别写成 2829449702(2829449702)。"""
+
+        class At:
+            def __init__(self, qq, name=""):
+                self.qq = qq
+                self.name = name
+
+        class _Msg:
+            def __init__(self, items):
+                self.message = items
+
+        class _Ev:
+            def __init__(self, items):
+                self.message_obj = _Msg(items)
+
+            def get_self_id(self):
+                return "10001"
+
+        note = self.module._mention_note(
+            _Ev([At("10001", "10001"), At("42", "42")])
+        )
+        self.assertIn("你（10001）", note)
+        self.assertIn("42", note)
+        self.assertNotIn("10001(10001)", note)
+        self.assertNotIn("42(42)", note)
+
+    def test_soft_wake_does_not_claim_she_was_mentioned(self):
+        """意图路由补的那个 @ 是假的：不能记成"这条消息 @ 了你"。"""
+
+        class At:
+            def __init__(self, qq, name=""):
+                self.qq = qq
+                self.name = name
+
+        class _Msg:
+            def __init__(self, items):
+                self.message = items
+
+        class _Ev:
+            def __init__(self, items, soft=False):
+                self.message_obj = _Msg(items)
+                self._extras = {"intent_router_no_at": True} if soft else {}
+
+            def get_self_id(self):
+                return "2829449702"
+
+            def get_extra(self, key, default=None):
+                return self._extras.get(key, default)
+
+        # 路由补的 @ 她自己（外加正文里真的 @ 了别人）：只留别人那一段
+        event = _Ev([At("2829449702", "2829449702"), At("42", "小明")], soft=True)
+        note = self.module._mention_note(event)
+        self.assertNotIn("你（", note.replace("没 @ 你", ""))
+        self.assertIn("小明(42)", note)
+        self.assertNotIn("2829449702(2829449702)", note)
+
+        # 只有那个假 @ 的时候：明说"没 @ 你，是顺着话题说到你的"
+        alone = self.module._mention_note(_Ev([At("2829449702", "2829449702")], soft=True))
+        self.assertIn("没 @ 你", alone)
+        self.assertNotIn("确实 @ 了你", alone)
+
+        # 结构化那份也要剔掉它，免得渲染成「→ 你」
+        targets = self.module._at_targets(_Ev([At("2829449702", "2829449702")], soft=True))
+        self.assertEqual(targets, [])
 
     def test_mention_note_about_someone_else_only(self):
         """整条消息只 @ 了别人：同样要标出来，别让她以为是叫自己。"""
@@ -2158,6 +2226,190 @@ class _GateRequest:
         self.system_prompt = ""
         self.contexts: list[dict] = []
         self.func_tool = None
+
+
+class TestAddressingInfo(unittest.TestCase):
+    """「这句是冲谁说的」：收到消息时就结构化存下来，渲染聊天记录时画箭头。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.module = load_plugin_module()
+
+    class At:
+        def __init__(self, qq: str, name: str = "") -> None:
+            self.qq = qq
+            self.name = name
+
+    class Reply:
+        def __init__(self, sender_id: str, nickname: str = "") -> None:
+            self.sender_id = sender_id
+            self.sender_nickname = nickname
+
+    class Plain:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+    class Msg:
+        def __init__(self, items: list) -> None:
+            self.message = items
+
+    class Ev:
+        def __init__(self, items: list, self_id: str = "10001") -> None:
+            self.message_obj = TestAddressingInfo.Msg(items)
+            self._self_id = self_id
+
+        def get_self_id(self) -> str:
+            return self._self_id
+
+    def test_targets_and_kind(self):
+        event = self.Ev(
+            [self.Plain("出来干活"), self.At("42", "老普机器人")]
+        )
+        targets = self.module._at_targets(event)
+        self.assertEqual(targets[0]["id"], "42")
+        self.assertFalse(targets[0]["self"])
+        self.assertEqual(
+            self.module._addressing_kind(targets, {}, "10001"), "others"
+        )
+
+        mine = self.Ev([self.At("10001", "小鲸鱼")])
+        targets = self.module._at_targets(mine)
+        self.assertTrue(targets[0]["self"])
+        self.assertEqual(self.module._addressing_kind(targets, {}, "10001"), "me")
+
+    def test_reply_target_counts_as_talking_to_her(self):
+        event = self.Ev([self.Reply("10001", "小鲸鱼")])
+        reply = self.module._reply_target(event)
+        self.assertEqual(reply.get("id"), "10001")
+        self.assertEqual(
+            self.module._addressing_kind([], reply, "10001"), "me"
+        )
+        other = self.Ev([self.Reply("42", "小明")])
+        self.assertEqual(
+            self.module._addressing_kind([], self.module._reply_target(other), "10001"),
+            "others",
+        )
+
+    def test_nothing_said_means_no_guess(self):
+        event = self.Ev([self.Plain("早上好")])
+        self.assertEqual(self.module._at_targets(event), [])
+        self.assertEqual(self.module._addressing_kind([], {}, "10001"), "")
+
+
+class TestExtensionScopes(unittest.TestCase):
+    """扩展页的「会话」选择器：会话组优先，组里的成员不再单独出现。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.module = load_plugin_module()
+
+    def test_groups_come_first_and_cover_their_members(self):
+        module = self.module
+        context = module.Context()
+        plugin = module.VirtualWorldPlugin(
+            context,
+            module.AstrBotConfig(
+                {"enabled": True, "web_enabled": True, "tick_interval": 60}
+            ),
+        )
+        try:
+            raw = plugin.store.raw_sessions()
+            raw["sessions"] = [
+                {"session_id": "aiocqhttp:GroupMessage:1", "type": "group", "enabled": True},
+                {"session_id": "aiocqhttp:FriendMessage:2", "type": "private", "enabled": True},
+                {"session_id": "aiocqhttp:GroupMessage:9", "type": "group", "enabled": True},
+            ]
+            raw["groups"] = [
+                {
+                    "id": "team",
+                    "name": "同一个她",
+                    "sessions": [
+                        "aiocqhttp:GroupMessage:1",
+                        "aiocqhttp:FriendMessage:2",
+                    ],
+                    "main_session": "aiocqhttp:GroupMessage:1",
+                }
+            ]
+            plugin.store.save_sessions(raw)
+            plugin.engine.reload_config()
+
+            items = plugin.extension_host.sessions()
+            labels = [str(item.get("label") or "") for item in items]
+            self.assertTrue(any("同一个她" in label for label in labels), labels)
+            group = [item for item in items if item.get("type") == "group"][0]
+            # 挑组 = 挑到组代表会话名下那一份状态
+            self.assertEqual(group["session_id"], "aiocqhttp:GroupMessage:1")
+            self.assertEqual(len(group["members"]), 2)
+            # 组里的成员不再单独列一遍
+            self.assertNotIn(
+                "aiocqhttp:FriendMessage:2",
+                [item["session_id"] for item in items],
+            )
+            # 没归组的会话照常列
+            self.assertIn(
+                "aiocqhttp:GroupMessage:9",
+                [item["session_id"] for item in items],
+            )
+        finally:
+            handle = getattr(getattr(plugin, "db", None), "raw", None)
+            if handle is not None:
+                handle.close()
+
+
+class TestInjectWorldState(unittest.TestCase):
+    """注入模式：世界状态要挂到用户消息那一侧，别把 system prompt 每轮都改一遍。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.module = load_plugin_module()
+
+    class _Req:
+        def __init__(self, system_prompt: str = "") -> None:
+            self.system_prompt = system_prompt
+            self.extra_user_content_parts: list = []
+
+    def _inject(self, req, injection: str) -> str:
+        return self.module.VirtualWorldPlugin._inject_world_state(
+            self, req, injection
+        )
+
+    def test_world_state_goes_to_the_user_side(self):
+        req = self._Req("主人格提示词")
+        where = self._inject(req, "世界状态：她在书房，心情一般")
+        self.assertEqual(where, "user")
+        # system prompt 只多了那段固定说明：跨轮一字不差，缓存前缀才不会被切断
+        self.assertIn("主人格提示词", req.system_prompt)
+        self.assertIn(self.module.INJECT_STUB.strip(), req.system_prompt)
+        self.assertNotIn("她在这个书房", req.system_prompt)
+        self.assertNotIn("世界状态：她在书房", req.system_prompt)
+        # 真正会变的那一大段在用户消息那一侧
+        self.assertEqual(len(req.extra_user_content_parts), 1)
+        part = req.extra_user_content_parts[0]
+        text = part.get("text") if isinstance(part, dict) else getattr(part, "text", "")
+        self.assertEqual(text, "世界状态：她在书房，心情一般")
+
+    def test_system_prompt_stays_identical_across_turns(self):
+        first = self._Req("主人格提示词")
+        self._inject(first, "第一轮的状态：t=1")
+        second = self._Req("主人格提示词")
+        self._inject(second, "第二轮的状态：t=2")
+        self.assertEqual(first.system_prompt, second.system_prompt)
+
+    def test_old_astrbot_without_extra_parts_falls_back(self):
+        class _Old:
+            def __init__(self) -> None:
+                self.system_prompt = "主人格提示词"
+
+        req = _Old()
+        where = self._inject(req, "世界状态：她在书房")
+        self.assertEqual(where, "system")
+        self.assertIn("世界状态：她在书房", req.system_prompt)
+
+    def test_the_same_injection_is_not_added_twice(self):
+        req = self._Req("主人格提示词")
+        self._inject(req, "状态")
+        self.assertEqual(self._inject(req, "状态"), "user（已在）")
+        self.assertEqual(len(req.extra_user_content_parts), 1)
 
 
 class TestImageExtraction(unittest.TestCase):

@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.decider import SEARCH_COOLDOWN_MINUTES, Decider  # noqa: E402
 from core.defaults import default_world  # noqa: E402
 from core.engagement import EngagementTracker  # noqa: E402
+from core.extensions import ExtensionHost, ExtensionSpec  # noqa: E402
 from core.json_actions import (  # noqa: E402
     MAX_SAY_LINES_HARD,
     extract_json_object,
@@ -22,7 +23,20 @@ from core.json_actions import (  # noqa: E402
     strip_reasoning,
 )
 from core.memory import emotional_weight  # noqa: E402
-from core.mood import cause_text, cell_for, mood_label, style_block  # noqa: E402
+from core.mood import (  # noqa: E402
+    DAY_MOODS,
+    DAY_MOOD_RATE_KEYS,
+    VAGUE_CELLS,
+    VAGUE_WORDS,
+    cause_text,
+    cell_for,
+    day_mood_info,
+    day_mood_rate,
+    mood_label,
+    roll_day_mood,
+    style_block,
+    vague_word_for,
+)
 from core.search import (  # noqa: E402
     merge_evidence,
     parse_search_results,
@@ -495,6 +509,92 @@ class TestMoodGrid(unittest.TestCase):
         self.assertIn("撒娇", excited.style)
 
 
+class _StubDraw:
+    """固定骰子：用来验证"按权重抽"，不用碰真随机。"""
+
+    def __init__(self, value: float) -> None:
+        self.value = value
+
+    def random(self) -> float:
+        return self.value
+
+    def choice(self, items):
+        return list(items)[0]
+
+
+class TestDayMood(unittest.TestCase):
+    """今天的基调：掷一次、只改曲线快慢、说不清的那天有模糊档。"""
+
+    def test_every_mood_has_a_label_and_sane_rates(self):
+        for key, info in DAY_MOODS.items():
+            self.assertEqual(info.id, key)
+            self.assertTrue(info.label)
+            self.assertTrue(info.hint)
+            for name, factor in info.rates.items():
+                self.assertIn(name, DAY_MOOD_RATE_KEYS)
+                # 倍率是"调快调慢"，不该出现负值或离谱的极端
+                self.assertGreaterEqual(factor, 0.4)
+                self.assertLessEqual(factor, 2.0)
+        # 平静是"什么都没有"：不带任何倍率
+        self.assertEqual(DAY_MOODS["calm"].rates, {})
+
+    def test_roll_covers_the_whole_range(self):
+        self.assertEqual(roll_day_mood(_StubDraw(0.0)), "calm")
+        self.assertEqual(roll_day_mood(_StubDraw(0.999)), "vague")
+        seen = {roll_day_mood(_StubDraw(index / 200.0)) for index in range(200)}
+        self.assertEqual(seen, set(DAY_MOODS))
+
+    def test_strength_scales_the_factor(self):
+        self.assertAlmostEqual(day_mood_rate("clingy", "loneliness"), 1.5)
+        self.assertAlmostEqual(day_mood_rate("clingy", "loneliness", strength=0.5), 1.25)
+        self.assertAlmostEqual(day_mood_rate("clingy", "loneliness", strength=0.0), 1.0)
+        # 没配到的维度、不认识的 id 都按 1.0 算，等于没这回事
+        self.assertAlmostEqual(day_mood_rate("clingy", "energy"), 1.0)
+        self.assertAlmostEqual(day_mood_rate("", "loneliness"), 1.0)
+        self.assertAlmostEqual(day_mood_rate("nope", "loneliness"), 1.0)
+
+    def test_vague_word_is_stable_within_a_day(self):
+        first = vague_word_for("2026-09-30")
+        self.assertIn(first, VAGUE_WORDS)
+        self.assertEqual(first, vague_word_for("2026-09-30"))
+        self.assertIn(vague_word_for(""), VAGUE_WORDS)
+        # 不同日子不必都不样，但总得落在词库里
+        for day in ("2026-01-01", "2026-02-02", "2026-12-31"):
+            self.assertIn(vague_word_for(day), VAGUE_WORDS)
+
+    def test_vague_replaces_only_the_unsure_cells(self):
+        word = "说不上来"
+        # 说不上好坏的那几格换成模糊词，风格不变
+        for arousal, valence in ((0.5, 0.5), (0.7, 0.5), (0.9, 0.5)):
+            cell = cell_for(arousal, valence)
+            self.assertIn(cell.key, VAGUE_CELLS)
+            self.assertEqual(mood_label(arousal, valence, vague=word), word)
+        # 说得清的格子照旧
+        self.assertEqual(mood_label(0.9, 0.9, vague=word), "欢呼雀跃")
+        self.assertEqual(mood_label(0.1, 0.1, vague=word), "沉郁")
+        # 平时（没有模糊档）那几格还是原来的词
+        self.assertEqual(mood_label(0.5, 0.5), cell_for(0.5, 0.5).mood)
+        self.assertEqual(mood_label(0.5, 0.5), "心潮起伏")
+
+    def test_info_lookup_tolerates_junk(self):
+        self.assertIsNone(day_mood_info(""))
+        self.assertIsNone(day_mood_info("whatever"))
+        self.assertEqual(day_mood_info("lazy").label, "懒散")
+
+    def test_log_line_reads_like_chinese(self):
+        """日志里那条不能是 day_mood=clingy 这种原始字段。"""
+
+        line = render_event(
+            {
+                "event_type": "day_mood",
+                "detail": {"day_mood": "clingy", "label": "黏人", "hint": "今天格外想有人陪"},
+            }
+        )
+        self.assertIn("今天的调子", line)
+        self.assertIn("黏人", line)
+        self.assertNotIn("day_mood=", line)
+
+
 class TestStateDynamics(unittest.TestCase):
     def setUp(self) -> None:
         self.world = make_world()
@@ -552,6 +652,132 @@ class TestStateDynamics(unittest.TestCase):
         state.mood = "温柔"
         state.mood_override_until = state.world_time + 10
         self.assertEqual(self.dynamics.derive_mood(state), "温柔")
+
+    def test_day_mood_drives_the_curves(self):
+        """今天的基调只改速率：懒散掉精力慢、黏人涨孤独快。"""
+
+        def drained(day_mood: str) -> float:
+            state = WorldState(session_id="s1", energy=0.6, day_mood=day_mood)
+            self.dynamics.tick(
+                state, node=self.node, elapsed_seconds=3600, world=self.world
+            )
+            return state.energy
+
+        lazy = drained("lazy")
+        calm = drained("calm")
+        lively = drained("lively")
+        self.assertGreater(lazy, calm)
+        self.assertGreater(calm, lively)
+
+        def lonely(day_mood: str) -> float:
+            state = WorldState(session_id="s1", loneliness=0.4, day_mood=day_mood)
+            self.dynamics.tick(
+                state, node=self.node, elapsed_seconds=3600, world=self.world
+            )
+            return state.loneliness
+
+        self.assertGreater(lonely("clingy"), lonely("calm"))
+        self.assertLess(lonely("solitary"), lonely("calm"))
+
+    def test_day_mood_strength_zero_is_a_no_op(self):
+        config = self.world.state_dynamics.model_copy(update={"daily_mood_strength": 0.0})
+        dynamics = StateDynamics(config, hour_provider=lambda: 12)
+
+        def drained(day_mood: str) -> float:
+            state = WorldState(session_id="s1", energy=0.6, day_mood=day_mood)
+            dynamics.tick(state, node=self.node, elapsed_seconds=3600, world=self.world)
+            return state.energy
+
+        self.assertAlmostEqual(drained("lazy"), drained("calm"), places=6)
+
+    def test_day_mood_disabled_ignores_the_base(self):
+        config = self.world.state_dynamics.model_copy(update={"daily_mood_enabled": False})
+        dynamics = StateDynamics(config, hour_provider=lambda: 12)
+
+        def drained(day_mood: str) -> float:
+            state = WorldState(session_id="s1", energy=0.6, day_mood=day_mood)
+            dynamics.tick(state, node=self.node, elapsed_seconds=3600, world=self.world)
+            return state.energy
+
+        self.assertAlmostEqual(drained("lazy"), drained("lively"), places=6)
+
+    def test_a_vague_day_shows_up_in_the_mood_word(self):
+        """那一天掷到"说不上来"，中间那几格的心情词就换成模糊档。"""
+
+        state = WorldState(
+            session_id="s1",
+            affect=0.5,
+            valence=0.5,
+            day_mood="vague",
+            day_mood_day="2026-09-30",
+        )
+        word = self.dynamics.derive_mood(state)
+        self.assertIn(word, VAGUE_WORDS)
+        # 同一天连着问，词不变
+        self.assertEqual(word, self.dynamics.derive_mood(state))
+        # 换成别的基调，就回到格子自己的词
+        state.day_mood = "lively"
+        self.assertEqual(self.dynamics.derive_mood(state), "心潮起伏")
+        # 说得清的格子不受模糊档影响
+        state.day_mood = "vague"
+        state.affect = 0.9
+        state.valence = 0.9
+        self.assertEqual(self.dynamics.derive_mood(state), "欢呼雀跃")
+
+    def test_desire_grows_on_its_own(self):
+        """欲求没人管就慢慢涨：默认大约三天攒满。"""
+
+        state = WorldState(session_id="s1", desire=0.2)
+        self.dynamics.tick(state, node=self.node, elapsed_seconds=3600, world=self.world)
+        self.assertGreater(state.desire, 0.2)
+        self.assertLess(state.desire - 0.2, 0.02)
+
+    def test_being_held_settles_the_need(self):
+        """真的被碰到才落：抱一下落得多，拍拍肩落得少，跟人无关的动作完全不碰它。"""
+
+        state = WorldState(session_id="s1", desire=0.9)
+        held = self.dynamics.satisfy_desire(state, 1.0)
+        self.assertAlmostEqual(held, 0.25, places=4)
+        shallow = self.dynamics.satisfy_desire(state, 0.2)
+        self.assertGreater(shallow, 0.0)
+        self.assertLess(shallow, held)
+        self.assertEqual(self.dynamics.satisfy_desire(state, 0.0), 0.0)
+
+    def test_being_teased_raises_it(self):
+        """嘴上撩不算碰到：欲求不落，反而往上跳一点（越亲近的人跳得越多）。"""
+
+        state = WorldState(session_id="s1", desire=0.2)
+        self.assertAlmostEqual(self.dynamics.tease_desire(state), 0.05, places=4)
+        self.assertAlmostEqual(
+            self.dynamics.tease_desire(state, scale=0.0), 0.0, places=4
+        )
+        far = WorldState(session_id="s1", desire=0.2)
+        close = WorldState(session_id="s1", desire=0.2)
+        self.assertLess(
+            self.dynamics.tease_desire(far, scale=0.3),
+            self.dynamics.tease_desire(close, scale=1.6),
+        )
+
+    def test_sleep_softens_the_need(self):
+        """睡一觉没那么憋：睡着时慢慢落，醒来那一拍再乘一次"睡醒系数"。"""
+
+        state = WorldState(session_id="s1", desire=0.9, state="sleeping")
+        self.dynamics.tick(
+            state, node=self.node, elapsed_seconds=8 * 3600, world=self.world
+        )
+        self.assertLess(state.desire, 0.6)
+        self.assertTrue(state.desire_slept)
+        slept = float(state.desire)
+        state.state = "idle"
+        self.dynamics.tick(state, node=self.node, elapsed_seconds=60, world=self.world)
+        self.assertLess(state.desire, slept)
+        self.assertFalse(state.desire_slept)
+
+    def test_high_desire_shows_up_in_the_mood(self):
+        state = WorldState(session_id="s1", affect=0.2, valence=0.7, desire=0.9)
+        self.assertIn("想贴着人", self.dynamics.derive_mood(state))
+        calm = WorldState(session_id="s1", affect=0.2, valence=0.7, desire=0.2)
+        self.assertNotIn("想贴着人", self.dynamics.derive_mood(calm))
 
     def test_effects_syntax(self):
         state = WorldState(session_id="s1", energy=0.5)
@@ -1857,6 +2083,103 @@ class TestDecider(unittest.TestCase):
         state = WorldState(session_id="s1", current_action={"type": "read"})
         self.assertFalse(self.decider.needs_plan(state))
 
+    def _busy_state(self, **kwargs) -> WorldState:
+        """一个"几件事同时够格"的状态：孤独、无聊、好奇都过了线，还在书房。"""
+
+        base = dict(
+            session_id="s1",
+            node_id="study",
+            world_time=10,
+            energy=0.8,
+            loneliness=0.9,
+            boredom=0.9,
+            curiosity=0.9,
+            valence=0.6,
+        )
+        base.update(kwargs)
+        return WorldState(**base)
+
+    def test_flat_weights_keep_the_old_priority(self):
+        """平常的日子（没有基调 / 天平一样重）不掷骰子，还是按原来的优先级。"""
+
+        state = self._busy_state()
+        weights = self.decider.branch_weights(state)
+        self.assertTrue(all(abs(value - 1.0) < 1e-9 for value in weights.values()))
+        # 孤独这条在老链条里排在最前
+        self.assertEqual(self.decider.rule_plan(state)["reason"], "孤独感偏高，想找人说话")
+
+    def test_today_basis_reweights_the_branches(self):
+        """今天的基调给分支拨权重：黏人的日子特别想找人，懒散的日子不太想查东西。"""
+
+        self.assertGreater(
+            self.decider.branch_weights(self._busy_state(day_mood="clingy"))["reach_out"],
+            self.decider.branch_weights(self._busy_state())["reach_out"],
+        )
+        lazy = self.decider.branch_weights(self._busy_state(day_mood="lazy"))
+        self.assertLess(lazy["search"], 1.0)
+        self.assertGreater(lazy["read"], 1.0)
+        solitary = self.decider.branch_weights(self._busy_state(day_mood="solitary"))
+        self.assertLess(solitary["reach_out"], 1.0)
+
+    def test_a_skewed_day_can_pick_a_lower_priority_branch(self):
+        """权重真的会改变结果，而不只是写在配置里。"""
+
+        # 平常的日子：不掷骰子，还是老链条的第一条
+        plain = self._busy_state()
+        self.assertEqual(
+            self.decider.rule_plan(plain)["reason"],
+            "孤独感偏高，想找人说话",
+        )
+        # 懒散的一天：发呆的权重比找人高，骰子靠后就会落在老链条更后面的那一件上
+        lazy = self._busy_state(day_mood="lazy")
+        self.assertEqual(
+            Decider(self.world, rng=_StubDraw(0.99)).rule_plan(lazy)["reason"],
+            "太无聊了，换个环境",
+        )
+        # 同一个状态、同一套权重：骰子靠前还是老链条的第一条
+        self.assertEqual(
+            Decider(self.world, rng=_StubDraw(0.0)).rule_plan(lazy)["reason"],
+            "孤独感偏高，想找人说话",
+        )
+
+    def test_hungry_means_she_leans_towards_people(self):
+        """欲求高的时候，"找人"这条分支的权重抬起来（和数值系统联动）。"""
+
+        calm = self.decider.branch_weights(self._busy_state(day_mood="calm"))
+        hungry = self.decider.branch_weights(
+            self._busy_state(day_mood="calm", desire=0.9)
+        )
+        self.assertGreater(hungry["reach_out"], calm["reach_out"])
+
+    def test_weights_respect_the_strength_knob(self):
+        world = make_world()
+        world.state_dynamics.daily_mood_strength = 0.0
+        decider = Decider(world)
+        weights = decider.branch_weights(self._busy_state(day_mood="clingy"))
+        self.assertAlmostEqual(weights["reach_out"], 1.0)
+
+    def test_rule_chain_does_not_hardcode_a_cuddle(self):
+        """「想被碰一碰」不在规则链里：它是"交给她自己决定"的那一条，
+        规则决策器只会按数值安排找人 / 上网 / 换地方 / 看书。"""
+
+        state = WorldState(
+            session_id="s1",
+            node_id="study",
+            world_time=10,
+            energy=0.8,
+            loneliness=0.2,
+            boredom=0.2,
+            curiosity=0.2,
+            desire=0.9,
+        )
+        self.assertIsNone(self.decider.rule_plan(state))
+
+    def test_cuddle_weight_follows_the_day(self):
+        clingy = self.decider.branch_weights(self._busy_state(day_mood="clingy"))
+        solitary = self.decider.branch_weights(self._busy_state(day_mood="solitary"))
+        self.assertGreater(clingy["cuddle"], 1.0)
+        self.assertLess(solitary["cuddle"], 1.0)
+
     def test_loneliness_interject_rule(self):
         """孤独感高 + 群里在聊 -> 主动插话；群里安静或冷却中则不插话。"""
 
@@ -2136,6 +2459,21 @@ class TestTimeline(unittest.TestCase):
         text = render_event(event, self.world)
         self.assertIn("今天有点想他", text)
         self.assertIn("想事情", text)
+
+    def test_plan_says_where_the_words_will_land(self):
+        """计划那一行要写清"这些话准备在哪儿说"：日志写着私聊、消息跑到群里就说不清了。"""
+
+        event = {
+            "event_type": "plan",
+            "detail": {
+                "reason": "群聊热闹得厉害，插一句",
+                "source": "rule",
+                "steps": [{"action": "say", "interject": True}],
+                "send_to": "群 1001「测试群」",
+            },
+        }
+        text = render_event(event, self.world)
+        self.assertIn("说给 群 1001「测试群」", text)
 
     def test_skip_and_unknown_type(self):
         self.assertIn("跳过", render_event({"event_type": "skip", "detail": {"note": "缺少工具"}}))
@@ -2866,6 +3204,70 @@ class TestPromptBuilder(unittest.TestCase):
         self.assertIn("字没显示）", body)
         self.assertLessEqual(len(body), self.builder.world.context.chat_line_chars + 40)
 
+    def test_cutting_a_line_keeps_the_mention_note(self):
+        """正文太长被掐时，末尾那段「@ 了谁」的注释必须完整留下。
+
+        注释正是"这句到底冲谁说的"，被掐掉半句（"其中 X 还有 12 字没显示"）的话，
+        她会把别人之间的话当成在叫自己。
+        """
+
+        long_one = "很" * 900
+        note = "［这条消息 @ 了：你（10001）；其中 小明(42) 不是在 @ 你（那是在叫别人）］"
+        blocks = self.builder.chat_blocks(
+            [{"user_id": "42", "name": "小明", "text": long_one + " " + note, "at": 100.0}]
+        )
+        line = [
+            item
+            for item in "\n".join(blocks).splitlines()
+            if item.startswith("- [")
+        ][0]
+        body = line.split(": ", 1)[1]
+        self.assertIn("（这条还有", body)
+        self.assertIn("不是在 @ 你", body)
+        self.assertIn("那是在叫别人）］", body)
+
+    def test_every_line_says_who_it_is_talking_to(self):
+        """谁在跟谁说话：@ 名单和引用对象要画成箭头，确定不是说给她听的要标出来。"""
+
+        blocks = self.builder.chat_blocks(
+            [
+                {
+                    "user_id": "7",
+                    "name": "牛佳晨",
+                    "text": "出来干活",
+                    "at": 100.0,
+                    "at_targets": [
+                        {"id": "9", "name": "老普机器人", "self": False},
+                    ],
+                    "addressing": "others",
+                },
+                {
+                    "user_id": "7",
+                    "name": "牛佳晨",
+                    "text": "贴贴",
+                    "at": 100.0,
+                    "at_targets": [{"id": "1", "name": "她", "self": True}],
+                    "addressing": "me",
+                },
+                {
+                    "user_id": "8",
+                    "name": "小明",
+                    "text": "你怎么看",
+                    "at": 100.0,
+                    "reply_to": {"id": "1", "name": "她"},
+                    "addressing": "me",
+                },
+            ]
+        )
+        blob = "\n".join(blocks)
+        # @ 了别人 + 明确不是在问她
+        self.assertIn("→ @老普机器人：出来干活", blob)
+        self.assertIn("（这句是冲别人说的，不是在问你）", blob)
+        # @ 了她自己
+        self.assertIn("→ 你：贴贴", blob)
+        # 引用的是她
+        self.assertIn("→ 引用 她：你怎么看", blob)
+
     def test_answered_lines_keep_the_short_background_limit(self):
         """已经回过的那批只当背景：仍然按短上限（默认 100 字）处理。"""
 
@@ -3082,6 +3484,295 @@ class TestPromptBuilder(unittest.TestCase):
             engagement_hint="你最近连续 2 次主动说话都没人回应。",
         )
         self.assertIn("没人回应", text)
+
+
+class ExtensionHostTest(unittest.IsolatedAsyncioTestCase):
+    """扩展挂载点里"主插件自己负责"的那几件小事。"""
+
+    def test_action_groups_say_which_extension_brought_them(self):
+        host = ExtensionHost()
+        host.register(
+            ExtensionSpec(
+                name="demo",
+                title="示例扩展",
+                actions=[{"id": "demo_a"}, {"id": "hand"}, {}],
+            )
+        )
+        self.assertEqual(
+            [{"name": "demo", "title": "示例扩展", "ids": ["demo_a", "hand"]}],
+            host.action_groups(),
+        )
+        self.assertEqual({"demo_a", "hand"}, host.owned_actions())
+        # 没装扩展时两边都是空的：编辑器里那一半整段不出现
+        empty = ExtensionHost()
+        self.assertEqual([], empty.action_groups())
+        self.assertEqual(set(), empty.owned_actions())
+
+    async def test_touch_is_only_forwarded_when_someone_wants_it(self):
+        """「他碰了她哪儿」是个**通用**字段：没人声明时主插件完全不知道它存在。"""
+
+        state = WorldState(session_id="s1")
+        empty = ExtensionHost()
+        self.assertFalse(empty.wants("touch"))
+        self.assertFalse(await empty.touch(state, ["腰"]))
+
+        seen: list[list[str]] = []
+        host = ExtensionHost()
+
+        async def _on_touch(state, parts, scale, host):
+            seen.append(list(parts))
+
+        host.register(
+            ExtensionSpec(name="demo", wants=("touch",), on_touch=_on_touch)
+        )
+        self.assertTrue(host.wants("touch"))
+        self.assertTrue(await host.touch(state, ["腰", "耳后"]))
+        self.assertEqual([["腰", "耳后"]], seen)
+        # 空列表不触发回调
+        self.assertFalse(await host.touch(state, []))
+        self.assertEqual(1, len(seen))
+
+    async def test_touch_field_is_parsed_from_the_model_reply(self):
+        result = parse_action_payload(
+            '{"touch": ["腰", "耳后", "腰", ""], "actions": [{"type": "say", '
+            '"messages": ["嗯"]}]}',
+            available_actions={"say"},
+        )
+        self.assertEqual(["腰", "耳后"], result.touch)
+        # 没写这一项时就是空列表（老配置 / 没装扩展时的常态）
+        result2 = parse_action_payload(
+            '{"actions": [{"type": "say", "messages": ["嗯"]}]}',
+            available_actions={"say"},
+        )
+        self.assertEqual([], result2.touch)
+
+    def test_declared_fields_are_rendered_into_the_static_prefix(self):
+        """扩展声明的字段写在「输出格式」那一段里：来源固定，所以不吃掉前缀缓存。"""
+
+        builder = PromptBuilder(make_world())
+        self.assertNotIn('"arousal"', builder.format_layer())
+
+        host = ExtensionHost()
+        host.register(
+            ExtensionSpec(
+                name="demo",
+                json_fields=(
+                    {
+                        "name": "arousal",
+                        "kind": "num",
+                        "prompt": "这一轮你想被继续下去的强度（0~1 的小数）",
+                    },
+                ),
+                on_json=lambda state, values, host: None,
+            )
+        )
+        fields = host.json_fields()
+        self.assertEqual(["arousal"], [item.name for item in fields])
+        self.assertTrue(host.wants("arousal"))
+        rendered = builder.format_layer(json_fields=fields)
+        self.assertIn('"arousal"', rendered)
+        self.assertIn("被继续下去", rendered)
+        # 同一份声明渲染两次逐字一样：不然每轮都变，前缀缓存全砸
+        self.assertEqual(rendered, builder.format_layer(json_fields=fields))
+
+    async def test_declared_fields_are_parsed_and_forwarded(self):
+        state = WorldState(session_id="s1")
+        seen: list = []
+        host = ExtensionHost()
+        host.register(
+            ExtensionSpec(
+                name="demo",
+                json_fields=(
+                    {"name": "arousal", "kind": "num", "prompt": "强度"},
+                    {"name": "asking", "kind": "list", "prompt": "她想被碰哪儿"},
+                    {"name": "hold", "kind": "bool", "prompt": "是不是先按住他不让动"},
+                    {"name": "want", "kind": "str", "prompt": "她最想说的那句"},
+                ),
+                on_json=lambda state, values, host: seen.append(dict(values)),
+            )
+        )
+        parsed = parse_action_payload(
+            '{"arousal": "0.72", "asking": ["腰", "腰", "耳后"], "hold": "yes", '
+            '"want": "别停", "没声明过": 1, "actions": []}',
+            available_actions=set(),
+            json_fields=host.json_fields(),
+        )
+        self.assertAlmostEqual(0.72, float(parsed.extra["arousal"]), places=4)
+        self.assertEqual(["腰", "耳后"], parsed.extra["asking"])
+        self.assertTrue(parsed.extra["hold"])
+        self.assertEqual("别停", parsed.extra["want"])
+        # 没声明过的键不进 extra：主插件不认识的东西一律不转
+        self.assertNotIn("没声明过", parsed.extra)
+        self.assertTrue(await host.extra(state, parsed.extra))
+        self.assertEqual([parsed.extra], seen)
+        # 空值不触发回调
+        self.assertFalse(await host.extra(state, {"arousal": None, "asking": []}))
+
+    def test_field_values_are_clipped_to_the_declaration(self):
+        parsed = parse_action_payload(
+            '{"words": ["一二三四五六七八", "b", "c", "d", "e"], "actions": []}',
+            available_actions=set(),
+            json_fields=(
+                {"name": "words", "kind": "list", "max_items": 3, "max_chars": 4},
+            ),
+        )
+        self.assertEqual(["一二三四", "b", "c"], parsed.extra["words"])
+
+    def test_bad_or_reserved_field_declarations_are_dropped(self):
+        host = ExtensionHost()
+        host.register(
+            ExtensionSpec(
+                name="demo",
+                json_fields=(
+                    {"name": "touch", "kind": "list"},  # 主插件自己的键：不许占
+                    {"name": "Bad-Name", "kind": "num"},
+                    {"name": "9lead", "kind": "num"},
+                    {"name": "", "kind": "num"},
+                    "不是字典",
+                    {"name": "arousal", "kind": "乱写的形状"},
+                ),
+            )
+        )
+        fields = host.json_fields()
+        self.assertEqual(["arousal"], [item.name for item in fields])
+        self.assertEqual("list", fields[0].kind)
+
+        many = ExtensionHost()
+        many.register(
+            ExtensionSpec(
+                name="demo",
+                json_fields=tuple({"name": f"f{index}", "kind": "num"} for index in range(6)),
+            )
+        )
+        self.assertEqual(4, len(many.json_fields()))
+
+    async def test_no_declaration_means_no_trace_at_all(self):
+        """没人声明时：提示词逐字不变、parse 里也不多东西。"""
+
+        state = WorldState(session_id="s1")
+        host = ExtensionHost()
+        self.assertEqual([], host.json_fields())
+        self.assertFalse(host.wants("arousal"))
+        self.assertFalse(await host.extra(state, {"arousal": 0.5}))
+        builder = PromptBuilder(make_world())
+        self.assertEqual(builder.format_layer(), builder.format_layer(json_fields=()))
+        parsed = parse_action_payload(
+            '{"arousal": 0.5, "actions": []}', available_actions=set()
+        )
+        self.assertEqual({}, parsed.extra)
+
+    async def test_say_it_for_real_goes_through_the_send_channel(self):
+        """`say` 是"真的说话"：发到会话里，也记进她自己的留档。
+
+        跟 `note_self` 的区别在于那个只写背景（平台不发）。
+        """
+
+        import contextlib
+        import types
+
+        state = WorldState(session_id="s1")
+        sent: list[tuple[str, str]] = []
+
+        class _Engine:
+            say_sink = None
+            debug_sink = None
+
+            def __init__(self) -> None:
+                self.say_sink = self._send
+
+            async def _send(self, session_id: str, message: str) -> bool:
+                sent.append((session_id, message))
+                return True
+
+            def _now(self) -> float:
+                return 1000.0
+
+            def chat_history_limit(self) -> int:
+                return 12
+
+            def _tag_chat_origin(self, state: Any, session_id: str) -> None:
+                return None
+
+            @contextlib.asynccontextmanager
+            async def session_state(self, session_id: str):
+                yield state
+
+        host = ExtensionHost(types.SimpleNamespace(engine=_Engine()))
+        self.assertTrue(await host.say(state, "她刚写的那一段", "s1"))
+        self.assertEqual([("s1", "她刚写的那一段")], sent)
+        # 记进留档了：下一轮她自己在提示词里看得到"我说过这句"
+        self.assertTrue(any(item.get("is_self") for item in state.recent_chat))
+
+        # 没接上主插件 / 没有发送通道：不算说出去
+        bare = ExtensionHost()
+        self.assertFalse(await bare.say(state, "一句话", "s1"))
+        self.assertFalse(await bare.say(state, "  ", "s1"))
+
+    async def test_command_event_lets_an_extension_claim_it(self):
+        """`/vw event <文本>` 先问一句扩展：谁认领这条就归谁，没人认领主插件照旧。"""
+
+        import types
+
+        state = WorldState(session_id="s1")
+
+        class _Engine:
+            async def load_state(self, session_id: str, *, cold_start: bool = True):
+                return state
+
+        host = ExtensionHost(types.SimpleNamespace(engine=_Engine()))
+        self.assertIsNone(await host.command_event("s1", "随便一件事"))
+        host.register(
+            ExtensionSpec(
+                name="demo",
+                on_command_event=lambda st, text, sid, h: "" if text == "h" else None,
+            )
+        )
+        self.assertEqual("", await host.command_event("s1", "h"))
+        # 不认识的说法还给主插件（None = 没人接手）
+        self.assertIsNone(await host.command_event("s1", "出门忘了带伞"))
+
+    def test_adjust_only_touches_known_values_and_stays_in_range(self):
+        host = ExtensionHost()
+        state = WorldState(session_id="s1")
+        state.energy = 0.5
+        state.affect = 0.95
+        applied = host.adjust(state, energy=-0.2, affect=0.5, 没这个字段=1)
+        self.assertAlmostEqual(0.3, state.energy, places=4)
+        self.assertAlmostEqual(1.0, state.affect, places=4)
+        self.assertEqual({"energy", "affect"}, set(applied))
+
+    async def test_remember_and_node_are_safe_without_a_plugin(self):
+        """没接上主插件时这些能力都得安静地什么都不做，而不是炸掉。"""
+
+        host = ExtensionHost()
+        state = WorldState(session_id="s1", node_id="卧室")
+        self.assertFalse(host.remember(state, "一段摘要"))
+        self.assertIsNone(host.node(state))
+        self.assertEqual("卧室", host.place_text(state))
+        self.assertEqual([], host.sessions())
+        self.assertIsNone(await host.state(""))
+
+
+class RefuseToneTest(unittest.TestCase):
+    """「他说停」这条口吻：协议认它，状态也留得住。"""
+
+    def test_protocol_accepts_refuse(self):
+        def tone_of(raw: str) -> str:
+            return parse_action_payload(raw, available_actions={"say"}).tone
+
+        self.assertEqual("refuse", tone_of('{"tone": "refuse", "actions": []}'))
+        # 模型写中文也算数（别名表）
+        self.assertEqual("refuse", tone_of('{"tone": "明确拒绝", "actions": []}'))
+        self.assertEqual("", tone_of('{"tone": "乱写", "actions": []}'))
+
+    def test_state_keeps_it_after_clamping(self):
+        state = WorldState(session_id="s1")
+        state.last_user_tone = "refuse"
+        state.clamp()
+        self.assertEqual("refuse", state.last_user_tone)
+        state.last_user_tone = "乱写"
+        state.clamp()
+        self.assertEqual("", state.last_user_tone)
 
 
 if __name__ == "__main__":

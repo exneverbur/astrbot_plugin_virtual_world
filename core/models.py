@@ -48,6 +48,7 @@ REQUIRED_BUILTIN_ACTIONS: tuple[str, ...] = (
     "think",
     "share",
     "recall",
+    "remember",
     "poke",
     "search_web",
     "check_weather",
@@ -75,6 +76,70 @@ BUILTIN_ACTION_UPDATES: dict[str, dict[str, tuple[str, str]]] = {
         ),
     },
 }
+
+
+TUNED_DEFAULT_UPGRADES: dict[str, tuple[float, float]] = {
+    # 「配置里存着老默认值」时跟着新默认走：字段 -> (老默认, 新默认)。
+    # 用户自己调过（值不等于老默认）就不动他——跟 BUILTIN_ACTION_UPDATES 一个道理。
+    "profile.miss_growth_per_min": (0.0006, 0.0012),
+    "profile.miss_cooldown_min_minutes": (45.0, 15.0),
+    "profile.miss_cooldown_max_minutes": (240.0, 60.0),
+    "profile.miss_push_threshold": (0.85, 0.70),
+}
+"""这一轮调过默认值的字段：老配置里还是旧默认就顺手升级，改过的不碰。"""
+
+
+DEFAULT_INTIMACY: dict[str, float] = {
+    # 默认动作库里"确实是**肢体接触**"的那些：摸头、抱抱、亲亲、蹭蹭、靠肩膀…
+    # 数字是这一下有多解渴（0~1），动作做完时按它去满足欲求。
+    # 只牵过手、拍过肩膀的算浅浅一下；抱紧、亲上、依偎是实实在在的一下。
+    "hug": 1.0,
+    "kiss": 1.0,
+    "kiss_lips": 1.0,
+    "nestle": 0.9,
+    "kiss_forehead": 0.9,
+    "nuzzle": 0.8,
+    "lean_on": 0.8,
+    "interlock": 0.7,
+    "pat": 0.7,
+    "hold_hands": 0.6,
+    "close_eyes": 0.6,
+    "massage": 0.6,
+    "whisper_ear": 0.6,
+    "drape_coat": 0.5,
+    "feed_bite": 0.5,
+    "ruffle_hair": 0.5,
+    "bite_shoulder": 0.5,
+    "bite_wrist": 0.4,
+    "pinch_cheek": 0.4,
+    "wipe_tears": 0.4,
+    "tug_sleeve": 0.3,
+    "cold_hands": 0.3,
+    "bump_shoulder": 0.3,
+    "pinch_nose": 0.3,
+    "pat_shoulder": 0.2,
+    "high_five": 0.1,
+    "give_snack": 0.1,
+    "hand_tissue": 0.1,
+}
+"""内置动作里的"亲密度"：动作没自己写 ``intimacy`` 时按这张表算。
+
+用户改了动作的 ``intimacy``（编辑器里那个「亲密程度」）就以他自己的为准；
+表里没有的动作一律算 0——对欲求完全没有影响。
+"""
+
+
+def action_intimacy(action: Any) -> float:
+    """这个动作算多亲密的肢体接触（0 = 不算）。"""
+
+    value = getattr(action, "intimacy", None)
+    if value is None:
+        value = DEFAULT_INTIMACY.get(str(getattr(action, "id", "") or ""), 0.0)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, number))
 
 
 def _clean_names(names: Any, fallback: Any = "") -> list[str]:
@@ -390,6 +455,14 @@ class ActionDef(Permissive):
     """``duration_mode=llm`` 时的最长时长（秒）。"""
 
     interruptible: bool = True
+    intimacy: float | None = None
+    """这个动作有多"亲密的肢体接触"：0 = 不是，1 = 就是抱抱亲亲这种。
+
+    它只有一个用处：动作做完时按这个数去**满足欲求**（贴得越近，落得越多）。
+    留空（``None``）表示"按内置对照表算"，也就是老配置原样不动就有正确的值；
+    填 0 是**明确说这件事不算亲密接触**。见 ``DEFAULT_INTIMACY`` / ``action_intimacy``。
+    """
+
     preconditions: Preconditions = Field(default_factory=Preconditions)
     params: dict[str, ParamDef] = Field(default_factory=dict)
     during: During = Field(default_factory=During)
@@ -609,6 +682,52 @@ class StateDynamics(Permissive):
     atmosphere_multiplier: float = 0.5
     mood_override_duration: int = 600
 
+    daily_mood_enabled: bool = True
+    """每天（或一觉睡醒）掷一次"今天的基调"，改的是各条数值曲线走得快慢。
+
+    基调不改变她是谁：它只把精力 / 孤独 / 好奇 / 无聊 / 心潮 / 效价这几条的
+    速率乘上一个倍率，剩下的照旧由数值、事件和情绪两轴自己长出来。
+    """
+
+    daily_mood_strength: float = 1.0
+    """基调的作用强度，0~1。0 = 掷了也不生效（但状态页还看得见）。"""
+
+    # ---------------- 欲求：想被碰一碰 ----------------
+
+    desire_growth_per_min: float = 0.000231
+    """欲求每分钟自然涨多少。默认约 72 小时攒满（没人碰她、也没人撩她）。"""
+
+    desire_soft_top: float = 0.85
+    """过了这条线涨速减半：不然攒满之后就一直吊在顶上，反而不像"想要"。"""
+
+    desire_sleep_fall_per_hour: float = 0.05
+    """睡着时每小时落一点：睡一觉起来没那么憋。"""
+
+    desire_wake_keep: float = 0.7
+    """睡醒时把欲求乘上这个系数。"""
+
+    desire_relief: float = 0.25
+    """被亲近一次落多少（再乘动作自己的「亲密程度」）。"""
+
+    desire_tease: float = 0.05
+    """被撩一下涨多少（再乘这个人的关系系数：越亲近越管用）。"""
+
+    desire_low_energy_factor: float = 0.6
+    desire_low_valence_factor: float = 0.2
+    """累着 / 心情差的时候涨得慢：那会儿她想的是睡觉，不是贴贴。"""
+
+    desire_push_enabled: bool = True
+    """「想被碰一碰」时**交给大模型自己安排一轮**：去哪、找谁、做什么都由她定。"""
+
+    desire_push_threshold: float = 0.75
+    """欲求过这条线才会推一次（还会乘当天基调里「贴一下」那一条的权重）。"""
+
+    desire_push_daily_max: int = 3
+    """一天最多推几次（整个会话组一份）：推多了她会显得很黏。"""
+
+    desire_push_min_interval_minutes: int = 40
+    """两次之间至少隔这么久，别每一拍都问她一遍。"""
+
     # ---------------- 心事：她心里搁着的事 ----------------
 
     heart_knot_enabled: bool = True
@@ -735,6 +854,10 @@ ECHO_EVENT_TYPES: dict[str, str] = {
     "command_result": "📤",
     "skip": "⏭️",
     "memory": "📝",
+    "remember": "🗂️",
+    "drowsy": "😪",
+    "goodnight": "🌙",
+    "goodmorning": "☀️",
     "nickname": "🏷️",
     "cancel": "🛑",
     "vision": "🖼️",
@@ -749,6 +872,7 @@ ECHO_EVENT_TYPES: dict[str, str] = {
     "sleep_reply": "😴",
     "sleep_skip": "🤐",
     "mood_reset": "🌤️",
+    "soothed": "🫂",
     "poke": "👉",
     "search_sources": "🔗",
     "weather": "🌤️",
@@ -884,6 +1008,21 @@ class SleepConfig(Permissive):
 
     clear_plan_on_wake: bool = True
     """叫醒时连同手头排队的计划一起清掉，避免睡醒后补发几小时前的台词。"""
+
+    drowsy: bool = True
+    """睡前先迷糊一会儿（临睡期）再睡，而不是说完晚安立刻躺下。"""
+
+    drowsy_minutes: int = 5
+    """临睡期要安静这么久（没人跟她说话）才真的睡着。"""
+
+    drowsy_max_minutes: int = 30
+    """临睡期最多拖多久：到点无论如何都睡（不然又聊起来就熬到天亮了）。"""
+
+    goodnight: bool = True
+    """睡前给她一次机会说晚安：由她自己决定发给谁、发不发。"""
+
+    goodmorning: bool = True
+    """睡醒后给她一次机会说早安（同上，发不发由她定）。"""
 
     applies_to_nap: bool = True
     """小睡（nap）也按睡觉处理。"""
@@ -1453,13 +1592,13 @@ class ProfileConfig(Permissive):
     recall_topic_gap_days: int = 7
     """同一件事多久之内不重复提起。"""
 
-    miss_growth_per_min: float = 0.0006
+    miss_growth_per_min: float = 0.0012
     """对某个人的"想念"涨多快（每分钟）：只在她没跟这个人说话时累积。"""
 
-    miss_cooldown_min_minutes: int = 45
+    miss_cooldown_min_minutes: int = 15
     """刚跟他聊过（或刚去找过他）之后，最少隔多久才会开始想他（分钟）。"""
 
-    miss_cooldown_max_minutes: int = 240
+    miss_cooldown_max_minutes: int = 60
     """最长隔多久开始想他（分钟）。每次清零后在这段区间里随机取一个，
     所以"想他"不是固定节拍——有时一下午就想，有时一整天都没想起来。"""
 
@@ -1479,7 +1618,7 @@ class ProfileConfig(Permissive):
     miss_push_enabled: bool = True
     """「软推」：想念攒够了她会**主动去找他一次**（在哪说由她自己决定）。"""
 
-    miss_push_threshold: float = 0.85
+    miss_push_threshold: float = 0.70
     """软推的触发线（比写进提示词的 ``miss_threshold`` 高：先想，真想得不行才动手）。"""
 
     miss_push_daily_max: int = 2
@@ -1787,13 +1926,16 @@ class DefaultState(Permissive):
     curiosity: float = 0.5
     affect: float = 0.3
     boredom: float = 0.3
+    desire: float = 0.2
 
     @model_validator(mode="before")
     @classmethod
     def _legacy_keys(cls, data: Any) -> Any:
         return _rename_keys(data, {"social": "affect"})
 
-    @field_validator("energy", "loneliness", "curiosity", "affect", "boredom", mode="before")
+    @field_validator(
+        "energy", "loneliness", "curiosity", "affect", "boredom", "desire", mode="before"
+    )
     @classmethod
     def _clamp(cls, value: Any) -> float:
         return _clamp01(value, 0.5)
@@ -2718,7 +2860,11 @@ FIELD_LABELS: dict[str, str] = {
     "profile.miss_threshold": "多想你才会主动找你",
     "profile.miss_push_daily_max": "每天最多主动找你几次",
     "profile.miss_cooldown_min_minutes": "两次主动找你的间隔（分钟）",
+    "profile.miss_cooldown_max_minutes": "刚聊完之后最久隔多久才开始想你（分钟）",
     "profile.miss_loneliness_weight": "孤独感对想念的影响",
+    "profile.miss_push_threshold": "想念到多少她才主动去找你",
+    "state_dynamics.desire_growth_per_min": "欲求涨得多快（每分钟）",
+    "state_dynamics.desire_push_threshold": "欲求到多少她会想要人贴过来",
     "profile.digest_chars": "画像缩略版最长几个字",
     "profile.digest_limit": "缩略版最多写几个人",
     "reply_style.dense_max_lines": "多少行算说话太密",
@@ -2727,6 +2873,8 @@ FIELD_LABELS: dict[str, str] = {
     "state_dynamics.chat_valence_daily_cap": "聊天涨效价的每天上限",
     "state_dynamics.valence_decay_per_min": "效价每分钟回落多少",
     "state_dynamics.mood_override_duration": "情绪上头压过理智多久（秒）",
+    "state_dynamics.daily_mood_enabled": "每天掷一次今天的基调",
+    "state_dynamics.daily_mood_strength": "今日基调的作用强度",
     "events.micro_per_hour": "每小时约几件小事",
     "events.small_per_hour": "每小时约几件中等事",
     "events.big_per_hour": "每小时约几件大事",
@@ -2749,6 +2897,34 @@ def parse_world(data: dict[str, Any]) -> tuple[WorldConfig, list[str]]:
     world = WorldConfig.model_validate(
         normalize_legacy_keys(normalize_edge_keys(data))
     )
+    # 调过的默认值要跟上：**只有还等于老默认值**才动（用户自己改过的不碰）。
+    # 不然老配置里存着 0.85 / 240 分钟这些旧数字，改了默认值也白改。
+    for path, (before, after) in TUNED_DEFAULT_UPGRADES.items():
+        target: Any = world
+        parts = path.split(".")
+        for part in parts[:-1]:
+            target = getattr(target, part, None)
+            if target is None:
+                break
+        if target is None:
+            continue
+        current = getattr(target, parts[-1], None)
+        try:
+            same = current is not None and float(current) == float(before)
+        except (TypeError, ValueError):
+            same = False
+        if same:
+            setattr(target, parts[-1], after)
+            warnings.append(
+                f"「{FIELD_LABELS.get(path, path)}」用的是老默认值，已按新版默认调整"
+                f"（{before} → {after}）"
+            )
+    # 「朋友」那一档去掉了别名「老铁」：老配置里还留着的话顺手摘掉
+    for bond in list(getattr(getattr(world, "profile", None), "bonds", None) or []):
+        aliases = [str(item) for item in (getattr(bond, "aliases", None) or [])]
+        if str(getattr(bond, "name", "")) == "朋友" and "老铁" in aliases:
+            bond.aliases = [item for item in aliases if item != "老铁"]
+            warnings.append("「朋友」这一档去掉了别名「老铁」")
 
     # 节点：去重、保证 id 非空
     seen: set[str] = set()

@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import random
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone as dt_timezone
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -23,7 +24,7 @@ from typing import Any, Callable
 from .config_store import ConfigStore
 from .db import AsyncDatabase
 from .defaults import DEFAULT_WEATHER_PROMPT
-from .decider import Decider, reply_willingness
+from .decider import DESIRE_CUDDLE, Decider, reply_willingness
 from .engagement import EngagementTracker
 from .events import (
     ABILITIES,
@@ -78,6 +79,7 @@ from .models import (
     NodeDef,
     SessionDef,
     WorldConfig,
+    action_intimacy,
     pronoun_for as pronounce_for,
 )
 from .nickname import compute_nickname, should_update
@@ -90,6 +92,7 @@ from .timeline import render_event
 from .ports import CardResult, ToolCallResult
 from .state import (
     STATE_AWAKENING,
+    STATE_DROWSY,
     STATE_IDLE,
     STATE_NAPPING,
     STATE_SLEEPING,
@@ -99,7 +102,7 @@ from .state import (
     group_chat_items,
     take_last_chat_groups,
 )
-from .state_dynamics import StateDynamics
+from .state_dynamics import SOOTHE_VALENCE_BELOW, StateDynamics
 from .search import (
     Evidence,
     clean_passage,
@@ -127,7 +130,10 @@ from .mood import (
     SELF_CARE_NOTE,
     StyleCell,
     cell_for,
+    day_mood_branch,
+    day_mood_info,
     keyword_signal,
+    roll_day_mood,
     style_block as render_style_block,
 )
 
@@ -184,6 +190,16 @@ SEARCH_LOG_KEY = "search.last"
 SEARCH_LOG_MINUTES = 60
 # 好奇高过这条线时，除了上网查，也会想去问人（和 decider 里"好奇→搜索"用同一条线）
 ASK_ABOUT_CURIOSITY = 0.7
+# 别人的负面口吻在她这儿有多重，按**亲密度**缩放：路人几乎不往心里去，
+# 特别的人一句话顶别人几句。曲线是 `floor + (ceil - floor) * (档位比例 ^ 1.6)`，
+# 七档时的实际值大约是：敌意 0.20 / 冷淡 0.27 / 客气 0.42 / 熟人 0.63 /
+# 朋友 0.88 / 亲近 1.17 / 特别的人 1.50。
+TONE_INTIMACY_FLOOR = 0.2
+TONE_INTIMACY_CEIL = 1.5
+
+DESIRE_TEASE_FLOOR = 0.3
+DESIRE_TEASE_CEIL = 1.6
+"""被撩一下的加成倍数：路人撩她几乎没用，特别的人撩一下跳得最明显。"""
 # 生成搜索关键词时的额外要求：不写清楚，模型会给你一个"什么都要"的万能查询
 SEARCH_QUERY_RULES = (
     "这次要填的是**搜索关键词**：写成能直接丢进搜索框的词（谁 / 什么时候 / 哪方面），"
@@ -420,6 +436,19 @@ class MessageContext:
     image_marks: dict[str, str] = field(default_factory=dict)
     """这一轮真的附给主模型的聊天记录图片：``地址 -> 图N``（提示词里标「（见图N）」）。"""
 
+    at_targets: list[dict] = field(default_factory=list)
+    """这条消息 @ 了谁：``[{"id": "42", "name": "小明", "self": False}]``（含她自己在内）。
+
+    渲染聊天记录时用它写清"这句是冲谁说的"：光看正文分不清别人话里的「你」
+    指的是谁，尤其是一条消息同时 @ 了两个人的时候。
+    """
+
+    reply_to: dict = field(default_factory=dict)
+    """这条消息引用/回复的是谁：``{"id": "42", "name": "小明"}``；没引用就是空的。"""
+
+    addressing: str = ""
+    """这句是冲谁说的：``me``（点了她）/ ``others``（在叫别人）/ 空（看不出来）。"""
+
 
 @dataclass
 class SleepReply:
@@ -636,9 +665,14 @@ class VirtualWorldEngine:
         decider_interval: float = 300.0,
         debug: bool = False,
         logger=None,
+        extensions=None,
     ) -> None:
         self.store = store
         self.db = db
+        # 扩展挂载点：没装扩展时就是个空壳（见 core/extensions.py）
+        from .extensions import ExtensionHost
+
+        self.extensions = extensions if extensions is not None else ExtensionHost()
         self.llm = llm
         # 辅助模型：只负责"把意图翻译成工具参数"，留空时复用主模型
         self.helper_llm = helper_llm or llm
@@ -749,6 +783,69 @@ class VirtualWorldEngine:
 
     # ================= 配置 =================
 
+    # ---------------- 扩展挂载点 ----------------
+
+    def _apply_extension_actions(self, world: Any) -> None:
+        """把扩展包注册的动作合进动作库。
+
+        撞名的以原有动作为准（用户自己配过的东西不该被扩展悄悄改掉）；
+        扩展给来的定义跑一遍校验，坏的就丢掉并记一条日志。
+        """
+
+        raw = self.extensions.actions()
+        if not raw or world is None:
+            return
+        existing = {str(item.id) for item in getattr(world, "actions", []) or []}
+        for item in raw:
+            try:
+                definition = ActionDef.model_validate(dict(item))
+            except Exception as exc:
+                self._log("warning", f"扩展动作定义不对，已忽略：{exc}")
+                continue
+            if not definition.id or definition.id in existing:
+                continue
+            definition.builtin = False
+            world.actions.append(definition)
+            existing.add(definition.id)
+
+    def _extension_prompt(self, state: WorldState, session_id: str = "") -> str:
+        """扩展要加进提示词的那一段（没装扩展就是空串）。"""
+
+        try:
+            return self.extensions.prompt_text(state, session_id or state.session_id)
+        except Exception:
+            return ""
+
+    def _extension_gate(self, definition: ActionDef, state: WorldState) -> str:
+        """扩展不让做这件事时给一句原因（空串 = 允许）。"""
+
+        try:
+            return self.extensions.gate_reason(definition, state, state.session_id)
+        except Exception:
+            return ""
+
+    def _hidden_actions(self, state: WorldState, session_id: str = "") -> set[str]:
+        """这一轮连名字都不该出现的动作：配额用尽的 + 扩展要求藏起来的。
+
+        只在执行时拦不够——动作名出现在"你能写的 type"清单里就是泄漏。
+        """
+
+        picked = set(self.exhausted_actions(state))
+        sid = str(session_id or state.session_id or "")
+        # 扩展说"这个会话里不让做"的动作，连名字都不该出现——
+        # 直接用它的 gate 判一遍，不指望扩展再单独维护一份隐藏名单
+        for definition in getattr(self.world, "actions", []) or []:
+            try:
+                if self.extensions.gate_reason(definition, state, sid):
+                    picked.add(str(definition.id))
+            except Exception:
+                continue
+        try:
+            picked.update(self.extensions.hidden_actions(state, sid))
+        except Exception:
+            pass
+        return picked
+
     def reload_config(self) -> list[str]:
         """热加载配置：世界 / 日程 / 会话。"""
 
@@ -769,6 +866,8 @@ class VirtualWorldEngine:
         if self._schedule_signature is not None and signature != self._schedule_signature:
             self._schedule_reset_pending = True
         self._schedule_signature = signature
+        # 扩展包带来的动作：合并进动作库（坏的定义直接丢，不影响原动作）
+        self._apply_extension_actions(world)
         self.world = world
         self.schedules = schedules
         self.sessions = sessions
@@ -1225,6 +1324,7 @@ class VirtualWorldEngine:
             curiosity=defaults.curiosity,
             affect=defaults.affect,
             boredom=defaults.boredom,
+            desire=defaults.desire,
             abilities=dict(self.world.abilities.initial),
             node_since=self._now(),
         )
@@ -1419,6 +1519,29 @@ class VirtualWorldEngine:
             return datetime.fromtimestamp(float(now)).strftime("%Y-%m-%d")
         except (OverflowError, OSError, ValueError):
             return ""
+
+    def _roll_day_mood(self, state: WorldState, now: float) -> bool:
+        """每天掷一次"今天的基调"，同一天只掷一次。
+
+        掷的是**曲线快慢**，不是性格：今天懒散就精力掉得慢、坐得住，
+        今天黏人就更容易觉得孤单。她不会主动解释这件事，但状态页和提示词里
+        都写着，免得"为什么她今天怪怪的"只能靠猜。
+
+        返回 True 表示这一次刚好掷出了新的一天（用来记一条日志）。
+        """
+
+        if not bool(getattr(self.world.state_dynamics, "daily_mood_enabled", True)):
+            state.day_mood = ""
+            state.day_mood_day = ""
+            return False
+        day = self._today_key(now)
+        if not day:
+            return False
+        if str(state.day_mood_day or "") == day and str(state.day_mood or ""):
+            return False
+        state.day_mood = roll_day_mood(self.rng)
+        state.day_mood_day = day
+        return True
 
     def _event_block_reason(
         self, state: WorldState, now: float, *, manual: bool = False
@@ -1654,6 +1777,9 @@ class VirtualWorldEngine:
         - **我正在经历**：当前那一件事的详细处境；
         - **最近发生在我身上的事**：窗口内的全部事件，按时间从早到晚、每条一行带时间；
         - **有件事我心里还挂着**：挂起中的那件事，一行轻提示。
+
+        末尾再补一段「你排好的日程」：每条写清是什么、上次什么时候跑的、
+        下次大概什么时候（一次性日程没有"下次"）。
         """
 
         moment = float(now if now is not None else self._now())
@@ -1744,7 +1870,81 @@ class VirtualWorldEngine:
                 note = str(item.get("pending_followup") or "").strip() or "还没弄清楚"
                 rows.append(f"- {head}：{note}")
             blocks.append("# 有件事我心里还挂着（不用现在提，别反复念叨）\n" + "\n".join(rows))
+
+        plan = self.schedule_journal(state, moment)
+        if plan:
+            blocks.append(plan)
         return "\n\n".join(blocks)
+
+
+    def schedule_journal(self, state: WorldState, now: float | None = None) -> str:
+        """「你排好的日程」：是什么、上次什么时候跑的、下次什么时候（一次性没有“下次”）。"""
+
+        items = [
+            item
+            for item in list(getattr(self.schedules, "schedules", None) or [])
+            if bool(getattr(item, "enabled", True))
+        ]
+        if not items:
+            return ""
+        moment = datetime.fromtimestamp(float(now if now is not None else self._now()))
+        last_map = dict(getattr(state, "schedule_last_fired", None) or {})
+        rows: list[str] = []
+        for item in items:
+            bits: list[str] = []
+            note = str(getattr(item, "note", "") or "").strip()
+            when = str(getattr(item, "time", "") or "").strip()
+            once = bool(getattr(item, "once", False))
+            days = [str(day) for day in (getattr(item, "days", None) or [])]
+            if once:
+                date = str(getattr(item, "date", "") or "").strip()
+                label = date or "下一次到点就跑"
+                bits.append("只做这一次（" + label + " " + when + "）")
+            else:
+                day_text = "每天" if (not days or len(days) >= 7) else "、".join(days)
+                bits.append(f"{day_text} {when}")
+            if note:
+                bits.append(f"做什么：{note}")
+            last = float(last_map.get(str(getattr(item, "id", "") or "")) or 0.0)
+            bits.append("上次：" + (self._ago_text(max(0.0, float(self._now()) - last)) if last > 0 else "还没跑过"))
+            if not once:
+                nxt = self._next_time_text(item, moment)
+                if nxt:
+                    bits.append("下次：" + nxt)
+            rows.append("- " + "；".join(bits))
+        return "# 你排好的日程\n" + "\n".join(rows[:8])
+
+    @staticmethod
+    def _ago_text(seconds: float) -> str:
+        minutes = max(0, int(seconds // 60))
+        if minutes < 1:
+            return "刚刚"
+        if minutes < 60:
+            return f"{minutes} 分钟前"
+        hours = minutes // 60
+        if hours < 24:
+            return f"{hours} 小时前"
+        return f"{hours // 24} 天前"
+
+    def _next_time_text(self, schedule: Any, moment: datetime) -> str:
+        """这条日程下一次什么时候：今天/明天/N 天后 + 时间。"""
+
+        try:
+            hour, minute = (int(part) for part in str(schedule.time).split(":")[:2])
+        except (TypeError, ValueError):
+            return ""
+        days = [str(day) for day in (schedule.days or [])]
+        for offset in range(0, 8):
+            when = (moment + timedelta(days=offset)).replace(
+                hour=hour, minute=minute, second=0, microsecond=0
+            )
+            if when <= moment:
+                continue
+            if days and self.WEEKDAY_KEYS[when.weekday()] not in days:
+                continue
+            label = "今天" if offset == 0 else ("明天" if offset == 1 else f"{offset} 天后")
+            return f"{label} {hour:02d}:{minute:02d}"
+        return ""
 
     def _thread_suspended(
         self, state: WorldState, thread: dict[str, Any] | None, now: float
@@ -3562,6 +3762,9 @@ class VirtualWorldEngine:
                         samples=self.voice_sample_lines(
                             state, session_id, preview=True
                         ),
+                        # 测评也要跟实跑完全一致：该有的字段一个都不能少
+                        wants_touch=self.extensions.wants("touch"),
+                        json_fields=self.extensions.json_fields(),
                         hidden_actions=self.exhausted_actions(state),
                         **await self.runtime_notes(session_id),
                     )
@@ -3668,6 +3871,7 @@ class VirtualWorldEngine:
                         valid_nodes=set(self.world.node_map()),
                         max_actions=self.world.limits.max_actions_per_message,
                         max_messages=say_limit,
+                        json_fields=self.extensions.json_fields(),
                     )
                     for action in parsed.actions:
                         if action.type == "say" and action.messages:
@@ -3975,6 +4179,7 @@ class VirtualWorldEngine:
         "praise": "positive",
         "attack": "negative",
         "hug": "hug",
+        "comfort": "comfort",
         "positive": "positive",
         "negative": "negative",
     }
@@ -4640,6 +4845,13 @@ class VirtualWorldEngine:
         """睡着被吵醒 / 起床气这几句临时说明（提示词用，过期自动失效）。"""
 
         notes: list[str] = []
+        if str(getattr(state, "state", "")) == STATE_DROWSY or state.drowsy_sleep_step:
+            # 临睡期：她已经困得不行了，只是还没躺下
+            notes.append(
+                "你现在困得不行了（正要睡）：**说话短、断断续续、迷迷糊糊的**——"
+                "可以只说半句、只说一个词、或者说到一半就没下文；别安排事情、别长篇解释，"
+                "也别主动挑话题。"
+            )
         if self._startled_active(state) and state.startled_note:
             notes.append(state.startled_note)
         elif int(state.startled_until or 0) and int(state.startled_until) <= int(
@@ -4654,6 +4866,199 @@ class VirtualWorldEngine:
         elif state.grumpy_note:
             state.grumpy_note = ""
         return notes
+
+    # ---------------- 临睡期与晚安 / 早安 ----------------
+
+    def _should_drowse(self, state: WorldState, definition: ActionDef, *, skip_drowsy: bool = False) -> bool:
+        """这一步是不是"夜里睡前"——要不要先进入临睡期。
+
+        只有**睡整觉**（不是小睡）走这一套，而且一天最多一次（回笼觉就直接躺）。
+        极端保护的强制补觉不拖：那是她已经透支了。
+        """
+
+        if skip_drowsy or definition.id != "sleep":
+            return False
+        if not bool(getattr(self.world.sleep, "drowsy", True)):
+            return False
+        if str((active_plan(state) or {}).get("source") or "") == "forced":
+            return False
+        if state.state == STATE_DROWSY or state.drowsy_sleep_step:
+            return False
+        return str(state.drowsy_day or "") != self._today_key(self._now())
+
+    async def _enter_drowsy(
+        self,
+        state: WorldState,
+        node: NodeDef | None,
+        outcome: TickOutcome,
+        definition: ActionDef,
+        action: PlannedAction,
+        depth: int,
+    ) -> None:
+        """进入临睡期：把"真的睡"那一步先揣着，先迷糊一会儿。
+
+        这一段她还在（能回消息、会说晚安），等安静下来才真的躺下。
+        """
+
+        now = self._now()
+        payload = (
+            action.model_dump(mode="json")
+            if hasattr(action, "model_dump")
+            else asdict(action)
+        )
+        state.drowsy_sleep_step = dict(payload or {})
+        state.drowsy_started_world_time = int(state.world_time or 0)
+        state.drowsy_started_at = float(now)
+        state.drowsy_day = self._today_key(now)
+        state.current_action = None
+        state.state = STATE_DROWSY
+        state.add_event("drowsy", {"action": definition.id})
+        await self._log_event(
+            state,
+            "drowsy",
+            {
+                "action": definition.id,
+                "note": (
+                    f"困了，先临睡一会儿（安静 {int(getattr(self.world.sleep, 'drowsy_minutes', 5) or 5)} "
+                    f"分钟、最多 {int(getattr(self.world.sleep, 'drowsy_max_minutes', 30) or 30)} 分钟后去睡）"
+                ),
+            },
+            outcome=outcome,
+        )
+        # 睡前这一段：要不要说声晚安，由她自己定（发给谁、发不发都行）
+        await self._maybe_say_goodnight(state, node, outcome)
+
+    async def _drowsy_tick(
+        self, state: WorldState, node: NodeDef | None, outcome: TickOutcome
+    ) -> None:
+        """临睡期的一拍：够安静了（或者拖太久了）就真的去睡。"""
+
+        if not state.drowsy_sleep_step:
+            # 没揣着那一步（老存档 / 中途被清）：就当它结束了
+            state.state = STATE_IDLE
+            state.drowsy_started_world_time = 0
+            state.drowsy_started_at = 0.0
+            return
+        config = self.world.sleep
+        quiet_minutes = max(1, int(getattr(config, "drowsy_minutes", 5) or 5))
+        max_minutes = max(quiet_minutes, int(getattr(config, "drowsy_max_minutes", 30) or 30))
+        ticks = max(1, int(round(max_minutes * 60 / max(1.0, self.tick_seconds))))
+        elapsed = max(0, int(state.world_time or 0) - int(state.drowsy_started_world_time or 0))
+        # "安静了多久"从进临睡期的这一刻算起，不能被更早的那次发言提前满足
+        base = max(float(state.drowsy_started_at or 0.0), float(state.last_user_activity_at or 0.0))
+        idle_seconds = self._now() - base
+        if elapsed >= ticks:
+            await self._go_to_sleep(state, node, outcome, reason="拖太久了，去睡吧")
+            return
+        if idle_seconds >= quiet_minutes * 60:
+            await self._go_to_sleep(state, node, outcome, reason="安静下来了，去睡吧")
+
+    async def _go_to_sleep(
+        self, state: WorldState, node: NodeDef | None, outcome: TickOutcome, *, reason: str
+    ) -> None:
+        """临睡期结束：把揣着的那一步睡觉真的执行掉。"""
+
+        step = dict(state.drowsy_sleep_step or {})
+        state.drowsy_sleep_step = {}
+        state.drowsy_started_world_time = 0
+        state.drowsy_started_at = 0.0
+        state.state = STATE_IDLE
+        definition = self.world.action_map().get("sleep")
+        if not step or definition is None:
+            return
+        outcome.notes.append(reason)
+        # 存的是 PlannedAction 的字段（``type``），这里换回计划步骤的写法（``action``）
+        action = self._step_to_action({**step, "action": step.get("type") or "sleep"})
+        # 这一步已经在临睡期里"等过了"：直接睡（skip_drowsy）
+        await self._execute_actions(
+            state,
+            node,
+            outcome,
+            [action],
+            depth=0,
+            autonomous=True,
+            from_plan=False,
+            skip_drowsy=True,
+        )
+
+    async def _maybe_say_goodnight(
+        self, state: WorldState, node: NodeDef | None, outcome: TickOutcome
+    ) -> bool:
+        """睡前一次机会：要不要说晚安、发给谁——**由她自己决定**，也可以不发。"""
+
+        if not bool(getattr(self.world.sleep, "goodnight", True)) or self.llm is None:
+            return False
+        if str(state.goodnight_day or "") == self._today_key(self._now()):
+            return False
+        now = self.local_now()
+        hint = (
+            f"这会儿你困得不行，正准备睡（现在是 {now.strftime('%H:%M')}，{period_of(now.hour)}）。\n"
+            "**要不要说声晚安，由你自己决定**：\n"
+            "- 想发就写一条 `say`，写清 `send_to`——发给谁、发到哪个会话都看你："
+            "想单独跟谁道晚安就发他的私聊，想让大家都看到就发群里，"
+            "也可以分别给几个人各发一条；\n"
+            "- **不想发就什么都不写**（返回空 actions）：今天没人理你、你懒得开口、"
+            "或者白天刚聊过，都可以不说，不会被记成「没礼貌」；\n"
+            "- 要说就说得短一点、迷迷糊糊的（「睡了啊…明天再聊」「困死了，先躺了」），"
+            "别写小作文，也别挨个点名问候。\n"
+            "你手边能说话的地方见上面的「你能说话的地方」。"
+        )
+        plan = await self._ask_llm_for_plan(state, node, outcome, force=True, hint=hint)
+        if plan is None or not self.plan_speaks(plan):
+            # 她决定不说了：记一笔，今天不再问
+            state.goodnight_day = self._today_key(self._now())
+            await self._log_event(state, "goodnight", {"said": False}, outcome=outcome)
+            return False
+        outcome.session_id = self._freeze_plan_target(
+            state, outcome, plan, fallback=state.session_id
+        )
+        await self._apply_plan(state, node, outcome, plan)
+        state.goodnight_day = self._today_key(self._now())
+        await self._tick_plan(state, node, outcome, depth=0)
+        await self._log_event(
+            state,
+            "goodnight",
+            {"said": True, "note": str(plan.get("reason") or "")[:80]},
+            outcome=outcome,
+        )
+        return True
+
+    async def _maybe_say_goodmorning(
+        self, state: WorldState, node: NodeDef | None, outcome: TickOutcome
+    ) -> bool:
+        """睡醒后一次机会：要不要说早安、发给谁——同样由她自己决定。"""
+
+        if not bool(getattr(self.world.sleep, "goodmorning", True)) or self.llm is None:
+            return False
+        if str(state.goodmorning_day or "") == self._today_key(self._now()):
+            return False
+        state.goodmorning_day = self._today_key(self._now())
+        now = self.local_now()
+        hint = (
+            f"你刚睡醒（现在是 {now.strftime('%H:%M')}，{period_of(now.hour)}）。\n"
+            "**要不要说声早安，由你自己决定**：\n"
+            "- 想发就写一条 `say` 并写清 `send_to`：单独跟谁说就发私聊，想让大家都看到就发群里；\n"
+            "- **不想发就什么都不写**（返回空 actions）——刚醒还没缓过来、或者昨天没人接你的话，"
+            "都可以不主动冒头；\n"
+            "- 要说就短一点、带着刚醒的迷糊（「早…」「醒了，有点渴」），别写成问候模板。\n"
+            "你手边能说话的地方见上面的「你能说话的地方」。"
+        )
+        plan = await self._ask_llm_for_plan(state, node, outcome, force=True, hint=hint)
+        if plan is None or not self.plan_speaks(plan):
+            await self._log_event(state, "goodmorning", {"said": False}, outcome=outcome)
+            return False
+        outcome.session_id = self._freeze_plan_target(
+            state, outcome, plan, fallback=state.session_id
+        )
+        await self._apply_plan(state, node, outcome, plan)
+        await self._tick_plan(state, node, outcome, depth=0)
+        await self._log_event(
+            state,
+            "goodmorning",
+            {"said": True, "note": str(plan.get("reason") or "")[:80]},
+            outcome=outcome,
+        )
+        return True
 
     def _apply_wake_quality(
         self, state: WorldState, *, slept_minutes: float, startled: int = 0
@@ -4908,6 +5313,7 @@ class VirtualWorldEngine:
                     ctx.session_id,
                     signal=self.tone_signal(state, ctx.text),
                 ),
+                hidden_actions=self._hidden_actions(state, ctx.session_id),
                 **await self.runtime_notes(state.session_id),
             )
             if ctx.other_context:
@@ -4934,6 +5340,10 @@ class VirtualWorldEngine:
                 persona_id=ctx.persona_id,
                 place=ctx.session_id,
             )
+            # 扩展层（装了扩展才有）：只在它自己允许的会话里加
+            layer = self._extension_prompt(state, ctx.session_id)
+            if layer:
+                injection = f"{injection}\n\n{layer}"
             return injection
 
     # ---------------- 对话记忆：攒片段，再总结 ----------------
@@ -5150,6 +5560,43 @@ class VirtualWorldEngine:
         ]
         return [name for name in dict.fromkeys(names) if name]
 
+    PROFILE_HINT_WORDS = (
+        "我是", "我叫", "我的名字", "我生日", "我今年", "我喜欢", "我不喜欢", "我不吃",
+        "我讨厌", "我爱吃", "我住", "以后叫我", "叫我", "我上班", "我工作", "我养",
+        "我老婆", "我老公", "我女朋友", "我男朋友", "我妈", "我爸",
+    )
+    """他的话里出现这些词，通常是在说"关于他自己"的稳定信息。"""
+
+    def remember_hint(self, text: str, *, ctx: MessageContext | None = None) -> str:
+        """他说了关于自己的事时，提醒她顺手把这条写进通讯录。
+
+        「记住」这个动作以前藏在七十多个动作的清单里，说明里还写着"日常寒暄不要用"，
+        于是实际上几乎没人用它——档案全靠睡前整理补。这里只在真的像"个人信息"的那一轮
+        加一句，平时不啰嗦。
+        """
+
+        if not bool(getattr(self.world.profile, "enabled", True)):
+            return ""
+        body = str(text or "")
+        if not body or not any(word and word in body for word in self.PROFILE_HINT_WORDS):
+            return ""
+        who = str(getattr(ctx, "user_id", "") or "").strip()
+        target = (
+            f"`user` 填他的号码 `{who}`"
+            if who
+            else "`user` 填他的号码（上面聊天记录里名字后面括号里那串）"
+        )
+        return (
+            "# 顺手记进通讯录\n"
+            "他这句里有关于他自己的信息（称呼、喜好、生日、工作、关系这类以后还用得上的事）。\n"
+            "回话之外，**再写一个 `remember` 动作**把它记进通讯录："
+            f"{target}，`text` 一句话说清是什么，`evidence` 填**他的原话**（必填），"
+            "`kind` 选 喜好 / 厌恶 / 习惯 / 基本信息 / 关系 / 约定。\n"
+            "只写进 `memory` 是不够的：那是你自己的回忆，不进他的档案，"
+            "下次问起你还是答不出来。\n"
+            "如果这句只是玩笑、或者他并没有真的说清楚，就别写。\n"
+        )
+
     def reply_addressing(self, state: WorldState, ctx: MessageContext) -> str:
         """这次回复是「对她说」还是「群里在聊、她去插一句」。
 
@@ -5234,24 +5681,309 @@ class VirtualWorldEngine:
     TONE_EVENTS = {
         "praise": "positive_words",
         "hug": "hug_bot",
+        "comfort": "hug_bot",
         "attack": "negative_words",
         "positive": "positive_words",
         "negative": "negative_words",
     }
     """口吻 → 情绪脉冲。``normal`` / 空不产生任何脉冲。"""
 
-    def _apply_tone_pulse(self, state: WorldState, tone: str) -> str:
+    def _she_was_hurting(self, state: WorldState, *, user_id: str = "") -> bool:
+        """她这会儿是不是真的难受着——决定"被理解"算不算数。
+
+        不设这道门的话，对方随手一句"我懂你"就能加一次心情，那条通道会变成免费回血。
+        三个信号随便中一个就算：效价偏低、心里搁着一件事、或者本来就在记他的账。
+        """
+
+        if float(state.valence) < 0.45:
+            return True
+        if str(getattr(state, "heart_knot", "") or "").strip():
+            return True
+        uid = str(user_id or "")
+        if uid:
+            try:
+                if self.grudge_for(state, uid):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _mark_reply_addressing(
+        self, state: WorldState, ctx: MessageContext, addressing: str
+    ) -> str:
+        """把"这句其实是在跟别人说话"记在那条消息上。
+
+        结构化信息（@ 名单、引用对象）只能认出"明说"的情况；一句没有 @ 的
+        「你倒是说啊」得靠主模型判。它说是别人就信它：下一轮渲染聊天记录时
+        会带上「（这句是冲别人说的，不是在问你）」，免得她再揽一次。
+        """
+
+        kind = str(addressing or "")
+        if kind not in ("me", "others"):
+            return ""
+        for item in reversed(list(state.recent_chat or [])[-5:]):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("user_id")) != str(ctx.user_id or ""):
+                continue
+            item["addressing"] = kind
+            return kind
+        return ""
+
+    def _comfort_pulse(
+        self, state: WorldState, tone: str, *, user_id: str = ""
+    ) -> str:
+        """安慰类的口吻走"安抚通道"：不占当天的聊天额度（见 dynamics.soothed）。
+
+        - ``hug``：他哄她、贴一贴——她正低落才算；
+        - ``comfort``：他还听懂了她说的那几句——要求多一点，效果也强一点。
+        """
+
+        now = self._now()
+        if str(tone or "") == "comfort":
+            if not self._she_was_hurting(state, user_id=user_id):
+                return ""
+            if self.dynamics.soothed(state, kind="understood", now=now):
+                return "understood"
+            return ""
+        if self.dynamics.soothed(state, kind="soothed", now=now):
+            return "soothed"
+        return ""
+
+    INTIMACY_CACHE_KEY = "action_intimacy"
+    """动作"亲密度"标签的缓存键（存在 kv 表，不写进世界配置 / 预设）。"""
+
+    def _intimacy_traits(self) -> dict[str, Any]:
+        cache = getattr(self, "_intimacy_traits_data", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._intimacy_traits_data = cache
+        return cache
+
+    @staticmethod
+    def _action_fingerprint(definition: ActionDef) -> str:
+        """动作改过（名字或说明变了）就重新判一次，别拿旧标签糊弄。"""
+
+        raw = f"{definition.name or ''}|{definition.description or ''}"
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+
+    def intimacy_of(self, definition: ActionDef | None) -> float | None:
+        """这个动作有多"亲密"（0~1）：决定它能不能走安抚通道。
+
+        默认动作库靠效果就能认出来（冲着某个人、降孤独 / 抬心潮），不用问模型；
+        用户自己加的动作看不出来时返回 ``None``，交给便宜模型判一次（判完记住）。
+        """
+
+        if definition is None:
+            return 0.0
+        if str(getattr(definition, "target_type", "") or "") != "user":
+            return 0.0
+        complete = getattr(definition, "on_complete", None)
+        effects = dict(getattr(complete, "effects", {}) or {})
+        warm = any(
+            str(effects.get(key) or "").strip().startswith(sign)
+            for key, sign in (("loneliness", "-"), ("affect", "+"))
+        )
+        if warm:
+            return 1.0
+        cached = self._intimacy_traits().get(str(definition.id))
+        if isinstance(cached, dict) and str(cached.get("fp") or "") == self._action_fingerprint(
+            definition
+        ):
+            return float(cached.get("score") or 0.0)
+        return None
+
+    async def _ensure_intimacy_traits(self) -> None:
+        """把缓存的标签读进来（每个进程一次）。"""
+
+        if getattr(self, "_intimacy_traits_loaded", False):
+            return
+        self._intimacy_traits_loaded = True
+        try:
+            value = await self.db.call("kv_get", self.INTIMACY_CACHE_KEY)
+        except Exception:
+            value = None
+        if isinstance(value, dict):
+            self._intimacy_traits_data = {
+                str(key): dict(item)
+                for key, item in value.items()
+                if isinstance(item, dict)
+            }
+
+    async def _classify_intimacy(
+        self, state: WorldState, definition: ActionDef
+    ) -> float:
+        """让便宜模型判一次"这个动作算不算亲昵接触"，判完缓存（不会每轮都问）。"""
+
+        channel = self.helper_llm or self.llm
+        if channel is None:
+            return 0.0
+        system = (
+            "你在给一个角色插件的动作分类。判断这个动作是不是**亲昵的身体接触**"
+            "（抱、亲、贴、拉手、摸头、靠肩膀这类，重点是「主动贴近某个人」）。"
+            "\n只输出 JSON：{\"intimacy\": 1} 或 {\"intimacy\": 0}"
+        )
+        prompt = (
+            f"动作 id：{definition.id}\n"
+            f"动作名字：{definition.name or definition.id}\n"
+            f"动作说明：{definition.description or '（没有说明）'}\n"
+            f"它的目标：{getattr(definition, 'target_type', '') or '无'}"
+        )
+        try:
+            reply = await channel.generate(
+                session_id=state.session_id,
+                system_prompt=system,
+                prompt=prompt,
+                temperature=0.0,
+            )
+        except Exception as exc:
+            self._log("debug", f"判断动作亲密度失败：{exc}")
+            return 0.0
+        text = getattr(reply, "text", "") if getattr(reply, "ok", False) else ""
+        payload = extract_json_object(str(text or ""))
+        score = 0.0
+        if isinstance(payload, dict):
+            try:
+                score = 1.0 if float(payload.get("intimacy") or 0) >= 0.5 else 0.0
+            except (TypeError, ValueError):
+                score = 0.0
+        else:
+            body = str(text or "").strip()
+            if body.startswith("{"):
+                return 0.0
+            score = 1.0 if ("亲密" in body or "是" == body[:1]) else 0.0
+        cache = self._intimacy_traits()
+        cache[str(definition.id)] = {"fp": self._action_fingerprint(definition), "score": score}
+        try:
+            await self.db.call("kv_set", self.INTIMACY_CACHE_KEY, cache)
+        except Exception:
+            pass
+        return score
+
+    async def _maybe_soothe_from_action(
+        self,
+        state: WorldState,
+        definition: ActionDef | None,
+        *,
+        outcome: TickOutcome | None = None,
+    ) -> bool:
+        """她主动贴过来这一下，如果她正低落，也算一次安抚（不占聊天额度）。"""
+
+        if definition is None or float(state.valence) >= SOOTHE_VALENCE_BELOW:
+            return False
+        await self._ensure_intimacy_traits()
+        score = self.intimacy_of(definition)
+        if score is None:
+            score = await self._classify_intimacy(state, definition)
+        if float(score or 0.0) < 0.5:
+            return False
+        if not self.dynamics.soothed(state, kind="soothed", now=self._now()):
+            return False
+        await self._log_event(
+            state,
+            "soothed",
+            {
+                "kind": "soothed",
+                "cause": f"她自己贴过来（{definition.name or definition.id}）",
+                "valence": round(float(state.valence), 3),
+            },
+            outcome=outcome,
+        )
+        return True
+
+    async def _apply_tone_pulse(
+        self,
+        state: WorldState,
+        tone: str,
+        *,
+        user_id: str = "",
+        outcome: TickOutcome | None = None,
+    ) -> str:
         """按"对方这一轮的口吻"给一次情绪脉冲（心潮 / 孤独感的来源之一）。
 
         主路径是主模型在 JSON 里写的 ``tone``；只有它没写时才用关键词表兜底——
         表只认字面，遇到反话就会判错（"你可真行啊"当年被当成夸奖）。
+
+        安慰类（``hug`` / ``comfort``）还额外走一次"安抚通道"：她低潮时那一下不占
+        当天的聊天额度，见 ``_comfort_pulse``。
         """
 
-        event = self.TONE_EVENTS.get(str(tone or "").strip().lower())
+        key = str(tone or "").strip().lower()
+        event = self.TONE_EVENTS.get(key)
         if not event:
             return ""
-        self.dynamics.apply_event(state, event, now=self._now())
+        magnitude = self._tone_magnitude(state, event, user_id)
+        self.dynamics.apply_event(state, event, magnitude=magnitude, now=self._now())
+        if key in ("hug", "comfort"):
+            kind = self._comfort_pulse(state, key, user_id=user_id)
+            if kind:
+                await self._log_event(
+                    state,
+                    "soothed",
+                    {
+                        "kind": kind,
+                        "cause": (
+                            "他听懂了你那几句" if kind == "understood" else "被安抚了一会儿"
+                        ),
+                        "valence": round(float(state.valence), 3),
+                    },
+                    outcome=outcome,
+                )
+            # 被他撩了一下（这一轮只是嘴上/氛围上，不是真的碰到）：想被碰一碰的劲头跳一点。
+            # 同一句口吻连着来不重复算，越亲近的人越撩得动她。
+            if key != str(getattr(state, "last_user_tone", "") or ""):
+                gained = self.dynamics.tease_desire(
+                    state, scale=self._desire_tease_scale(state, user_id)
+                )
+                if gained > 0 and outcome is not None:
+                    outcome.notes.append(f"被撩了一下：欲求 +{gained:.2f}")
         return event
+
+    def _desire_tease_scale(self, state: WorldState, user_id: str) -> float:
+        """这一下撩动她多少：按关系档位从 0.3 涨到 1.6（跟"被怼多疼"同一套档位）。"""
+
+        uid = str(user_id or "")
+        if not uid or not self.profiles.enabled():
+            return 1.0
+        try:
+            view = self.profiles.view(state.session_id, uid)
+        except Exception:
+            return 1.0
+        if view is None:
+            return DESIRE_TEASE_FLOOR
+        levels = list(getattr(self.world.profile, "levels", None) or [])
+        if len(levels) <= 1:
+            return 1.0
+        index = max(0, min(int(getattr(view, "level_index", 0) or 0), len(levels) - 1))
+        ratio = index / (len(levels) - 1)
+        return round(DESIRE_TEASE_FLOOR + (DESIRE_TEASE_CEIL - DESIRE_TEASE_FLOOR) * ratio, 3)
+
+    def _tone_magnitude(self, state: WorldState, event: str, user_id: str) -> float:
+        """这一句话在她这儿有多重：**越亲近的人，伤她越深**。
+
+        路人怼她一句几乎不往心里去（0.2 倍），特别的人说一句顶别人几句（1.5 倍）。
+        只对负面口吻（``negative_words``）加权：正面那几条本来就压得很小、还带"连着被哄会麻木"，
+        再按亲密度放大反而会让熟人一句夸奖把她顶满。
+        """
+
+        if event != "negative_words":
+            return 1.0
+        uid = str(user_id or "")
+        if not uid or not self.profiles.enabled():
+            return 1.0
+        try:
+            view = self.profiles.view(state.session_id, uid)
+        except Exception:
+            return 1.0
+        if view is None:
+            return TONE_INTIMACY_FLOOR
+        levels = list(getattr(self.world.profile, "levels", None) or [])
+        if len(levels) <= 1:
+            return 1.0
+        index = max(0, min(int(getattr(view, "level_index", 0) or 0), len(levels) - 1))
+        # 归一化到 0~1 再上一条幂曲线：低档更平（路人几乎没感觉），高档更陡
+        ratio = index / (len(levels) - 1)
+        return round(TONE_INTIMACY_FLOOR + (TONE_INTIMACY_CEIL - TONE_INTIMACY_FLOOR) * ratio**1.6, 3)
 
     def note_open_topic(self, state: WorldState, ctx: Any, text: str) -> None:
         """记下"他没说完的事"。空字符串 = 这轮没有，什么都不做。
@@ -5725,6 +6457,12 @@ class VirtualWorldEngine:
                 missing = self.extra_reminders(state, ctx=ctx)
                 if missing:
                     extra_notes = [*(extra_notes or []), missing]
+                remember_note = self.remember_hint(" ".join(texts), ctx=ctx)
+                if remember_note:
+                    extra_notes = [*(extra_notes or []), remember_note]
+                layer = self._extension_prompt(state, ctx.session_id)
+                if layer:
+                    extra_notes = [*(extra_notes or []), layer]
                 # 「你还不知道他的事」：只有知道是谁在说话时才算得出来
                 ask = self._ask_about_hint(state, ctx)
                 if ask:
@@ -5742,7 +6480,7 @@ class VirtualWorldEngine:
                     state, ctx.session_id, direct=True
                 )
                 # 配额用尽的动作：这一轮既不列进提示词，也不接受模型写它
-                blocked_actions = self.exhausted_actions(state)
+                blocked_actions = self._hidden_actions(state, ctx.session_id)
                 system_prompt = self.prompts.build_autonomous_system_prompt(
                     persona_text=persona_text,
                     state=state,
@@ -5765,6 +6503,8 @@ class VirtualWorldEngine:
                     samples=self.voice_sample_lines(
                         state, ctx.session_id, signal=self.tone_signal(state, ctx.text)
                     ),
+                    wants_touch=self.extensions.wants("touch"),
+                    json_fields=self.extensions.json_fields(),
                     **await self.runtime_notes(state.session_id),
                 )
                 user_prompt = self.prompts.build_reply_user_prompt(
@@ -5833,6 +6573,7 @@ class VirtualWorldEngine:
             valid_nodes=set(self.world.node_map()),
             max_actions=self.world.limits.max_actions_per_message,
             max_messages=say_limit,
+            json_fields=self.extensions.json_fields(),
         )
         # 空内容的 say 直接丢掉：模型没想好要说什么时不该发一条空气泡
         actions = [
@@ -5976,9 +6717,43 @@ class VirtualWorldEngine:
                 )
             self.mark_open_topics_asked(state, ctx)
             # 对方的口吻：模型判的优先，没判才用关键词表兜底（表只认字面，会认错反话）
-            self._apply_tone_pulse(state, parsed.tone or keyword_signal(ctx.text))
+            # 带上"谁说的"：同样一句难听的，亲近的人说她更受伤（见 _tone_magnitude）
+            await self._apply_tone_pulse(
+                state,
+                parsed.tone or keyword_signal(ctx.text),
+                user_id=str(getattr(ctx, "user_id", "") or ""),
+                outcome=outcome,
+            )
+            # 「他这一轮碰了她哪儿」：主插件不解释这些词，只转给声明要它的扩展
+            # （没人声明时 parsed.touch 一定是空的，这里什么都不做）
+            if parsed.touch:
+                handled = await self.extensions.touch(state, parsed.touch)
+                if handled:
+                    await self._log_event(
+                        state,
+                        "touch",
+                        {"parts": list(parsed.touch), "by": ctx.user_name or ctx.user_id},
+                        outcome=outcome,
+                    )
+            # 扩展**自己声明**的字段：主插件同样不解释，只按声明的形状转交
+            # （没人声明时 parsed.extra 一定是空的，这里什么都不做）
+            if parsed.extra:
+                handled = await self.extensions.extra(state, parsed.extra)
+                if handled:
+                    await self._log_event(
+                        state,
+                        "ext_fields",
+                        {
+                            "fields": dict(parsed.extra),
+                            "by": ctx.user_name or ctx.user_id,
+                        },
+                        outcome=outcome,
+                    )
             # 记下来给下一轮抽声音样例用：模型判的口吻比关键词表准得多
             state.last_user_tone = str(parsed.tone or "")
+            # 主模型判的"这句在跟谁说话"：它比结构化信息看得多（没有 @ 的一句
+            # 「你倒是说啊」它也能判出来），所以它说是别人就信它
+            self._mark_reply_addressing(state, ctx, parsed.addressing)
             await self._echo_events_since(state, outcome, echo_marker)
             # 模型顺手给的总结只当"写记忆时的提示"，不单独落成一条记忆
             self.note_memory_hint(state, parsed.memory)
@@ -6005,6 +6780,8 @@ class VirtualWorldEngine:
                     "valence_delta": round(float(parsed.valence_delta or 0.0), 3),
                     # 对方这一轮的口吻（模型判的）：信号不对时，日志里能一眼看出来
                     "tone": str(parsed.tone or ""),
+                    # 这句是在跟谁说话（模型判的）：判成 "others" 时这一条会被标出来
+                    "addressing": str(parsed.addressing or ""),
                     # 这一轮生成出来的图（生图 / 出图的动作）：日志里能看出贴了几张
                     "images": len(self._group_images(outcome)),
                 },
@@ -6789,9 +7566,9 @@ class VirtualWorldEngine:
         now = self._now()
         config = self.world.profile
         try:
-            threshold = float(getattr(config, "miss_push_threshold", 0.85) or 0.85)
+            threshold = float(getattr(config, "miss_push_threshold", 0.70) or 0.70)
         except (TypeError, ValueError):
-            threshold = 0.85
+            threshold = 0.70
         presence = {
             str(item.get("user_id") or ""): str(item.get("name") or "")
             for item in (state.user_presence or {}).values()
@@ -6874,7 +7651,7 @@ class VirtualWorldEngine:
         """现在最想找、而且今天还允许主动去找的那个人。"""
 
         threshold = float(
-            getattr(self.world.profile, "miss_push_threshold", 0.85) or 0.85
+            getattr(self.world.profile, "miss_push_threshold", 0.70) or 0.70
         )
         best: tuple[str, float] | None = None
         for user_id, value in (state.miss or {}).items():
@@ -6893,6 +7670,243 @@ class VirtualWorldEngine:
             if best is None or score > best[1]:
                 best = (uid, score)
         return best
+
+    # ---------------- 想被碰一碰：交给她自己安排 ----------------
+    #
+    # 这里**不替她决定动作**：只把"你现在很想被人碰一下"+ 手边有哪些人、
+    # 哪些肢体接触、可以在哪些会话里做，一起交给大模型，让她自己挑一个。
+    # （规则决策器只知道数值、不认识人，硬塞一个动作会变成"她一想要就去抱"，
+    #   抱谁、抱成什么样、在群里还是私聊，那些都得看关系和她当时的心情。）
+
+    def desire_push_ready(self, state: WorldState) -> bool:
+        """现在该不该把这一轮交给大模型，让她自己想想怎么贴。"""
+
+        config = self.world.state_dynamics
+        if not bool(getattr(config, "desire_push_enabled", True)):
+            return False
+        if float(getattr(state, "desire", 0.0) or 0.0) <= 0.0:
+            return False
+        if not self._desire_push_left(state):
+            return False
+        gap = max(0, int(getattr(config, "desire_push_min_interval_minutes", 40) or 0))
+        last = float(getattr(state, "desire_push_at", 0.0) or 0.0)
+        if gap and last and self._now() - last < gap * 60:
+            return False
+        # 今天的基调也会拨一下：黏人的日子更容易"想要"，想独处的日子基本不会
+        try:
+            strength = float(getattr(config, "daily_mood_strength", 1.0))
+        except (TypeError, ValueError):
+            strength = 1.0
+        weight = day_mood_branch(
+            str(getattr(state, "day_mood", "") or ""), "cuddle", strength=strength
+        )
+        threshold = float(getattr(config, "desire_push_threshold", 0.75) or 0.75)
+        return float(state.desire) * weight >= threshold
+
+    def _desire_push_left(self, state: WorldState) -> int:
+        """今天还能推几次（整个会话组一份，按世界日期算）。"""
+
+        cap = max(
+            0, int(getattr(self.world.state_dynamics, "desire_push_daily_max", 0) or 0)
+        )
+        if cap <= 0:
+            return 0
+        today = time.strftime("%Y-%m-%d", time.localtime(self._now()))
+        if str(state.desire_push_day or "") != today:
+            state.desire_push_day = today
+            state.desire_push_count = 0
+        return max(0, cap - int(state.desire_push_count or 0))
+
+    def _cuddle_people(self, state: WorldState, session_id: str) -> list[dict[str, Any]]:
+        """能去贴的人，**按亲密度从高到低**排。
+
+        每人带上：现在是什么关系档、这一档明确不许的动作、今天还剩几次主动找他的额度。
+        """
+
+        rows: list[dict[str, Any]] = []
+        presence = state.user_presence or {}
+        for user_id in list(presence.keys()):
+            uid = str(user_id or "").strip()
+            if not uid:
+                continue
+            view = self.profiles.view(session_id, uid)
+            if view is None or self._miss_ignored(view):
+                continue
+            level = getattr(view, "level", None)
+            rows.append(
+                {
+                    "user_id": uid,
+                    "name": str(getattr(view, "name", "") or uid),
+                    "affinity": float(getattr(view, "affinity", 0.0) or 0.0),
+                    "level": str(getattr(level, "name", "") or ""),
+                    "deny": [str(item) for item in (getattr(level, "deny", None) or [])],
+                    "quota_left": int(
+                        self.profiles.proactive_quota_left(session_id, uid) or 0
+                    ),
+                    "places": self._person_places(state, uid),
+                }
+            )
+        rows.sort(key=lambda item: (-item["affinity"], item["user_id"]))
+        return rows
+
+    async def _maybe_desire_push(
+        self,
+        state: WorldState,
+        node: NodeDef | None,
+        outcome: TickOutcome,
+        session_id: str,
+    ) -> bool:
+        """「很想被人碰一碰」：把这一轮交给大模型，让她自己安排。
+
+        提示词里给全三件事——**现在什么状态**、**能找谁**（按亲密度排，附关系档与
+        那条档位不许的动作）、**能做哪些肢体接触**（附亲密程度），然后让她自己决定
+        去哪说（``send_to``）、做什么、对谁做。什么都不想做也可以，写别的计划就行。
+        """
+
+        if self.llm is None or not self.desire_push_ready(state):
+            return False
+        people = [
+            item for item in self._cuddle_people(state, session_id) if item["quota_left"] > 0
+        ]
+        selfs = self._self_comfort_options(state)
+        if not people and not selfs:
+            # 既没人可找、也没有"自己解决"这种动作 → 这一轮没什么可摆给她的
+            return False
+        actions = (
+            self._cuddle_action_lines(state, people[0].get("deny") or []) if people else []
+        )
+        who_lines = []
+        for item in people[:4]:
+            deny = "、".join(
+                self.world.action_map().get(name, None).name or name
+                if self.world.action_map().get(name, None)
+                else name
+                for name in (item["deny"] or [])[:6]
+            )
+            where = f"；他最近在：{item['places']}" if item["places"] else ""
+            who_lines.append(
+                f"- {item['name']}（好感 {item['affinity']:.0f}，{item['level'] or '还不熟'}；"
+                f"今天还能主动找他 {item['quota_left']} 次{where}）"
+                + (f"。**跟他不能做**：{deny}" if deny else "")
+            )
+        parts = [
+            f"你这会儿**很想被人碰一碰**（欲求 {float(state.desire):.2f}）。"
+            "不是非得做什么——想凑过去蹭一下、想被摸摸头、想拉他的手、想凑近了说句话、"
+            "或者只想让他注意到你，都算。**想要就直接说**——说清你想被怎么碰、"
+            "想让他在哪儿、想他怎么做，别只绕着「抱紧我一点」打转；"
+            "**做什么、对谁做、在哪儿做都由你定。**"
+        ]
+        if who_lines:
+            parts.append(
+                "你能找的人（越靠前越亲近）：\n"
+                + "\n".join(who_lines)
+                + "\n\n能做的肢体接触（括号里是贴得多近，0~1）：\n"
+                + ("\n".join(actions) or "（这个地点这会儿没有能做的接触动作）")
+                + "\n\n在哪说也由你定：想私密、想撒娇就发他的私聊；"
+                "想让别人看见你们关系好就发群里（计划里写 send_to）。"
+            )
+        else:
+            parts.append(
+                "这会儿没有能找的人（不在身边、或者今天的次数已经用完了）——"
+                "那就别硬凑上去。"
+            )
+        if selfs:
+            listed = "、".join(f"{action_id}（{label}）" for action_id, label in selfs)
+            parts.append(
+                "**也可以自己解决**（如果你不想让任何人知道、或者实在没人在）："
+                f"{listed}。\n"
+                "　自己解决不用找谁、也不会被谁看见，但**只是没那么急了**，不算被满足——"
+                "做完会有点空落、反而更想他；被人抱着是完全不一样的。"
+            )
+        parts.append(
+            "**也可以什么都不做**：如果这会儿不方便、或者你其实不太想，"
+            "那就写个别的计划（看会儿书、发会儿呆都行），不用勉强。"
+        )
+        hint = "\n\n".join(parts) + "\n" + self.autonomous_prompt_note(state)
+        plan = await self._ask_llm_for_plan(
+            state, node, outcome, force=True, hint=hint, with_extension=True
+        )
+        state.desire_push_at = self._now()
+        state.desire_push_count = int(state.desire_push_count or 0) + 1
+        if plan is None:
+            outcome.notes.append("想被人碰一碰，但这一轮没想出要做什么")
+            return False
+        outcome.session_id = self._freeze_plan_target(
+            state, outcome, plan, fallback=session_id
+        )
+        await self._apply_plan(state, node, outcome, plan)
+        self._count_autonomous(state)
+        await self._log_event(
+            state,
+            "desire_push",
+            {
+                "desire": round(float(state.desire), 3),
+                "people": [item["name"] for item in people[:4]],
+                "self_options": [action_id for action_id, _label in selfs],
+                "plan": plan.get("steps"),
+                "reason": plan.get("reason"),
+            },
+            outcome=outcome,
+        )
+        return True
+
+    def _self_comfort_options(self, state: WorldState) -> list[tuple[str, str]]:
+        """扩展提供的"不用找人也能解决"的动作：动作上打了 ``self_option`` 标记的。
+
+        主插件不认识具体是哪个扩展：**谁注册了带这个标记的动作，就多出那个选项**。
+        没装扩展 → 空列表 → 那一轮只摆「找谁」和「什么都不做」。
+        """
+
+        picked: list[tuple[str, str]] = []
+        for definition in self.world.actions_in(state.node_id):
+            if not bool(getattr(definition, "enabled", True)):
+                continue
+            label = str(getattr(definition, "self_option", "") or "").strip()
+            if not label:
+                continue
+            picked.append((definition.id, label))
+        return picked
+
+    def _cuddle_action_lines(
+        self, state: WorldState, deny: list[str] | None = None
+    ) -> list[str]:
+        """这个地点现在能做的"肢体接触"动作，一行一个（附亲密程度）。"""
+
+        blocked = {str(item) for item in (deny or [])}
+        rows: list[tuple[float, str]] = []
+        for definition in self.world.actions_in(state.node_id):
+            if not bool(getattr(definition, "enabled", True)):
+                continue
+            if str(getattr(definition, "target_type", "none") or "none") != "user":
+                continue
+            if definition.id in blocked:
+                continue
+            score = action_intimacy(definition)
+            if score <= 0:
+                continue
+            rows.append((score, definition.id))
+        rows.sort(key=lambda item: -item[0])
+        lines: list[str] = []
+        for score, action_id in rows[:10]:
+            definition = self.world.action_map().get(action_id)
+            name = (definition.name or action_id) if definition is not None else action_id
+            lines.append(f"- {action_id}（{name}，{score:.1f}）")
+        return lines
+
+    def desire_panel(self, state: WorldState) -> dict[str, Any]:
+        """编辑器「想念」那一栏旁边要显示的欲求信息（含"还要多久才轮到她主动"）。"""
+
+        config = self.world.state_dynamics
+        return {
+            "value": round(float(getattr(state, "desire", 0.0) or 0.0), 3),
+            "threshold": round(
+                float(getattr(config, "desire_push_threshold", 0.75) or 0.75), 3
+            ),
+            "enabled": bool(getattr(config, "desire_push_enabled", True)),
+            "push_left": self._desire_push_left(state),
+            "push_cap": max(0, int(getattr(config, "desire_push_daily_max", 0) or 0)),
+            "last_push_at": float(getattr(state, "desire_push_at", 0.0) or 0.0),
+        }
 
     async def _maybe_miss_push(
         self,
@@ -6942,7 +7956,9 @@ class VirtualWorldEngine:
             # 想不出来就先把这个人的想念压一半，别每轮都来问一次
             state.miss[uid] = max(0.0, score * 0.5)
             return False
-        outcome.session_id = self._plan_target(state, outcome, plan, fallback=session_id)
+        outcome.session_id = self._freeze_plan_target(
+            state, outcome, plan, fallback=session_id
+        )
         await self._apply_plan(state, node, outcome, plan)
         self._count_autonomous(state)
         self.profiles.note_proactive(state.session_id, uid)
@@ -7714,6 +8730,9 @@ class VirtualWorldEngine:
                 keep=self.chat_history_limit(),
                 images=ctx.chat_images,
                 origin=ctx.session_id,
+                at=ctx.at_targets,
+                reply_to=ctx.reply_to,
+                addressing=ctx.addressing,
             )
             self._tag_chat_origin(state, ctx.session_id)
         state.last_user_activity_at = self._now()
@@ -8170,6 +9189,10 @@ class VirtualWorldEngine:
             chat_note=self.chat_note_for(state),
             persona=_clip_text(await self._persona_text(state.session_id), 800),
             steps=steps,
+            # 「这条日程是干什么的」+ 完整动作链：只给"这一步是什么动作"，
+            # 补出来的意图容易跟日程本来的目的对不上
+            schedule_note=str(getattr(schedule, "note", "") or ""),
+            chain_labels=self._chain_labels(chain),
         )
         reply = await self._ask_llm(state.session_id, system_prompt, prompt)
         self._count_llm_plan(state)
@@ -8453,6 +9476,10 @@ class VirtualWorldEngine:
                     )
                     if not claimed:
                         continue
+                    # 记下"这条日程上次什么时候真的跑了"：提示词里要写给她看
+                    last_map = dict(getattr(state, "schedule_last_fired", None) or {})
+                    last_map[str(schedule.id)] = float(self._now())
+                    state.schedule_last_fired = last_map
                     # 日程闸门：她正忙着处理一件事件时，睡觉/小睡/换地方要先问一句
                     choice, gate_note = await self._schedule_gate(
                         state, schedule, label=label
@@ -8502,14 +9529,25 @@ class VirtualWorldEngine:
                             "intents": smart_note,
                         },
                     )
-                    if schedule.note:
-                        # 当初为什么排这件事，一并带进这一轮的上下文里
-                        state.event_digest = [
-                            *list(state.event_digest or []),
-                            f"到点了：这是你之前专门排的一件事——{schedule.note}",
-                        ][-6:]
+                    # 「这条日程是干什么的」+ 完整动作链，一并带进这一轮的上下文：
+                    # 她说话时才有背景（不然只知道自己"正在做某个动作"，
+                    # 不知道为什么做、后面还要做什么）。
+                    chain_labels = self._chain_labels(chain)
+                    brief: list[str] = []
+                    if str(schedule.note or "").strip():
+                        brief.append(f"到点了：这是你之前专门排的一件事——{schedule.note}")
+                    if chain_labels:
+                        brief.append("这条日程要做的事（按顺序）：" + " → ".join(chain_labels))
+                    if brief:
+                        state.event_digest = [*list(state.event_digest or []), *brief][-6:]
                     await self._run_chain(state, chain, outcome, depth=0)
                     outcome.notes.append(f"日程 {schedule.id} 已触发")
+                    # 做完了这一整串要有交代：她之后提起"我刚做了…"才有据可依
+                    if chain_labels:
+                        state.event_digest = [
+                            *list(state.event_digest or []),
+                            "按日程做完了：" + " → ".join(chain_labels),
+                        ][-6:]
                     state.add_event(
                         "schedule",
                         {"id": schedule.id, "note": str(schedule.note or "")},
@@ -8566,7 +9604,20 @@ class VirtualWorldEngine:
                 chain, smart_note = await self._smart_chain(state, schedule)
             if schedule.auto_travel:
                 chain = self.expand_chain_for_travel(state, chain)
+            # 手动跑一次也把"这条日程是什么 + 动作链"记进她自己的账
+            manual_labels = self._chain_labels(chain)
+            manual_brief: list[str] = []
+            if str(schedule.note or "").strip():
+                manual_brief.append(f"你刚跑了一遍日程：{schedule.note}")
+            if manual_labels:
+                manual_brief.append("这条日程要做的事（按顺序）：" + " → ".join(manual_labels))
+            if manual_brief:
+                state.event_digest = [*list(state.event_digest or []), *manual_brief][-6:]
             await self._run_chain(state, chain, outcome, depth=0)
+            # 手动跑一次也算"上次执行"：编辑器里试跑之后，提示词里就能看到时间
+            last_map = dict(getattr(state, "schedule_last_fired", None) or {})
+            last_map[str(schedule.id)] = float(self._now())
+            state.schedule_last_fired = last_map
             state.add_event(
                 "schedule",
                 {"id": schedule.id, "manual": True, "note": str(schedule.note or "")},
@@ -9127,6 +10178,10 @@ class VirtualWorldEngine:
             # 2) 计划推进（无 LLM）
             await self._tick_plan(state, node, outcome, depth=0)
 
+            # 2.6) 临睡期：安静够了（或拖太久了）就真的去睡；否则这一轮什么都不做
+            if state.state == STATE_DROWSY and state.current_action is None:
+                await self._drowsy_tick(state, node, outcome)
+
             # 2.5) 刚到新地方、手上又没安排：就地决定接下来做什么
             #      ——只在她真的空下来、而且计划里也没有下一步时才问；
             #      "移动后本来就有动作"（同一串动作或计划里的下一步）不该再问一次
@@ -9141,7 +10196,25 @@ class VirtualWorldEngine:
                     )
 
             # 3) 数值演化
+            #    扩展包先走一拍（数值、状态结算），再走主插件自己的演化
+            try:
+                notes = await self.extensions.on_tick(state, self.world, self._now())
+                outcome.notes.extend(notes)
+            except Exception as exc:
+                self._log("warning", f"扩展这一拍出错：{exc}")
             was_storm = bool(state.storm)
+            # 新的一天：掷一次今天的基调（曲线快慢），一天只掷一次
+            if self._roll_day_mood(state, self._now()):
+                info = day_mood_info(state.day_mood)
+                await self._log_event(
+                    state,
+                    "day_mood",
+                    {
+                        "day_mood": state.day_mood,
+                        "label": info.label if info is not None else "",
+                        "hint": info.hint if info is not None else "",
+                    },
+                )
             mood_reset = self.dynamics.tick(
                 state,
                 node=node,
@@ -9421,10 +10494,14 @@ class VirtualWorldEngine:
         effects = (definition.on_complete.effects if definition else {}) or {}
         if effects:
             self.dynamics.apply_effects(state, effects, world=self.world, now=self._now())
+        # 持续型亲密动作（靠着、按摩这类）做完也算安抚，同上
+        await self._maybe_soothe_from_action(state, definition, outcome=outcome)
 
         # 查完东西的"满足感"：检索型动作真拿到结果之后，好奇心按动作配置回落一次
         if definition is not None:
             self._satisfy_curiosity(state, definition, action, outcome)
+            # 亲近了一下：抱一抱、摸摸头这种**真的碰到**的动作会满足欲求
+            await self._satisfy_desire_from_action(state, definition, outcome)
 
         # 按「实际持续时间」缩放的效果：例如小睡 30 分钟 → 精力 +0.002×30
         per_minute = (definition.on_complete.effects_per_minute if definition else {}) or {}
@@ -9444,6 +10521,8 @@ class VirtualWorldEngine:
                 startled=int(state.startled_count or 0),
             )
             state.sleep_started_at = 0
+            # 睡醒给她一次机会说早安（发不发、发给谁由她自己定，一天一次）
+            await self._maybe_say_goodmorning(state, node, outcome)
 
         # 行动完成 -> 记忆
         if definition is not None:
@@ -9452,7 +10531,26 @@ class VirtualWorldEngine:
         state.current_action = None
         state.state = STATE_IDLE
         if action.get("from_plan") and state.current_plan is not None:
-            advance(state)
+            plan = state.current_plan
+            recorded = action.get("plan_created_at")
+            if recorded is None:
+                # 没记下自己属于哪份计划（老存档、别的来源起跑的）：保持原来的做法
+                advance(state)
+            else:
+                try:
+                    same_plan = int(plan.get("created_at") or 0) == int(recorded)
+                    same_step = plan.get("current_step") is not None and int(
+                        plan.get("current_step")
+                    ) == int(action.get("plan_index", -1))
+                except (TypeError, ValueError):
+                    same_plan = same_step = False
+                if same_plan and same_step:
+                    # 计划还是带它起跑的那一份、也还指着它：推掉这一步
+                    advance(state)
+                else:
+                    # 计划中途换过 / 已经有新的安排排到前面：这一步不是计划的了，
+                    # 不能顺手把排在她前面的动作标成"做过了"
+                    outcome.notes.append("计划已经有别的安排了，这一步不再往后推")
 
         await self._log_event(
             state,
@@ -9708,7 +10806,7 @@ class VirtualWorldEngine:
     ) -> None:
         persona_text = await self._persona_text(state.session_id)
         _cell, say_limit, style_text = self.style_for(state, state.session_id)
-        blocked_actions = self.exhausted_actions(state)
+        blocked_actions = self._hidden_actions(state)
         system_prompt = self.prompts.build_autonomous_system_prompt(
             persona_text=persona_text,
             state=state,
@@ -9732,6 +10830,7 @@ class VirtualWorldEngine:
             session_labels=self.session_labels(state),
             profile_text=self.profile_block(state),
             extra_notes=[note for note in [self.extra_reminders(state)] if note],
+            json_fields=self.extensions.json_fields(),
             **await self.runtime_notes(state.session_id),
         )
         prompt = self.prompts.build_reply_followup_prompt(
@@ -9763,6 +10862,7 @@ class VirtualWorldEngine:
             valid_nodes=set(self.world.node_map()),
             max_actions=self.world.limits.max_actions_per_message,
             max_messages=say_limit,
+            json_fields=self.extensions.json_fields(),
         )
         actions, blocked = self._followup_actions(
             result.actions, depth=depth, after_search=after_search
@@ -9863,6 +10963,10 @@ class VirtualWorldEngine:
     ) -> None:
         if depth > self.world.limits.max_action_chain_depth:
             return
+        if state.state == STATE_DROWSY:
+            # 临睡期里计划不推进：她正打着盹，"睡觉"那一步已经揣在手里了，
+            # 这时候放计划往前走就等于当晚没打盹——下一拍又直接躺下了。
+            return
         if state.current_action is not None:
             return
         step = peek_step(state)
@@ -9873,6 +10977,9 @@ class VirtualWorldEngine:
         previous_home = outcome.speech_home
         if step_home:
             outcome.speech_home = step_home
+        if str(step.get("kind") or "") == "reply":
+            # 这一句是当时有人跟她说话时排下的：轮到时按"回话"发，不算她主动开口
+            outcome.speech_kind = "reply"
         executed = await self._execute_actions(
             state,
             node,
@@ -9904,10 +11011,12 @@ class VirtualWorldEngine:
         if not self.is_enabled(session_id):
             return None
         now = self._now()
-        last = self._last_decider_at.get(session_id, 0.0)
+        # 节流按"这一整个她"算，不按会话：同一个组的几个会话共用一个她
+        pace_key = self.state_key(session_id)
+        last = self._last_decider_at.get(pace_key, 0.0)
         if not force and now - last < self.decider_interval:
             return None
-        self._last_decider_at[session_id] = now
+        self._last_decider_at[pace_key] = now
 
         outcome = TickOutcome(session_id=session_id)
         outcome.place = session_id
@@ -9928,6 +11037,11 @@ class VirtualWorldEngine:
                 self._refresh_interject_closed(state)
                 # 先看"是不是想他想得不行了"：软推她自己去找他一次（在哪说由她决定）
                 pushed = await self._maybe_miss_push(state, node, outcome, session_id)
+                if not pushed:
+                    # 想被碰一碰：同样是"交给她自己决定"，但要排在"想他"后面
+                    pushed = await self._maybe_desire_push(
+                        state, node, outcome, session_id
+                    )
                 if not pushed:
                     await self._decide_normally(state, node, outcome, session_id)
             await self._echo_events_since(state, outcome, echo_marker)
@@ -9973,10 +11087,14 @@ class VirtualWorldEngine:
                 )
                 plan = None
         if plan is not None:
-            # 她想说给谁：她自己在计划里挑了一个会话就发那儿，
-            # 没挑（或挑不出来）就落在这一组的代表会话里。
-            outcome.session_id = self._plan_target(
-                state, outcome, plan, fallback=session_id
+            # 她想说给谁：她自己在计划里挑了一个会话就发那儿；没挑就按动机定——
+            # 「因为别人在说话所以她想接一句」要落在**那个说话的会话**，
+            # 其余情况落在这一次是在哪儿决定的。
+            outcome.session_id = self._freeze_plan_target(
+                state,
+                outcome,
+                plan,
+                fallback=self._plan_home_for(state, plan, session_id),
             )
             await self._apply_plan(state, node, outcome, plan)
             self._count_autonomous(state)
@@ -10014,6 +11132,10 @@ class VirtualWorldEngine:
         state.add_event(
             "plan", {"reason": plan.get("reason"), "source": plan.get("source")}
         )
+        # 这份计划要说的话落在哪个会话：日志里跟着一起写出来，
+        # 免得"决定在私聊"和"话说在群里"看起来对不上
+        target = str(plan.get("send_to") or "").strip()
+        target_label = self.session_label(target, state) if target else ""
         await self._log_event(
             state,
             "plan",
@@ -10021,6 +11143,7 @@ class VirtualWorldEngine:
                 "reason": plan.get("reason"),
                 "source": plan.get("source"),
                 "steps": plan.get("steps"),
+                "send_to": target_label,
                 "raw": _clip_text(plan.get("raw"), 200),
             },
             outcome=outcome,
@@ -10075,8 +11198,11 @@ class VirtualWorldEngine:
         if plan is None:
             return
         outcome.notes.append("抵达新地点，就地决定接下来做什么")
-        outcome.session_id = self._plan_target(
-            state, outcome, plan, fallback=outcome.session_id
+        outcome.session_id = self._freeze_plan_target(
+            state,
+            outcome,
+            plan,
+            fallback=self._plan_home_for(state, plan, outcome.session_id),
         )
         await self._apply_plan(state, node, outcome, plan)
         await self._tick_plan(state, node, outcome, depth=0)
@@ -10089,6 +11215,7 @@ class VirtualWorldEngine:
         *,
         force: bool = False,
         hint: str = "",
+        with_extension: bool = True,
     ) -> dict[str, Any] | None:
         if self.llm is None:
             return None
@@ -10098,7 +11225,7 @@ class VirtualWorldEngine:
         persona_text = await self._persona_text(state.session_id)
         _cell, say_limit, style_text = self.style_for(state, state.session_id)
         # 配额用尽的动作：计划里既不列出来，也不接受模型写它
-        blocked_actions = self.exhausted_actions(state)
+        blocked_actions = self._hidden_actions(state)
         system_prompt = self.prompts.build_autonomous_system_prompt(
             persona_text=persona_text,
             state=state,
@@ -10124,6 +11251,12 @@ class VirtualWorldEngine:
             ],
             **await self.runtime_notes(state.session_id),
         )
+        # 装了扩展（注册了提示词层的那种）就把它的那一层也带上：
+        # 她自己决定这一轮做什么的时候，得看得见扩展那几个数值。
+        if with_extension:
+            layer = self._extension_prompt(state, state.session_id)
+            if layer:
+                system_prompt = f"{system_prompt}\n\n{layer}"
         note = self.autonomous_prompt_note(state)
         prompt = (
             (f"{hint}\n\n" if hint else "")
@@ -10301,16 +11434,97 @@ class VirtualWorldEngine:
         )
         return str(fallback)
 
+    def _freeze_plan_target(
+        self,
+        state: WorldState,
+        outcome: TickOutcome,
+        plan: dict[str, Any],
+        *,
+        fallback: str,
+    ) -> str:
+        """把"这份计划要在哪儿说"当场定死，写进计划和每一步。
+
+        不定死的话，落点是**执行那一刻**按"谁在推进这一拍"算的：一个会话组里几个
+        群 / 私聊共用同一份状态，她在私聊里决定要说的话，可能被群里那一拍捡去执行，
+        说出口的地方就跟着变了（日志写着私聊、消息却出现在群里）。
+        每一步上的 ``session`` 就是执行时用的落点，``send_to`` 留给人看。
+        """
+
+        target = self._plan_target(state, outcome, plan, fallback=fallback)
+        plan["send_to"] = str(target or "")
+        for step in plan.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            raw = str(step.get("send_to") or "").strip()
+            if raw:
+                # 她自己给某一步单独写了落点（"先去群里说，再私聊告诉他"）
+                picked = self.resolve_send_to(state, raw, fallback="")
+                if not picked:
+                    outcome.notes.append(
+                        f"这一步想说到「{raw}」，但那儿不在她能说话的地方里，"
+                        "改按整份计划的落点处理"
+                    )
+                    step["send_to"] = ""
+                    picked = str(target or "")
+            else:
+                picked = str(target or "")
+            if not str(step.get("session") or "").strip():
+                step["session"] = picked
+        return str(target or "")
+
+    def talking_session(self, state: WorldState) -> str:
+        """最近别人是在哪个会话里说话的。
+
+        她想接话、想找人聊的时候，落点看这个：会话组里几个群 / 私聊共用一份状态，
+        「群里正热闹」里的"群里"是**那个真的有人在说话的会话**，不是碰巧在推进的这一拍。
+        """
+
+        for item in reversed(self.chat_window(state)):
+            if item.get("is_self"):
+                continue
+            origin = str(item.get("origin") or "")
+            if origin and self.is_enabled(origin):
+                return origin
+        return str(state.session_id)
+
+    def _plan_home_for(
+        self, state: WorldState, plan: dict[str, Any], fallback: str
+    ) -> str:
+        """这份计划没写落点时该落在哪儿。
+
+        规则决策里"她主动开口"的动机（群里热闹想接一句、孤独了想找人说话）本来就来自
+        某个人在某个会话里说的话，那就落在那个会话；其余情况留在决定它的地方。
+        """
+
+        steps = [step for step in (plan.get("steps") or []) if isinstance(step, dict)]
+        if not steps:
+            return str(fallback)
+        wants_people = any(step.get("interject") for step in steps)
+        if not wants_people and str(plan.get("source") or "") == "rule":
+            # 规则排的"去大厅找人说话"这类计划：没有 interject 标记，但同样是冲着人去的
+            wants_people = any(
+                str(step.get("action") or "") == "say" for step in steps
+            )
+        if not wants_people:
+            return str(fallback)
+        return self.talking_session(state) or str(fallback)
+
     @staticmethod
-    def _step_payload(item: PlannedAction, session: str = "") -> dict[str, Any]:
+    def _step_payload(
+        item: PlannedAction, session: str = "", kind: str = ""
+    ) -> dict[str, Any]:
         """把待执行动作转成计划里的一步。
 
         注意 ``intent`` 一定要带上：工具型动作的参数就是靠它补出来的，
         少了它这一步到点执行时只会得到「没有给出想做什么」。
+
+        ``kind`` 记的是这一步的来路（``reply`` = 当时有人在跟她说话）：
+        排队到后面才轮到时，这种话不该被"主动发言冷却"吞掉。
         """
 
         return {
             "action": item.type,
+            "kind": str(kind or ""),
             "interject": bool(item.interject),
             "messages": list(item.messages or []),
             "target": item.target,
@@ -10330,25 +11544,110 @@ class VirtualWorldEngine:
 
     @staticmethod
     def _plan_remaining_steps(
-        plan: dict[str, Any] | None, *, skip_current: bool = False
+        plan: dict[str, Any] | None,
+        *,
+        skip_current: bool = False,
+        after: int | None = None,
     ) -> list[dict[str, Any]]:
         """一份计划里还没做完的步骤。
 
         ``skip_current=True`` 用于"正在执行计划里这一步"的场景：那一步已经拿在手上了，
         再排一遍会重复执行。
+        ``after`` 直接指定从哪一步之后开始算：她自己那一步正在跑时必须用它，
+        光看 ``current_step`` 已经不准了（中途可能往队里插过新的动作）。
         """
 
         if not isinstance(plan, dict):
             return []
         steps = plan.get("steps") or []
-        index = max(0, int(plan.get("current_step", 0) or 0))
-        if skip_current:
-            index += 1
+        if after is None:
+            index = max(0, int(plan.get("current_step", 0) or 0))
+            if skip_current:
+                index += 1
+        else:
+            index = max(0, int(after) + 1)
         return [
             dict(step)
             for step in steps[index:]
             if isinstance(step, dict) and step.get("action")
         ]
+
+    def _running_plan_index(
+        self, state: WorldState, plan: dict[str, Any] | None
+    ) -> int | None:
+        """她手上正在做的那一步在这份计划里的下标。
+
+        计划中途可能被插进新的安排（``current_step`` 会指到别的地方），所以不能只看
+        下标；这里要求动作是**从这份计划**起跑的，计划号和下标都对得上才算数。
+        """
+
+        if not isinstance(plan, dict):
+            return None
+        action = state.current_action if isinstance(state.current_action, dict) else None
+        if not action or not action.get("from_plan"):
+            return None
+        recorded = action.get("plan_created_at")
+        if recorded is None:
+            return None
+        try:
+            if int(recorded) != int(plan.get("created_at") or 0):
+                return None
+            index = int(action.get("plan_index") or 0)
+        except (TypeError, ValueError):
+            return None
+        if 0 <= index < len(plan.get("steps") or []):
+            return index
+        return None
+
+    def _plan_queue_anchor(self, state: WorldState, plan: dict[str, Any]) -> int:
+        """新排的动作插在计划的第几步：她手上那一步正跑就插在它后面，否则插在当前步上。
+
+        插进去而不是"重建一份计划"，是为了让正在跑的那一步还认得出自己——
+        重建会把它的下标冲掉，等它做完时一推进就会误伤排在前面的新动作。
+        """
+
+        steps = plan.get("steps") or []
+        running = self._running_plan_index(state, plan)
+        if running is not None:
+            index = running + 1
+        else:
+            index = int(plan.get("current_step", 0) or 0)
+        return max(0, min(index, len(steps)))
+
+    def _queue_steps(
+        self,
+        state: WorldState,
+        outcome: TickOutcome,
+        rest: list[PlannedAction],
+        carried: list[dict[str, Any]],
+        *,
+        kind: str,
+        note: str,
+    ) -> None:
+        """把这一批里还没做的动作排进计划：接在她手头那一步之后，原来的安排照样保住。"""
+
+        fresh = [self._step_payload(item, outcome.home(), kind) for item in rest]
+        plan = state.current_plan if isinstance(state.current_plan, dict) else None
+        if plan is None:
+            state.current_plan = create_plan(
+                steps=fresh + carried,
+                world_time=state.world_time,
+                valid_for=self.world.limits.plan_valid_duration,
+                reason="同一轮里还没做完的动作",
+                source="pending",
+            )
+        else:
+            anchor = self._plan_queue_anchor(state, plan)
+            steps = list(plan.get("steps") or [])
+            steps[anchor:anchor] = fresh
+            plan["steps"] = steps
+            # 新排的动作有自己的有效期，别一排队就过期
+            plan["valid_until"] = max(
+                int(plan.get("valid_until") or 0),
+                int(state.world_time) + max(60, int(self.world.limits.plan_valid_duration)),
+            )
+        if note:
+            outcome.notes.append(note)
 
     async def _execute_actions(
         self,
@@ -10362,6 +11661,7 @@ class VirtualWorldEngine:
         from_plan: bool = False,
         allow_remote_travel: bool = True,
         from_schedule: bool = False,
+        skip_drowsy: bool = False,
     ) -> bool:
         """执行一串动作。返回"有没有真的执行到至少一个"。
 
@@ -10380,9 +11680,21 @@ class VirtualWorldEngine:
         # 进入这一轮之前她自己没做完的安排：这一轮要排队时接在它们前面，而不是把它们顶掉。
         # 正在执行计划里的某一步时要跳过那一步，否则它会做第二遍。
         existing_plan = active_plan(state)
-        carried = self._plan_remaining_steps(existing_plan, skip_current=from_plan)
+        # 她自己那一步还握在手上：那一步既不能再排一遍（会做两遍），
+        # 也不能算进"还没做完的步骤"里
+        running_index = self._running_plan_index(state, existing_plan)
+        if running_index is not None:
+            carried = self._plan_remaining_steps(existing_plan, after=running_index)
+        else:
+            carried = self._plan_remaining_steps(existing_plan, skip_current=from_plan)
         carried_reason = str((existing_plan or {}).get("reason") or "")
         carried_source = str((existing_plan or {}).get("source") or "")
+        # 这一批是"有人跟她说话"（被动回复）还是她自己想做什么：
+        # 排队久了以后，被动回复那几句不该被"主动发言冷却"当成刷屏吞掉
+        batch_kind = "" if autonomous else "reply"
+        # 这一批里有没有动作把她的"手头那件事"换掉：只有那种情况才需要排队——
+        # 她原来就在做的事不该拦住"说一句话"这种瞬时动作，否则对方等的是几分钟后的回话
+        started_here = False
         for index, action in enumerate(queued_actions):
             definition = self.world.action_map().get(action.type)
             if definition is None:
@@ -10474,6 +11786,7 @@ class VirtualWorldEngine:
                 self.profiles.note_proactive(
                     state.session_id, action.target, now=self._now()
                 )
+            before_action = state.current_action
             await self._start_action(
                 state,
                 node,
@@ -10483,7 +11796,29 @@ class VirtualWorldEngine:
                 depth,
                 autonomous,
                 from_plan=from_plan,
+                skip_drowsy=skip_drowsy,
             )
+            if state.current_action is not before_action:
+                # 她手头换成了这一批里的动作：后面的才需要排队等它做完
+                started_here = True
+            if state.state == STATE_DROWSY and state.drowsy_sleep_step:
+                # 这一步没真做，被揣进临睡期了：得从计划里划掉，否则醒来还会再做一遍。
+                # 同一串里排在它后面的动作接在睡觉之后，等她睡下再继续。
+                if from_plan:
+                    advance(state)
+                rest = queued_actions[index + 1 :]
+                if rest:
+                    self._queue_steps(
+                        state,
+                        outcome,
+                        rest,
+                        carried,
+                        kind=batch_kind,
+                        note=(
+                            f"她正要睡下，剩下的 {len(rest)} 个动作排在她睡下之后"
+                        ),
+                    )
+                return True
             if action.type != "walk_to" and state.pending_arrival:
                 # 走到这儿之后紧接着就有安排（同一串动作 / 计划里的下一步）：
                 # 「落地后再问一次大模型」是给"只移动、没说到了做什么"兜底的，
@@ -10495,25 +11830,31 @@ class VirtualWorldEngine:
             executed = True
             # 她开始做一个要花时间的动作时，后面的动作不能立刻抢着执行，
             # 更不能把它顶掉——转成计划，等她忙完再做。
+            #
+            # 「她本来就忙着」是另一回事：手上的事不是这一批开的，就不该拦住一句
+            # 瞬时的话（那是对方正等着的回话，排到十几分钟后就没意义了）。
             if state.current_action is not None:
                 rest = queued_actions[index + 1 :]
-                if rest:
-                    fresh = [self._step_payload(item, outcome.home()) for item in rest]
-                    state.current_plan = create_plan(
-                        steps=fresh + carried,
-                        world_time=state.world_time,
-                        valid_for=self.world.limits.plan_valid_duration,
-                        reason=carried_reason or "同一轮里还没做完的动作",
-                        source=carried_source or "pending",
+                if rest and started_here:
+                    self._queue_steps(
+                        state,
+                        outcome,
+                        rest,
+                        carried,
+                        kind=batch_kind,
+                        note="",
                     )
                     note = (
                         f"她开始「{definition.name or definition.id}」，"
-                        f"剩下的 {len(fresh)} 个动作排队等它做完"
+                        f"剩下的 {len(rest)} 个动作排队等它做完"
                     )
                     if carried:
                         note += f"；原来没做完的 {len(carried)} 步接在它们后面"
                     outcome.notes.append(note)
-                return True
+                    return True
+                if not rest:
+                    return True
+                # 剩下的是她正等着的回话：这一批里继续做掉，不排队
         return executed
 
     @staticmethod
@@ -12940,6 +14281,69 @@ class VirtualWorldEngine:
             outcome.notes.append(f"查完东西了：好奇心 -{dropped:.2f}")
         return dropped
 
+    async def desire_intimacy(self, state: WorldState, definition: ActionDef | None) -> float:
+        """这个动作算多"亲密的肢体接触"（0~1），用来满足欲求。
+
+        三层，从确定到不确定：
+
+        1. 动作自己在编辑器里写了「亲密程度」→ 直接用；
+        2. 内置对照表（`DEFAULT_INTIMACY`）里有的 → 用表里的值，不花任何调用；
+        3. **用户自己新加的动作**：交给便宜模型判一次（跟"能不能走安抚通道"共用
+           同一份判断与缓存，动作改过名字 / 说明才会重判）。
+        """
+
+        if definition is None:
+            return 0.0
+        explicit = getattr(definition, "intimacy", None)
+        if explicit is not None:
+            try:
+                return max(0.0, min(1.0, float(explicit)))
+            except (TypeError, ValueError):
+                return 0.0
+        known = action_intimacy(definition)
+        if known > 0:
+            return known
+        if str(getattr(definition, "target_type", "none") or "none") == "none":
+            return 0.0
+        await self._ensure_intimacy_traits()
+        score = self.intimacy_of(definition)
+        if score is None:
+            score = await self._classify_intimacy(state, definition)
+        try:
+            return max(0.0, min(1.0, float(score or 0.0)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    async def _satisfy_desire_from_action(
+        self,
+        state: WorldState,
+        definition: ActionDef,
+        outcome: TickOutcome | None = None,
+    ) -> float:
+        """亲近一下：抱一抱、摸摸头这种**真的碰到**的动作会满足欲求。
+
+        跟好奇心那条不一样——它不需要"查到东西"才算数：她是真把这一下做到人身上了，
+        做完就是做完了。欲求是**跟人有关**的驱力（见 WorldState.desire），
+        所以只有对着人的动作才动它，冲着空气做的动作（发呆、看书）没有影响。
+
+        返回降了多少（0 = 这一步不算亲密接触）。
+        """
+
+        if definition is None:
+            return 0.0
+        if not self.extensions.allows_desire_relief(state):
+            # 扩展说了"这回不算满足"（例如她正处在只会更想要的状态里）
+            return 0.0
+        weight = await self.desire_intimacy(state, definition)
+        if weight <= 0:
+            return 0.0
+        dropped = self.dynamics.satisfy_desire(state, weight)
+        if dropped <= 0:
+            return 0.0
+        if outcome is not None:
+            outcome.notes.append(f"亲近了一下：欲求 -{dropped:.2f}")
+        return dropped
+
     async def _call_one_tool(
         self,
         state: WorldState,
@@ -13202,9 +14606,28 @@ class VirtualWorldEngine:
         autonomous: bool,
         *,
         from_plan: bool = False,
+        skip_drowsy: bool = False,
     ) -> None:
         # 这里是所有动作真正开始执行的唯一入口（计划 / 日程 / 自主行为 / 工具后续都走这里），
         # 因此把「能不能做」的校验统一放在这里，避免某条路径绕过检查。
+        blocked = self._extension_gate(definition, state)
+        if blocked:
+            # 扩展说了不让做（例如"这个动作只能在私聊里做"）：跳过并留痕
+            outcome.notes.append(f"动作 {definition.id} 被扩展拦下：{blocked}")
+            await self._log_event(
+                state,
+                "skip",
+                {"action": definition.id, "note": f"「{definition.id}」被扩展拦下：{blocked}"},
+                outcome=outcome,
+            )
+            return
+        # 扩展想在"这件事真的做起来"时记一笔（返回的话顺口说出去）
+        try:
+            note = self.extensions.action_note(definition, state, state.session_id)
+        except Exception:
+            note = ""
+        if note:
+            outcome.add_speech(note, outcome.home())
         if not definition.available_in(state.node_id):
             outcome.notes.append(
                 f"动作 {definition.id} 在 {state.node_id} 不可用，已跳过"
@@ -13243,6 +14666,10 @@ class VirtualWorldEngine:
             )
             return
         self._count_action_use(state, definition)
+        if self._should_drowse(state, definition, skip_drowsy=skip_drowsy):
+            # 睡前先进临睡期：不立刻躺下（见 _enter_drowsy）
+            await self._enter_drowsy(state, node, outcome, definition, action, depth)
+            return
         if definition.llm_level == "tool":
             if not await self._prepare_tool_action(state, definition, action, outcome):
                 return
@@ -13278,6 +14705,11 @@ class VirtualWorldEngine:
                 "session": outcome.home(),
                 "desc": definition.name or definition.id,
             }
+            if from_plan and isinstance(state.current_plan, dict):
+                # 记下"这一步属于哪份计划的第几步"：计划中途可能被插进新的安排，
+                # 只凭下标认不出自己，做完时就可能把别人的步骤当成自己的推掉
+                payload["plan_created_at"] = int(state.current_plan.get("created_at") or 0)
+                payload["plan_index"] = int(state.current_plan.get("current_step") or 0)
             if definition.id == "walk_to":
                 target = action.target_node or action.target
                 if target in self.world.node_map():
@@ -13319,6 +14751,16 @@ class VirtualWorldEngine:
                     },
                     outcome=outcome,
                 )
+            if previous and previous.get("from_plan"):
+                # 被顶掉的那一步别再捡回来接着做：从计划里划掉，
+                # 否则新动作做完之后又会回到旧动作，看着像"同一件事做了两遍"
+                index = self._running_plan_index(state, state.current_plan)
+                if index is not None:
+                    advance(state)
+                    outcome.notes.append(
+                        f"「{previous.get('desc') or previous.get('type')}」被打断，"
+                        "计划里那一步不再接着做"
+                    )
             state.current_action = payload
             state.add_event("action_start", {"type": definition.id})
             await self._log_event(
@@ -13462,6 +14904,11 @@ class VirtualWorldEngine:
         self.dynamics.apply_effects(
             state, definition.on_complete.effects, world=self.world, now=self._now()
         )
+        # 她主动贴过来这一下：低落时也算一次安抚（不占当天聊天额度）
+        await self._maybe_soothe_from_action(state, definition, outcome=outcome)
+        # 瞬时动作也走这条完成路径（`_finish_action` 是持续 / 工具动作那条），
+        # 所以"亲近一下满足欲求"两边都要接上
+        await self._satisfy_desire_from_action(state, definition, outcome)
         state.add_event("action", {"type": definition.id, "visible": definition.visible})
         await self._log_event(
             state,
@@ -13801,7 +15248,11 @@ class VirtualWorldEngine:
                     state, self.node(state.node_id), outcome, definition, action, depth, True
                 )
                 rest = chain[index + 1 :]
-                if rest and state.current_action is not None:
+                if rest and (
+                    state.current_action is not None or state.state == STATE_DROWSY
+                ):
+                    # 临睡期也算"手上这件事没做完"：日程后面那几步要等她睡下再继续，
+                    # 不能因为还没真躺下就把它们丢掉。
                     remaining = [
                         {
                             "action": str(getattr(item, "type", "") or ""),
@@ -14182,7 +15633,15 @@ class VirtualWorldEngine:
     ) -> dict[str, float]:
         """手改她的数值（编辑器「实时状态」用）：只认已知字段，自动夹到 0~1，并记一条日志。"""
 
-        allowed = ("energy", "loneliness", "curiosity", "affect", "valence", "boredom")
+        allowed = (
+            "energy",
+            "loneliness",
+            "curiosity",
+            "affect",
+            "valence",
+            "boredom",
+            "desire",
+        )
         applied: dict[str, float] = {}
         async with self.session_state(session_id) as state:
             for key, value in (values or {}).items():
@@ -14428,7 +15887,13 @@ class VirtualWorldEngine:
         if not self.is_enabled(session_id):
             return False
         async with self.session_state(session_id) as state:
-            was_sleeping = state.is_sleeping
+            # 临睡期被叫醒 = "别睡了，再陪我一会儿"：把揣着的那一步睡觉丢掉
+            was_sleeping = state.is_sleeping or state.state == STATE_DROWSY
+            if state.state == STATE_DROWSY:
+                state.drowsy_sleep_step = {}
+                state.drowsy_started_world_time = 0
+                state.drowsy_started_at = 0.0
+                state.state = STATE_IDLE
             self._wake_up_state(
                 state, MessageContext(session_id=session_id, user_name="你", text="")
             )
@@ -15504,15 +16969,23 @@ class VirtualWorldEngine:
         # 事件里的发言（求助 / 事件结果）不算"她主动找人聊天"：
         # 不走无人回应保护，也不会把她的冷却期拖长。
         is_event_speech = str(outcome.speech_kind or "") == "event"
+        # 排在后面的回话（当时有人跟她说话，她在忙，轮到她时才说）同样不算"主动开口"：
+        # 被"主动发言冷却"吞掉的话，对方再也等不到那句回应，而计划上却记成"已经说过了"
+        is_reply_speech = str(outcome.speech_kind or "") == "reply"
         # 已经即时发出去的几句挡不回来：这一轮不能再看冷却，否则群里会"说了一句就没下文"，
         # 那句即时发言也不进聊天记录（下一轮她就不知道自己刚说过）
         spoke_live = bool(outcome.live_messages)
-        if not is_event_speech and not spoke_live and not self.engagement.can_speak(state):
+        if (
+            not is_event_speech
+            and not is_reply_speech
+            and not spoke_live
+            and not self.engagement.can_speak(state)
+        ):
             outcome.notes.append("冷却期内不发送")
             return
         async with self.session_state(outcome.session_id) as state:
             if said or images or routed or routed_images:
-                if not is_event_speech:
+                if not is_event_speech and not is_reply_speech:
                     self.engagement.on_bot_spoke(state)
                 await self._log_event(
                     state,
@@ -15744,6 +17217,22 @@ class VirtualWorldEngine:
             "node_name": node.name if node else "",
             "state": state.state,
             "mood": state.mood,
+            # 今天的基调（每天掷一次）：只调各条曲线的快慢，界面上说清是哪一种
+            "day_mood": {
+                "id": str(state.day_mood or ""),
+                "label": (
+                    day_mood_info(state.day_mood).label
+                    if day_mood_info(state.day_mood) is not None
+                    else ""
+                ),
+                "hint": (
+                    day_mood_info(state.day_mood).hint
+                    if day_mood_info(state.day_mood) is not None
+                    else ""
+                ),
+                "day": str(state.day_mood_day or ""),
+                "enabled": bool(getattr(self.world.state_dynamics, "daily_mood_enabled", True)),
+            },
             "values": self.dynamics.values(state),
             # 情绪两轴的派生结果：心情词、正在气头上的标记、这一轮的表达格
             "storm": bool(state.storm),
@@ -15895,6 +17384,8 @@ class VirtualWorldEngine:
             "user_presence_total": len(state.user_presence),
             # 「她想找谁」：想念值 / 冷却中的冷却时间 / 今天的主动额度
             "miss": self.miss_overview(state),
+            # 「想被碰一碰」：欲求值、触发线、今天还能推几次（和想念并排显示）
+            "desire": self.desire_panel(state),
             # 从当前位置能直达哪里、各需要多少 tick（给编辑器和调试看）
             "travel": [
                 {
@@ -15922,19 +17413,22 @@ class VirtualWorldEngine:
             node_id=state.node_id,
             limit=self.world.limits.max_think_memory,
         )
-        return self.prompts.build_injection(
+        text = self.prompts.build_injection(
             state,
             node=node,
             memories=memories,
             engagement_hint=self.engagement.hint(state),
             recent_chat=self.chat_window(state),
-            # 预览要和实跑一致：带上通讯录和"这条来自哪儿"
+            # 预览要和实跑一致：带上通讯录和"这条来自哪儿"、以及扩展要藏的 / 要加的
             current_session=session_id,
             session_labels=self.session_labels(state),
             profile_text=self.profile_block(state),
             samples=self.voice_sample_lines(state, session_id, preview=True),
+            hidden_actions=self._hidden_actions(state, session_id),
             **await self.runtime_notes(state.session_id),
         )
+        layer = self._extension_prompt(state, session_id)
+        return f"{text}\n\n{layer}" if layer else text
 
     async def overview(self) -> list[dict[str, Any]]:
         """所有启用会话的简要状态：编辑器地图页一次看全"谁在哪"。"""
@@ -15989,6 +17483,9 @@ class VirtualWorldEngine:
             profile_text=self.profile_block(state),
             # 声音样例也要一致：预览里看不到，用户就没法确认挑中的那几句到底进没进
             samples=self.voice_sample_lines(state, session_id, preview=True),
+            # 预览要跟实跑一致：有扩展声明要"他碰了她哪儿"时，这里也得带上那个字段
+            wants_touch=self.extensions.wants("touch"),
+            json_fields=self.extensions.json_fields(),
             # 预览要跟实跑一致：实跑会带上「好奇心」那一段，这里也要带
             extra_notes=[
                 note for note in [self.extra_reminders(state, autonomy=True)] if note

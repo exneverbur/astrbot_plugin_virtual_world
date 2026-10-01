@@ -40,6 +40,9 @@ def create_plan(
         normalized.append(
             {
                 "action": action,
+                # 这一步的来路（``reply`` = 排它的时候正有人在跟她说话）：
+                # 轮到她做的时候要靠它判断"这算回话还是她主动开口"
+                "kind": str(step.get("kind", "") or ""),
                 "target_node": str(step.get("target_node", "") or ""),
                 "target": str(step.get("target", "") or ""),
                 "duration": int(step.get("duration", 0) or 0),

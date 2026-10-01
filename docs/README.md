@@ -13,7 +13,7 @@
 | 文档 | 讲什么 |
 | --- | --- |
 | [快速上手](../README.md#快速开始) | 装插件、加会话、跑设置向导，五分钟能对话 |
-| [网页编辑器](getting-started.md#网页编辑器) | 状态 / 地图 / 动作库 / 日程 / 会话 / 通讯录 / 记忆库 / 日志 / 预设 / 全局设置 / 调试，11 个页签各管什么 |
+| [网页编辑器](getting-started.md#网页编辑器) | 左侧导航 12 页各管什么：控制台 / 事件 / 通讯录 / 记忆库 / 日志 / 调试 / 地图 / 动作库 / 日程 / 会话 / 全局设置 / 预设 |
 | [设置向导与手感滑块](getting-started.md#设置向导与手感滑块) | 向导的六步、8 个滑块各管什么、三条规矩 |
 | [插件配置](getting-started.md#插件配置) | 全局设置里每一项的作用与默认值 |
 | [默认世界](getting-started.md#默认世界) | 开局自带的区域、地点、动作和日程 |
@@ -121,11 +121,12 @@
 
 | 页面 | 截图 |
 | --- | --- |
-| 实时状态 | [status.png](images/status.png) |
-| 她遇上什么事（能力值与事件） | [events.png](images/events.png) |
+| 控制台（人物面板 + 当前状态） | [status.png](images/status.png) |
+| 事件（现在这件事 / 她的本事 / 最近的线索） | [events.png](images/events.png) |
 | 世界地图 | [world_map.png](images/world_map.png) |
 | 区域地图与地点氛围 | [region_map.png](images/region_map.png) |
 | 动作库 | [actions.png](images/actions.png) |
+| 动作库 · 表格视图（动作多了用它核对） | [actions-table.png](images/actions-table.png) |
 | 动作属性（编辑一个动作） | [action_edit.png](images/action_edit.png) |
 | 日程 | [schedules.png](images/schedules.png) |
 | 通讯录 | [contacts.png](images/contacts.png) |

@@ -222,6 +222,28 @@ class ParseResult:
     它反正要看这一整句话，多输出一个词不花钱。
     """
 
+    addressing: str = ""
+    """这一句**是在跟谁说话**：``me``（对她说）/ ``others``（在跟别人说）/
+    ``unclear``（看不出来）／空 = 没判。
+
+    群里一句「你倒是说啊」不写清是在问谁，很容易被她当成在问自己。
+    """
+
+    touch: list[str] = field(default_factory=list)
+    """他这一轮**碰到她身上哪儿**（模型写的自由文本，例如 ``["腰", "耳后"]``）。
+
+    只有扩展声明要这项（``ExtensionSpec.wants``）时提示词里才会要求模型填，
+    没人要就永远是空列表——主插件自己不解释、不用它做任何事，
+    只是原样转给声明了的扩展。
+    """
+
+    extra: dict[str, Any] = field(default_factory=dict)
+    """扩展**自己声明**的那些字段（``ExtensionSpec.json_fields``）。
+
+    主插件不认识它们是什么，只按扩展声明的形状收拾干净（截断 / 去重 / 限长）再转交。
+    没人声明时这里永远是空的，主插件的提示词里也不会多一个字。
+    """
+
     valence_delta: float = 0.0
     """这一轮的心情变化（模型给的 -1~1，正=变好、负=变差）。缺失当 0。"""
 
@@ -381,6 +403,7 @@ def parse_action_payload(
     valid_targets: set[str] | None = None,
     max_actions: int = 3,
     max_messages: int = 3,
+    json_fields: Any = (),
 ) -> ParseResult:
     """把模型输出解析成动作列表。
 
@@ -390,6 +413,9 @@ def parse_action_payload(
     - target_node 不存在 -> 丢弃该动作；
     - messages 超限 -> 截断；
     - 工具型动作缺 params -> 丢弃。
+
+    ``json_fields``：扩展声明要主模型额外标出来的字段（``ExtensionSpec.json_fields``），
+    按声明的形状解析进 :attr:`ParseResult.extra`；不传就是空字典。
     """
 
     warnings: list[str] = []
@@ -544,14 +570,173 @@ def parse_action_payload(
         own_topic=_clean_note(payload.get("own_topic")),
         own_topic_done=_as_bool(payload.get("own_topic_done")),
         tone=_parse_tone(payload.get("tone")),
+        addressing=_parse_addressing(payload.get("addressing")),
+        touch=_parse_touch(payload.get("touch")),
+        extra=_parse_extra_fields(payload, json_fields),
         valence_delta=_parse_valence_delta(payload.get("valence_delta")),
         affinity_delta=_parse_affinity_delta(payload.get("affinity_delta")),
         tail=_json_tail(cleaned_text),
     )
 
 
-TONES = ("praise", "hug", "attack", "normal")
-"""对方口吻的合法取值。``normal`` 与空字符串都表示"不加情绪脉冲"。"""
+TONES = ("praise", "hug", "comfort", "attack", "refuse", "normal")
+"""对方口吻的合法取值。``normal`` 与空字符串都表示"不加情绪脉冲"。
+
+``refuse`` 是他**明确叫停 / 拒绝**（他说了停、不要、别这样）：它不产生情绪脉冲，
+但会被别的层读到——挂了扩展时，扩展据此收手并记下"这件事他不要"。
+"""
+
+ADDRESSING = ("me", "others", "unclear")
+"""「这句是在跟谁说话」的合法取值。"""
+
+
+def _parse_touch(value: Any) -> list[str]:
+    """模型标的"他碰了她哪儿"：只收短名词，去重保序，最多 5 个。
+
+    主插件**不解释**这些词——原样交给声明要它的扩展（谁要谁自己认）。
+    """
+
+    items: list[Any]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        items = re.split(r"[、,，/\s]+", text)
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        return []
+    picked: list[str] = []
+    for item in items:
+        body = " ".join(str(item or "").split())[:12]
+        if body and body not in picked:
+            picked.append(body)
+    return picked[:5]
+
+
+_BUILTIN_JSON_KEYS = frozenset(
+    {
+        "reasoning",
+        "memory",
+        "chat_note",
+        "open_topic",
+        "heart_knot",
+        "grudge",
+        "forgive",
+        "own_topic",
+        "own_topic_done",
+        "tone",
+        "addressing",
+        "touch",
+        "valence_delta",
+        "affinity_delta",
+        "actions",
+        "cancel",
+        "plan_mode",
+    }
+)
+"""主插件自己那套键名：扩展声明里写了它们也一律跳过（那是协议的地盘）。"""
+
+
+def _field_declaration(raw: Any) -> dict[str, Any]:
+    """声明写成 dict 或 :class:`JsonField` 都认，统一成 dict。"""
+
+    if isinstance(raw, dict):
+        return dict(raw)
+    return {
+        "name": getattr(raw, "name", ""),
+        "kind": getattr(raw, "kind", "list"),
+        "max_items": getattr(raw, "max_items", 5),
+        "max_chars": getattr(raw, "max_chars", 24),
+    }
+
+
+def _to_float_or_none(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return max(-1_000_000.0, min(1_000_000.0, number))
+
+
+def _parse_extra_fields(payload: dict[str, Any], fields: Any) -> dict[str, Any]:
+    """按扩展声明的形状收拾"主模型额外标出来的字段"。
+
+    声明长这样：``{"name": "arousal", "kind": "list|str|num|bool",
+    "max_items": 5, "max_chars": 24}``（:class:`JsonField` 也认）。
+
+    主插件不猜扩展想要什么——声明认不出来、或者模型没写这个键，就当作没这一项。
+    """
+
+    picked: dict[str, Any] = {}
+    for raw in tuple(fields or ()):
+        data = _field_declaration(raw)
+        name = " ".join(str(data.get("name") or "").split())
+        if not name or name in _BUILTIN_JSON_KEYS or name not in payload:
+            continue
+        value = payload.get(name)
+        if value is None:
+            continue
+        kind = str(data.get("kind") or "list").strip().lower()
+        # 列表型每一项最多 24 个字；字符串型整段最多 60 个字
+        hard_chars = 60 if kind == "str" else 24
+        try:
+            limit_chars = max(1, min(hard_chars, int(data.get("max_chars") or hard_chars)))
+        except (TypeError, ValueError):
+            limit_chars = hard_chars
+        try:
+            limit_items = max(1, min(5, int(data.get("max_items") or 5)))
+        except (TypeError, ValueError):
+            limit_items = 5
+        if kind == "list":
+            items: list[Any]
+            if isinstance(value, str):
+                items = re.split(r"[、,，/\s]+", value.strip()) if value.strip() else []
+            elif isinstance(value, (list, tuple, set)):
+                items = list(value)
+            else:
+                continue
+            words: list[str] = []
+            for item in items:
+                body = " ".join(str(item or "").split())[:limit_chars]
+                if body and body not in words:
+                    words.append(body)
+            if words:
+                picked[name] = words[:limit_items]
+        elif kind == "num":
+            number = _to_float_or_none(value)
+            if number is not None:
+                picked[name] = number
+        elif kind == "bool":
+            picked[name] = _as_bool(value)
+        else:
+            text = " ".join(str(value or "").split())[:limit_chars]
+            if text:
+                picked[name] = text
+    return picked
+
+
+def _parse_addressing(value: Any) -> str:
+    """模型判的"在跟谁说话"：只认白名单，其余当没判。"""
+
+    text = str(value or "").strip().lower()
+    aliases = {
+        "我": "me",
+        "对我说": "me",
+        "对我": "me",
+        "自己": "me",
+        "别人": "others",
+        "对别人": "others",
+        "他人": "others",
+        "别人说的": "others",
+        "不确定": "unclear",
+        "看不清": "unclear",
+        "未知": "unclear",
+    }
+    text = aliases.get(text, text)
+    return text if text in ADDRESSING else ""
 
 
 def _parse_tone(value: Any) -> str:
@@ -563,9 +748,19 @@ def _parse_tone(value: Any) -> str:
         "夸": "praise",
         "亲昵": "hug",
         "哄": "hug",
+        "安慰": "comfort",
+        "理解": "comfort",
+        "共情": "comfort",
         "怼": "attack",
         "阴阳": "attack",
         "攻击": "attack",
+        "拒绝": "refuse",
+        "明确拒绝": "refuse",
+        "叫停": "refuse",
+        "喊停": "refuse",
+        "制止": "refuse",
+        "不要": "refuse",
+        "停": "refuse",
         "普通": "normal",
     }
     text = aliases.get(text, text)

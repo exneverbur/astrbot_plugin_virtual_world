@@ -1,10 +1,23 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="light">
+<html lang="zh-CN" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>虚拟世界编辑器</title>
     <link rel="stylesheet" href="./style.css" />
+    <!-- 主题在解析样式前就定下来，避免刷新时先闪一下浅色 -->
+    <script>
+      (function () {
+        try {
+          var saved = window.localStorage.getItem("vw-theme");
+          if (saved === "light" || saved === "dark") {
+            document.documentElement.dataset.theme = saved;
+          }
+        } catch (error) {
+          /* 隐私模式下读不到缓存，用默认主题 */
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="login" class="login hidden">
@@ -18,48 +31,60 @@
     </div>
 
     <div id="app" class="app hidden">
-      <header class="topbar">
+      <aside class="sidebar">
         <div class="brand">
           <span class="dot"></span>
-          <span>虚拟世界编辑器</span>
+          <span class="brand-name">虚拟世界编辑器</span>
         </div>
         <nav id="tabs" class="tabs">
-          <button data-tab="status" class="active">实时状态</button>
+          <span class="nav-group">观察</span>
+          <button data-tab="status" class="active">控制台</button>
+          <button data-tab="events">事件</button>
+          <button data-tab="contacts">通讯录</button>
+          <button data-tab="memories">记忆库</button>
+          <button data-tab="logs">日志</button>
+          <button data-tab="debug">调试</button>
+          <span class="nav-group">编辑</span>
           <button data-tab="map">地图</button>
           <button data-tab="actions">动作库</button>
           <button data-tab="schedules">日程</button>
           <button data-tab="sessions">会话</button>
-          <button data-tab="contacts">通讯录</button>
-          <button data-tab="memories">记忆库</button>
-          <button data-tab="logs">日志</button>
+          <span class="nav-group">配置</span>
           <button data-tab="settings">全局设置</button>
           <button data-tab="presets">预设</button>
-          <button data-tab="debug">调试</button>
         </nav>
-        <div class="topbar-right">
-          <span id="save-state" class="muted"></span>
-          <button id="save" class="primary">保存</button>
+        <div class="sidebar-foot">
+          <span class="muted sidebar-note">v2 · 本地编辑器</span>
         </div>
-      </header>
+      </aside>
 
-      <main>
-        <!-- 实时状态 -->
+      <div class="content">
+        <header class="topbar">
+          <div class="topbar-left">
+            <span id="page-title" class="page-title">控制台</span>
+            <label class="field field-session">
+              <span>会话</span>
+              <select id="status-session"></select>
+            </label>
+          </div>
+          <div class="topbar-right">
+            <span id="save-state" class="muted"></span>
+            <button id="theme-toggle" class="ghost" title="切换深色 / 浅色主题（记住选择）">🌙 深色</button>
+            <button id="save" class="primary">保存</button>
+          </div>
+        </header>
+
+        <main>
+        <!-- 控制台：人物面板 + 当前状态 -->
         <section id="tab-status" class="tab active">
           <div class="page-head">
             <div class="page-head-left">
-              <label class="field">
-                <span>会话</span>
-                <select id="status-session"></select>
-              </label>
               <div class="toolbar">
                 <button id="status-refresh" class="ghost">刷新</button>
                 <button id="state-tick" class="ghost" title="手动推进 1 个 tick">推进 tick</button>
                 <button id="state-decide" class="ghost">触发决策</button>
                 <button id="state-interrupt" class="ghost">打断动作</button>
                 <button id="state-wake" class="ghost">叫醒</button>
-                <button id="state-clear-context" class="danger" title="清空这个会话的群聊留档与摘要">
-                  清空上下文
-                </button>
               </div>
             </div>
             <div class="page-head-right">
@@ -73,13 +98,29 @@
                 <button id="status-nickname-toggle" class="ghost">锁定</button>
                 <button id="status-nickname-reset" class="ghost" title="改回她原来的群名片">恢复原名</button>
               </div>
+              <div class="toolbar toolbar-danger">
+                <button id="state-clear-context" class="danger" title="清空这个会话的群聊留档与摘要">
+                  清空上下文
+                </button>
+              </div>
             </div>
           </div>
 
           <div class="dash">
             <div class="dash-col">
-              <div class="card">
-                <h2>当前状态</h2>
+              <!-- 人物面板：一眼看清她是谁、在哪、在做什么 -->
+              <div class="card hero-card">
+                <div class="hero-top">
+                  <div class="hero-avatar" id="hero-avatar" data-keep-text>她</div>
+                  <div class="hero-ident">
+                    <div class="hero-name" id="hero-name" data-keep-text>（还没选会话）</div>
+                    <div class="hero-sub muted" id="hero-sub" data-keep-text></div>
+                  </div>
+                  <div class="hero-actions">
+                    <button id="hero-goto-events" class="ghost small" title="去事件页看她遇上什么事">事件页 →</button>
+                  </div>
+                </div>
+                <div class="hero-kpis" id="hero-kpis" data-keep-text></div>
                 <div id="status-banner" class="banner hidden" data-keep-text></div>
                 <div id="status-head" class="status-head" data-keep-text></div>
                 <div class="status-card" data-keep-text>
@@ -97,11 +138,6 @@
                   </section>
                 </div>
                 <div id="status-warn"></div>
-              </div>
-
-              <div class="card">
-                <h2>事件日志</h2>
-                <pre id="status-logs" class="pre tall" data-keep-text></pre>
               </div>
             </div>
 
@@ -141,27 +177,41 @@
               </div>
             </div>
           </div>
+        </section>
+
+        <!-- 事件：投递、当前这件事、她的本事、最近的线索 -->
+        <section id="tab-events" class="tab">
+          <div class="page-head">
+            <div class="page-head-left">
+              <div class="toolbar">
+                <button id="event-refresh" class="ghost">刷新</button>
+              </div>
+            </div>
+            <div class="page-head-right">
+              <label class="field grow">
+                <span>给她安排一件事</span>
+                <input id="event-seed" placeholder="例如：出门忘了带伞" />
+              </label>
+              <div class="toolbar">
+                <button id="event-submit" class="primary">投递事件</button>
+              </div>
+            </div>
+          </div>
 
           <div class="card">
             <h2 class="values-head">
-              <span>她遇上什么事</span>
+              <span>现在这件事</span>
               <span class="row-item">
-                <input id="event-seed" placeholder="给她安排一件事，例如：出门忘了带伞" />
-                <button id="event-submit" class="ghost">投递事件</button>
-                <button id="event-refresh" class="ghost">刷新</button>
+                <span id="event-current-badge" class="pane-badge"></span>
               </span>
             </h2>
             <div class="event-panel">
+              <div class="event-pane current">
+                <div id="event-current" class="event-current" data-keep-text></div>
+              </div>
               <div class="event-pane">
                 <div class="pane-label">她的本事</div>
                 <div id="status-abilities" class="radar-wrap"></div>
-              </div>
-              <div class="event-pane current">
-                <div class="pane-label">
-                  <span>现在这件事</span>
-                  <span id="event-current-badge" class="pane-badge"></span>
-                </div>
-                <div id="event-current" class="event-current" data-keep-text></div>
               </div>
             </div>
             <div class="event-recent-head">
@@ -190,13 +240,22 @@
                 <button id="zone-delete" class="danger">删除选中区域</button>
                 <button id="zone-edge-add" class="ghost">区域连线…</button>
                 <button id="zone-enter" class="ghost">进入区域 →</button>
-                <button id="map-json" class="ghost" title="直接编辑地图结构的 JSON，方便批量导入导出">编辑 JSON</button>
+                <button id="map-fit" class="ghost" title="把所有区域挪到画布中间，方便一眼看全">适应画布</button>
+                <details class="adv-menu">
+                  <summary title="给会用的人准备的：批量导入导出、直接改结构">高级</summary>
+                  <div class="adv-menu-body">
+                    <button id="map-json" class="ghost" title="直接编辑地图结构的 JSON，方便批量导入导出">
+                      编辑地图 JSON…
+                    </button>
+                  </div>
+                </details>
               </div>
               <div class="row wrap hidden" id="toolbar-zone">
                 <button id="node-add" class="primary">新增节点</button>
                 <button id="node-delete" class="danger">删除选中</button>
                 <button id="edge-add" class="ghost">连线到…</button>
                 <button id="portal-add" class="ghost">连到其他区域…</button>
+                <button id="map-fit-zone" class="ghost" title="把这个区域里的地点挪到画布中间">适应画布</button>
                 <label class="field">
                   <span>查看会话</span>
                   <select id="map-session"></select>
@@ -239,23 +298,55 @@
                 <span>搜索</span>
                 <input id="action-search" placeholder="搜索动作（名称 / id / 说明 / 工具）" />
               </label>
-              <label class="field">
-                <span>分组</span>
-                <select id="action-filter"></select>
-              </label>
             </div>
             <div class="page-head-right">
               <span class="muted" id="action-count"></span>
+              <div class="toolbar view-switch">
+                <button id="action-view-cards" class="pill on" type="button" title="按卡片看，适合挑动作">卡片</button>
+                <button id="action-view-table" class="pill" type="button" title="按表格看，适合批量核对">表格</button>
+              </div>
               <div class="toolbar">
-                <button id="action-json" class="ghost" title="直接编辑动作的 JSON，方便批量导入导出">编辑 JSON</button>
+                <details class="adv-menu">
+                  <summary title="给会用的人准备的：批量导入导出、直接改结构">高级</summary>
+                  <div class="adv-menu-body">
+                    <button id="action-json" class="ghost" title="直接编辑动作的 JSON，方便批量导入导出">
+                      编辑动作 JSON…
+                    </button>
+                  </div>
+                </details>
               </div>
             </div>
           </div>
           <p class="hint-line">
-            点卡片打开右侧抽屉编辑；卡片右下角的图标分别是复制 / 编辑 / 删除，左上角的开关可以停用动作
+            左边按组筛：上半是原版动作，下半是各扩展带来的动作。点卡片打开右侧抽屉编辑；
+            卡片右下角的图标分别是复制 / 编辑 / 删除，左上角的开关可以停用动作
             （停用等于她根本没有这个动作）。
           </p>
-          <div id="action-grid" class="action-grid" data-keep-text></div>
+          <div class="action-layout">
+            <aside class="card action-menu">
+              <h2>分组</h2>
+              <div id="action-menu" class="action-menu-list" data-keep-text></div>
+            </aside>
+            <div class="action-main">
+              <div id="action-grid" class="action-grid" data-keep-text></div>
+              <div id="action-table-wrap" class="table-wrap hidden">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>动作</th>
+                      <th>类别</th>
+                      <th>范围</th>
+                      <th>时长</th>
+                      <th>工具</th>
+                      <th>状态</th>
+                      <th class="col-actions">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="action-table-body" data-keep-text></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
         </section>
 
         <!-- 动作编辑抽屉 -->
@@ -363,33 +454,31 @@
               </label>
               <div class="toolbar">
                 <button id="session-add" class="primary">添加会话</button>
-              </div>
-            </div>
-            <div class="page-head-right">
-              <span class="muted">只有白名单里的会话才会启用虚拟世界</span>
-            </div>
-          </div>
-          <div class="card">
-            <h2>白名单</h2>
-          <div id="session-list" class="list" data-keep-text></div>
-          </div>
-          <div class="page-head">
-            <div class="page-head-left">
-              <div class="toolbar">
                 <button id="group-add" class="ghost">新增会话组</button>
               </div>
             </div>
             <div class="page-head-right">
-              <span class="muted">几个群 / 私聊算同一个她</span>
+              <span class="muted">只有白名单里的会话才会启用虚拟世界；同一组的群 / 私聊是同一个她</span>
             </div>
           </div>
-          <p class="hint-line">
-            同一组里的群 / 私聊是同一个她：位置、数值、计划、事件、记忆与聊天上下文
-            都只有一份；回别人的话在哪儿被问就在哪儿答，主动开口的落点由她自己挑。
-          </p>
           <div class="card">
-            <h2>会话组</h2>
-          <div id="group-list" class="list" data-keep-text></div>
+            <div class="seg" id="session-seg">
+              <button class="seg-item on" data-seg="sessions" type="button">白名单</button>
+              <button class="seg-item" data-seg="groups" type="button">会话组</button>
+            </div>
+            <div id="session-pane" class="seg-pane">
+              <p class="hint-line">
+                这里列出会被虚拟世界接管的群与私聊：启用状态、冷启动模式与备注都能直接改。
+              </p>
+              <div id="session-list" class="list" data-keep-text></div>
+            </div>
+            <div id="group-pane" class="seg-pane hidden">
+              <p class="hint-line">
+                同一组里的群 / 私聊是同一个她：位置、数值、计划、事件、记忆与聊天上下文
+                都只有一份；回别人的话在哪儿被问就在哪儿答，主动开口的落点由她自己挑。
+              </p>
+              <div id="group-list" class="list" data-keep-text></div>
+            </div>
           </div>
         </section>
 
@@ -402,38 +491,41 @@
                 <select id="memory-session"></select>
               </label>
               <label class="field">
-                <span>节点</span>
-                <select id="memory-node"></select>
-              </label>
-              <label class="field">
-                <span>类型</span>
-                <select id="memory-type">
-                  <option value="">全部</option>
-                  <option value="scene">场景</option>
-                  <option value="relation">关系</option>
-                  <option value="event">事件</option>
-                  <option value="inner">内心</option>
-                  <option value="interaction">互动</option>
-                </select>
-              </label>
-              <label class="field">
-                <span>作用域</span>
-                <select id="memory-scope">
-                  <option value="">全部</option>
-                  <option value="group">群</option>
-                  <option value="persona">人格</option>
-                  <option value="group_persona">群+人格</option>
-                  <option value="global">全局</option>
-                  <option value="node">节点</option>
-                </select>
-              </label>
-              <label class="field">
                 <span>关键词</span>
                 <input id="memory-keyword" placeholder="搜索内容" />
               </label>
+              <div class="filter-extra hidden">
+                <label class="field">
+                  <span>节点</span>
+                  <select id="memory-node"></select>
+                </label>
+                <label class="field">
+                  <span>类型</span>
+                  <select id="memory-type">
+                    <option value="">全部</option>
+                    <option value="scene">场景</option>
+                    <option value="relation">关系</option>
+                    <option value="event">事件</option>
+                    <option value="inner">内心</option>
+                    <option value="interaction">互动</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>作用域</span>
+                  <select id="memory-scope">
+                    <option value="">全部</option>
+                    <option value="group">群</option>
+                    <option value="persona">人格</option>
+                    <option value="group_persona">群+人格</option>
+                    <option value="global">全局</option>
+                    <option value="node">节点</option>
+                  </select>
+                </label>
+              </div>
             </div>
             <div class="page-head-right">
               <div class="toolbar">
+                <button id="memory-filter-toggle" class="ghost filter-toggle" type="button">更多筛选 ▾</button>
                 <button id="memory-search" class="ghost">筛选</button>
                 <button id="memory-add" class="primary">新增记忆</button>
               </div>
@@ -465,18 +557,25 @@
                 <span>关键词</span>
                 <input id="log-keyword" placeholder="搜内容，例如 做饭 / 孤独 / 搜索" />
               </label>
-              <label class="field">
-                <span>条数</span>
-                <select id="log-limit">
-                  <option value="100">100</option>
-                  <option value="200" selected>200</option>
-                  <option value="500">500</option>
-                  <option value="1000">1000</option>
-                </select>
-              </label>
+              <div class="filter-extra hidden">
+                <label class="field">
+                  <span>类型</span>
+                  <select id="log-type"></select>
+                </label>
+                <label class="field">
+                  <span>条数</span>
+                  <select id="log-limit">
+                    <option value="100">100</option>
+                    <option value="200" selected>200</option>
+                    <option value="500">500</option>
+                    <option value="1000">1000</option>
+                  </select>
+                </label>
+              </div>
             </div>
             <div class="page-head-right">
               <div class="toolbar">
+                <button id="log-filter-toggle" class="ghost filter-toggle" type="button">更多筛选 ▾</button>
                 <button id="log-refresh" class="ghost">刷新</button>
                 <label class="inline"><input id="log-auto" type="checkbox" /><span>自动刷新</span></label>
               </div>
@@ -497,8 +596,16 @@
             </div>
             <div class="card side">
               <h2>事件详情</h2>
-              <pre id="log-detail" class="pre tall" data-keep-text>（点左边任意一条查看原始数据）</pre>
+              <div id="log-detail" class="log-detail" data-keep-text>
+                <p class="muted">点左边任意一条，这里会用人话讲清发生了什么。</p>
+              </div>
             </div>
+          </div>
+          <div class="card">
+            <details class="collapse">
+              <summary>实时事件流（最近 60 条原始记录）</summary>
+              <pre id="status-logs" class="pre tall" data-keep-text></pre>
+            </details>
           </div>
         </section>
 
@@ -540,9 +647,14 @@
               <div class="toolbar">
                 <button id="preset-save" class="primary">把当前配置存成预设</button>
                 <button id="preset-new-default" class="ghost">新建默认预设</button>
-                <button id="preset-import" class="ghost">粘贴 JSON 导入…</button>
                 <button id="preset-refresh" class="ghost">刷新</button>
                 <button id="history-open" class="ghost">改动历史</button>
+                <details class="adv-menu">
+                  <summary title="给会用的人准备的：从一段 JSON 建预设">高级</summary>
+                  <div class="adv-menu-body">
+                    <button id="preset-import" class="ghost">粘贴 JSON 导入…</button>
+                  </div>
+                </details>
               </div>
             </div>
           </div>
@@ -573,8 +685,15 @@
             </div>
           </div>
           <div class="card">
-            <h2>预览输出</h2>
-            <pre id="debug-output" class="pre tall" data-keep-text></pre>
+            <h2 class="values-head">
+              <span>预览输出</span>
+              <span class="row-item">
+                <span class="muted" id="debug-summary"></span>
+                <button id="debug-copy" class="ghost small" type="button">复制全文</button>
+                <button id="debug-expand" class="ghost small" type="button">全部展开</button>
+              </span>
+            </h2>
+            <div id="debug-output" class="debug-output" data-keep-text></div>
           </div>
           <div class="card">
             <h2>AstrBot 已注册工具</h2>
@@ -716,6 +835,7 @@
       </div>
 
       <div id="toast" class="toast hidden"></div>
+      </div>
     </div>
 
     <script type="module" src="./app.js"></script>

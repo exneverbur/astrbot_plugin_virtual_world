@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from .models import WorldConfig
+from .mood import DAY_BRANCH_KEYS, day_mood_branches
 from .pathfinding import find_path
 from .planner import active_plan, create_plan
 from .state import WorldState
@@ -49,6 +50,12 @@ SELF_CARE_IDLE = 0.3
 # 好奇心触发的"去查点东西"两次之间至少隔这么久：查一次只降一点点好奇心，
 # 不设冷却的话她会每隔几分钟就查同一件事，群里看到的就是她在刷新闻。
 SEARCH_COOLDOWN_MINUTES = 45
+
+DESIRE_HUNGRY = 0.7
+"""欲求过了这条线，她会更愿意往有人那边凑（"找人"这条分支权重抬高）。"""
+
+DESIRE_CUDDLE = 0.7
+"""欲求过了这条线，她甚至会主动凑过去要贴贴（挑一个"肢体接触"的动作做）。"""
 
 # 白天小睡睡多久：按小睡动作自己写的「每持续 1 分钟恢复多少精力」反推，
 # 睡到大约这个精力为止，再卡在动作声明的时长范围内。
@@ -219,6 +226,9 @@ class Decider:
 
         ``group_chatting``：群里最近是否有人在聊（由引擎提供）。
         ``interject_allowed``：插话冷却与上限是否允许（由引擎提供）。
+
+        「想被碰一碰」不在这里：那条要交给她自己决定（去哪、找谁、做什么），
+        走引擎的 :meth:`VirtualWorldEngine._maybe_desire_push`。
         """
 
         node_id = state.node_id
@@ -258,16 +268,26 @@ class Decider:
                 source="rule",
             )
 
+        # 2~5) 剩下的几件事都**不是**非做不可的：各自先判断"够不够格"，
+        #      再由今天的基调给它们拨权重，从够格的里面挑一件。
+        #      （精力那条是安全阀，按原样强制，不参与加权。）
+        candidates: list[tuple[str, dict[str, Any]]] = []
+
         # 2) 孤独感过高 -> 去大厅找人说话
         if state.loneliness > 0.7:
             steps = self._travel_then(node_id, "lobby", graph)
             steps.append({"action": "say"})
-            return create_plan(
-                steps=steps,
-                world_time=state.world_time,
-                valid_for=self._plan_valid(),
-                reason="孤独感偏高，想找人说话",
-                source="rule",
+            candidates.append(
+                (
+                    "reach_out",
+                    create_plan(
+                        steps=steps,
+                        world_time=state.world_time,
+                        valid_for=self._plan_valid(),
+                        reason="孤独感偏高，想找人说话",
+                        source="rule",
+                    ),
+                )
             )
 
         # 3) 好奇心高且在书房 -> 上网搜索并分享
@@ -283,12 +303,17 @@ class Decider:
                 # 规则触发也要说清"查什么"：用户给动作配过主题就直接用，
                 # 没配就留空，交给引擎用查询模板 / 中性兜底主题
                 step["intent"] = topic
-            return create_plan(
-                steps=[step],
-                world_time=state.world_time,
-                valid_for=self._plan_valid(),
-                reason="好奇心高，想查点东西",
-                source="rule",
+            candidates.append(
+                (
+                    "search",
+                    create_plan(
+                        steps=[step],
+                        world_time=state.world_time,
+                        valid_for=self._plan_valid(),
+                        reason="好奇心高，想查点东西",
+                        source="rule",
+                    ),
+                )
             )
 
         # 心情低落时，自我调节类动作的门槛下调：她更容易选择"缓一缓"，
@@ -300,12 +325,17 @@ class Decider:
             target = self._pick_idle_node(exclude=node_id)
             steps = self._travel_then(node_id, target, graph) if target else []
             steps.append({"action": "stare"})
-            return create_plan(
-                steps=steps,
-                world_time=state.world_time,
-                valid_for=self._plan_valid(),
-                reason="太无聊了，换个环境",
-                source="rule",
+            candidates.append(
+                (
+                    "wander",
+                    create_plan(
+                        steps=steps,
+                        world_time=state.world_time,
+                        valid_for=self._plan_valid(),
+                        reason="太无聊了，换个环境",
+                        source="rule",
+                    ),
+                )
             )
 
         # 5) 精力尚可且是白天 -> 去书房看书
@@ -316,15 +346,75 @@ class Decider:
         ):
             steps = self._travel_then(node_id, "study", graph)
             steps.append({"action": "read", "duration": self._action_duration("read")})
-            return create_plan(
-                steps=steps,
-                world_time=state.world_time,
-                valid_for=self._plan_valid(),
-                reason="有点闲，去看会儿书",
-                source="rule",
+            candidates.append(
+                (
+                    "read",
+                    create_plan(
+                        steps=steps,
+                        world_time=state.world_time,
+                        valid_for=self._plan_valid(),
+                        reason="有点闲，去看会儿书",
+                        source="rule",
+                    ),
+                )
             )
 
-        return None
+        return self._pick_branch(state, candidates)
+
+    def branch_weights(self, state: WorldState) -> dict[str, float]:
+        """今天各决策分支的权重（1.0 = 跟平常一样）。
+
+        两个来源：今天的基调（懒散的日子不太想查东西、黏人的日子特别想找人）、
+        以及欲求（想被摸摸的时候更愿意往人那边凑）。
+        """
+
+        weights = {name: 1.0 for name in DAY_BRANCH_KEYS}
+        if bool(getattr(self.world.state_dynamics, "daily_mood_enabled", True)):
+            try:
+                strength = float(
+                    getattr(self.world.state_dynamics, "daily_mood_strength", 1.0)
+                )
+            except (TypeError, ValueError):
+                strength = 1.0
+            weights.update(
+                day_mood_branches(
+                    str(getattr(state, "day_mood", "") or ""), strength=strength
+                )
+            )
+        if float(getattr(state, "desire", 0.0) or 0.0) > DESIRE_HUNGRY:
+            # 想被碰一碰的时候，找人这条路的权重抬起来（她想往人那边凑）
+            weights["reach_out"] *= 1.6
+        return weights
+
+    def _pick_branch(
+        self,
+        state: WorldState,
+        candidates: list[tuple[str, dict[str, Any]]],
+    ) -> dict[str, Any] | None:
+        """从几个都够格的分支里挑一个。
+
+        权重全一样（平常的日子）就按原来的优先级走，不掷骰子——决策要可复现，
+        只有今天确实偏了才让它显出"今天跟昨天不一样"。
+        """
+
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0][1]
+        weights = self.branch_weights(state)
+        scaled = [max(0.0, float(weights.get(name, 1.0))) for name, _plan in candidates]
+        if len({round(item, 6) for item in scaled}) == 1:
+            return candidates[0][1]
+        total = sum(scaled)
+        if total <= 0:
+            return candidates[0][1]
+        point = self.rng.random() * total
+        acc = 0.0
+        for (_name, plan), weight in zip(candidates, scaled):
+            acc += weight
+            if point < acc:
+                return plan
+        return candidates[-1][1]
 
     def forced_plan(self, state: WorldState, flag: str) -> dict[str, Any] | None:
         """极端保护触发的计划。"""

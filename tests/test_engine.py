@@ -22,8 +22,11 @@ from core.engine import (  # noqa: E402
     _guess_duration_seconds,
 )
 from core.json_actions import PlannedAction  # noqa: E402
-from core.models import parse_world  # noqa: E402
+from core.models import ActionDef, parse_world  # noqa: E402
+from core.mood import DAY_MOODS  # noqa: E402
+from core.prompt import PromptBuilder  # noqa: E402
 from core.state import WorldState, chat_item_is_fresh, group_chat_items  # noqa: E402
+from core.state import STATE_DROWSY, STATE_SLEEPING  # noqa: E402
 from tests.stub_ports import (  # noqa: E402
     StubClock,
     StubLLM,
@@ -534,6 +537,50 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(echoed, "这条日程应该产生回显")
         self.assertEqual(set(echoed), {PRIVATE_SESSION}, echoed)
 
+    async def test_schedule_brief_tells_her_what_she_is_doing(self):
+        """日程触发时，她要知道"这条日程是干什么的"+完整动作链；跑完还要知道做完了什么。"""
+
+        self.add_schedule(
+            id="night",
+            time="23:30",
+            note="睡前收尾：洗漱完回卧室躺下",
+            action_chain=[{"type": "stretch"}, {"type": "think"}],
+        )
+        self.clock.set_struct(datetime(2026, 9, 10, 23, 30))
+        await self.engine.run_schedules()
+        async with self.engine.session_state(SESSION) as state:
+            digest = " ".join(str(item) for item in (state.event_digest or []))
+        self.assertIn("睡前收尾", digest)
+        self.assertIn("这条日程要做的事（按顺序）", digest)
+        # 动作名要按顺序带上（伸懒腰 → 想事情）
+        self.assertIn("伸懒腰", digest)
+        self.assertIn("想事情", digest)
+        self.assertIn("按日程做完了", digest)
+
+    def test_smart_schedule_prompt_gets_the_description_and_chain(self):
+        """智能日程补意图时也要看到描述和整条链，不然补出来的意图对不上日程本来的目的。"""
+
+        _system, prompt = self.engine.prompts.build_schedule_intent_prompt(
+            schedule_id="night",
+            when="2026-09-10 23:30（深夜）",
+            where="书房",
+            state_hint="有点困",
+            chat_note="",
+            steps=[
+                {
+                    "index": 1,
+                    "label": "上网查热搜新闻",
+                    "action_id": "search_news",
+                    "kind": "工具型",
+                    "description": "查一下当前的热搜新闻。",
+                }
+            ],
+            schedule_note="睡前收尾：洗漱完回卧室躺下",
+            chain_labels=["倒茶提醒喝水", "走到卧室", "睡觉"],
+        )
+        self.assertIn("这条日程是：睡前收尾", prompt)
+        self.assertIn("倒茶提醒喝水 → 走到卧室 → 睡觉", prompt)
+
     # ---------------- 用户画像（提示词里"这个人是谁"）----------------
 
     async def test_profile_block_reaches_the_reply_prompt(self):
@@ -792,6 +839,40 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         events = await self.engine.db.call("query_events", session_id=SESSION, limit=10)
         reply = next(item for item in events if item["event_type"] == "reply")
         self.assertEqual(reply["detail"]["tone"], "attack")
+
+    async def test_an_attack_hurts_more_when_it_comes_from_someone_close(self):
+        """同样一句难听的：路人几乎不往心里去，亲近的人一句话顶别人几句。"""
+
+        async with self.engine.session_state(SESSION) as state:
+            # 陌生人（默认关系 → 客气档）和 亲近的人 各一个
+            self.engine.profiles.touch(state.session_id, "9", "小刚")
+            self.engine.profiles.touch(state.session_id, "7", "小红")
+            self.engine.profiles.note_bond(
+                state.session_id, "7", type="闺蜜", asserted_by="测试"
+            )
+            self.engine.profiles.adjust_affinity(state.session_id, "7", 60, reason="测试")
+
+            stranger = self.engine._tone_magnitude(state, "negative_words", "9")
+            close = self.engine._tone_magnitude(state, "negative_words", "7")
+            unknown = self.engine._tone_magnitude(state, "negative_words", "404")
+
+            # 实际落地的效果也要有差别（不只是算了个数）
+            before = float(state.valence)
+            await self.engine._apply_tone_pulse(state, "attack", user_id="9")
+            stranger_drop = before - float(state.valence)
+            before = float(state.valence)
+            await self.engine._apply_tone_pulse(state, "attack", user_id="7")
+            close_drop = before - float(state.valence)
+
+        self.assertLess(stranger, 0.5, "路人怼一句不该太往心里去")
+        self.assertGreater(close, 1.0, "亲近的人说她，比平时更疼")
+        self.assertLess(unknown, stranger, "连档案都没有的路人最轻")
+        self.assertGreater(close_drop, stranger_drop)
+        # 正面口吻不缩放：那几条本来就压得很小，还有"连着被哄会麻木"
+        async with self.engine.session_state(SESSION) as state:
+            self.assertEqual(
+                self.engine._tone_magnitude(state, "positive_words", "7"), 1.0
+            )
 
     async def test_analyst_variant_appends_instead_of_replacing(self):
         """分析层是**补充**：原始信息一个不少，分析贴在最后，并写明"冲突以事实为准"。"""
@@ -2463,6 +2544,17 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         await self.engine.tick()
         state = await self.get_state()
         self.assertEqual(state.node_id, "bedroom")
+        # 到点也先迷糊一会儿（临睡期），不立刻躺下
+        await self.engine.tick()
+        state = await self.get_state()
+        self.assertEqual(state.state, STATE_DROWSY)
+        self.assertTrue(state.drowsy_sleep_step)
+        self.assertIsNone(state.current_action)
+
+        # 安静够久之后才真的躺下
+        async with self.engine.session_state(SESSION) as held:
+            held.drowsy_started_at = self.clock.now() - 6 * 60
+            held.last_user_activity_at = self.clock.now() - 6 * 60
         await self.engine.tick()
         state = await self.get_state()
         self.assertEqual(state.state, "sleeping")
@@ -2496,6 +2588,17 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
 
         await self.engine.maybe_decide(SESSION)
 
+        state = await self.get_state()
+        # 夜里精力低：先进临睡期（不立刻躺下），安静一会儿才真的睡
+        self.assertEqual(state.state, STATE_DROWSY)
+        self.assertTrue(state.drowsy_sleep_step)
+        self.assertIsNone(state.current_action)
+
+        # 安静 5 分钟之后：真的睡整觉
+        async with self.engine.session_state(SESSION) as held:
+            held.drowsy_started_at = self.clock.now() - 6 * 60
+            held.last_user_activity_at = self.clock.now() - 6 * 60
+        await self.engine.tick()
         state = await self.get_state()
         self.assertEqual((state.current_action or {}).get("type"), "sleep")
 
@@ -5165,7 +5268,301 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
 
         steps = [step.get("action") for step in (state.current_plan or {}).get("steps", [])]
         self.assertEqual(steps, ["cook", "walk_to", "read"], steps)
+        # 睡前那一步进了临睡期：它不算做完（她还没躺下），同一批里排在它后面的
+        # cook 也不该在打盹的时候做，一起接在原计划的两步前面等睡下再继续。
         self.assertEqual((state.current_plan or {}).get("reason"), "她自己的安排")
+
+    async def test_a_reply_arrives_while_she_is_busy_and_still_comes_out(self):
+        """她正瘫着时有人找她：回话当场就说，不必等瘫完；瘫着那一步也不会做两遍。"""
+
+        from core import planner as planner_module  # noqa: PLC0415
+
+        await self.set_state(node_id="lobby", energy=0.9, loneliness=0.1, boredom=0.1)
+        async with self.engine.session_state(SESSION) as live:
+            live.current_plan = planner_module.create_plan(
+                steps=[{"action": "lounge"}, {"action": "think"}],
+                world_time=live.world_time,
+                valid_for=6000,
+                reason="她想瘫一会儿",
+                source="llm",
+            )
+        await self.engine.tick()
+        self.assertEqual(
+            str(((await self.get_state()).current_action or {}).get("type")), "lounge"
+        )
+
+        outcome = TickOutcome(session_id=SESSION)
+        async with self.engine.session_state(SESSION) as live:
+            await self.engine._execute_actions(
+                live,
+                self.engine.node(live.node_id),
+                outcome,
+                [
+                    PlannedAction(type="nuzzle"),
+                    PlannedAction(type="say", messages=["知道啦，别闹"]),
+                ],
+                depth=0,
+                autonomous=False,
+            )
+            # 她没被打断，回话也没有被排到"瘫完以后"
+            self.assertEqual(str((live.current_action or {}).get("type")), "lounge")
+            self.assertEqual(
+                [
+                    step.get("action")
+                    for step in (live.current_plan or {}).get("steps", [])
+                ],
+                ["lounge", "think"],
+            )
+        self.assertIn("知道啦，别闹", outcome.messages)
+
+        # 瘫完了：计划顺着下一步走，不会把"瘫着"再做一遍
+        async with self.engine.session_state(SESSION) as live:
+            payload = dict(live.current_action or {})
+            payload["elapsed_ticks"] = payload.get("duration_ticks", 1)
+            await self.engine._finish_action(
+                live,
+                self.engine.node(live.node_id),
+                TickOutcome(session_id=SESSION),
+                payload,
+            )
+            plan = live.current_plan or {}
+            self.assertEqual(int(plan.get("current_step") or 0), 1)
+            self.assertEqual(str((plan.get("steps") or [{}])[0].get("status")), "done")
+
+    async def test_a_queued_reply_line_is_still_said_after_the_slow_step(self):
+        """先走一步、再把话说出来：这句话轮到时要真发出去，不能被"主动发言冷却"吞掉。"""
+
+        await self.set_state(node_id="lobby", energy=0.9, loneliness=0.1, boredom=0.1)
+        outcome = TickOutcome(session_id=SESSION)
+        async with self.engine.session_state(SESSION) as live:
+            await self.engine._execute_actions(
+                live,
+                self.engine.node(live.node_id),
+                outcome,
+                [
+                    PlannedAction(type="walk_to", target_node="bedroom"),
+                    PlannedAction(type="say", messages=["等我一下，这就过去"]),
+                ],
+                depth=0,
+                autonomous=False,
+            )
+            steps = (live.current_plan or {}).get("steps", [])
+            self.assertEqual([step.get("action") for step in steps], ["say"])
+            # 排队的这一步要记得自己是"回话"
+            self.assertEqual(str(steps[0].get("kind")), "reply")
+            # 主动发言的冷却正卡着：回话不该被它吞掉
+            live.cooldown_until = int(live.world_time) + 300
+        for _ in range(4):
+            await self.engine.tick()
+        self.assertIn("等我一下，这就过去", self.messenger.flat_messages)
+
+    async def test_being_interrupted_does_not_make_her_redo_the_old_step(self):
+        """她瘫着时被叫去别处：原来那一步算过去了，做完新的事不会再回去瘫一遍。"""
+
+        from core import planner as planner_module  # noqa: PLC0415
+
+        await self.set_state(node_id="lobby", energy=0.9, loneliness=0.1, boredom=0.1)
+        async with self.engine.session_state(SESSION) as live:
+            live.current_plan = planner_module.create_plan(
+                steps=[{"action": "lounge"}, {"action": "think"}],
+                world_time=live.world_time,
+                valid_for=6000,
+                reason="她想瘫一会儿",
+                source="llm",
+            )
+        await self.engine.tick()
+        self.assertEqual(
+            str(((await self.get_state()).current_action or {}).get("type")), "lounge"
+        )
+
+        async with self.engine.session_state(SESSION) as live:
+            await self.engine._execute_actions(
+                live,
+                self.engine.node(live.node_id),
+                TickOutcome(session_id=SESSION),
+                [
+                    PlannedAction(type="walk_to", target_node="bedroom"),
+                    PlannedAction(type="say", messages=["这就过去"]),
+                ],
+                depth=0,
+                autonomous=False,
+            )
+            plan = live.current_plan or {}
+            # 被顶掉的"瘫着"已经划掉，剩下的是"回一句 → 想事情"
+            self.assertEqual(str((plan.get("steps") or [{}])[0].get("status")), "done")
+            self.assertEqual(
+                [step.get("action") for step in (plan.get("steps") or [])],
+                ["lounge", "say", "think"],
+            )
+            self.assertEqual(int(plan.get("current_step") or 0), 1)
+            self.assertEqual(str((live.current_action or {}).get("type")), "walk_to")
+
+        for _ in range(5):
+            await self.engine.tick()
+        state = await self.get_state()
+        self.assertEqual(state.node_id, "bedroom")
+        # 瘫着只起过一次头，没有被翻出来做第二遍
+        starts = [
+            item
+            for item in (state.recent_events or [])
+            if item.get("kind") == "action_start"
+            and (item.get("detail") or {}).get("type") == "lounge"
+        ]
+        self.assertEqual(len(starts), 1, state.recent_events)
+
+    async def test_she_marks_a_line_that_was_actually_meant_for_someone_else(self):
+        """主模型判断"这句是在跟别人说话"时，要记在那条消息上，下一轮别再揽到自己身上。"""
+
+        await self.engine.note_presence(
+            self.ctx(session_id=SESSION, user_id="42", user_name="小明", text="你倒是说啊")
+        )
+        async with self.engine.session_state(SESSION) as state:
+            self.assertEqual(
+                self.engine._mark_reply_addressing(
+                    state, self.ctx(user_id="42"), "others"
+                ),
+                "others",
+            )
+            self.assertEqual(str(state.recent_chat[-1].get("addressing")), "others")
+            # 判成是跟她说的就不加提示
+            self.engine._mark_reply_addressing(state, self.ctx(user_id="42"), "me")
+            self.assertEqual(str(state.recent_chat[-1].get("addressing")), "me")
+            # 没判（或判成不确定）时不动它
+            self.engine._mark_reply_addressing(state, self.ctx(user_id="42"), "")
+            self.assertEqual(str(state.recent_chat[-1].get("addressing")), "me")
+
+    async def test_a_hug_helps_more_when_she_is_really_low(self):
+        """她真的低落时，被安抚走的是另一条通道：不占当天聊天额度，也不会被连着哄磨没。"""
+
+        today = datetime.fromtimestamp(self.clock.now()).strftime("%Y-%m-%d")
+        await self.set_state(node_id="study")
+        # 心情要按"基线 + 偏移"改，直接赋值会被下一次刷新覆盖
+        await self.engine.set_values(SESSION, {"valence": 0.18})
+        async with self.engine.session_state(SESSION) as state:
+            # 今天"聊天推效价"那点额度（默认 0.15）先用光
+            state.chat_day = today
+            state.chat_valence_spent = 0.15
+        # 日常那条路已经堵住：普通的一次"被哄"推不动效价
+        async with self.engine.session_state(SESSION) as state:
+            before = float(state.valence)
+            self.engine.dynamics.apply_event(state, "hug_bot")
+            self.assertLess(float(state.valence) - before, 0.05)
+            self.assertAlmostEqual(float(state.chat_valence_spent), 0.15, places=3)
+        # 安抚通道照样有效，而且记了次数
+        async with self.engine.session_state(SESSION) as state:
+            before = float(state.valence)
+            self.assertTrue(self.engine.dynamics.soothed(state))
+            self.assertGreater(float(state.valence), before + 0.025)
+            self.assertEqual(len(state.soothe_log), 1)
+            # 连着来会被限流（一小时最多 3 次）
+            self.engine.dynamics.soothed(state)
+            self.engine.dynamics.soothed(state)
+            self.assertFalse(self.engine.dynamics.soothed(state))
+
+    async def test_being_understood_only_counts_when_she_was_hurting(self):
+        """「被理解」不是免费回血：她真的难受着才算，一天也只认几次。"""
+
+        await self.engine.set_values(SESSION, {"valence": 0.8})
+        async with self.engine.session_state(SESSION) as state:
+            self.assertFalse(self.engine._she_was_hurting(state))
+            self.assertEqual(self.engine._comfort_pulse(state, "comfort"), "")
+            self.assertEqual(list(state.soothe_log), [])
+        await self.engine.set_values(SESSION, {"valence": 0.2})
+        async with self.engine.session_state(SESSION) as state:
+            self.assertTrue(self.engine._she_was_hurting(state))
+            self.assertEqual(self.engine._comfort_pulse(state, "comfort"), "understood")
+            self.assertEqual(str(state.soothe_log[-1].get("kind")), "understood")
+            # 一天最多 3 次
+            self.engine._comfort_pulse(state, "comfort")
+            self.engine._comfort_pulse(state, "comfort")
+            self.assertEqual(self.engine._comfort_pulse(state, "comfort"), "")
+
+    async def test_her_own_hug_soothes_her_when_she_is_low(self):
+        """她自己贴过来（抱抱这类动作）在她低落时也算安抚；普通动作不算。"""
+
+        await self.set_state(node_id="study")
+        await self.engine.set_values(SESSION, {"valence": 0.2})
+        async with self.engine.session_state(SESSION) as state:
+            definition = self.engine.world.action_map()["hug"]
+            before = float(state.valence)
+            self.assertTrue(
+                await self.engine._maybe_soothe_from_action(state, definition)
+            )
+            self.assertGreater(float(state.valence), before)
+            # 想事情这种动作跟她想要的无关，不该算
+            other = self.engine.world.action_map()["think"]
+            self.assertFalse(
+                await self.engine._maybe_soothe_from_action(state, other)
+            )
+
+    async def test_a_long_message_keeps_the_mention_note(self):
+        """正文太长被截时，末尾那段「@ 了谁」的注释也要留住（它是判断冲谁说的关键）。"""
+
+        note = "［这条消息 @ 了：你（10001）；其中 小明(42) 不是在 @ 你（那是在叫别人）］"
+        async with self.engine.session_state(SESSION) as state:
+            state.note_chat(
+                user_id="42",
+                name="小明",
+                text="很" * 400 + " " + note,
+                now=self.clock.now(),
+                keep=200,
+            )
+            item = dict(state.recent_chat[-1])
+        self.assertIn("不是在 @ 你", str(item.get("text")))
+        self.assertTrue(str(item.get("text")).endswith("］"))
+
+    async def test_she_is_reminded_to_write_down_what_he_says_about_himself(self):
+        """他说了关于自己的事：这一轮要提醒她顺手 remember，别只写进她自己的记忆。"""
+
+        hint = self.engine.remember_hint(
+            "我是做后端的，以后叫我老李就行", ctx=self.ctx(user_id="42")
+        )
+        self.assertIn("remember", hint)
+        self.assertIn("42", hint)
+        self.assertIn("evidence", hint)
+        # 平常见面寒暄不加这一段，免得每轮都啰嗦
+        self.assertEqual(self.engine.remember_hint("在吗", ctx=self.ctx()), "")
+
+    async def test_chiming_in_lands_in_the_chat_that_is_actually_busy(self):
+        """她在哪个会话名下做的决定不重要：想接的那句话在群里，就该说在群里。"""
+
+        private = "aiocqhttp:FriendMessage:2002"
+        self.store.add_session(private, session_type="private", platform="aiocqhttp")
+        self.add_group(sessions=[SESSION, private], main=SESSION)
+        for text in ("在吗", "今晚吃啥", "打游戏不", "来不来"):
+            await self.engine.note_presence(
+                self.ctx(session_id=SESSION, text=text, user_id="7", user_name="群友")
+            )
+        self.engine.decider.rng = _NoLlmDraw()
+        await self.set_state(
+            node_id="study", loneliness=0.95, energy=0.8, boredom=0.1, curiosity=0.1
+        )
+        async with self.engine.session_state(SESSION) as state:
+            state.last_interject_at = 0.0
+            state.interject_stats = {}
+
+        # 时钟那一拍照常推进，决策这次特意挂在私聊名下
+        await self.engine.tick()
+        outcome = await self.engine.maybe_decide(private)
+
+        self.assertIsNotNone(outcome)
+        assert outcome is not None
+        self.assertEqual(outcome.session_id, SESSION)
+        self.assertEqual([item[0] for item in self.messenger.sent], [SESSION])
+        async with self.engine.session_state(SESSION) as state:
+            # 落点在生成时就定死了，不在执行时看"谁在推进这一拍"
+            self.assertEqual(str((state.last_plan or {}).get("send_to")), SESSION)
+
+    async def test_the_clock_asks_for_a_decision_once_per_group(self):
+        """一个会话组只催一次：不然同一个她会被催好几遍，落点还容易挂在别的会话名下。"""
+
+        private = "aiocqhttp:FriendMessage:2002"
+        self.store.add_session(private, session_type="private", platform="aiocqhttp")
+        self.add_group(sessions=[SESSION, private], main=SESSION)
+        self.engine.decider_interval = 600.0
+
+        await self.engine.maybe_decide(SESSION)
+        self.assertIsNone(await self.engine.maybe_decide(private))
 
     async def test_sleeping_chatter_only_logs_once_per_window(self):
         """睡着时群里刷屏：消息照样挡下、照样记进上下文，但日志不能一条一条刷。"""
@@ -6912,6 +7309,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         """计划提示词别写死"接下来 15~30 分钟"，否则深夜也只会挑小睡。"""
 
         await self.set_state(energy=0.2, node_id="bedroom")
+        await self.set_state(energy=0.2, node_id="bedroom")
         self.llm.replies = [
             '{"plan":[{"action":"sleep","duration":28800}],"reason":"太晚了，去睡"}'
         ]
@@ -6928,6 +7326,148 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(plan)
         system_prompt = self.llm.calls[-1]["system_prompt"]
         self.assertIn("现在是：", system_prompt)
+
+    async def test_sleep_waits_in_the_drowsy_phase_before_lying_down(self):
+        """睡前先进临睡期：不立刻躺下；安静够久（或拖太久）才真的睡。"""
+
+        await self.set_state(energy=0.9, node_id="bedroom")
+        self.llm.replies = []
+        async with self.engine.session_state(SESSION) as state:
+            node = self.engine.node(state.node_id or "bedroom")
+            outcome = TickOutcome(session_id=SESSION)
+            definition = self.engine.world.action_map()["sleep"]
+            action = self.engine._step_to_action({"action": "sleep", "duration": 28800})
+            await self.engine._start_action(
+                state, node, outcome, definition, action, 0, True
+            )
+            # 没有立刻睡：临睡期，揣着"睡觉"那一步
+            self.assertEqual(state.state, STATE_DROWSY)
+            self.assertIsNone(state.current_action)
+            self.assertTrue(state.drowsy_sleep_step)
+            # 刚进临睡期：还不睡
+            state.drowsy_started_at = self.clock.now()
+            state.last_user_activity_at = self.clock.now()
+            await self.engine._drowsy_tick(state, node, outcome)
+            self.assertEqual(state.state, STATE_DROWSY)
+            # 安静够 5 分钟 → 真的躺下
+            state.drowsy_started_at = self.clock.now() - 6 * 60
+            state.last_user_activity_at = self.clock.now() - 6 * 60
+            await self.engine._drowsy_tick(state, node, outcome)
+            self.assertEqual(state.state, STATE_SLEEPING)
+            self.assertEqual(str((state.current_action or {}).get("type")), "sleep")
+
+    async def test_drowsy_phase_holds_the_plan_instead_of_sleeping_next_tick(self):
+        """临睡期里计划不许抢跑：睡觉那一步不会在下一拍被再做一次，醒来也不会重睡。"""
+
+        from core import planner as planner_module  # noqa: PLC0415
+
+        await self.set_state(energy=0.9, node_id="bedroom")
+        self.llm.replies = []
+        node = self.engine.node("bedroom")
+        async with self.engine.session_state(SESSION) as state:
+            state.current_plan = planner_module.create_plan(
+                steps=[{"action": "sleep", "duration": 28800}],
+                world_time=state.world_time,
+                valid_for=600,
+                reason="夜深了，该睡了",
+                source="rule",
+            )
+        # 计划走到「睡觉」这一步：先进临睡期，不躺下
+        async with self.engine.session_state(SESSION) as state:
+            await self.engine._tick_plan(
+                state, node, TickOutcome(session_id=SESSION), depth=0
+            )
+            self.assertEqual(state.state, STATE_DROWSY)
+            self.assertTrue(state.drowsy_sleep_step)
+            self.assertIsNone(state.current_action)
+            # 临睡期里再推一拍计划：不许抢跑，也不能把这一步当成"没做成"丢掉
+            await self.engine._tick_plan(
+                state, node, TickOutcome(session_id=SESSION), depth=0
+            )
+            self.assertEqual(state.state, STATE_DROWSY)
+            self.assertIsNone(state.current_action)
+            self.assertTrue(state.drowsy_sleep_step)
+        # 安静够 5 分钟 → 真的躺下
+        async with self.engine.session_state(SESSION) as state:
+            state.drowsy_started_at = self.clock.now() - 6 * 60
+            state.last_user_activity_at = self.clock.now() - 6 * 60
+            await self.engine._drowsy_tick(
+                state, node, TickOutcome(session_id=SESSION)
+            )
+            self.assertEqual(state.state, STATE_SLEEPING)
+            self.assertEqual(str((state.current_action or {}).get("type")), "sleep")
+            # 揣着的那一步已经从计划里划掉了：醒来不会又睡一遍
+            self.assertIsNone(planner_module.peek_step(state))
+
+    async def test_drowsy_note_tells_her_to_sound_sleepy(self):
+        """临睡期提示词要写清"困得迷迷糊糊"：说话断断续续。"""
+
+        await self.set_state(node_id="bedroom")
+        async with self.engine.session_state(SESSION) as state:
+            state.state = STATE_DROWSY
+            notes = " ".join(self.engine.sleep_notes(state))
+        self.assertIn("困得不行", notes)
+        self.assertIn("迷迷糊糊", notes)
+
+    async def test_goodnight_and_goodmorning_are_her_choice(self):
+        """晚安 / 早安：想发就发（发到哪由她挑），不想发就什么都不发；一天各问一次。"""
+
+        # ① 晚安：她决定说一句，发到群里
+        await self.set_state(node_id="bedroom")
+        self.llm.replies = [
+            '{"plan":[{"action":"say","messages":["睡了啊…明天再聊"],"send_to":"群 1001"}],'
+            '"reason":"困了，跟他们说一声"}'
+        ]
+        async with self.engine.session_state(SESSION) as state:
+            node = self.engine.node(state.node_id or "bedroom")
+            outcome = TickOutcome(session_id=SESSION)
+            self.assertTrue(await self.engine._maybe_say_goodnight(state, node, outcome))
+            self.assertEqual(
+                state.goodnight_day, self.engine._today_key(self.engine._now())
+            )
+            # 同一天不再问第二遍
+            self.assertFalse(
+                await self.engine._maybe_say_goodnight(
+                    state, node, TickOutcome(session_id=SESSION)
+                )
+            )
+        # 发送必须在**出锁之后**：_deliver 自己还要拿这把会话锁
+        await self.engine._deliver(outcome)
+        self.assertIn("睡了啊…明天再聊", self.messenger.flat_messages)
+
+        async with self.engine.session_state(SESSION) as state:
+            node = self.engine.node(state.node_id or "bedroom")
+            # ② 晚安：她决定不说（空计划）→ 一条消息都不发，但也不再问
+            state.goodnight_day = ""
+            self.llm.replies = ['{"plan":[],"reason":"不发了"}']
+            before = len(self.messenger.flat_messages)
+            self.assertFalse(
+                await self.engine._maybe_say_goodnight(
+                    state, node, TickOutcome(session_id=SESSION)
+                )
+            )
+            self.assertEqual(len(self.messenger.flat_messages), before)
+            self.assertEqual(
+                state.goodnight_day, self.engine._today_key(self.engine._now())
+            )
+
+        # ③ 早安：睡醒那一刻问一次（这条走的是 _finish_action 的睡醒分支）
+        self.llm.replies = [
+            '{"plan":[{"action":"say","messages":["早…困死了"]}],"reason":"醒了打个招呼"}'
+        ]
+        async with self.engine.session_state(SESSION) as state:
+            node = self.engine.node(state.node_id or "bedroom")
+            outcome = TickOutcome(session_id=SESSION)
+            state.state = STATE_SLEEPING
+            state.sleep_started_at = 0
+            await self.engine._finish_action(
+                state, node, outcome, {"type": "sleep", "elapsed_ticks": 480}
+            )
+            self.assertEqual(
+                state.goodmorning_day, self.engine._today_key(self.engine._now())
+            )
+        await self.engine._deliver(outcome)
+        self.assertIn("早…困死了", self.messenger.flat_messages)
 
     async def test_last_generated_plan_is_remembered(self):
         from core.planner import create_plan
@@ -9505,6 +10045,305 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_speech_density_hint_is_quiet_when_she_barely_talked(self):
         state = await self.get_state()
         self.assertEqual(self.engine.speech_density_hint(state), "")
+
+    # ---------------- 今天的基调 ----------------
+
+    async def test_day_mood_is_rolled_once_a_day(self):
+        state = WorldState(session_id=SESSION)
+        now = self.engine._now()
+
+        self.assertTrue(self.engine._roll_day_mood(state, now))
+        first = state.day_mood
+        self.assertIn(first, DAY_MOODS)
+
+        # 同一天再来多少次都不重掷
+        self.assertFalse(self.engine._roll_day_mood(state, now + 3600))
+        self.assertEqual(state.day_mood, first)
+        self.assertEqual(state.day_mood_day, self.engine._today_key(now))
+
+        # 第二天早上醒来是另一天，会重新掷一次
+        self.assertTrue(self.engine._roll_day_mood(state, now + 86400))
+        self.assertEqual(state.day_mood_day, self.engine._today_key(now + 86400))
+
+    async def test_day_mood_disabled_leaves_nothing_behind(self):
+        config = self.engine.world.state_dynamics
+        original = config.daily_mood_enabled
+        self.addCleanup(setattr, config, "daily_mood_enabled", original)
+        state = WorldState(
+            session_id=SESSION, day_mood="lazy", day_mood_day="2026-09-30"
+        )
+        self.engine.world.state_dynamics.daily_mood_enabled = False
+        self.assertFalse(self.engine._roll_day_mood(state, self.engine._now()))
+        self.assertEqual(state.day_mood, "")
+        self.assertEqual(state.day_mood_day, "")
+
+    async def test_day_mood_reaches_the_prompt(self):
+        state = WorldState(session_id=SESSION)
+        state.day_mood = "lazy"
+        block = PromptBuilder._state_block(state)
+        self.assertIn("今天的基调", block)
+        self.assertIn("懒散", block)
+
+        # 平静是默认值，不该占一行
+        state.day_mood = "calm"
+        self.assertNotIn("今天的基调", PromptBuilder._state_block(state))
+
+    async def test_snapshot_carries_the_day_mood(self):
+        async with self.engine.session_state(SESSION) as state:
+            state.day_mood = "clingy"
+            state.day_mood_day = "2026-09-30"
+        snap = await self.engine.snapshot(SESSION)
+        self.assertEqual(snap["day_mood"]["id"], "clingy")
+        self.assertEqual(snap["day_mood"]["label"], "黏人")
+        self.assertTrue(snap["day_mood"]["hint"])
+
+    # ---------------- 欲求 ----------------
+
+    async def test_being_held_settles_the_need(self):
+        """抱抱做完要满足欲求；看书这种跟人无关的动作一点都不碰它。"""
+
+        async with self.engine.session_state(SESSION) as live:
+            live.desire = 0.9
+        state = await self.get_state()
+        actions = self.engine.world.action_map()
+        dropped = await self.engine._satisfy_desire_from_action(state, actions["hug"])
+        self.assertGreater(dropped, 0.0)
+        self.assertLess(float(state.desire), 0.9)
+
+        before = float(state.desire)
+        self.assertEqual(
+            await self.engine._satisfy_desire_from_action(state, actions["read"]), 0.0
+        )
+        self.assertAlmostEqual(float(state.desire), before, places=6)
+
+    async def test_a_plan_step_that_touches_her_settles_the_need(self):
+        """走完整条执行链也要算数：瞬时动作（抱一下）在计划里做完就满足欲求。"""
+
+        from core import planner as planner_module
+
+        async with self.engine.session_state(SESSION) as live:
+            live.desire = 0.9
+            live.current_plan = planner_module.create_plan(
+                steps=[{"action": "hug", "target": "2692047521"}],
+                world_time=live.world_time,
+                reason="测试",
+            )
+        # 「主动找人」是按关系档限额的：亲近的人才主动贴得过去，先把这个人提上来
+        async with self.engine.session_state(SESSION):
+            self.engine.profiles.touch(SESSION, "2692047521", "never")
+            self.engine.profiles.note_bond(
+                SESSION, "2692047521", type="闺蜜", asserted_by="测试"
+            )
+            self.engine.profiles.adjust_affinity(
+                SESSION, "2692047521", 60, reason="测试"
+            )
+        node = self.engine.node("study")
+        outcome = TickOutcome(session_id=SESSION)
+        async with self.engine.session_state(SESSION) as live:
+            await self.engine._tick_plan(live, node, outcome, depth=0)
+        state = await self.get_state()
+        self.assertLess(float(state.desire), 0.9)
+
+    async def test_the_snapshot_shows_the_need(self):
+        async with self.engine.session_state(SESSION) as live:
+            live.desire = 0.55
+        snap = await self.engine.snapshot(SESSION)
+        self.assertAlmostEqual(snap["values"]["desire"], 0.55, places=3)
+
+    async def test_close_people_tease_her_more(self):
+        """被撩一下涨多少看关系：路人几乎撩不动她，特别的人一跳就上来。"""
+
+        state = await self.get_state()
+        # 没人 / 没开画像：不缩放
+        self.assertEqual(self.engine._desire_tease_scale(state, ""), 1.0)
+        if not self.engine.profiles.enabled():
+            return
+
+        class _View:
+            level_index = 6
+
+        original = self.engine.profiles.view
+        self.engine.profiles.view = lambda *args, **kwargs: _View()
+        self.addCleanup(setattr, self.engine.profiles, "view", original)
+        self.assertGreater(self.engine._desire_tease_scale(state, "123456"), 1.0)
+
+    async def test_unknown_actions_get_judged_so_new_ones_work(self):
+        """用户自己新加的动作也能满足欲求：先看有没有写「亲密程度」，
+        没写就看效果（冲着人、降孤独/抬心潮），再不行才问一次便宜模型。"""
+
+        state = await self.get_state()
+        warm = ActionDef.model_validate(
+            {
+                "id": "user_snuggle",
+                "name": "搂一会儿",
+                "target_type": "user",
+                "on_complete": {"effects": {"loneliness": "-0.1", "affect": "+0.05"}},
+            }
+        )
+        self.assertGreater(await self.engine.desire_intimacy(state, warm), 0.0)
+
+        cold = ActionDef.model_validate({"id": "user_water", "name": "给花浇水"})
+        self.assertEqual(await self.engine.desire_intimacy(state, cold), 0.0)
+
+        # 自己写了「亲密程度」的，以他写的为准
+        pinned = ActionDef.model_validate(
+            {"id": "user_poke_face", "name": "戳脸", "target_type": "user", "intimacy": 0.35}
+        )
+        self.assertAlmostEqual(await self.engine.desire_intimacy(state, pinned), 0.35)
+        zeroed = ActionDef.model_validate(
+            {"id": "hug_copy", "name": "抱抱", "target_type": "user", "intimacy": 0.0}
+        )
+        self.assertEqual(await self.engine.desire_intimacy(state, zeroed), 0.0)
+
+    async def test_desire_push_needs_a_need_and_someone_to_reach(self):
+        """「想被碰一碰」要交给她自己决定：够不够、有没有人能找，都在这儿判。"""
+
+        # 欲求不高：不推
+        async with self.engine.session_state(SESSION) as live:
+            live.desire = 0.2
+            live.user_presence = {"2692047521": {"name": "never", "last_seen": 1.0}}
+        state = await self.get_state()
+        self.assertFalse(self.engine.desire_push_ready(state))
+
+        # 欲求够了，但没人能找：也不推
+        async with self.engine.session_state(SESSION) as live:
+            live.desire = 0.9
+            live.user_presence = {}
+        state = await self.get_state()
+        self.assertTrue(self.engine.desire_push_ready(state))
+        self.assertEqual(self.engine._cuddle_people(state, SESSION), [])
+
+        # 有人、关系够近（主动找他还有额度）：能推，而且人选按好感从高到低排
+        async with self.engine.session_state(SESSION) as live:
+            live.desire = 0.9
+            live.user_presence = {
+                "2692047521": {"name": "never", "last_seen": 5.0},
+                "42": {"name": "路人", "last_seen": 1.0},
+            }
+            self.engine.profiles.touch(SESSION, "2692047521", "never")
+            self.engine.profiles.note_bond(
+                SESSION, "2692047521", type="闺蜜", asserted_by="测试"
+            )
+            self.engine.profiles.adjust_affinity(
+                SESSION, "2692047521", 60, reason="测试"
+            )
+        state = await self.get_state()
+        people = self.engine._cuddle_people(state, SESSION)
+        self.assertEqual([item["user_id"] for item in people][0], "2692047521")
+        panel = self.engine.desire_panel(state)
+        self.assertGreaterEqual(panel["push_left"], 1)
+
+    async def test_the_push_hands_her_a_list_and_asks_a_model(self):
+        """推的时候是把"人 + 能做哪些接触"交给大模型，让她自己挑，而不是替她做动作。"""
+
+        async with self.engine.session_state(SESSION) as live:
+            live.desire = 0.9
+            live.user_presence = {
+                "2692047521": {"name": "never", "last_seen": 5.0}
+            }
+            self.engine.profiles.touch(SESSION, "2692047521", "never")
+            self.engine.profiles.note_bond(
+                SESSION, "2692047521", type="闺蜜", asserted_by="测试"
+            )
+            self.engine.profiles.adjust_affinity(
+                SESSION, "2692047521", 60, reason="测试"
+            )
+        state = await self.get_state()
+        lines = self.engine._cuddle_action_lines(state)
+        self.assertTrue(any("hug" in line for line in lines), lines)
+        # 提示词里要写明"在哪说由你定"和"可以什么都不做"
+        self.assertTrue(lines)
+
+    async def test_self_comfort_option_only_exists_when_the_extension_is_in(self):
+        """「自己解决」是扩展带来的动作：没装扩展就没有这个选项，
+        装了之后那一轮会多摆一条给她（代价也写清楚）。"""
+
+        state = await self.get_state()
+        self.assertEqual(self.engine._self_comfort_options(state), [])
+
+        async with self.engine.session_state(SESSION) as live:
+            live.desire = 0.9
+            live.user_presence = {"2692047521": {"name": "never", "last_seen": 5.0}}
+            self.engine.profiles.touch(SESSION, "2692047521", "never")
+            self.engine.profiles.note_bond(
+                SESSION, "2692047521", type="闺蜜", asserted_by="测试"
+            )
+            self.engine.profiles.adjust_affinity(SESSION, "2692047521", 60, reason="测试")
+
+        # 没装扩展：那一轮只摆「找谁 / 什么都不做」
+        self.llm.replies = ['{"plan":[{"action":"say","messages":["在的"]}]}']
+        state = await self.get_state()
+        outcome = TickOutcome(session_id=SESSION)
+        node = self.engine.node(state.node_id)
+        await self.engine._maybe_desire_push(state, node, outcome, SESSION)
+        prompt = self.llm.calls[-1]["prompt"]
+        self.assertNotIn("自己解决", prompt)
+        self.assertIn("也可以什么都不做", prompt)
+
+        # 装一个带 self_option 标记的动作（就是扩展那种接法）
+        raw = self.store.raw_world()
+        raw["actions"].append(
+            {
+                "id": "demo_self_option",
+                "name": "示例动作",
+                "category": "continuous",
+                "llm_level": "template",
+                "scope": "global",
+                "target_type": "none",
+                "duration": 720,
+                "self_option": "自己解决一下（示例）",
+                "on_complete": {"trigger": "none", "effects": {}},
+            }
+        )
+        self.store.save_world(raw)
+        self.engine.reload_config()
+        state = await self.get_state()
+        self.assertEqual(
+            [item[0] for item in self.engine._self_comfort_options(state)], ["demo_self_option"]
+        )
+        self.llm.replies = ['{"plan":[{"action":"say","messages":["在的"]}]}']
+        async with self.engine.session_state(SESSION) as live:
+            live.desire = 0.9
+            live.desire_push_at = 0.0
+        state = await self.get_state()
+        outcome = TickOutcome(session_id=SESSION)
+        await self.engine._maybe_desire_push(state, node, outcome, SESSION)
+        prompt = self.llm.calls[-1]["prompt"]
+        self.assertIn("demo_self_option", prompt)
+        self.assertIn("不算被满足", prompt)
+
+    async def test_nobody_to_find_but_she_can_still_solve_it_herself(self):
+        """没人可找、但扩展给了"自己解决"这个动作时，那一轮照样要摆给她
+        （以前这种情况直接跳过，什么都不发生）。"""
+        raw = self.store.raw_world()
+        raw["actions"].append(
+            {
+                "id": "demo_self_option",
+                "name": "示例动作",
+                "category": "continuous",
+                "llm_level": "template",
+                "scope": "global",
+                "target_type": "none",
+                "duration": 720,
+                "self_option": "自己解决一下（示例）",
+                "on_complete": {"trigger": "none", "effects": {}},
+            }
+        )
+        self.store.save_world(raw)
+        self.engine.reload_config()
+        async with self.engine.session_state(SESSION) as live:
+            live.desire = 0.9
+            live.user_presence = {}
+            live.desire_push_at = 0.0
+        state = await self.get_state()
+        self.llm.replies = ['{"plan":[{"action":"demo_self_option"}]}']
+        outcome = TickOutcome(session_id=SESSION)
+        node = self.engine.node(state.node_id)
+        pushed = await self.engine._maybe_desire_push(state, node, outcome, SESSION)
+        self.assertTrue(pushed)
+        prompt = self.llm.calls[-1]["prompt"]
+        self.assertIn("没有能找的人", prompt)
+        self.assertIn("demo_self_option", prompt)
 
 
 if __name__ == "__main__":

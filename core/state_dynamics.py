@@ -28,7 +28,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 from .models import NodeDef, StateDynamics as DynamicsConfig, WorldConfig
-from .mood import cause_text, mood_label
+from .mood import cause_text, day_mood_info, day_mood_rate, mood_label, vague_word_for
 from .state import WorldState
 
 # ---------------- 事件表 ----------------
@@ -55,6 +55,16 @@ EVENT_EFFECTS: dict[str, dict[str, float]] = {
         "_tone": -1.0,
     },
     "hug_bot": {"affect": 0.08, "valence": 0.04, "loneliness": -0.16, "_tone": 1.0},
+    # 低潮时的安抚通道（见 ``StateDynamics.soothed``）：不吃"聊天推效价"的当天额度，
+    # 靠"每小时/每天几次"限流。普通时候用不到，所以她真的难过了才有这一条路。
+    "soothed": {"affect": 0.04, "valence": 0.10, "loneliness": -0.06, "_tone": 1.0},
+    # 「有人听懂我那几句」：比单纯抱一下更管用，一天只认几次
+    "understood": {
+        "affect": 0.05,
+        "valence": 0.12,
+        "loneliness": -0.12,
+        "_tone": 1.0,
+    },
     # 群里热闹**既不算有人陪她，也不算"她不闷"**：
     # - 孤独要有"有人直接跟她说话"才降（mention_bot / positive_words / hug_bot）；
     # - 无聊是"她自己没事做"，跟群里热闹无关——以前这条扣无聊，群里活跃一整天
@@ -85,6 +95,8 @@ MOOD_CAUSE_TEXT: dict[str, str] = {
     "positive_words": "被夸了",
     "negative_words": "被怼了",
     "hug_bot": "被哄了一下",
+    "soothed": "被安抚了一会儿",
+    "understood": "有人听懂你那几句",
     "ignored": "你说了话没人接",
     "tool_failed": "手上的活没做成",
     "interrupted": "手上的事被打断了",
@@ -146,6 +158,22 @@ IGNORED_RESET_MINUTES = 30
 
 IGNORED_STREAK_MAGNITUDES = (1.0, 0.5, 0.0)
 """第 1/2/3 次被冷落的力度：第一次最疼，之后递减，三次之后暂时放下。"""
+
+SOOTHE_VALENCE_BELOW = 0.38
+"""效价低于这儿，"被安抚"才另算一份。
+
+心情好的时候抱一下只是亲密（本来就降孤独、抬心潮），不需要再补心情；
+真的难过了才该有一条更宽的路——日常的效价量程仍然由
+``chat_valence_daily_cap`` 管着，不然"被抱几句"就能盖过她真经历的一件事。
+"""
+
+SOOTHE_MAX_PER_HOUR = 3
+SOOTHE_MAX_PER_DAY = 6
+UNDERSTOOD_MAX_PER_DAY = 3
+"""安抚通道的限流：每小时 / 每天最多认几次（按小时算的是两条路合起来）。"""
+
+SOOTHE_LOG_KEEP = 30
+"""安抚记录最多留几条（够算当天次数就行）。"""
 
 REPEAT_TRACKED = ("mention_bot", "positive_words", "hug_bot")
 """会被"连着来"磨掉效力的事件：被叫、被夸、被哄。
@@ -344,6 +372,16 @@ class StateDynamics:
                 cool = max(0.0, float(self.config.sleep_curiosity_decay_per_min)) * minutes
                 floor = clamp_value(float(self.config.sleep_curiosity_floor), 0.0, 1.0)
                 state.curiosity = max(min(floor, curiosity), curiosity - cool)
+            # 睡着的时候那股"想被碰一碰"也淡下去：睡醒没那么憋
+            state.desire = clamp_value(
+                float(state.desire)
+                - max(0.0, float(self._desire_config("desire_sleep_fall_per_hour", 0.05)))
+                * minutes
+                / 60.0,
+                0.0,
+                1.0,
+            )
+            state.desire_slept = True
             # 睡着了也要让情绪平复：醒来时不该还揣着昨晚那口气
             reset = self._sync_emotions(state, now=now, node=node)
             self._clamp(state)
@@ -355,23 +393,40 @@ class StateDynamics:
         lonely_air = atmosphere.loneliness if atmosphere else 0.0
         curious_air = atmosphere.curiosity if atmosphere else 0.0
 
+        # 刚睡醒：睡了一觉，那股"想被碰一碰"松下来一截
+        if bool(getattr(state, "desire_slept", False)):
+            state.desire = clamp_value(
+                float(state.desire) * self._desire_config("desire_wake_keep", 0.7),
+                0.0,
+                1.0,
+            )
+            state.desire_slept = False
+
+        # 今天的基调：只调这几条曲线的快慢，不改别的（见 mood.DAY_MOODS）
+        day_energy = self._day_rate(state, "energy")
+        day_lonely = self._day_rate(state, "loneliness")
+        day_curious = self._day_rate(state, "curiosity")
+        day_bored = self._day_rate(state, "boredom")
+
         # 精力：基础衰减；安静环境恢复更快
-        energy_delta = -self.config.energy_decay_per_min * minutes
+        energy_delta = -self.config.energy_decay_per_min * day_energy * minutes
         if calm > 0:
-            energy_delta += self.config.energy_decay_per_min * calm * mult * minutes
+            energy_delta += (
+                self.config.energy_decay_per_min * day_energy * calm * mult * minutes
+            )
         if state.state == "walking":
             energy_delta *= 1.2
         state.energy += energy_delta
 
         # 孤独：基础增长；窗边发呆加速；氛围调制
-        lonely_rate = self.config.loneliness_growth_per_min
+        lonely_rate = self.config.loneliness_growth_per_min * day_lonely
         lonely_rate *= 1 + lonely_air * mult
         if state.state == "staring":
             lonely_rate *= 1.5
         state.loneliness += lonely_rate * minutes
 
         # 好奇：基础增长；氛围调制；搜索时消耗
-        curiosity_rate = self.config.curiosity_growth_per_min
+        curiosity_rate = self.config.curiosity_growth_per_min * day_curious
         curiosity_rate *= 1 + curious_air * mult
         # 已经很想知道点什么了：再涨就慢下来，别一天下来钉死在满值（见 CURIOSITY_SOFT_CAP）
         curiosity_rate *= curiosity_growth_factor(state.curiosity)
@@ -381,12 +436,22 @@ class StateDynamics:
             state.boredom -= 0.003 * minutes
 
         # 无聊：基础增长；安静环境增长变慢；热闹环境下降
-        boredom_rate = self.config.boredom_growth_per_min
+        boredom_rate = self.config.boredom_growth_per_min * day_bored
         boredom_rate *= 1 - calm * mult * 0.5
         boredom_rate *= 1 - liveliness * mult * 0.5
         # 同一个地方待得越久越坐不住：换地点（node_since 重置）就把这个系数清零
         boredom_rate *= self.dwell_factor(state, now)
         state.boredom += boredom_rate * minutes
+
+        # 欲求：想被碰一碰。没人碰就一直慢慢涨，累着 / 心情差的时候涨得慢。
+        desire_rate = self._desire_config("desire_growth_per_min", 0.000231)
+        if float(state.desire) >= self._desire_config("desire_soft_top", 0.85):
+            desire_rate *= 0.5
+        if float(state.energy) < 0.3:
+            desire_rate *= self._desire_config("desire_low_energy_factor", 0.6)
+        if float(state.valence) < 0.15:
+            desire_rate *= self._desire_config("desire_low_valence_factor", 0.2)
+        state.desire = clamp_value(float(state.desire) + desire_rate * minutes, 0.0, 1.0)
 
         # 情绪两轴：按真实时间结算（tick 长度改了也不影响曲线形状）
         reset = self._sync_emotions(state, now=now, node=node)
@@ -426,11 +491,16 @@ class StateDynamics:
 
         base = arousal_baseline(state, hour=hour)
         current = float(state.affect)
-        rate = self.config.affect_decay_per_min * nonlinear_factor(current - base)
+        day_affect = self._day_rate(state, "affect")
+        rate = (
+            self.config.affect_decay_per_min
+            * day_affect
+            * nonlinear_factor(current - base)
+        )
         if liveliness > 0:
-            rate -= self.config.affect_decay_per_min * liveliness * 1.5 * mult
+            rate -= self.config.affect_decay_per_min * day_affect * liveliness * 1.5 * mult
         if intimate > 0:
-            rate -= self.config.affect_decay_per_min * intimate * mult
+            rate -= self.config.affect_decay_per_min * day_affect * intimate * mult
         rate = max(0.0, rate)
         # 负效价 + 高心潮：平复得更快（连续倍率，避免锯齿）
         rate *= self._calm_boost(state, current=current)
@@ -438,7 +508,11 @@ class StateDynamics:
 
         # 效价偏移：指数衰减回 0（也就回到了基线）
         offset = float(state.valence_offset)
-        v_rate = self._valence_decay_per_min() * nonlinear_factor(offset)
+        v_rate = (
+            self._valence_decay_per_min()
+            * self._day_rate(state, "valence")
+            * nonlinear_factor(offset)
+        )
         state.valence_offset = offset * math.exp(-v_rate * minutes)
 
         state.affect_synced_at = stamp
@@ -538,6 +612,55 @@ class StateDynamics:
             cause=MOOD_CAUSE_TEXT.get(kind, ""),
             chat=kind in REPEAT_TRACKED,
         )
+
+    def soothed(
+        self,
+        state: WorldState,
+        *,
+        kind: str = "soothed",
+        now: float | None = None,
+    ) -> bool:
+        """安抚通道：她真的难过时，抱一会儿、有人听懂她那几句，走这条路。
+
+        日常陪伴改的是好感度，心情的量程由 ``chat_valence_daily_cap`` 管着——
+        那是为了不让"被夸两句"盖过她真经历的一件事。但她低潮的时候该有另一条更宽的路：
+        这一下**不占当天的聊天额度**，改用"每小时 / 每天几次"限流，
+        所以连着哄十次和哄一次不是同一回事，也不会被刷成永动机。
+
+        ``kind``：``soothed``（被安抚，要求当前效价偏低）/ ``understood``（被理解，一天只认几次）。
+        返回 True 表示这一次真的推动了心情（也才记进限额）。
+        """
+
+        if kind not in ("soothed", "understood"):
+            return False
+        if kind == "soothed" and float(state.valence) >= SOOTHE_VALENCE_BELOW:
+            return False
+        stamp = self._now() if now is None else float(now)
+        try:
+            day = datetime.fromtimestamp(stamp).strftime("%Y-%m-%d")
+        except (OverflowError, OSError, ValueError):
+            day = ""
+        log = [
+            dict(item)
+            for item in list(getattr(state, "soothe_log", []) or [])
+            if isinstance(item, dict)
+        ]
+        hour_ago = stamp - 3600
+        recent = [item for item in log if float(item.get("at") or 0.0) >= hour_ago]
+        if len(recent) >= SOOTHE_MAX_PER_HOUR:
+            return False
+        today = [item for item in log if str(item.get("day") or "") == day]
+        limit = UNDERSTOOD_MAX_PER_DAY if kind == "understood" else SOOTHE_MAX_PER_DAY
+        if len([item for item in today if str(item.get("kind")) == kind]) >= limit:
+            return False
+        before = float(state.valence)
+        self.apply_event(state, kind, now=stamp)
+        if abs(float(state.valence) - before) < 0.005:
+            # 一点都没推动（比如效价已经贴顶）：不占额度，下次还有机会
+            return False
+        log.append({"at": stamp, "day": day, "kind": kind})
+        state.soothe_log = log[-SOOTHE_LOG_KEEP:]
+        return True
 
     def apply_event_delta(
         self,
@@ -752,10 +875,31 @@ class StateDynamics:
             loneliness=state.loneliness,
             boredom=state.boredom,
             curiosity=state.curiosity,
+            desire=float(getattr(state, "desire", 0.0) or 0.0),
             cause=cause_text(
                 state.mood_cause, at=state.mood_cause_at, now=self._now()
             ),
+            vague=self._vague_word(state),
         )
+
+    def _day_rate(self, state: WorldState, key: str) -> float:
+        """今天这条速率要乘多少。没开基调 / 不是那几条之一时恒为 1.0。"""
+
+        if not bool(getattr(self.config, "daily_mood_enabled", True)):
+            return 1.0
+        try:
+            strength = float(getattr(self.config, "daily_mood_strength", 1.0))
+        except (TypeError, ValueError):
+            strength = 1.0
+        return day_mood_rate(getattr(state, "day_mood", ""), key, strength=strength)
+
+    @staticmethod
+    def _vague_word(state: WorldState) -> str:
+        """今天是"说不上来"的一天时，给模糊档的那个词；否则空串。"""
+
+        if str(getattr(state, "day_mood", "") or "") != "vague":
+            return ""
+        return vague_word_for(str(getattr(state, "day_mood_day", "") or ""))
 
     # ---------------- 极端保护 ----------------
 
@@ -823,6 +967,46 @@ class StateDynamics:
         state.praise_streak = streak_map
         state.praise_streak_at = streak_at
         return magnitude
+
+    # ---------------- 欲求：想被碰一碰 ----------------
+
+    def _desire_config(self, key: str, fallback: float) -> float:
+        """读一条欲求相关的配置；老存档 / 测试桩里没有就用兜底值。"""
+
+        try:
+            value = float(getattr(self.config, key, fallback))
+        except (TypeError, ValueError):
+            return float(fallback)
+        return value if value >= 0 else float(fallback)
+
+    def satisfy_desire(
+        self, state: WorldState, intimacy: float = 1.0, *, scale: float = 1.0
+    ) -> float:
+        """被**实实在在地亲近**了一次：欲求落一截，落多少看动作自己的亲密程度。
+
+        返回实际落了多少（0 表示这一步不算亲密接触）。
+        """
+
+        weight = max(0.0, float(intimacy or 0.0)) * max(0.0, float(scale or 0.0))
+        if weight <= 0:
+            return 0.0
+        before = float(state.desire)
+        relief = self._desire_config("desire_relief", 0.25) * weight
+        state.desire = clamp_value(before - relief, 0.0, 1.0)
+        return before - float(state.desire)
+
+    def tease_desire(self, state: WorldState, *, scale: float = 1.0) -> float:
+        """被**撩**了一下（只是嘴上/氛围上，不是真碰到）：欲求往上跳一点。
+
+        ``scale`` 由调用方按关系亲疏给（越亲近的人越管用）。
+        """
+
+        bonus = self._desire_config("desire_tease", 0.05) * max(0.0, float(scale or 0.0))
+        if bonus <= 0:
+            return 0.0
+        before = float(state.desire)
+        state.desire = clamp_value(before + bonus, 0.0, 1.0)
+        return float(state.desire) - before
 
     # ---------------- 工具 ----------------
 
@@ -909,6 +1093,7 @@ class StateDynamics:
             "affect": round(state.affect, 4),
             "valence": round(state.valence, 4),
             "boredom": round(state.boredom, 4),
+            "desire": round(float(state.desire), 4),
         }
 
 

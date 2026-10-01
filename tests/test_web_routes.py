@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import tempfile
+import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -147,6 +148,43 @@ class WebRouteRegistryTest(unittest.TestCase):
         with open(APP_JS, encoding="utf-8") as handle:
             source = handle.read()
         self.assertIn('apiGet("state/history"', source)
+
+    def test_extension_actions_do_not_get_written_into_the_world_config(self) -> None:
+        """扩展带来的动作只是"加载时并进来"，不能落进世界配置。
+
+        落进去的话，扩展一卸载，它们就变成一堆没人认领、也删不掉的动作。
+        """
+
+        module = self.module
+        context = module.Context()
+        plugin = module.VirtualWorldPlugin(
+            context,
+            module.AstrBotConfig({"enabled": True, "web_enabled": True}),
+        )
+        try:
+            plugin.extension_host.register(
+                module.ExtensionSpec(
+                    name="demo",
+                    title="示例扩展",
+                    actions=[{"id": "demo_action", "name": "演示"}],
+                )
+            )
+            world = {
+                "actions": [
+                    {"id": "say", "name": "说话"},
+                    {"id": "demo_action", "name": "演示"},
+                    {"id": "cook", "name": "做饭"},
+                ]
+            }
+            kept = plugin._without_extension_actions(world)
+            self.assertEqual(["say", "cook"], [item["id"] for item in kept["actions"]])
+            # 没装扩展时原样返回（别动用户自己的配置）
+            bare = types.SimpleNamespace(extension_host=module.ExtensionHost())
+            self.assertIs(world, module.VirtualWorldPlugin._without_extension_actions(bare, world))
+        finally:
+            raw = getattr(getattr(plugin, "db", None), "raw", None)
+            if raw is not None:
+                raw.close()
 
 
 if __name__ == "__main__":

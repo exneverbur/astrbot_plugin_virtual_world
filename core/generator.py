@@ -186,6 +186,21 @@ def parse_generated_actions(
             completed.get("effects_per_minute")
         )
         payload["on_complete"] = completed
+        # 「亲密程度」：只有**碰到人**的动作才有意义。模型写 0 或者没写都当"没提"，
+        # 交给内置对照表 / 运行时分类去判——免得它顺手写个 0 把抱抱判成不亲密。
+        raw_intimacy = payload.get("intimacy")
+        if raw_intimacy in (None, "", 0, 0.0, "0"):
+            payload.pop("intimacy", None)
+        else:
+            try:
+                value = max(0.0, min(1.0, float(raw_intimacy)))
+            except (TypeError, ValueError):
+                payload.pop("intimacy", None)
+            else:
+                if value > 0:
+                    payload["intimacy"] = value
+                else:
+                    payload.pop("intimacy", None)
         payload.pop("node", None)
 
         try:

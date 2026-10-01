@@ -13,6 +13,12 @@ STATE_IDLE = "idle"
 STATE_AWAKENING = "awakening"
 STATE_SLEEPING = "sleeping"
 STATE_NAPPING = "napping"
+STATE_DROWSY = "drowsy"
+"""临睡期：困得不行、正要睡，但还没躺下。
+
+夜里睡前的那一小段：这段时间她还能说话（而且说得迷迷糊糊），
+等安静下来才真的睡——"说完晚安立刻断线"看着像关机，不像人。
+"""
 STATE_STARING = "staring"
 STATE_SEARCHING = "searching"
 STATE_READING = "reading"
@@ -102,13 +108,29 @@ _ANNOTATION_MARKS = ("\n［", "\n[", " ［", " [")
 def chat_core_text(text: str) -> str:
     """切掉注释尾巴，只留"人说的那句话"。"""
 
+    return split_annotation(text)[0]
+
+
+def split_annotation(text: str) -> tuple[str, str]:
+    """把一行拆成「人说的那句话」和尾部那段注释。
+
+    注释是 ``_annotate_message`` 补上去的（@ 了谁、引用了什么、图里有什么），
+    它是"这句到底冲谁说的"的关键信息，截断正文的时候不能连它一起掐掉。
+    """
+
     body = str(text or "")
     cut = -1
     for mark in _ANNOTATION_MARKS:
         index = body.find(mark)
         if index >= 0 and (cut < 0 or index < cut):
             cut = index
-    return body[:cut] if cut >= 0 else body
+    if cut < 0:
+        return body, ""
+    return body[:cut], body[cut:]
+
+
+ANNOTATION_KEEP_CHARS = 240
+"""注释最多留多少字：注释本身也可能很长（@ 了五个人 + 引用 + 三张图）。"""
 
 
 CHAT_MERGE_GAP_SECONDS = 300.0
@@ -304,6 +326,19 @@ class WorldState:
     "她真的经历了一件事"还管用，尺子就反了。
     """
 
+    soothe_log: list[dict[str, Any]] = field(default_factory=list)
+    """安抚通道（低潮时的抱抱、有人听懂她）最近的几次记录。
+
+    这条路不吃"聊天推效价"的当天额度，改用"每小时/每天几次"限流，所以要自己记账。
+    每项形如 ``{"at": 时间戳, "day": "2026-09-29", "kind": "soothed|understood"}``。
+    """
+
+    ext_data: dict[str, dict[str, Any]] = field(default_factory=dict)
+    """扩展包自己的状态（按扩展名分格）。
+
+    主插件既不读也不渲染这里，谁挂上来的谁自己管——没装扩展时它就是空的。
+    """
+
     # ---------------- 能力值（跑团味的那四项） ----------------
 
     abilities: dict[str, float] = field(default_factory=dict)
@@ -372,6 +407,8 @@ class WorldState:
     """
 
     schedule_delays: dict[str, dict[str, Any]] = field(default_factory=dict)
+    schedule_last_fired: dict[str, float] = field(default_factory=dict)
+    """每条日程上次真正跑起来的时间戳（按日程 id 记）：提示词里要写清"上次什么时候做的"。"""
     """日程被事件推迟的记录：``日程 id -> {count, minutes, until, day, slot}``。
 
     推迟有上限（次数 + 总时长），到顶就必须执行——睡觉这件事没有商量余地。
@@ -392,6 +429,15 @@ class WorldState:
     """
 
     boredom: float = 0.3
+    desire: float = 0.2
+    """欲求：对**亲密的肢体接触**的需求（摸摸头、抱抱、亲亲、蹭蹭、靠着）。
+
+    跟孤独感是两回事：孤独是"想有人说话、有人在"，欲求是"想被实实在在碰一下"。
+    没人碰她它就慢慢涨，被亲近一次就落一截——所以它是**身体接触**那一路的驱力，
+    亲密动作（动作自己的「亲密程度」不为 0）会来满足它。
+    """
+    desire_slept: bool = False
+    """这一觉睡过没有：睡醒时欲求要按「睡醒系数」松一截，只做一次。"""
     current_action: dict[str, Any] | None = None
     current_plan: dict[str, Any] | None = None
     last_plan: dict[str, Any] = field(default_factory=dict)
@@ -543,6 +589,13 @@ class WorldState:
     mood_cause_at: float = 0.0
     """上面那句是什么时候记的：太旧的来源不再挂在"现在的心情"上。"""
 
+    day_mood: str = ""
+    """今天的基调（懒散 / 活跃 / 黏人 / 想独处 / 说不上来）：每天掷一次，
+    改的是各条数值曲线走得快慢，不是她的性格。"""
+
+    day_mood_day: str = ""
+    """上面那条基调是哪一天的（YYYY-MM-DD）：换天重掷一次。"""
+
     last_user_activity_at: float = 0.0
     last_nickname_update_at: float = 0.0
     sleep_reply_at: float = 0.0
@@ -572,6 +625,30 @@ class WorldState:
 
     sleep_started_at: int = 0
     """这一段睡眠是从哪个 tick 开始的（算"睡了多久"，起床气按它结账）。"""
+
+    drowsy_sleep_step: dict[str, Any] = field(default_factory=dict)
+    """临睡期里**存着的那一步睡觉**：安静下来之后就拿它真的躺下。
+
+    睡前先进临睡期（可能又说了两句、可能被消息打断），所以这一步不能当场执行，
+    先揣着——不然"说完晚安立刻睡死"看着像关机，不像人。
+    """
+
+    drowsy_started_world_time: int = 0
+    """临睡期从第几个 tick 开始：兜底用（太久了就赶紧睡，别熬到天亮）。"""
+
+    drowsy_started_at: float = 0.0
+    """临睡期开始的真实时间："安静了多久"要从这一刻算起（不能拿她上次说话的时间
+    当起点——那样一进临睡期就立刻睡着了）。"""
+
+    drowsy_day: str = ""
+    """上一次进临睡期是哪天：一晚只走一次临睡期（回笼觉就直接躺）。"""
+
+    goodnight_day: str = ""
+    """上一次「睡前要不要说晚安」是哪天：同一段睡眠只问一次，别一晚问三遍。"""
+
+    goodmorning_day: str = ""
+    """上一次「睡醒要不要说早安」是哪天。"""
+
     startled_count: int = 0
     """这一段睡眠里被吵醒过几次（``sleep.max_per_sleep`` 管着上限）。"""
     sleep_noise_at: float = 0.0
@@ -593,6 +670,12 @@ class WorldState:
     """「想他想到主动去找他」这一天记到哪天了（软推每天有次数上限）。"""
     miss_push_count: int = 0
     """上面那一天已经软推过几次。"""
+    desire_push_day: str = ""
+    """「想被碰一碰」这一天记到哪天了（交给大模型自己安排的那条）。"""
+    desire_push_count: int = 0
+    """上面那一天已经推过几次。"""
+    desire_push_at: float = 0.0
+    """上一次「想被碰一碰」是什么时候：两次之间要隔一会儿，别每拍都问她一遍。"""
     low_energy_since: int = 0
     high_loneliness_since: int = 0
     autonomous_count_hour: int = 0
@@ -706,6 +789,8 @@ class WorldState:
             offset = 0.0
         self.valence_offset = max(-0.5, min(0.5, offset))
         self.boredom = _clamp01(self.boredom, 0.3)
+        self.desire = _clamp01(self.desire, 0.2)
+        self.desire_slept = bool(self.desire_slept)
         self.unanswered_count = max(0, int(self.unanswered_count))
         self.ignored_streak = max(0, int(self.ignored_streak or 0))
         if not isinstance(self.praise_streak, dict):
@@ -723,6 +808,20 @@ class WorldState:
                 for key, value in self.praise_streak_at.items()
             }
         self.chat_day = str(self.chat_day or "")
+        if not isinstance(self.soothe_log, list):
+            self.soothe_log = []
+        else:
+            self.soothe_log = [
+                dict(item) for item in self.soothe_log if isinstance(item, dict)
+            ][-30:]
+        if not isinstance(self.ext_data, dict):
+            self.ext_data = {}
+        else:
+            self.ext_data = {
+                str(key): dict(value)
+                for key, value in self.ext_data.items()
+                if isinstance(value, dict)
+            }
         if not isinstance(self.last_voice_samples, list):
             self.last_voice_samples = []
         else:
@@ -756,10 +855,28 @@ class WorldState:
         self.world_time = max(0, int(self.world_time))
         self.cooldown_until = max(0, int(self.cooldown_until))
         self.mood_override_until = max(0, int(self.mood_override_until))
+        self.day_mood = str(self.day_mood or "")
+        self.day_mood_day = str(self.day_mood_day or "")
+        self.desire_push_day = str(self.desire_push_day or "")
+        self.desire_push_count = max(0, int(self.desire_push_count or 0))
+        try:
+            self.desire_push_at = float(self.desire_push_at or 0.0)
+        except (TypeError, ValueError):
+            self.desire_push_at = 0.0
         self.no_sleep_until = max(0, int(self.no_sleep_until))
         self.memory_flush_wanted = bool(self.memory_flush_wanted)
         self.wake_note_until = max(0, int(self.wake_note_until))
         self.sleep_started_at = max(0, int(self.sleep_started_at or 0))
+        if not isinstance(self.drowsy_sleep_step, dict):
+            self.drowsy_sleep_step = {}
+        self.drowsy_started_world_time = max(0, int(self.drowsy_started_world_time or 0))
+        try:
+            self.drowsy_started_at = float(self.drowsy_started_at or 0.0)
+        except (TypeError, ValueError):
+            self.drowsy_started_at = 0.0
+        self.goodnight_day = str(self.goodnight_day or "")
+        self.goodmorning_day = str(self.goodmorning_day or "")
+        self.drowsy_day = str(self.drowsy_day or "")
         self.startled_count = max(0, int(self.startled_count or 0))
         self.sleep_noise_count = max(0, int(self.sleep_noise_count or 0))
         self.sleep_named_count = max(0, int(self.sleep_named_count or 0))
@@ -885,6 +1002,16 @@ class WorldState:
             self.event_genre_at = cleaned
         if not isinstance(self.schedule_delays, dict):
             self.schedule_delays = {}
+        if not isinstance(self.schedule_last_fired, dict):
+            self.schedule_last_fired = {}
+        else:
+            cleaned_last: dict[str, float] = {}
+            for key, stamp in self.schedule_last_fired.items():
+                try:
+                    cleaned_last[str(key)] = float(stamp or 0.0)
+                except (TypeError, ValueError):
+                    continue
+            self.schedule_last_fired = cleaned_last
         self.stay_up_until = max(0, int(self.stay_up_until or 0))
         if not isinstance(self.event_digest, list):
             self.event_digest = []
@@ -894,7 +1021,9 @@ class WorldState:
             ][-40:]
         # 上一轮的口吻：只认白名单，写坏的当没判过
         tone = str(self.last_user_tone or "").strip().lower()
-        self.last_user_tone = tone if tone in ("praise", "hug", "attack", "normal") else ""
+        self.last_user_tone = (
+            tone if tone in ("praise", "hug", "attack", "refuse", "normal") else ""
+        )
         # 打招呼 / 主动问的账本：清了坏的，别的照原样
         if not isinstance(self.greet_pending, dict):
             self.greet_pending = {}
@@ -1030,6 +1159,9 @@ class WorldState:
         images: Any = None,
         buffer_dropped: bool = False,
         origin: str = "",
+        at: Any = None,
+        reply_to: Any = None,
+        addressing: str = "",
     ) -> None:
         """记录一条群聊内容（用于判断"大家在聊什么"）。
 
@@ -1074,10 +1206,16 @@ class WorldState:
         limit = (
             _FORWARD_TEXT_CHARS if FORWARD_SUMMARY_MARK in clean else _CHAT_TEXT_CHARS
         )
+        # 注释（@ 了谁、引用了什么）不跟着正文一起掐：它正是"这句冲谁说的"的关键，
+        # 掐掉半句（"（其中 老普机器人… 还有 12 字没显示"）反而会让她误会
+        body_text, note_text = split_annotation(clean)
+        kept = body_text[:limit]
+        if note_text:
+            kept = f"{kept}{note_text[:ANNOTATION_KEEP_CHARS]}"
         item = {
             "user_id": user_id,
             "name": name or user_id,
-            "text": clean[:limit],
+            "text": kept,
             "at": now,
             "world_time": self.world_time,
             "is_self": bool(is_self),
@@ -1087,6 +1225,26 @@ class WorldState:
             item["internal"] = True
         if str(origin or "").strip():
             item["origin"] = str(origin).strip()
+        # 「这句是冲谁说的」：@ 名单与引用对象结构化留一份，渲染聊天记录时画箭头用
+        at_list = [
+            {
+                "id": str(entry.get("id") or ""),
+                "name": str(entry.get("name") or ""),
+                "self": bool(entry.get("self")),
+            }
+            for entry in list(at or [])
+            if isinstance(entry, dict)
+        ]
+        if at_list:
+            # 注意别用 "at"：那是这条消息的时间戳
+            item["at_targets"] = at_list
+        if isinstance(reply_to, dict) and (reply_to.get("id") or reply_to.get("name")):
+            item["reply_to"] = {
+                "id": str(reply_to.get("id") or ""),
+                "name": str(reply_to.get("name") or ""),
+            }
+        if str(addressing or "") in ("me", "others"):
+            item["addressing"] = str(addressing)
         refs = _chat_image_refs(images)
         if refs:
             item["images"] = refs
