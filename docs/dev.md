@@ -68,14 +68,28 @@ astrbot_plugin_virtual_world/
   `save_settings()`），不写进世界配置和预设；
 - 挂载点还给扩展几件通用的能力：`sessions()`（当前启用的会话）、`state()` / `update_state()`
   （读、带锁改世界状态）、`node()` / `place_text()`（她现在在哪）、`adjust()`（推数值，0~1 夹住）、
-  `remember()`（写一条记忆）、`log()` / `note_self()`（写日志与聊天留档）、`generate()`（打杂模型写一段）；
+  `remember()`（写一条记忆）、`log()` / `note_self()`（写日志与聊天留档）、`generate()`（打杂模型写一段）、
+  `say()`（以她的身份往某个会话发一条）、`add_affinity(state, user_id, delta, reason=…)`
+  （走主插件那套好感度上下限与日志，返回实际变化量）；
 - **扩展要主模型额外标出来的字段**：扩展不改提示词，也改不动 JSON 协议，只能**声明**。
   声明写在 `ExtensionSpec.json_fields` 里：`{"name","kind","prompt","empty","max_items","max_chars"}`，
-  `kind` 是 `list` / `str` / `num` / `bool` 之一。主插件负责三件事——把说明拼进
+  `kind` 是 `list` / `str` / `num` / `bool` / `text` 之一（`text` = 保留换行的长文本，
+  上限 1200 字）。主插件负责三件事——把说明拼进
   「输出格式」那一层（**全是静态文本**，不随时间/地点变化，所以不影响前缀缓存）、
   按声明的形状把模型给的值收拾干净（截断 / 去重 / 限长 / 转类型）、把结果发给
   `ExtensionSpec.on_json(state, values, host)`。字段名必须是 `[a-z][a-z0-9_]*` 且不能占主插件
   已有的键（`actions`、`reasoning`、`tone`、`touch`…），最多 4 个字段；声明写错就安静丢掉。
   「他这一轮碰了她哪儿」（`touch`）是主插件自带的同类字段，用 `wants=("touch",)` 申请即可，
   形状由主插件定。**没人声明时提示词里一个字都不多**，代码里也没有任何扩展的痕迹。
+- **扩展要在她的话后面再补一段**：声明 `on_reply_extra(state, values, host) -> str`。
+  返回值非空时，主插件把它当成她的**下一条发言**排在同一个发送批次里发出去
+  （不占"一次最多说几条"的额度）；`values` 与 `on_json` 收到的是同一份。没人返回就什么都不发。
+- **扩展要认领某条指令**：声明 `on_command_event(state, text, session_id, host)`。
+  `/vw <第一个词> …` 会先问一遍所有扩展，返回 `None` = 不认识、主插件按原流程走；
+  返回字符串（可以是 `""`）= 认领了，这条就交给扩展，主插件不再当事件投递。
+  指令本身**不会进她的聊天记录**（`engine.is_plugin_command` 挡着），所以认领之后
+  该补一句什么由扩展自己决定。
+- **数值上的两个钩子**：`gate(definition, state, session_id, host)` 返回非空字符串 =
+  这个动作现在不让做（连名字都不进提示词）；`desire_relief(state)` 返回 `False` =
+  这次亲密接触不算"满足欲求"。
 - 没装扩展时，以上全部是空的，插件行为与从前完全一样。

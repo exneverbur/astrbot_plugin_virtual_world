@@ -737,11 +737,27 @@ class TestStateDynamics(unittest.TestCase):
 
         state = WorldState(session_id="s1", desire=0.9)
         held = self.dynamics.satisfy_desire(state, 1.0)
-        self.assertAlmostEqual(held, 0.25, places=4)
+        self.assertAlmostEqual(held, 0.08, places=4)
         shallow = self.dynamics.satisfy_desire(state, 0.2)
         self.assertGreater(shallow, 0.0)
         self.assertLess(shallow, held)
         self.assertEqual(self.dynamics.satisfy_desire(state, 0.0), 0.0)
+
+    def test_contact_never_drags_the_need_down_to_zero(self):
+        """贴着贴着慢慢降，但**压不到那条线以下**；在线下面再贴反而是往上一点。
+
+        以前一次抱抱就 -0.25，两次就把一天的欲求扣光了，她会变成"完全不想"。
+        """
+
+        state = WorldState(session_id="s1", desire=0.9)
+        for _ in range(30):
+            self.dynamics.satisfy_desire(state, 1.0)
+        floor = float(self.dynamics.config.desire_relief_floor)
+        self.assertAlmostEqual(float(state.desire), floor, places=4)
+        # 已经在线下面了：再抱一下不再往下压，反而往上一点（更想，而不是更不想）
+        low = WorldState(session_id="s1", desire=0.1)
+        self.dynamics.satisfy_desire(low, 1.0)
+        self.assertGreater(float(low.desire), 0.1)
 
     def test_being_teased_raises_it(self):
         """嘴上撩不算碰到：欲求不落，反而往上跳一点（越亲近的人跳得越多）。"""
@@ -3708,6 +3724,49 @@ class ExtensionHostTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await bare.say(state, "一句话", "s1"))
         self.assertFalse(await bare.say(state, "  ", "s1"))
 
+    async def test_say_keeps_the_paragraphs(self):
+        """长段叙述靠空行分段：发出去的时候**不能**把换行吃掉（否则一大坨没排版）。"""
+
+        import contextlib
+        import types
+
+        state = WorldState(session_id="s1")
+        sent: list[str] = []
+
+        class _Engine:
+            say_sink = None
+            debug_sink = None
+
+            def __init__(self) -> None:
+                self.say_sink = self._send
+
+            async def _send(self, session_id: str, message: str) -> bool:
+                sent.append(message)
+                return True
+
+            def _now(self) -> float:
+                return 1000.0
+
+            def chat_history_limit(self) -> int:
+                return 12
+
+            def _tag_chat_origin(self, state: Any, session_id: str) -> None:
+                return None
+
+            @contextlib.asynccontextmanager
+            async def session_state(self, session_id: str):
+                yield state
+
+        host = ExtensionHost(types.SimpleNamespace(engine=_Engine()))
+        body = "第一段：她的手贴上去。\n\n第二段：呼吸乱了一拍。\n\n\n第三段：她没吭声。   \n"
+        await host.say(state, body, "s1")
+        self.assertEqual(1, len(sent))
+        self.assertIn("\n\n", sent[0])
+        self.assertEqual(3, len([line for line in sent[0].split("\n\n") if line.strip()]))
+        # 行尾空格和超过一个的空行都清掉，但段落结构留着
+        self.assertNotIn("   \n", sent[0])
+        self.assertNotIn("\n\n\n", sent[0])
+
     async def test_command_event_lets_an_extension_claim_it(self):
         """`/vw event <文本>` 先问一句扩展：谁认领这条就归谁，没人认领主插件照旧。"""
 
@@ -3730,6 +3789,44 @@ class ExtensionHostTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("", await host.command_event("s1", "h"))
         # 不认识的说法还给主插件（None = 没人接手）
         self.assertIsNone(await host.command_event("s1", "出门忘了带伞"))
+
+    def test_text_fields_keep_their_paragraphs(self):
+        """长文本字段（正文那种）要**保留换行**；普通字符串还是压成一行。"""
+
+        body = "第一段。\n\n第二段。\n\n\n第三段。   \n"
+        parsed = parse_action_payload(
+            '{"story": "%s", "note": "%s", "actions": []}'
+            % (body.replace("\n", "\\n"), body.replace("\n", "\\n")),
+            available_actions=set(),
+            json_fields=(
+                {"name": "story", "kind": "text", "prompt": "正文"},
+                {"name": "note", "kind": "str", "prompt": "短备注"},
+            ),
+        )
+        self.assertIn("\n\n", parsed.extra["story"])
+        self.assertEqual(3, len([x for x in parsed.extra["story"].split("\n\n") if x.strip()]))
+        self.assertNotIn("\n", parsed.extra["note"])
+
+    async def test_reply_extra_lets_an_extension_append_a_paragraph(self):
+        """扩展可以要一段"补在她的话后面发出去"的文本（正文走这条）。"""
+
+        import types
+
+        state = WorldState(session_id="s1")
+        host = ExtensionHost(types.SimpleNamespace(engine=types.SimpleNamespace()))
+        self.assertEqual("", await host.reply_extra(state, {"story": "x"}))
+        host.register(
+            ExtensionSpec(
+                name="demo",
+                on_reply_extra=lambda st, values, h: str(values.get("story") or ""),
+            )
+        )
+        self.assertEqual(
+            "第一段。\n\n第二段。",
+            await host.reply_extra(state, {"story": "第一段。\n\n第二段。"}),
+        )
+        # 没给值就什么都不补
+        self.assertEqual("", await host.reply_extra(state, {}))
 
     def test_adjust_only_touches_known_values_and_stays_in_range(self):
         host = ExtensionHost()

@@ -148,6 +148,9 @@ from .generator import (
 
 DEFAULT_TICK_SECONDS = 60.0
 
+EXTENSION_LAYER_HEADING = "# ========== 扩展注入层： =========="
+"""预览里给扩展那一层起的小标题（调试页的分段索引按它列一段）。"""
+
 # 检索流水线：整条动作（多条查询 + 读正文 + 补查）一共最多花这么多秒
 SEARCH_BUDGET_SECONDS = 20.0
 # 读回来的正文按链接缓存这么久，避免同一篇被反复抓
@@ -181,6 +184,9 @@ REPLY_INTERRUPTED = "被新消息打断：这一次生成作废"
 
 REPLY_MUTED = "本小时被动回复已达上限：这一条不回"
 """``handle_reply`` 的 ``error`` 标记：配额用尽，接管但静默（不落回主人格）。"""
+
+REPLY_GUARD_RETRIES = 3
+"""扩展判"这一轮是废的"（模型拒答）时最多重问几次；问满就这一轮不出声。"""
 # 一轮里最多往群里贴几张工具 / 指令生成的图（批量出图时不至于刷屏）
 MAX_GROUP_IMAGES = 9
 # 事件掷骰最多按这么久折算概率：tick 被拖慢时不该一次补出"必中"
@@ -5535,18 +5541,62 @@ class VirtualWorldEngine:
         return not any(word and word in text for word in blocked)
 
     @staticmethod
-    def is_plugin_command(text: str) -> bool:
+    def command_words(text: str) -> list[str]:
+        """把一条指令拆成词：``/vw event h`` 和斜杠被吃掉的 ``vw event h`` 都认。"""
+
+        parts = [item for item in str(text or "").strip().split() if item]
+        if not parts:
+            return []
+        parts[0] = parts[0].lstrip("/／!！").lower()
+        return parts
+
+    @classmethod
+    def is_plugin_command(cls, text: str) -> bool:
         """是不是「本插件的指令」（``/vw …``）。
 
         这种消息是管理入口，不是有人在跟她讲话：不能进她的聊天记录，
         否则她会把「/vw event 逛街被跟了」当成"主人讲给我听的一件事"。
         """
 
+        raw = str(text or "").strip()
         body = str(text or "").strip().lower()
         for prefix in ("/vw", "！vw", "!vw", "／vw"):
             if body.startswith(prefix):
                 return True
-        return False
+        # AstrBot 在派发指令时会把**开头的斜杠**吃掉：她那边看到的其实是
+        # 「vw event h」。光认带斜杠那几种写法挡不住，这里再按「第一个词 + 子命令」认一次，
+        # 不然指令会被记成"他刚说的话"，她会一本正经地回一句"你怎么又敲这指令"。
+        parts = cls.command_words(raw)
+        if not parts or parts[0] not in ("vw", "世界", "virtualworld"):
+            return False
+        if len(parts) == 1:
+            return True
+        return parts[1] in cls.PLUGIN_SUBCOMMANDS
+
+    @classmethod
+    def is_event_command(cls, text: str) -> bool:
+        """``/vw event …``（斜杠被吃掉也算）：这一条是"开一件事"，不是"跟她说话"。"""
+
+        parts = cls.command_words(text)
+        return bool(
+            len(parts) >= 2
+            and parts[0] in ("vw", "世界", "virtualworld")
+            and parts[1] in ("event", "事件")
+        )
+
+    PLUGIN_SUBCOMMANDS = frozenset(
+        {
+            "state", "状态", "plan", "计划", "stop", "停", "停下", "打断",
+            "memories", "记忆", "memory", "session", "会话", "tools", "工具",
+            "prompt", "提示词", "autoprompt", "自主提示词", "tick", "推进",
+            "decide", "决策", "schedule", "日程", "map", "地图",
+            "nickname", "名片", "debug", "调试", "reload", "重载",
+            "reset", "重置", "restore-default", "恢复默认", "event", "事件",
+            "ability", "能力", "能力值", "thread", "线索", "未了",
+            "help", "帮助", "?",
+        }
+    )
+    """``/vw <这些>`` 认得出来的子命令：斜杠被吃掉之后靠它兜底。"""
 
     # ---------------- 这句话是不是「对她说的」 ----------------
 
@@ -5913,6 +5963,13 @@ class VirtualWorldEngine:
         if not event:
             return ""
         magnitude = self._tone_magnitude(state, event, user_id)
+        # 扩展可以给这一下打折（例如"正演着那一场戏，他说的重话是玩闹"）：
+        # 没扩展表态就是 1.0，一切照旧。
+        scale = self.extensions.tone_scale(state, key)
+        if scale != 1.0:
+            magnitude = round(magnitude * scale, 4)
+            if outcome is not None:
+                outcome.notes.append(f"这一轮的口吻脉冲按 {scale:g} 倍走")
         self.dynamics.apply_event(state, event, magnitude=magnitude, now=self._now())
         if key in ("hug", "comfort"):
             kind = self._comfort_pulse(state, key, user_id=user_id)
@@ -6433,11 +6490,16 @@ class VirtualWorldEngine:
             record["absorbed"] = True
         texts = [*(str(item.get("text") or "") for item in early), str(ctx.text or "")]
         texts = texts[:MERGE_MAX_TEXTS]
+        if self.is_event_command(ctx.text):
+            # 「/vw event h」这种指令是开关，不是他说的话：原样交给她，她会一本正经地
+            # 回一句"你怎么又敲这指令"。换成一句世界内的话，让她按"他刚把这一场开了起来"往下接。
+            texts = ["（他把这一场开了起来）"]
         restarts = 0
+        guard_strikes = 0
         wake_note_kept = ""
         raw: str | None = None
         blocked_actions: set[str] = set()
-        for attempt in range(MERGE_MAX_RESTARTS + 1):
+        for attempt in range(MERGE_MAX_RESTARTS + 1 + REPLY_GUARD_RETRIES):
             async with self.session_state(ctx.session_id) as state:
                 node = self.node(state.node_id) or self.node(self.default_node_id())
                 # 「刚被叫醒」之类的临时提示：接管模式也要带上，否则她会以完全清醒的状态回话
@@ -6528,6 +6590,21 @@ class VirtualWorldEngine:
             )
             if raw is None:
                 return ReplyOutcome(ok=False, error="大模型调用失败")
+            # 扩展可以判"这一轮是废的"（模型丢了一句"我不能生成这类内容"）：
+            # 不解析、不执行、不发送，直接重问一次；问满次数就这一轮不出声。
+            if self.extensions.reply_is_bad(state, raw):
+                guard_strikes += 1
+                self._log(
+                    "debug",
+                    f"这一轮被扩展判为拒答/废输出，重新生成（第 {guard_strikes} 次）",
+                )
+                if guard_strikes <= REPLY_GUARD_RETRIES:
+                    continue
+                return ReplyOutcome(
+                    ok=False,
+                    error=REPLY_MUTED,
+                    warnings=["模型拒答，重试后仍失败：这一轮不出声"],
+                )
             if attempt >= MERGE_MAX_RESTARTS or len(texts) >= MERGE_MAX_TEXTS:
                 break
             merged = self._take_merge_texts(
@@ -6660,6 +6737,17 @@ class VirtualWorldEngine:
                         live_sent=bool(outcome.live_messages),
                         debug_messages=self.take_pending_echo(ctx.session_id),
                     )
+            # 扩展要补的一段（例如叙述/正文）：接在她这一轮说完之后、同一个发送批次。
+            # 直接塞进 outcome.messages，所以不占"一次最多说几条"的额度。
+            extra_text = await self.extensions.reply_extra(state, parsed.extra)
+            if extra_text:
+                outcome.messages.append(extra_text)
+                await self._log_event(
+                    state,
+                    "ext_reply_extra",
+                    {"chars": len(extra_text), "text": extra_text[:200]},
+                    outcome=outcome,
+                )
             # 她这次说出去的话也要进聊天上下文：下一轮提示词里才有「你最近说过的话」，
             # 模型才知道自己刚用了什么说法，才能被要求换一种。
             # 已经即时发出去的那几句也算她说过（不然她刚说"等我两分钟"就不记得了）。
@@ -8721,7 +8809,9 @@ class VirtualWorldEngine:
             # 想念看的是这个时间，不是"他有没有在群里露过面"
             self.profiles.note_talked(ctx.session_id, ctx.user_id, now=now)
         self._note_session_activity(state, ctx)
-        if self._passes_safety(ctx.text):
+        # 旁观这条钩子也会收到每一句话：指令（``/vw …``）在这儿同样得挡住，
+        # 不然它会从这条路溜进她的聊天记录——她就会一本正经地回一句"你怎么又敲这指令"。
+        if self._passes_safety(ctx.text) and not self.is_plugin_command(ctx.text):
             state.note_chat(
                 user_id=ctx.user_id,
                 name=ctx.user_name,
@@ -17428,7 +17518,8 @@ class VirtualWorldEngine:
             **await self.runtime_notes(state.session_id),
         )
         layer = self._extension_prompt(state, session_id)
-        return f"{text}\n\n{layer}" if layer else text
+        # 单独起个小标题：不然这一段混在正文里，调试页的分段索引里看不到它
+        return f"{text}\n\n{EXTENSION_LAYER_HEADING}\n{layer}" if layer else text
 
     async def overview(self) -> list[dict[str, Any]]:
         """所有启用会话的简要状态：编辑器地图页一次看全"谁在哪"。"""
@@ -17458,7 +17549,7 @@ class VirtualWorldEngine:
         state = await self.load_state(session_id, cold_start=False)
         node = self.node(state.node_id)
         _cell, say_limit, style_text = self.style_for(state, session_id)
-        return self.prompts.build_autonomous_system_prompt(
+        text = self.prompts.build_autonomous_system_prompt(
             persona_text=await self._persona_text(session_id),
             state=state,
             node=node,
@@ -17492,6 +17583,10 @@ class VirtualWorldEngine:
             ],
             **await self.runtime_notes(session_id),
         )
+        # 预览要和实跑一致：实跑会带上扩展的注入层（engine 里的自主计划那条路），
+        # 以前这里漏了，调试页看"自主提示词"就像没装扩展一样
+        layer = self._extension_prompt(state, session_id)
+        return f"{text}\n\n{EXTENSION_LAYER_HEADING}\n{layer}" if layer else text
 
     async def preview_voice_samples(self, session_id: str) -> list[dict[str, Any]]:
         """调试页用：**这一轮会抽到哪几条声音样例**。

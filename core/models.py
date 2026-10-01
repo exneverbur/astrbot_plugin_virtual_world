@@ -85,6 +85,8 @@ TUNED_DEFAULT_UPGRADES: dict[str, tuple[float, float]] = {
     "profile.miss_cooldown_min_minutes": (45.0, 15.0),
     "profile.miss_cooldown_max_minutes": (240.0, 60.0),
     "profile.miss_push_threshold": (0.85, 0.70),
+    # 亲近一下不再是"扣四分之一"：降到 0.08，并且底下留了条 0.30 的线
+    "state_dynamics.desire_relief": (0.25, 0.08),
 }
 """这一轮调过默认值的字段：老配置里还是旧默认就顺手升级，改过的不碰。"""
 
@@ -706,8 +708,22 @@ class StateDynamics(Permissive):
     desire_wake_keep: float = 0.7
     """睡醒时把欲求乘上这个系数。"""
 
-    desire_relief: float = 0.25
-    """被亲近一次落多少（再乘动作自己的「亲密程度」）。"""
+    desire_relief: float = 0.08
+    """被亲近一次落多少（再乘动作自己的「亲密程度」）。
+
+    以前是 0.25——一次抱抱就把欲求扣掉四分之一，两次就见底了（戏还没开，
+    她已经"完全不想"）。现在贴着贴着慢慢降，配合下面那条下限用。
+    """
+
+    desire_relief_floor: float = 0.30
+    """亲近最多把欲求卸到这儿，不再往下压。
+
+    那下面本来就是"淡淡的、不太想"那一段：日常抱抱摸摸不该把人推进去
+    （以前没有这条，加上单次降幅 0.25，两次抱抱就把一天的欲求扣光了）。
+    """
+
+    desire_contact_warm: float = 0.005
+    """已经在这一线以下时，再被亲近一下反而涨多少（× 亲密程度）。"""
 
     desire_tease: float = 0.05
     """被撩一下涨多少（再乘这个人的关系系数：越亲近越管用）。"""
@@ -2857,6 +2873,9 @@ FIELD_LABELS: dict[str, str] = {
     "decider.interject_cooldown_minutes": "插话后至少安静几分钟",
     "decider.min_messages_to_interject": "群里至少聊几条她才插嘴",
     "profile.miss_growth_per_min": "想念涨得多快（每分钟）",
+    "state_dynamics.desire_relief": "被亲近一次欲求落多少",
+    "state_dynamics.desire_relief_floor": "亲昵最低把欲求卸到这儿",
+    "state_dynamics.desire_contact_warm": "已在低位时被亲近反而涨多少",
     "profile.miss_threshold": "多想你才会主动找你",
     "profile.miss_push_daily_max": "每天最多主动找你几次",
     "profile.miss_cooldown_min_minutes": "两次主动找你的间隔（分钟）",

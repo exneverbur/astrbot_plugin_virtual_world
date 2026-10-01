@@ -1873,8 +1873,19 @@ class EventEngineTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(self.engine.is_plugin_command("/vw event 逛街被跟了"))
         self.assertTrue(self.engine.is_plugin_command("／VW ability"))
+        # AstrBot 派发指令时会把开头的斜杠吃掉：她那边看到的是「vw event h」，
+        # 这一条也得认出来，不然指令会被记成"他刚说的话"
+        self.assertTrue(self.engine.is_plugin_command("vw event h"))
+        self.assertTrue(self.engine.is_plugin_command("VW 状态"))
         self.assertFalse(self.engine.is_plugin_command("/签到"))
         self.assertFalse(self.engine.is_plugin_command("在吗"))
+        # 「vw」后面不是子命令的，还是当成普通聊天
+        self.assertFalse(self.engine.is_plugin_command("vw 是什么意思"))
+        # 起事件的那条指令单独认（回复时换成一句世界内的话，别让她复述指令）
+        self.assertTrue(self.engine.is_event_command("/vw event h"))
+        self.assertTrue(self.engine.is_event_command("vw event 逛街被跟了"))
+        self.assertFalse(self.engine.is_event_command("/vw debug state"))
+        self.assertFalse(self.engine.is_event_command("在吗"))
 
         await self.engine.handle_incoming(
             MessageContext(

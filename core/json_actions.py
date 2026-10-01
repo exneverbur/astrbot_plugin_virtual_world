@@ -7,6 +7,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .extensions import _keep_paragraphs
+
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 # 模型的思考段：有的模型即使关了思考开关也会吐出来（有时还漏掉开标签）。
@@ -680,8 +682,8 @@ def _parse_extra_fields(payload: dict[str, Any], fields: Any) -> dict[str, Any]:
         if value is None:
             continue
         kind = str(data.get("kind") or "list").strip().lower()
-        # 列表型每一项最多 24 个字；字符串型整段最多 60 个字
-        hard_chars = 60 if kind == "str" else 24
+        # 列表型每一项最多 24 个字；字符串型整段最多 60 个字；长文本型最多 1200 个字
+        hard_chars = {"str": 60, "text": 1200}.get(kind, 24)
         try:
             limit_chars = max(1, min(hard_chars, int(data.get("max_chars") or hard_chars)))
         except (TypeError, ValueError):
@@ -711,6 +713,11 @@ def _parse_extra_fields(payload: dict[str, Any], fields: Any) -> dict[str, Any]:
                 picked[name] = number
         elif kind == "bool":
             picked[name] = _as_bool(value)
+        elif kind == "text":
+            # 长文本（正文那种）：**换行照原样留着**，它是靠空行分段的
+            text = _keep_paragraphs(value)[:limit_chars]
+            if text:
+                picked[name] = text
         else:
             text = " ".join(str(value or "").split())[:limit_chars]
             if text:

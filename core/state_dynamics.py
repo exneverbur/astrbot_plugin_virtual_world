@@ -985,14 +985,26 @@ class StateDynamics:
         """被**实实在在地亲近**了一次：欲求落一截，落多少看动作自己的亲密程度。
 
         返回实际落了多少（0 表示这一步不算亲密接触）。
+
+        两条护栏（以前没有，结果是"两次抱抱就把一天的欲求扣光"）：
+
+        - 单次降幅小（``desire_relief`` 默认 0.08）：贴着贴着慢慢降，不是一下抽干；
+        - 降到 ``desire_relief_floor``（默认 0.30）就**不再往下降**——那下面是
+          "淡淡的、不太想"那一段，日常亲密不该把人推进去；再贴反而是往上一点
+          （``desire_contact_warm``，默认 0.005×亲密度）。
         """
 
         weight = max(0.0, float(intimacy or 0.0)) * max(0.0, float(scale or 0.0))
         if weight <= 0:
             return 0.0
         before = float(state.desire)
-        relief = self._desire_config("desire_relief", 0.25) * weight
-        state.desire = clamp_value(before - relief, 0.0, 1.0)
+        floor = max(0.0, min(0.95, float(self._desire_config("desire_relief_floor", 0.30))))
+        if before <= floor:
+            warm = max(0.0, float(self._desire_config("desire_contact_warm", 0.005))) * weight
+            state.desire = clamp_value(before + warm, 0.0, 1.0)
+            return 0.0
+        relief = max(0.0, float(self._desire_config("desire_relief", 0.08))) * weight
+        state.desire = clamp_value(max(floor, before - relief), 0.0, 1.0)
         return before - float(state.desire)
 
     def tease_desire(self, state: WorldState, *, scale: float = 1.0) -> float:

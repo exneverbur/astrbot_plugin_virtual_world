@@ -35,7 +35,7 @@ MODEL_SLOTS = ("helper", "creator", "llm", "event", "judge", "consolidate")
 """
 
 
-JSON_FIELD_KINDS = ("list", "str", "num", "bool")
+JSON_FIELD_KINDS = ("list", "str", "text", "num", "bool")
 """扩展声明 JSON 字段时能选的形状。"""
 
 JSON_FIELD_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,23}$")
@@ -52,6 +52,9 @@ MAX_JSON_FIELD_ITEMS = 5
 
 MAX_JSON_FIELD_CHARS = 24
 """列表型字段每一项最多几个字。"""
+
+MAX_JSON_FIELD_TEXT = 1200
+"""长文本字段（``kind="text"``）最多多少字。"""
 
 RESERVED_JSON_KEYS = frozenset(
     {
@@ -116,6 +119,9 @@ class JsonField:
             return f'  "{self.name}": false,{"（" + note + "）" if note else ""}\n'
         if self.kind == "num":
             return f'  "{self.name}": 0,{"（" + note + "）" if note else ""}\n'
+        if self.kind == "text":
+            # 长文本：照字符串的写法给，但允许换行（发出去的时候换行照原样留着）
+            return f'  "{self.name}": "{note}",\n'
         return f'  "{self.name}": "{note}",\n'
 
 
@@ -130,6 +136,30 @@ BUILTIN_JSON_FIELDS: dict[str, JsonField] = {
     ),
 }
 """主插件自己认得的那几个字段：扩展只能"声明要它"，形状由这里定。"""
+
+
+def _keep_paragraphs(text: Any) -> str:
+    """收拾一段要发出去的文字：**保留换行**，只去掉多余空行与行尾空格。
+
+    扩展写的长段叙述靠空行分段；以前这里用 ``" ".join(text.split())`` 把换行全吃掉，
+    发到聊天里就是一大坨没有排版的字。
+    """
+
+    raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw:
+        return ""
+    lines = [line.rstrip() for line in raw.split("\n")]
+    out: list[str] = []
+    blank = 0
+    for line in lines:
+        if line:
+            blank = 0
+            out.append(line)
+            continue
+        blank += 1
+        if blank <= 1:
+            out.append("")
+    return "\n".join(out).strip()
 
 
 def normalize_json_field(raw: Any) -> JsonField | None:
@@ -157,21 +187,22 @@ def normalize_json_field(raw: Any) -> JsonField | None:
     kind = str(data.get("kind") or "list").strip().lower()
     if kind not in JSON_FIELD_KINDS:
         kind = "list"
+    upper_chars = MAX_JSON_FIELD_TEXT if kind == "text" else MAX_JSON_FIELD_CHARS
     try:
         max_items = int(data.get("max_items") or MAX_JSON_FIELD_ITEMS)
     except (TypeError, ValueError):
         max_items = MAX_JSON_FIELD_ITEMS
     try:
-        max_chars = int(data.get("max_chars") or MAX_JSON_FIELD_CHARS)
+        max_chars = int(data.get("max_chars") or upper_chars)
     except (TypeError, ValueError):
-        max_chars = MAX_JSON_FIELD_CHARS
+        max_chars = upper_chars
     return JsonField(
         name=name,
         kind=kind,
         prompt=str(data.get("prompt") or "")[:MAX_JSON_FIELD_PROMPT],
         empty=str(data.get("empty") or ""),
         max_items=max(1, min(MAX_JSON_FIELD_ITEMS, max_items)),
-        max_chars=max(1, min(MAX_JSON_FIELD_CHARS, max_chars)),
+        max_chars=max(1, min(upper_chars, max_chars)),
         example=str(data.get("example") or ""),
     )
 
@@ -249,11 +280,36 @@ class ExtensionSpec:
     只有该扩展自己声明过的字段会出现在 ``values`` 里（同名广播给所有声明方）。
     """
 
+    on_reply_extra: Callable[[Any, dict[str, Any], "ExtensionHost"], str] | None = None
+    """这一轮要**补在她的话后面**一起发出去的一段文本：``(state, values, host) -> str``。
+
+    ``values`` 和 :attr:`on_json` 收到的是同一份。返回非空字符串时，
+    主插件把它当作她的下一条发言发出去（同一个发送批次、排在她那几句之后），
+    也照常记进她的聊天留档；不占"一次最多说几条"的额度。
+    """
+
     desire_relief: Callable[[Any], bool] | None = None
     """这次亲密接触**要不要按"满足欲求"处理**：``(state) -> bool``。
 
     返回 False 表示"这回不算满足"（例如扩展那边认为"正处在一种持续的状态里，
     这时候只会更想要"）。没扩展声明时主插件照旧按接触满足。
+    """
+
+    tone_scale: Callable[[Any, str], float] | None = None
+    """这一轮"对方口吻"的情绪脉冲打几折：``(state, tone) -> 倍数``。
+
+    ``tone`` 是主插件判出来的口吻（``praise`` / ``hug`` / ``comfort`` / ``attack`` /
+    ``negative``…）。返回 ``None`` = 不表态；返回数字时**乘到这一下的幅度上**
+    （夹在 0~1.5 之间，0 = 这一下不产生情绪）。第一个表态的扩展说了算。
+    **没扩展声明时脉搏怎么算还是怎么算。**
+    """
+
+    reply_guard: Callable[[Any, str, "ExtensionHost"], bool] | None = None
+    """这一轮的模型原始输出要不要作废：``(state, raw, host) -> True = 废的``。
+
+    返回 True 时主插件**不解析、不执行、不发送**这一轮，直接重新问一次模型
+    （最多 ``REPLY_GUARD_RETRIES`` 次）；问满次数还是废的，这一轮就不出声、
+    也不会退回主人格。用来拦"我不能生成这类内容"这种拒答。
     """
 
     on_command_event: Callable[[Any, str, str, "ExtensionHost"], Any] | None = None
@@ -564,6 +620,65 @@ class ExtensionHost:
                 continue
         return handled
 
+    async def reply_extra(self, state: Any, values: dict[str, Any]) -> str:
+        """这一轮要补在她的话后面发出去的那段文本（第一个返回非空的扩展说了算）。"""
+
+        picked = {
+            str(key): value
+            for key, value in dict(values or {}).items()
+            if str(key) and value not in (None, "", [], {})
+        }
+        if not picked:
+            return ""
+        for spec in self.specs.values():
+            hook = getattr(spec, "on_reply_extra", None)
+            if hook is None:
+                continue
+            try:
+                result = hook(state, picked, self)
+                if hasattr(result, "__await__"):
+                    result = await result
+            except Exception:
+                continue
+            text = _keep_paragraphs(result)
+            if text:
+                return text
+        return ""
+
+    def tone_scale(self, state: Any, tone: str) -> float:
+        """这一轮口吻脉冲的倍数（第一个表态的扩展说了算，默认 1.0）。"""
+
+        for spec in self.specs.values():
+            hook = getattr(spec, "tone_scale", None)
+            if hook is None:
+                continue
+            try:
+                result = hook(state, str(tone or ""))
+            except Exception:
+                continue
+            if result is None:
+                continue
+            try:
+                number = float(result)
+            except (TypeError, ValueError):
+                continue
+            return max(0.0, min(1.5, number))
+        return 1.0
+
+    def reply_is_bad(self, state: Any, raw: str) -> bool:
+        """有没有扩展说"这一轮是废的"（例如模型拒答）。**第一个表态的说了算。**"""
+
+        for spec in self.specs.values():
+            hook = getattr(spec, "reply_guard", None)
+            if hook is None:
+                continue
+            try:
+                if hook(state, str(raw or ""), self):
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def touch(self, state: Any, parts: list[str]) -> bool:
         """把"他碰了她哪儿"转交给声明要它的扩展；没人要就什么都不做。"""
 
@@ -739,7 +854,59 @@ class ExtensionHost:
         except Exception:
             return "她"
 
+    def person(self, state: Any, user_id: str) -> dict[str, Any]:
+        """某个人在通讯录里的只读资料：名字、好感、关系档，以及**记在他名下的那些事实**。
+
+        扩展要"知道对方是谁、什么关系、有什么底细"（比如文案里要写清双方的性别）时用它。
+        读不到（没装通讯录 / 没这个人）就返回空字典，扩展自己兜底。
+        """
+
+        engine = getattr(self.plugin, "engine", None)
+        store = getattr(engine, "profiles", None)
+        uid = str(user_id or "").strip()
+        if store is None or not uid:
+            return {}
+        session_id = str(getattr(state, "session_id", "") or "")
+        try:
+            view = store.view(session_id, uid)
+        except Exception:
+            view = None
+        if view is None:
+            return {}
+        facts: list[dict[str, str]] = []
+        for item in list(getattr(view, "facts", None) or []):
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            facts.append({"kind": str(item.get("kind") or ""), "text": text})
+        return {
+            "user_id": uid,
+            "name": str(getattr(view, "name", "") or ""),
+            "call_him": str(getattr(view, "call_him", "") or ""),
+            "affinity": float(getattr(view, "affinity", 0.0) or 0.0),
+            "level": str(getattr(view, "level", "") or ""),
+            "facts": facts,
+        }
+
     # ---------------- 世界状态 ----------------
+
+    async def persona_text(self, state: Any, session_id: str = "") -> str:
+        """这个会话当前生效的人设原文：扩展要"照她的口吻写点什么"时用它。
+
+        读不到（没接引擎 / 会话没人设）就返回空串，扩展自己兜底。
+        """
+
+        engine = getattr(self.plugin, "engine", None)
+        sid = str(session_id or getattr(state, "session_id", "") or "")
+        hook = getattr(engine, "_persona_text", None)
+        if hook is None or not sid:
+            return ""
+        try:
+            return str(await hook(sid) or "")
+        except Exception:
+            return ""
 
     def sessions(self) -> list[dict[str, Any]]:
         """可选的"她在哪"：**会话组优先，然后是没有归组的会话**。
@@ -913,6 +1080,39 @@ class ExtensionHost:
         except Exception:
             pass
 
+    def add_affinity(
+        self,
+        state: Any,
+        user_id: str,
+        delta: float,
+        *,
+        reason: str = "",
+        source: str = "extension",
+    ) -> float:
+        """给某个人加/减好感度（走主插件那套上限与日志）；返回实际变化量。"""
+
+        engine = getattr(self.plugin, "engine", None)
+        store = getattr(engine, "profiles", None)
+        uid = str(user_id or "")
+        amount = float(delta or 0.0)
+        if store is None or not uid or not amount:
+            return 0.0
+        try:
+            before = 0.0
+            view = store.view(str(getattr(state, "session_id", "") or ""), uid)
+            before = float(getattr(view, "affinity", before) or before)
+            result = store.adjust_affinity(
+                str(getattr(state, "session_id", "") or ""),
+                uid,
+                amount,
+                reason=str(reason or ""),
+                source=str(source or "extension"),
+            )
+            after = float((result or {}).get("value") or before)
+            return after - before
+        except Exception:
+            return 0.0
+
     def note_self(self, state: Any, text: str, session_id: str = "") -> None:
         """把"她自己身上发生的事"写进聊天留档（private 会话才写；标成内部事件）。"""
 
@@ -940,11 +1140,14 @@ class ExtensionHost:
         跟 :meth:`note_self` 的区别：那个只写留档背景（`internal=True`，平台不发），
         这个是**真的说话**——短句之外，扩展自己写的那一段叙述也能发出来。
 
+        **换行照原样保留**：扩展写的长段叙述是靠空行分段的，
+        把它压成一行就等于没有排版（一段几百字糊成一坨）。
+
         只该在**后台任务**里调：动作回调 / tick 里正拿着这个会话的锁，
         再进来会等锁（等不到就是死等）。
         """
 
-        body = " ".join(str(text or "").split())
+        body = _keep_paragraphs(text)
         if not body:
             return False
         engine = getattr(self.plugin, "engine", None)
