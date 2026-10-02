@@ -3903,17 +3903,28 @@ function scopeOptions({ withMembers = false, onlyFor = "" } = {}) {
         (owner ? ` · 属于「${owner.name || owner.id}」` : ""),
     });
   });
+  // 兜底：onlyFor 指向一个已经不在名单里的会话（删过又加、id 变了）时，
+  // 别给一个空列表让人没法选——退回"全都列出来"。
+  if (onlyFor && !options.length) return scopeOptions({ withMembers });
   return options;
 }
 
-/** 这个会话属于哪个组（没进组返回 null）。 */
+/**
+ * 这里传进来的可能是**会话 id**，也可能是**组 id**。
+ *
+ * 「选会话」那一排下拉的第一个选项就是组（`options[0].value` = 组 id），
+ * 只认会话 id 的话就会返回 null → 日程的落点列表直接空掉（删过会话又加回来时最容易撞上）。
+ */
 function groupOwning(sessionId) {
   const wanted = String(sessionId || "");
   if (!wanted) return null;
+  const all = groups();
   return (
-    groups().find((group) =>
+    all.find((group) => String(group.id) === wanted) ||
+    all.find((group) =>
       (group.sessions || []).some((id) => String(id) === wanted),
-    ) || null
+    ) ||
+    null
   );
 }
 

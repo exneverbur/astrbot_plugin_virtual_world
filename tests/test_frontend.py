@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -284,6 +285,89 @@ class FrontendSyntaxTest(unittest.TestCase):
         self.assertIn("applyDebugEvents((ui.defaults || {}).debug_events)", source)
         # 筛选里要把注册过的类型并进数据库里出现过的那些
         self.assertIn("...EXT_DEBUG_TYPES", source)
+
+
+def _grab_function(source: str, name: str) -> str:
+    """把 app.js 里某个函数的源码抠出来（按括号配平，参数里的解构也认）。"""
+
+    start = source.index(f"function {name}(")
+    index = source.index("(", start)
+    depth = 0
+    after = -1
+    for position in range(index, len(source)):
+        char = source[position]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                after = position + 1
+                break
+    depth = 0
+    for position in range(source.index("{", after), len(source)):
+        char = source[position]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : position + 1]
+    raise AssertionError(f"{name} 的括号配不平")
+
+
+class SessionScopeTest(unittest.TestCase):
+    """「选会话」与「日程落点」的选项表：组 id 也得分得清。
+
+    日程落点用的是 ``scopeOptions({onlyFor: <会话下拉的值>})``，而下拉的第一个选项
+    是**组 id**；只认会话 id 的话（删过会话又加回来时下拉会落回第一项）落点列表就是空的。
+    """
+
+    def _options(self, only_for: str) -> list[str]:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("没有 node，跳过这一条")
+        source = APP_JS.read_text("utf-8")
+        stub = (
+            "const ui = {\n"
+            '  config: { sessions: { groups: [{ id: "team", name: "同一个她",'
+            ' sessions: ["g1", "p1"], main_session: "p1" }] } },\n'
+            '  sessions: [ { session_id: "g1", type: "group" },'
+            ' { session_id: "p1", type: "private" } ],\n'
+            "};\n"
+        )
+        script = (
+            stub
+            + _grab_function(source, "groups")
+            + "\n"
+            + _grab_function(source, "groupOwning")
+            + "\n"
+            + _grab_function(source, "scopeOptions")
+            + "\n"
+            + "console.log(JSON.stringify(scopeOptions({ withMembers: true, onlyFor: "
+            + json.dumps(only_for)
+            + " }).map((item) => item.value)));\n"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".cjs", delete=False, encoding="utf-8") as handle:
+            handle.write(script)
+            path = handle.name
+        try:
+            done = subprocess.run(
+                [node, path], capture_output=True, text=True, encoding="utf-8", timeout=30
+            )
+        finally:
+            Path(path).unlink(missing_ok=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_landing_point_accepts_a_group_id(self) -> None:
+        self.assertEqual(self._options('"team"'), ["team", "g1", "p1"])
+
+    def test_landing_point_accepts_a_member_session_id(self) -> None:
+        self.assertEqual(self._options('"p1"'), ["team", "g1", "p1"])
+
+    def test_landing_point_never_comes_back_empty(self) -> None:
+        # 下拉指向一个已经不存在的会话（删过又加、id 变了）：退回全都列出来
+        self.assertEqual(self._options('"gone"'), ["team", "g1", "p1"])
 
 
 if __name__ == "__main__":
