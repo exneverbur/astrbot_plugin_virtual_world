@@ -276,6 +276,15 @@ class FrontendSyntaxTest(unittest.TestCase):
             len(re.findall(r"stateLabelOf\(", source)), 3, "状态名要统一走 stateLabelOf"
         )
 
+    def test_extension_debug_types_reach_the_log_page(self) -> None:
+        """扩展注册的事件类型：编辑器要从 /defaults 读进来，并入日志页的类型表。"""
+
+        source = APP_JS.read_text("utf-8")
+        self.assertIn("function applyDebugEvents(", source)
+        self.assertIn("applyDebugEvents((ui.defaults || {}).debug_events)", source)
+        # 筛选里要把注册过的类型并进数据库里出现过的那些
+        self.assertIn("...EXT_DEBUG_TYPES", source)
+
 
 if __name__ == "__main__":
     unittest.main()

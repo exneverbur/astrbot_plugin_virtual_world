@@ -456,6 +456,48 @@ const LOG_TYPES = {
   bot_spoke: { icon: "🗣️", label: "发言等待回应" },
 };
 
+/** 扩展注册的事件类型（`/config` 里的 `debug_events`）：并进上面那张表。 */
+let EXT_DEBUG_TYPES = [];
+/** 扩展注册的调试类型在「调试输出」清单里长什么样（每种一行）。 */
+let EXT_ECHO_CHOICES = [];
+/** 它们各自归到哪一组（一个扩展一组）。 */
+let EXT_ECHO_GROUPS = [];
+
+function applyDebugEvents(rows) {
+  EXT_DEBUG_TYPES = [];
+  EXT_ECHO_CHOICES = [];
+  EXT_ECHO_GROUPS = [];
+  const byGroup = new Map();
+  (Array.isArray(rows) ? rows : []).forEach((item) => {
+    const key = String((item && item.type) || "").trim();
+    if (!key) return;
+    EXT_DEBUG_TYPES.push(key);
+    if (!LOG_TYPES[key]) {
+      LOG_TYPES[key] = {
+        icon: String((item && item.icon) || "•"),
+        label: String((item && item.label) || key),
+      };
+    }
+    const owner = String((item && item.ext) || "扩展");
+    const groupKey = `ext:${owner}`;
+    if (!byGroup.has(groupKey)) {
+      byGroup.set(groupKey, true);
+      EXT_ECHO_GROUPS.push({
+        key: groupKey,
+        label: `扩展：${owner}`,
+        hint: "扩展自己注册的调试类型：勾上就把它们也发到群里（完整 / 精简各选一次）。",
+      });
+    }
+    EXT_ECHO_CHOICES.push({
+      key,
+      icon: String((item && item.icon) || "•"),
+      label: String((item && item.label) || key),
+      hint: String((item && item.hint) || "扩展注册的调试类型。"),
+      group: groupKey,
+    });
+  });
+}
+
 const OPS = [
   { key: "+", label: "增加" },
   { key: "-", label: "减少" },
@@ -1155,15 +1197,15 @@ const KNOBS = [
     hint: "她多容易被逗乐、多容易被惹到，以及情绪回得多快。调高会更容易兴奋起来。",
     levels: [
       { "state_dynamics.chat_valence_cap": 0.02, "state_dynamics.chat_valence_daily_cap": 0.06,
-        "state_dynamics.valence_decay_per_min": 0.02 },
+        "state_dynamics.valence_decay_per_min": 0.022 },
       { "state_dynamics.chat_valence_cap": 0.035, "state_dynamics.chat_valence_daily_cap": 0.1,
-        "state_dynamics.valence_decay_per_min": 0.015 },
+        "state_dynamics.valence_decay_per_min": 0.018 },
       { "state_dynamics.chat_valence_cap": 0.05, "state_dynamics.chat_valence_daily_cap": 0.15,
-        "state_dynamics.valence_decay_per_min": 0.01 },
+        "state_dynamics.valence_decay_per_min": 0.014 },
       { "state_dynamics.chat_valence_cap": 0.08, "state_dynamics.chat_valence_daily_cap": 0.25,
-        "state_dynamics.valence_decay_per_min": 0.006 },
+        "state_dynamics.valence_decay_per_min": 0.010 },
       { "state_dynamics.chat_valence_cap": 0.12, "state_dynamics.chat_valence_daily_cap": 0.4,
-        "state_dynamics.valence_decay_per_min": 0.003 },
+        "state_dynamics.valence_decay_per_min": 0.006 },
     ],
   },
   {
@@ -1834,8 +1876,11 @@ function echoTypesField(world) {
   };
 
   const groups = el("div", "echo-groups");
-  ECHO_GROUPS.forEach((group) => {
-    const items = ECHO_TYPE_CHOICES.filter((item) => (item.group || "core") === group.key);
+  // 扩展注册的类型排在最后，一个扩展一组
+  const allGroups = [...ECHO_GROUPS, ...EXT_ECHO_GROUPS];
+  const allChoices = [...ECHO_TYPE_CHOICES, ...EXT_ECHO_CHOICES];
+  allGroups.forEach((group) => {
+    const items = allChoices.filter((item) => (item.group || "core") === group.key);
     if (!items.length) return;
     const block = el("div", "echo-group");
     const head = el("div", "echo-group-head");
@@ -3147,6 +3192,8 @@ async function loadAll() {
     ui.config = config;
     ui.tools = tools.tools || [];
     ui.defaults = defaults || { actions: {}, captions: {} };
+    // 扩展注册的调试类型跟内置默认文案一起给（同一份 /defaults 载荷）
+    applyDebugEvents((ui.defaults || {}).debug_events);
     ui.sessions = (config.sessions && config.sessions.sessions) || [];
     if (config.warnings && config.warnings.length) {
       toast(`配置提醒：${config.warnings.join("；")}`);
@@ -3370,6 +3417,33 @@ function bindButtons() {
   }
   if ($("contacts-search")) {
     $("contacts-search").addEventListener("input", renderContactsList);
+  }
+  if ($("contacts-clear")) {
+    $("contacts-clear").addEventListener("click", async () => {
+      const session = $("contacts-session") ? $("contacts-session").value : "";
+      if (!session) return;
+      const count = (ui.contacts || []).length;
+      const sure = await confirmDialog({
+        title: "清空通讯录",
+        message:
+          `这个会话组里她认识的人（现在 ${count} 个）会全部被忘掉：` +
+          "画像、事实、关系、好感记录一起删，没法撤回；关系档位、会话白名单、聊天记录都不动。",
+        confirmText: count ? `忘掉这 ${count} 个人` : "清空",
+      });
+      if (!sure) return;
+      try {
+        const result = await apiPost("profile/forget-all", { session });
+        ui.contactUser = "";
+        toast(
+          result.people
+            ? `清空好了：忘掉 ${result.people} 个人`
+            : "本来就没人，通讯录已经是空的",
+        );
+        await loadContacts();
+      } catch (error) {
+        toast(error.message || "清空失败");
+      }
+    });
   }
   if ($("contacts-session")) {
     $("contacts-session").addEventListener("change", () => {
@@ -6650,6 +6724,23 @@ function renderZoneForm(form) {
       hint: "可选，写个 emoji 也行。",
     }),
   );
+  form.appendChild(
+    checkboxField(
+      "这是她的家",
+      zone.is_home === true,
+      (value) => {
+        // 只能有一个家：勾了这个，别的区域自动取消
+        zones().forEach((item) => {
+          item.is_home = item.id === zone.id ? Boolean(value) : false;
+        });
+        renderNodeForm();
+        renderZoneList();
+      },
+      {
+        hint: "久待会想出去走走；一个区域就够，不勾就按卧室所在区域算。",
+      },
+    ),
+  );
   const position = el("div", "row-item");
   position.appendChild(
     inputField("世界地图 X", num(zone.x), (value) => {
@@ -9900,7 +9991,9 @@ function fillLogTypes(types) {
   const select = $("log-type");
   const current = select.value;
   const existing = Array.from(select.options).map((item) => item.value);
-  const wanted = ["", ...types];
+  // 扩展注册过、但今天还没写过日志的类型也要列出来（不然筛选里看不到）
+  const merged = [...new Set([...(types || []), ...EXT_DEBUG_TYPES])];
+  const wanted = ["", ...merged];
   if (
     existing.length === wanted.length &&
     existing.every((value, index) => value === wanted[index])
@@ -9909,7 +10002,7 @@ function fillLogTypes(types) {
   }
   select.innerHTML = "";
   select.appendChild(option("", "全部"));
-  types.forEach((type) => {
+  merged.forEach((type) => {
     const meta = LOG_TYPES[type];
     select.appendChild(option(type, meta ? `${meta.icon} ${meta.label}` : type));
   });
@@ -10788,7 +10881,14 @@ async function contactAction(node) {
         digest: box.querySelector("[data-act=field-digest]").value,
       });
     } else if (act === "person-forget") {
-      if (!window.confirm("真的要忘掉这个人吗？画像、事实、关系都会删掉。")) return;
+      // 插件页在 sandbox 的 iframe 里跑，没有 allow-modals：
+      // window.confirm 会被浏览器拦掉（点了没反应），只能用自己的弹窗
+      const sure = await confirmDialog({
+        title: "忘掉这个人",
+        message: "画像、事实、关系、好感记录都会删掉，而且没法撤回。",
+        confirmText: "忘掉他",
+      });
+      if (!sure) return;
       await apiPost("profile/forget", { session, user_id: userId });
       ui.contactUser = "";
     } else {
@@ -12047,7 +12147,7 @@ function renderSettings() {
     ["loneliness_growth_per_min", "孤独增长/分钟", "越大越容易想找人"],
     ["curiosity_growth_per_min", "好奇增长/分钟", "越大越想上网查东西"],
     ["affect_decay_per_min", "心潮回落/分钟", "越大情绪平复得越快（默认 0.02 ≈ 50 分钟从满值回到平静）"],
-    ["valence_decay_per_min", "效价回落/分钟", "越大心情平复得越快（默认 0.01 ≈ 一小时出头回落一半）"],
+    ["valence_decay_per_min", "效价回落/分钟", "越大心情平复得越快（默认 0.014 ≈ 50 分钟回落一半）"],
     ["chat_valence_cap", "聊天单轮最多推动效价", "一轮聊天最多让心情变化多少。调大她会因为几句夸奖就明显开心；默认 0.05 偏向「心情靠经历，不靠嘴甜」"],
     ["chat_valence_daily_cap", "聊天每天最多推动效价", "日常聊天一天最多把心情推多少（正负各算一份）。填 0 = 不限制；日常陪伴改的是好感度，不是心情的量程"],
     ["boredom_growth_per_min", "无聊增长/分钟", "越大越想换地方"],

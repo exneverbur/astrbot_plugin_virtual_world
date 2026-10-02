@@ -366,15 +366,50 @@ DAY_MOOD_RATE_KEYS = ("energy", "loneliness", "curiosity", "boredom", "affect", 
 # 没写到的分支按 1.0 算。除数是这套：权重一样就退回原来的优先级（不掷骰子）。
 DAY_MOOD_BRANCHES: dict[str, dict[str, float]] = {
     "calm": {},
-    "lazy": {"reach_out": 0.90, "search": 0.55, "wander": 0.70, "read": 1.30, "cuddle": 0.80},
-    "lively": {"reach_out": 1.10, "search": 1.50, "wander": 1.40, "read": 0.85, "cuddle": 1.20},
-    "clingy": {"reach_out": 2.00, "search": 0.80, "wander": 0.85, "read": 1.00, "cuddle": 1.70},
-    "solitary": {"reach_out": 0.45, "search": 1.20, "wander": 1.20, "read": 1.50, "cuddle": 0.35},
+    "lazy": {
+        "reach_out": 0.90,
+        "search": 0.55,
+        "wander": 0.70,
+        "read": 1.30,
+        "cuddle": 0.80,
+        "outdoor": 0.60,
+    },
+    "lively": {
+        "reach_out": 1.10,
+        "search": 1.50,
+        "wander": 1.40,
+        "read": 0.85,
+        "cuddle": 1.20,
+        "outdoor": 1.60,
+    },
+    "clingy": {
+        "reach_out": 2.00,
+        "search": 0.80,
+        "wander": 0.85,
+        "read": 1.00,
+        "cuddle": 1.70,
+        "outdoor": 0.70,
+    },
+    "solitary": {
+        "reach_out": 0.45,
+        "search": 1.20,
+        "wander": 1.20,
+        "read": 1.50,
+        "cuddle": 0.35,
+        "outdoor": 1.50,
+    },
     # 说不上来的一天：没有明显偏向，但也不完全按老顺序来
-    "vague": {"reach_out": 1.15, "search": 0.95, "wander": 1.20, "read": 1.05, "cuddle": 1.10},
+    "vague": {
+        "reach_out": 1.15,
+        "search": 0.95,
+        "wander": 1.20,
+        "read": 1.05,
+        "cuddle": 1.10,
+        "outdoor": 1.10,
+    },
 }
 
-DAY_BRANCH_KEYS = ("reach_out", "search", "wander", "read", "cuddle")
+DAY_BRANCH_KEYS = ("reach_out", "search", "wander", "read", "cuddle", "outdoor")
 
 VAGUE_WORDS = ("说不上来", "心浮", "没由来的烦", "空落落", "提不起劲", "有点飘")
 """模糊档用的词：同一天用同一个，别每轮换一个。"""

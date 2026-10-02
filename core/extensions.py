@@ -295,7 +295,27 @@ class ExtensionSpec:
     也照常记进她的聊天留档；不占"一次最多说几条"的额度。
     """
 
-    desire_relief: Callable[[Any], bool] | None = None
+    debug_events: tuple[dict[str, str], ...] = ()
+    """扩展会写进事件日志的类型：``({"type": "ext_climax", "label": "高潮结算",
+    "icon": "💞", "hint": "…", "render": 可调用对象}, …)``。
+
+    主插件把这份清单交给编辑器：
+
+    - 日志页的「类型」筛选里会出现这些条目（带图标和中文名）；
+    - 全局设置里的「调试输出」清单会多出一组，勾上就能把这些事件也发到群里；
+    - ``render(detail) -> str`` 可选：自己把这一条渲染成中文（日志和调试输出都用它），
+      不写就退回主插件的通用兜底（``类型：key=值，…``，能看但不好读）。
+    """
+
+    desire_relief: Callable[..., Any] | None = None
+    """这次肢体接触算不算"解渴"：``(definition, state, session_id, host) -> 0~1``。
+
+    返回 1 = 照常满足欲求，0 = 这一下一点都不解渴（只是更想要），中间按比例。
+    老写法 ``(state) -> bool`` 也认（``False`` = 0，``True`` = 1）。
+
+    "日常亲昵不解渴、只有性事才解渴"这种口味归扩展管——主插件只管把这一下
+    折算成欲求落多少，别在通用插件里写死哪类动作算解渴。
+    """
     """这次亲密接触**要不要按"满足欲求"处理**：``(state) -> bool``。
 
     返回 False 表示"这回不算满足"（例如扩展那边认为"正处在一种持续的状态里，
@@ -548,6 +568,58 @@ class ExtensionHost:
                 return text
         return ""
 
+    def debug_events(self) -> list[dict[str, str]]:
+        """扩展注册的事件类型（日志页的筛选与图标用它）。"""
+
+        rows: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for spec in self.specs.values():
+            for item in tuple(getattr(spec, "debug_events", ()) or ()):
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("type") or "").strip()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                rows.append(
+                    {
+                        "type": key,
+                        "label": str(item.get("label") or key),
+                        "icon": str(item.get("icon") or "•"),
+                        "hint": str(item.get("hint") or ""),
+                        "ext": str(spec.title or spec.name),
+                    }
+                )
+        return rows
+
+    def debug_event_types(self) -> set[str]:
+        """扩展注册过的事件类型（「调试输出」的白名单要用）。"""
+
+        return {str(item.get("type") or "") for item in self.debug_events()}
+
+    def debug_event_text(self, kind: str, detail: Any) -> str:
+        """让注册了这个类型的扩展自己把事件渲染成一行中文；没人认领返回空串。"""
+
+        key = str(kind or "").strip()
+        if not key:
+            return ""
+        for spec in self.specs.values():
+            for item in tuple(getattr(spec, "debug_events", ()) or ()):
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("type") or "").strip() != key:
+                    continue
+                render = item.get("render")
+                if not callable(render):
+                    continue
+                try:
+                    text = str(render(dict(detail or {})) or "").strip()
+                except Exception:
+                    return ""
+                if text:
+                    return text
+        return ""
+
     def action_note(self, definition: Any, state: Any, session_id: str = "") -> str:
         """某个动作真的做起来了：让扩展记一笔（返回她想顺口说的那句）。"""
 
@@ -721,25 +793,48 @@ class ExtensionHost:
                 continue
         return handled
 
-    def allows_desire_relief(self, state: Any) -> bool:
-        """这次亲密接触算不算"满足欲求"。
+    def contact_relief_scale(
+        self,
+        definition: Any,
+        state: Any,
+        session_id: str = "",
+    ) -> float:
+        """这一次接触有多"解渴"（0~1）：扩展说了算，没人说就是 1。
 
-        没有扩展声明这件事时一律算（老行为）；有声明时**每个声明方都要同意**才算，
-        免得两个扩展一个说算一个说不算。
+        新写法 ``(definition, state, session_id, host) -> 0~1``；老写法
+        ``(state) -> bool`` 也认。多个扩展时取**最小**的那一个——有人说
+        "这一下不算满足"，就别让另一个把它算成满足。
         """
 
-        asked = False
+        scale = 1.0
         for spec in self.specs.values():
             hook = getattr(spec, "desire_relief", None)
             if hook is None:
                 continue
-            asked = True
+            value: Any = None
             try:
-                if not hook(state):
-                    return False
+                value = hook(definition, state, session_id, self)
+            except TypeError:
+                try:
+                    value = hook(state)
+                except Exception:
+                    continue
             except Exception:
                 continue
-        return True if asked else True
+            try:
+                if isinstance(value, bool):
+                    number = 1.0 if value else 0.0
+                else:
+                    number = float(value)
+            except (TypeError, ValueError):
+                continue
+            scale = min(scale, max(0.0, min(1.0, number)))
+        return scale
+
+    def allows_desire_relief(self, state: Any) -> bool:
+        """老接口：这次接触算不算满足（0 比例 = 不算）。"""
+
+        return self.contact_relief_scale(None, state, "") > 0
 
     async def command_event(self, session_id: str, text: str) -> str | None:
         """``/vw event <文本>`` 交给扩展先看一眼：谁认领，这一条就归谁。

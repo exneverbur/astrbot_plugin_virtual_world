@@ -87,6 +87,8 @@ TUNED_DEFAULT_UPGRADES: dict[str, tuple[float, float]] = {
     "profile.miss_push_threshold": (0.85, 0.70),
     # 亲近一下不再是"扣四分之一"：降到 0.08，并且底下留了条 0.30 的线
     "state_dynamics.desire_relief": (0.25, 0.08),
+    # 效价回落快一点：一句重话打进冷脸之后别挂那么久（0.01 → 0.014）
+    "state_dynamics.valence_decay_per_min": (0.010, 0.014),
 }
 """这一轮调过默认值的字段：老配置里还是旧默认就顺手升级，改过的不碰。"""
 
@@ -317,6 +319,12 @@ class ZoneDef(Permissive):
     x: float = 0.0
     """世界地图上的位置。"""
     y: float = 0.0
+
+    is_home: bool = False
+    """这里是不是"她的家"：久待之后会想出去走走，也是"出门/回家"的参照点。
+
+    只标一个区域就够了（编辑器里是个勾选框）。一个都没标时按卧室所在的区域算。
+    """
 
 
 class EdgeDef(Permissive):
@@ -651,7 +659,11 @@ class StateDynamics(Permissive):
     affect_decay_per_min: float = 0.02
     """心潮每分钟回落多少。默认 0.02 ≈ 50 分钟从满值回到平静。"""
 
-    valence_decay_per_min: float = 0.010
+    valence_decay_per_min: float = 0.014
+    """效价回落速度：默认 0.014 ≈ 50 分钟回到基线一半。
+
+    以前是 0.01（一个半小时半衰）：一句重话打进冷脸之后要挂很久，聊天体验很差。
+    """
     """效价偏移每分钟回落多少。默认 0.01 ≈ 一小时出头回落一半。"""
 
     chat_valence_cap: float = 0.05
@@ -724,6 +736,21 @@ class StateDynamics(Permissive):
 
     desire_contact_warm: float = 0.005
     """已经在这一线以下时，再被亲近一下反而涨多少（× 亲密程度）。"""
+
+    desire_relief_from_contact: bool = True
+    """日常亲昵要不要「解渴」（默认**要**，这是原版自己的闭环）。
+
+    关掉的话：抱一下、蹭一下只会更想要（走 ``desire_contact_warm``），欲求该攒就攒着。
+    「日常亲昵不解渴、只有做爱才解渴」这种口味属于扩展的事——扩展通过
+    ``ExtensionSpec.desire_relief`` 钩子按**这一次接触**给比例（0 = 不解渴），
+    不必动这个总开关。
+    """
+
+    desire_relief_min_intimacy: float = 0.0
+    """开着「日常亲昵解渴」时：多亲密的接触才算数（低于它只升温，不解渴）。"""
+
+    desire_relief_hour_cap: float = 0.0
+    """开着「日常亲昵解渴」时：一小时里靠亲昵最多卸掉多少欲求（0 = 不限）。"""
 
     desire_tease: float = 0.05
     """被撩一下涨多少（再乘这个人的关系系数：越亲近越管用）。"""
@@ -2194,6 +2221,25 @@ class WorldConfig(Permissive):
     def default_zone_id(self) -> str:
         return self.zones[0].id if self.zones else ""
 
+    def home_zone_id(self) -> str:
+        """"她的家"在哪个区域：标了 ``is_home`` 就用它，否则按卧室所在的区域算。
+
+        不再拿"第一个区域"当家——那只是配置顺序，换个顺序家就跑了。
+        """
+
+        for zone in self.zones:
+            if bool(getattr(zone, "is_home", False)):
+                return zone.id
+        node = self.node_map().get(self.default_node_id())
+        if node is not None and node.zone_id:
+            return node.zone_id
+        return self.default_zone_id()
+
+    def is_home_zone(self, node_id: str) -> bool:
+        """这个地点算不算"在家里"（用来判断她有没有出门）。"""
+
+        return self.zone_of(node_id) == self.home_zone_id()
+
     def zone_of(self, node_id: str) -> str:
         node = self.node_map().get(node_id)
         return (node.zone_id if node else "") or self.default_zone_id()
@@ -2827,12 +2873,18 @@ def _migrate_bond_groups(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _expand_echo_types(names: list[str]) -> list[str]:
-    """把老的事件名换成新的事件名，顺手丢掉不认识的。"""
+    """把老的事件名换成新的事件名，顺手丢掉不认识的。
+
+    ``ext_*`` 是扩展自己注册的类型（见 ``ExtensionSpec.debug_events``）：主插件
+    这边不认识具体有哪些，但**不能把用户勾的丢掉**——执行时再按注册表核对。
+    """
 
     expanded: list[str] = []
     for name in names:
         key = str(name).strip()
-        targets = ECHO_TYPE_ALIASES.get(key) or ((key,) if key in ECHO_EVENT_TYPES else ())
+        targets = ECHO_TYPE_ALIASES.get(key) or (
+            (key,) if key in ECHO_EVENT_TYPES or key.startswith("ext_") else ()
+        )
         for item in targets:
             if item not in expanded:
                 expanded.append(item)
@@ -2876,6 +2928,9 @@ FIELD_LABELS: dict[str, str] = {
     "state_dynamics.desire_relief": "被亲近一次欲求落多少",
     "state_dynamics.desire_relief_floor": "亲昵最低把欲求卸到这儿",
     "state_dynamics.desire_contact_warm": "已在低位时被亲近反而涨多少",
+    "state_dynamics.desire_relief_from_contact": "日常亲昵也让它落下去",
+    "state_dynamics.desire_relief_min_intimacy": "多亲密才算真的解渴",
+    "state_dynamics.desire_relief_hour_cap": "一小时最多落多少（0 = 不限）",
     "profile.miss_threshold": "多想你才会主动找你",
     "profile.miss_push_daily_max": "每天最多主动找你几次",
     "profile.miss_cooldown_min_minutes": "两次主动找你的间隔（分钟）",

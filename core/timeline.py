@@ -76,15 +76,25 @@ def render_event(
     world: WorldConfig | None = None,
     *,
     compact: bool = False,
+    ext_render: Any = None,
 ) -> str:
     """把一个事件渲染成一行中文说明。
 
     ``compact`` 是调试输出的精简模式：只留"发生了什么"，去掉参数、返回值、
     模型原话这些需要展开看的细节。
 
+    ``ext_render``：扩展注册的渲染器 ``(类型, detail) -> str``。扩展自己的事件
+    （``ext_*``）优先交给它，写不出中文才走下面的通用兜底。
     """
 
-    text = _render_body(event, world, compact=compact)
+    text = ""
+    if callable(ext_render):
+        try:
+            text = str(ext_render(event.get("event_type"), event.get("detail") or {}) or "").strip()
+        except Exception:
+            text = ""
+    if not text:
+        text = _render_body(event, world, compact=compact)
     where = _place_text(event)
     return f"{text}　〔在 {where}〕" if where else text
 
@@ -630,14 +640,17 @@ def _render_body(
 
 
 def build_timeline(
-    events: list[dict[str, Any]], world: WorldConfig | None = None
+    events: list[dict[str, Any]],
+    world: WorldConfig | None = None,
+    *,
+    ext_render: Any = None,
 ) -> list[dict[str, Any]]:
     """给一组事件补上渲染文本，返回给前端。"""
 
     result: list[dict[str, Any]] = []
     for event in events:
         item = dict(event)
-        item["text"] = render_event(event, world)
+        item["text"] = render_event(event, world, ext_render=ext_render)
         result.append(item)
     return result
 

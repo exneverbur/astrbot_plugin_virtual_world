@@ -732,16 +732,68 @@ class TestStateDynamics(unittest.TestCase):
         self.assertGreater(state.desire, 0.2)
         self.assertLess(state.desire - 0.2, 0.02)
 
-    def test_being_held_settles_the_need(self):
-        """真的被碰到才落：抱一下落得多，拍拍肩落得少，跟人无关的动作完全不碰它。"""
+    def test_affection_that_does_not_quench_only_warms(self):
+        """扩展把这一下判成"不解渴"（比例 0）时：只升温，不动欲求。
+
+        （装了亲密扩展时，日常抱一下、蹭一下就属于这类——她一说话就又蹭又钻，
+          每一下都扣一点的话，欲求永远攒不起来。）
+        """
 
         state = WorldState(session_id="s1", desire=0.9)
-        held = self.dynamics.satisfy_desire(state, 1.0)
-        self.assertAlmostEqual(held, 0.08, places=4)
+        self.assertEqual(self.dynamics.satisfy_desire(state, 1.0, scale=0.0), 0.0)
+        self.assertGreater(float(state.desire), 0.9)
+        self.assertEqual(self.dynamics.satisfy_desire(state, 0.0, scale=0.0), 0.0)
+        # 比例 0.5 = 落一半
+        half = WorldState(session_id="s1", desire=0.9)
+        self.assertAlmostEqual(
+            self.dynamics.satisfy_desire(half, 1.0, scale=0.5), 0.04, places=4
+        )
+
+    def test_being_held_settles_the_need(self):
+        """默认（原版的手感）：真的被碰到就落——抱一下落得多，拍拍肩落得少。"""
+
+        state = WorldState(session_id="s1", desire=0.9)
+        self.assertAlmostEqual(self.dynamics.satisfy_desire(state, 1.0), 0.08, places=4)
         shallow = self.dynamics.satisfy_desire(state, 0.2)
         self.assertGreater(shallow, 0.0)
-        self.assertLess(shallow, held)
+        self.assertLess(shallow, 0.08)
         self.assertEqual(self.dynamics.satisfy_desire(state, 0.0), 0.0)
+
+    def test_min_intimacy_gate_is_configurable(self):
+        """``desire_relief_min_intimacy`` 调起来以后：轻接触不算解渴，只升温。"""
+
+        dynamics = StateDynamics(
+            self.world.state_dynamics.model_copy(
+                update={"desire_relief_min_intimacy": 0.9}
+            ),
+            hour_provider=lambda: 12,
+        )
+        state = WorldState(session_id="s1", desire=0.9)
+        self.assertEqual(dynamics.satisfy_desire(state, 0.5, now=3600.0), 0.0)
+        self.assertGreater(float(state.desire), 0.9)
+        self.assertAlmostEqual(
+            dynamics.satisfy_desire(state, 1.0, now=3600.0), 0.08, places=4
+        )
+
+    def test_the_relief_of_one_hour_is_capped(self):
+        """开着这条路时，一小时里靠亲昵最多卸掉设定值那么多：抱不停也掏不空。"""
+
+        dynamics = StateDynamics(
+            self.world.state_dynamics.model_copy(
+                update={"desire_relief_from_contact": True, "desire_relief_hour_cap": 0.12}
+            ),
+            hour_provider=lambda: 12,
+        )
+        state = WorldState(session_id="s1", desire=0.9)
+        for _ in range(10):
+            dynamics.satisfy_desire(state, 1.0, now=3600.0)
+        # 抱了十次也只卸得掉这一小时的额度（剩下的只是升温）
+        self.assertGreaterEqual(float(state.desire), 0.9 - 0.12 - 1e-6)
+        self.assertLess(float(state.desire), 0.9)
+        # 换一个小时：额度重新算，还能再落一截
+        before = float(state.desire)
+        dynamics.satisfy_desire(state, 1.0, now=3600.0 * 2)
+        self.assertLess(float(state.desire), before)
 
     def test_contact_never_drags_the_need_down_to_zero(self):
         """贴着贴着慢慢降，但**压不到那条线以下**；在线下面再贴反而是往上一点。
@@ -749,6 +801,9 @@ class TestStateDynamics(unittest.TestCase):
         以前一次抱抱就 -0.25，两次就把一天的欲求扣光了，她会变成"完全不想"。
         """
 
+        self.dynamics.config = self.world.state_dynamics.model_copy(
+            update={"desire_relief_from_contact": True, "desire_relief_hour_cap": 0.0}
+        )
         state = WorldState(session_id="s1", desire=0.9)
         for _ in range(30):
             self.dynamics.satisfy_desire(state, 1.0)
@@ -1032,8 +1087,10 @@ class TestStateDynamics(unittest.TestCase):
             world=self.world,
             now=1_000_000.0 + 31 * 60,
         )
-        self.assertTrue(fired)
-        self.assertLess(abs(state.valence_offset), abs(offset) * 0.6)
+        # 回落变快之后，这半小时里它自己就往回走了——可能都轮不到阀出手。
+        # 不管走哪条路，结果都该是"不再吊在 0.05"。
+        self.assertTrue(fired or float(state.valence) > 0.25)
+        self.assertLess(abs(state.valence_offset), abs(offset) * 0.7)
         self.assertGreater(state.valence, 0.05)
         # 直接验证那一下"减半"本身
         before = state.valence_offset
@@ -1965,6 +2022,58 @@ class TestDecider(unittest.TestCase):
         self.assertIn("sleep", actions)
         self.assertNotIn("nap", actions)
 
+    def test_she_can_plan_a_trip_outside(self):
+        """在家待腻了 + 白天 → 她会想去外面走走（不再一直窝在家里）。"""
+
+        decider = Decider(self.world, hour_provider=lambda: 15)
+        state = WorldState(
+            session_id="s1",
+            node_id="lobby",
+            energy=0.7,
+            curiosity=0.3,
+            boredom=0.6,
+            world_time=100,
+        )
+        plan = decider.rule_plan(state)
+        self.assertIsNotNone(plan)
+        actions = [step["action"] for step in plan["steps"]]
+        self.assertIn("walk_to", actions)
+        target = plan["steps"][0].get("target_node")
+        home_zone = self.world.default_zone_id()
+        self.assertNotEqual(self.world.zone_of(target), home_zone, target)
+        # 到了地方真有事可做（不是走到商场站着发呆，那种到点会被跳过）
+        self.assertGreater(len(plan["steps"]), 1)
+        doing = plan["steps"][1]["action"]
+        available = {action.id for action in self.world.actions_in(target)}
+        self.assertIn(doing, available)
+
+        # 已经不在家（在外面）：不再安排"出门"
+        outside = WorldState(
+            session_id="s1",
+            node_id="park_lake",
+            energy=0.7,
+            curiosity=0.3,
+            boredom=0.6,
+            world_time=100,
+        )
+        again = decider.rule_plan(outside) or {"reason": "", "steps": []}
+        self.assertNotEqual(str(again.get("reason")), "在家待久了，想出去走走")
+
+    def test_night_keeps_her_inside(self):
+        """夜里不安排出门：外面黑、也没意思。"""
+
+        decider = Decider(self.world, hour_provider=lambda: 2)
+        state = WorldState(
+            session_id="s1",
+            node_id="lobby",
+            energy=0.7,
+            curiosity=0.3,
+            boredom=0.6,
+            world_time=100,
+        )
+        plan = decider.rule_plan(state) or {"steps": []}
+        self.assertNotIn("outdoor", str(plan.get("reason") or ""))
+
     def test_night_window_is_configurable(self):
         """夜晚时段可配：几点到几点算晚上由「作息与夜晚」决定。"""
 
@@ -2022,12 +2131,16 @@ class TestDecider(unittest.TestCase):
         # 恢复快了三倍多，睡 36 分钟就够（(0.42-0.24)/0.005）
         self.assertEqual(stronger.nap_seconds(state), 36 * 60)
 
-    def test_lonely_goes_to_lobby(self):
+    def test_loneliness_no_longer_means_walking_to_the_lobby(self):
+        """孤独不再让规则排"走去客厅"：找人 = 在会话里说话，那条路交给"主动找他"。
+
+        （引擎那边会用 `reach_out_eagerness()` 把孤独折算成"更想主动开口"。）
+        """
+
         state = WorldState(session_id="s1", node_id="bedroom", loneliness=0.9, world_time=10)
-        plan = self.decider.rule_plan(state)
-        self.assertIsNotNone(plan)
-        self.assertEqual(plan["steps"][0]["action"], "walk_to")
-        self.assertEqual(plan["steps"][0]["target_node"], "lobby")
+        self.assertIsNone(self.decider.rule_plan(state))
+        # 孤独感高的时候，主动找他的意愿要抬起来
+        self.assertGreaterEqual(self.decider.reach_out_eagerness(state), 1.0)
 
     def test_curious_in_study_searches(self):
         """好奇心高 + 在书房 + 真的配了搜索工具 → 安排上网搜索。"""
@@ -2112,7 +2225,7 @@ class TestDecider(unittest.TestCase):
 
         base = dict(
             session_id="s1",
-            node_id="study",
+            node_id="bedroom",
             world_time=10,
             energy=0.8,
             loneliness=0.9,
@@ -2129,8 +2242,8 @@ class TestDecider(unittest.TestCase):
         state = self._busy_state()
         weights = self.decider.branch_weights(state)
         self.assertTrue(all(abs(value - 1.0) < 1e-9 for value in weights.values()))
-        # 孤独这条在老链条里排在最前
-        self.assertEqual(self.decider.rule_plan(state)["reason"], "孤独感偏高，想找人说话")
+        # 链条第一条是"换个环境"（孤独那条已经删了，交给"主动找他"）
+        self.assertEqual(self.decider.rule_plan(state)["reason"], "太无聊了，换个环境")
 
     def test_today_basis_reweights_the_branches(self):
         """今天的基调给分支拨权重：黏人的日子特别想找人，懒散的日子不太想查东西。"""
@@ -2152,18 +2265,18 @@ class TestDecider(unittest.TestCase):
         plain = self._busy_state()
         self.assertEqual(
             self.decider.rule_plan(plain)["reason"],
-            "孤独感偏高，想找人说话",
+            "太无聊了，换个环境",
         )
-        # 懒散的一天：发呆的权重比找人高，骰子靠后就会落在老链条更后面的那一件上
+        # 懒散的一天：看书的权重被抬起来（1.30 对发呆的 0.70），骰子靠后就会落在它上面
         lazy = self._busy_state(day_mood="lazy")
         self.assertEqual(
             Decider(self.world, rng=_StubDraw(0.99)).rule_plan(lazy)["reason"],
-            "太无聊了，换个环境",
+            "有点闲，去看会儿书",
         )
         # 同一个状态、同一套权重：骰子靠前还是老链条的第一条
         self.assertEqual(
             Decider(self.world, rng=_StubDraw(0.0)).rule_plan(lazy)["reason"],
-            "孤独感偏高，想找人说话",
+            "太无聊了，换个环境",
         )
 
     def test_hungry_means_she_leans_towards_people(self):
@@ -3579,6 +3692,93 @@ class ExtensionHostTest(unittest.IsolatedAsyncioTestCase):
 
         broken.register(ExtensionSpec(name="bad", status_text=_boom))
         self.assertEqual("", broken.status_text(state, "s1"))
+
+    def test_debug_events_are_registered_for_the_log_page(self):
+        """扩展注册的调试类型要能被主插件列出来（日志页的筛选用它）。"""
+
+        host = ExtensionHost()
+        self.assertEqual([], host.debug_events())
+        host.register(
+            ExtensionSpec(
+                name="demo",
+                title="示例扩展",
+                debug_events=(
+                    {"type": "ext_climax", "label": "高潮结算", "icon": "💥"},
+                    {"type": "ext_sex", "label": "做爱结算"},
+                    {"type": ""},
+                ),
+            )
+        )
+        host.register(
+            ExtensionSpec(
+                name="other",
+                debug_events=({"type": "ext_climax", "label": "重复的不算"},),
+            )
+        )
+        rows = host.debug_events()
+        self.assertEqual([item["type"] for item in rows], ["ext_climax", "ext_sex"])
+        self.assertEqual(rows[0]["label"], "高潮结算")
+        self.assertEqual(rows[0]["icon"], "💥")
+        self.assertEqual(rows[0]["ext"], "示例扩展")
+        # 没给图标时兜一个点，别让前端拿到空字符串
+        self.assertEqual(rows[1]["icon"], "•")
+
+    def test_debug_events_can_render_their_own_text(self):
+        """扩展可以自己把事件渲染成中文：日志和调试输出都走它。"""
+
+        host = ExtensionHost()
+        host.register(
+            ExtensionSpec(
+                name="demo",
+                debug_events=(
+                    {
+                        "type": "ext_sex",
+                        "label": "做爱结算",
+                        "hint": "记一次做爱",
+                        "render": lambda detail: f"做爱第 {detail.get('sex')} 次",
+                    },
+                ),
+            )
+        )
+        self.assertEqual({"ext_sex"}, host.debug_event_types())
+        self.assertEqual("做爱第 3 次", host.debug_event_text("ext_sex", {"sex": 3}))
+        # 别人不认识这个类型、或者渲染器抛错：返回空串，走主插件的兜底
+        self.assertEqual("", host.debug_event_text("ext_other", {}))
+        broken = ExtensionHost()
+
+        def _boom(detail):
+            raise RuntimeError("坏了")
+
+        broken.register(
+            ExtensionSpec(name="bad", debug_events=({"type": "ext_x", "render": _boom},))
+        )
+        self.assertEqual("", broken.debug_event_text("ext_x", {}))
+
+    def test_contact_relief_scale_defaults_to_one(self):
+        """没人表态时按 1 算（老手感）；有人说 0 就按 0（这一下不解渴）。"""
+
+        state = WorldState(session_id="s1")
+        self.assertEqual(1.0, ExtensionHost().contact_relief_scale(None, state, "s1"))
+        host = ExtensionHost()
+        host.register(
+            ExtensionSpec(
+                name="demo",
+                desire_relief=lambda definition, state, session_id, host: 0.0,
+            )
+        )
+        self.assertEqual(0.0, host.contact_relief_scale(None, state, "s1"))
+        # 老写法：False = 0，True = 1
+        old = ExtensionHost()
+        old.register(ExtensionSpec(name="old", desire_relief=lambda state: False))
+        self.assertEqual(0.0, old.contact_relief_scale(None, state, "s1"))
+        yes = ExtensionHost()
+        yes.register(ExtensionSpec(name="yes", desire_relief=lambda state: True))
+        self.assertEqual(1.0, yes.contact_relief_scale(None, state, "s1"))
+        # 多个扩展时取最小：一个说 0，另一个说 1 → 0
+        both = ExtensionHost()
+        both.register(ExtensionSpec(name="a", desire_relief=lambda state: False))
+        both.register(ExtensionSpec(name="b", desire_relief=lambda state: True))
+        self.assertEqual(0.0, both.contact_relief_scale(None, state, "s1"))
 
     async def test_touch_is_only_forwarded_when_someone_wants_it(self):
         """「他碰了她哪儿」是个**通用**字段：没人声明时主插件完全不知道它存在。"""

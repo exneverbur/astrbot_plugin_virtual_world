@@ -48,10 +48,12 @@ EVENT_EFFECTS: dict[str, dict[str, float]] = {
         "loneliness": -0.12,
         "_tone": 1.0,
     },
+    # 负面口吻的附加刻意压小：它本来就会带着"基线漂移"（孤独涨 → 效价基线跟着掉），
+    # 附加给多了就是"一句话吃两笔账"，在很亲近的人身上会直接把她打进冷脸。
     "negative_words": {
-        "affect": 0.13,
+        "affect": 0.07,
         "valence": -0.08,
-        "loneliness": 0.10,
+        "loneliness": 0.05,
         "_tone": -1.0,
     },
     "hug_bot": {"affect": 0.08, "valence": 0.04, "loneliness": -0.16, "_tone": 1.0},
@@ -980,32 +982,81 @@ class StateDynamics:
         return value if value >= 0 else float(fallback)
 
     def satisfy_desire(
-        self, state: WorldState, intimacy: float = 1.0, *, scale: float = 1.0
+        self,
+        state: WorldState,
+        intimacy: float = 1.0,
+        *,
+        scale: float = 1.0,
+        now: float | None = None,
     ) -> float:
         """被**实实在在地亲近**了一次：欲求落一截，落多少看动作自己的亲密程度。
 
         返回实际落了多少（0 表示这一步不算亲密接触）。
 
-        两条护栏（以前没有，结果是"两次抱抱就把一天的欲求扣光"）：
+        三道护栏：
 
+        - ``scale`` 是"这一下有多解渴"（0~1）——**扩展可以通过钩子按接触类型给**：
+          装了亲密扩展时，日常抱一抱、蹭一蹭、钻个怀会被判成 0（只升温、欲求该攒
+          就攒着），真正落下去交给性事 / 高潮那一头。没装扩展 / 没表态时是 1。
+        - ``desire_relief_from_contact`` 是主插件自己的总开关（默认开 = 原版闭环）；
+          关掉就一律只升温。另有 ``desire_relief_min_intimacy`` 与
+          ``desire_relief_hour_cap``（默认 0 = 不设限）两道可选闸门；
         - 单次降幅小（``desire_relief`` 默认 0.08）：贴着贴着慢慢降，不是一下抽干；
         - 降到 ``desire_relief_floor``（默认 0.30）就**不再往下降**——那下面是
           "淡淡的、不太想"那一段，日常亲密不该把人推进去；再贴反而是往上一点
           （``desire_contact_warm``，默认 0.005×亲密度）。
         """
 
-        weight = max(0.0, float(intimacy or 0.0)) * max(0.0, float(scale or 0.0))
-        if weight <= 0:
+        touch = max(0.0, float(intimacy or 0.0))
+        if touch <= 0:
             return 0.0
+        quench = max(0.0, min(1.0, float(scale or 0.0)))
         before = float(state.desire)
         floor = max(0.0, min(0.95, float(self._desire_config("desire_relief_floor", 0.30))))
-        if before <= floor:
-            warm = max(0.0, float(self._desire_config("desire_contact_warm", 0.005))) * weight
+
+        def _warm() -> float:
+            """不够解渴的那种贴：反而往上一点。"""
+
+            warm = max(0.0, float(self._desire_config("desire_contact_warm", 0.005))) * touch
             state.desire = clamp_value(before + warm, 0.0, 1.0)
             return 0.0
-        relief = max(0.0, float(self._desire_config("desire_relief", 0.08))) * weight
+
+        if not bool(self._desire_config("desire_relief_from_contact", 1.0)):
+            # 总开关关着：日常亲昵不解渴，只升温
+            return _warm()
+        if quench <= 0:
+            # 扩展说"这一下不算满足"（例如装了亲密扩展时的日常抱抱蹭蹭）：只升温
+            return _warm()
+        min_intimacy = max(
+            0.0, float(self._desire_config("desire_relief_min_intimacy", 0.0))
+        )
+        if touch < min_intimacy:
+            # 蹭一下、牵个手这种：算不上"满足"，只是更想要
+            return _warm()
+        if before <= floor:
+            return _warm()
+        relief = (
+            max(0.0, float(self._desire_config("desire_relief", 0.08))) * touch * quench
+        )
+        cap = max(0.0, float(self._desire_config("desire_relief_hour_cap", 0.0)))
+        if cap > 0:
+            hour = int(float(now or 0.0) // 3600)
+            if int(getattr(state, "desire_relief_hour_marker", 0) or 0) != hour:
+                state.desire_relief_hour_marker = hour
+                state.desire_relief_hour_sum = 0.0
+            used = max(0.0, float(getattr(state, "desire_relief_hour_sum", 0.0) or 0.0))
+            left = max(0.0, cap - used)
+            if left <= 0:
+                # 这一小时的"解渴额度"用完了：剩下的亲近只升温
+                return _warm()
+            relief = min(relief, left)
         state.desire = clamp_value(max(floor, before - relief), 0.0, 1.0)
-        return before - float(state.desire)
+        dropped = before - float(state.desire)
+        if dropped > 0 and cap > 0:
+            state.desire_relief_hour_sum = (
+                float(getattr(state, "desire_relief_hour_sum", 0.0) or 0.0) + dropped
+            )
+        return dropped
 
     def tease_desire(self, state: WorldState, *, scale: float = 1.0) -> float:
         """被**撩**了一下（只是嘴上/氛围上，不是真碰到）：欲求往上跳一点。

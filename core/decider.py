@@ -45,6 +45,15 @@ HAPPY_THRESHOLD_DROP = 0.05
 # 安全阀不是"触发一个动作"，而是让她的行为自然偏向自我修复。
 SELF_CARE_VALENCE = 0.4
 SELF_CARE_BOREDOM = 0.55
+
+OUTDOOR_MIN_ENERGY = 0.45
+"""想出门至少得有这么多精力：累着的时候她只想窝着。"""
+
+OUTDOOR_MIN_BOREDOM = 0.5
+"""在家待腻到这条线才会想到"出去走走"（天天在家就是这么修掉的）。
+
+比发呆那条（0.8）低：待腻了就该出门，不用等到坐不住。
+"""
 SELF_CARE_IDLE = 0.3
 
 # 好奇心触发的"去查点东西"两次之间至少隔这么久：查一次只降一点点好奇心，
@@ -273,22 +282,11 @@ class Decider:
         #      （精力那条是安全阀，按原样强制，不参与加权。）
         candidates: list[tuple[str, dict[str, Any]]] = []
 
-        # 2) 孤独感过高 -> 去大厅找人说话
-        if state.loneliness > 0.7:
-            steps = self._travel_then(node_id, "lobby", graph)
-            steps.append({"action": "say"})
-            candidates.append(
-                (
-                    "reach_out",
-                    create_plan(
-                        steps=steps,
-                        world_time=state.world_time,
-                        valid_for=self._plan_valid(),
-                        reason="孤独感偏高，想找人说话",
-                        source="rule",
-                    ),
-                )
-            )
+        # （原来这里有一条"孤独 → 走到大厅喊一声"。删掉了：
+        #   她说话是发到会话里的，跟站在哪个房间无关，走那几步纯属浪费；
+        #   而"想找人"这件事本来就该由「想念 → 主动去找他」那条路负责
+        #   （见引擎的 `_maybe_miss_push`）。孤独感会让她涨得更想他——
+        #   见 `branch_weights` 里 reach_out 那一档，现在用来抬主动找他的意愿。）
 
         # 3) 好奇心高且在书房 -> 上网搜索并分享
         if (
@@ -321,7 +319,8 @@ class Decider:
         low_mood = float(state.valence) < SELF_CARE_VALENCE
 
         # 4) 无聊 -> 换个地方发呆
-        if state.boredom > (SELF_CARE_BOREDOM if low_mood else 0.8):
+        wander_eligible = state.boredom > (SELF_CARE_BOREDOM if low_mood else 0.8)
+        if wander_eligible:
             target = self._pick_idle_node(exclude=node_id)
             steps = self._travel_then(node_id, target, graph) if target else []
             steps.append({"action": "stare"})
@@ -338,7 +337,35 @@ class Decider:
                 )
             )
 
-        # 5) 精力尚可且是白天 -> 去书房看书
+        # 5) 在家待腻了 -> 出门走走。
+        #    没有这一条她可以连着几天不出门：规则里"找人就近去客厅"、"看书去书房"，
+        #    全是屋里；发呆那条虽然可能抽到公园 / 海边，但门槛高、还老被别的动机挤掉。
+        #    这里只管"在家待腻了"这一种：好奇心那条走的是上网查，不是出门。
+        if (
+            self.world.is_home_zone(node_id)
+            and not self.is_night()
+            and not wander_eligible
+            and state.energy > OUTDOOR_MIN_ENERGY
+            and state.boredom > OUTDOOR_MIN_BOREDOM
+        ):
+            target, doing = self._pick_outdoor_node(state)
+            steps = self._travel_then(node_id, target, graph) if target else []
+            if doing:
+                steps.append({"action": doing})
+            candidates.append(
+                (
+                    "outdoor",
+                    create_plan(
+                        steps=steps,
+                        world_time=state.world_time,
+                        valid_for=self._plan_valid(),
+                        reason="在家待久了，想出去走走",
+                        source="rule",
+                    ),
+                )
+            )
+
+        # 6) 精力尚可且是白天 -> 去书房看书
         if (
             state.energy > 0.5
             and state.boredom > (SELF_CARE_IDLE if low_mood else 0.45)
@@ -366,6 +393,10 @@ class Decider:
 
         两个来源：今天的基调（懒散的日子不太想查东西、黏人的日子特别想找人）、
         以及欲求（想被摸摸的时候更愿意往人那边凑）。
+
+        ``reach_out`` 这一档**不再对应规则里的一条分支**（那条"走去大厅喊一声"
+        已经删了）：它现在是"她有多想主动去找他"的倍率，由引擎在
+        `_maybe_miss_push` 里读着用——黏人的日子、想被碰的时候，她更容易主动开口。
         """
 
         weights = {name: 1.0 for name in DAY_BRANCH_KEYS}
@@ -382,9 +413,18 @@ class Decider:
                 )
             )
         if float(getattr(state, "desire", 0.0) or 0.0) > DESIRE_HUNGRY:
-            # 想被碰一碰的时候，找人这条路的权重抬起来（她想往人那边凑）
+            # 想被碰一碰的时候，主动找他的意愿抬起来（她想往人那边凑）
             weights["reach_out"] *= 1.6
         return weights
+
+    def reach_out_eagerness(self, state: WorldState) -> float:
+        """她这会儿有多想主动找他（1.0 = 平常）。引擎拿它压/抬"想念"的门槛。"""
+
+        try:
+            value = float(self.branch_weights(state).get("reach_out", 1.0))
+        except (TypeError, ValueError):
+            return 1.0
+        return max(0.2, min(4.0, value))
 
     def _pick_branch(
         self,
@@ -438,8 +478,8 @@ class Decider:
                 source="extreme",
             )
         if flag == "force_reach_out":
-            steps = self._travel_then(state.node_id, "lobby", graph)
-            steps.append({"action": "say"})
+            # 太久没和人说话了：原地开口就行（说话发到会话里，跟房间无关）
+            steps = [{"action": "say"}]
             return create_plan(
                 steps=steps,
                 world_time=state.world_time,
@@ -486,6 +526,51 @@ class Decider:
         if not candidates:
             return ""
         return self.rng.choice(candidates)
+
+    def _pick_outdoor_node(self, state: WorldState) -> tuple[str, str]:
+        """出门该去哪、到了做什么：返回 ``(地点 id, 动作 id)``。
+
+        只在家外（``zone != 首页区``）的地点里选，优先"到了真有事可做"的
+        （商场 / 小吃街 / 图书馆 / 教室 / 操场…），纯发呆的地方排后面；
+        好奇心不低于无聊时，从最热闹的那一半里挑。
+        """
+
+        home_zone = self.world.home_zone_id()
+        rows: list[tuple[float, str, str]] = []
+        for node in self.world.nodes:
+            zone = self.world.zone_of(node.id)
+            if zone == home_zone:
+                continue
+            actions = [
+                action
+                for action in self.world.actions_in(node.id)
+                if action.scope == "node" and action.enabled
+            ]
+            if not actions:
+                continue
+            # 到了先做点什么：优先"正经事"（逛街 / 吃点东西 / 看会儿书），
+            # 没有就发呆——别挑一个跟目的地对不上的动作，那样到点会被跳过。
+            doing = next(
+                (action.id for action in actions if action.id != "stare"), actions[0].id
+            )
+            lively = float(len([action for action in actions if action.id != "stare"]))
+            rows.append((lively, node.id, doing))
+        if not rows:
+            # 外面一个能去的都没有：退回"有发呆动作的地方"，再不行就哪儿都不去
+            rows = [
+                (0.0, node.id, "stare")
+                for node in self.world.nodes
+                if self.world.zone_of(node.id) != home_zone
+            ]
+        if not rows:
+            return "", ""
+        if float(state.curiosity) >= float(state.boredom):
+            rows.sort(key=lambda item: (-item[0], item[1]))
+            pool = rows[: max(1, len(rows) // 2)]
+        else:
+            pool = rows
+        _lively, node_id, doing = self.rng.choice(pool)
+        return node_id, doing
 
     def _action_duration(self, action_id: str) -> int:
         action = self.world.action_map().get(action_id)

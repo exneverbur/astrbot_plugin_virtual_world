@@ -2032,6 +2032,59 @@ class TestMainImport(unittest.TestCase):
             module.request._json = {}
             plugin.db.raw.close()
 
+    def test_contacts_clear_forgets_everyone(self):
+        """通讯录上方那个「清空」：把这个会话组里认识的人一次全忘掉。"""
+
+        session = "aiocqhttp:GroupMessage:probe-contacts-clear"
+        plugin, _context, _session = self._plugin_with_session(session=session)
+        module = self.module
+        original_query = module.request.query
+
+        def get():
+            module.request.query = module.request._Query({"session": session})
+            return asyncio.run(plugin.api_profile_people())
+
+        def post(handler, payload):
+            module.request.query = module.request._Query(
+                {"session": session, "_method": "POST"}
+            )
+            module.request._json = {"session": session, **payload}
+            return asyncio.run(handler())
+
+        try:
+            # 她见过这个人，而且已经记了点东西
+            asyncio.run(plugin.on_any_message(_GateEvent("你好", session=session)))
+            post(plugin.api_profile_affinity, {"user_id": "42", "value": 60, "reason": "测试"})
+            post(
+                plugin.api_profile_fact,
+                {"user_id": "42", "action": "add", "kind": "喜好", "text": "喜欢猫"},
+            )
+            listed = (get().get("data") or {}).get("people") or []
+            self.assertEqual([item["user_id"] for item in listed], ["42"])
+
+            result = post(plugin.api_profile_forget_all, {})
+            data = result.get("data") or {}
+            self.assertTrue(data.get("ok"))
+            self.assertEqual(data.get("people"), 1)
+            self.assertGreater(data.get("removed"), 0)
+            # 画像 / 事实 / 关系 / 好感日志一起没，列表也空了
+            self.assertEqual((get().get("data") or {}).get("people"), [])
+            self.assertEqual(
+                (post(plugin.api_profile_person, {"user_id": "42"}).get("data") or {}).get(
+                    "facts"
+                ),
+                [],
+            )
+
+            # 已经空了再点一次：不报错，也不说清掉了人
+            again = post(plugin.api_profile_forget_all, {}).get("data") or {}
+            self.assertTrue(again.get("ok"))
+            self.assertEqual(again.get("people"), 0)
+        finally:
+            module.request.query = original_query
+            module.request._json = {}
+            plugin.db.raw.close()
+
     def test_saving_schedules_with_null_sessions_succeeds(self):
         """落点多选框里混进 null（编辑器偶发）时，保存不该整份失败。"""
 

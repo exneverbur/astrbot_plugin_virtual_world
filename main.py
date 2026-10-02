@@ -2703,7 +2703,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "exneverbur",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v2.1.3",
+    "v2.1.4",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -4940,6 +4940,12 @@ class VirtualWorldPlugin(Star):
             "通讯录：她记着的一笔账",
         )
         register(f"/{p}/profile/forget", self.api_profile_forget, ["POST"], "通讯录：忘掉一个人")
+        register(
+            f"/{p}/profile/forget-all",
+            self.api_profile_forget_all,
+            ["POST"],
+            "通讯录：清空（忘掉全部）",
+        )
         register(f"/{p}/profile/consolidate", self.api_profile_consolidate, ["POST"], "立刻整理一次（记忆 + 画像）")
         register(f"/{p}/extensions", self.api_extensions, ["GET", "POST"], "扩展包：设置与数据")
 
@@ -5295,6 +5301,37 @@ class VirtualWorldPlugin(Star):
             group_id=store.group_key(session_id), user_id=user_id
         )
         return json_response({"ok": True, "removed": removed})
+
+    async def api_profile_forget_all(self):
+        """通讯录上方那个「清空」：把这个会话组里她认识的人全忘掉。
+
+        只删这个 group_key 下的画像 / 事实 / 关系 / 好感日志；世界配置里的
+        关系档位（profile.bonds）和会话白名单都不动。
+        """
+
+        payload = await request.json(default={}) or {}
+        guard = self._guard(payload)
+        if guard is not None:
+            return guard
+        session_id = self._profile_scope(payload.get("session"))
+        store = getattr(self.engine, "profiles", None)
+        if store is None or not session_id:
+            return error_response("缺少参数")
+        group_id = store.group_key(session_id)
+        people = store.list_people(session_id, limit=5000)
+        removed = 0
+        forgotten = 0
+        for item in people:
+            user_id = str(item.get("user_id") or "")
+            if not user_id:
+                continue
+            removed += int(
+                store.db.delete_user_profile(group_id=group_id, user_id=user_id) or 0
+            )
+            forgotten += 1
+        # 她"今天还能主动找几个人"的额度也跟着清，免得留下没人认领的计数
+        store.drop_daily_people(group_id)
+        return json_response({"ok": True, "people": forgotten, "removed": removed})
 
     async def api_profile_consolidate(self):
         """立刻整理一次（编辑器上的"现在整理一次"）：消化这段时间的经历。"""
@@ -6240,7 +6277,11 @@ class VirtualWorldPlugin(Star):
         types = await self.db.call("event_types", session_id=session_id or None)
         return json_response(
             {
-                "events": build_timeline(events, self.engine.world),
+                "events": build_timeline(
+                    events,
+                    self.engine.world,
+                    ext_render=self.engine.extensions.debug_event_text,
+                ),
                 "types": types,
                 "has_more": len(events) >= limit,
             }
@@ -6258,7 +6299,11 @@ class VirtualWorldPlugin(Star):
         payload = {
             "session": session_id,
             "exported_at": time.time(),
-            "events": build_timeline(events, self.engine.world),
+            "events": build_timeline(
+                events,
+                self.engine.world,
+                ext_render=self.engine.extensions.debug_event_text,
+            ),
         }
         return json_response(
             payload,
@@ -6517,6 +6562,8 @@ class VirtualWorldPlugin(Star):
                     "relation": DEFAULT_CAPTION_RELATION_PROMPT,
                     "forward": DEFAULT_FORWARD_PROMPT,
                 },
+                # 扩展注册的事件类型：日志页的「类型」筛选和图标用它
+                "debug_events": self.engine.extensions.debug_events(),
             }
         )
 

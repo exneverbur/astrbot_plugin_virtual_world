@@ -196,12 +196,35 @@ SEARCH_LOG_KEY = "search.last"
 SEARCH_LOG_MINUTES = 60
 # 好奇高过这条线时，除了上网查，也会想去问人（和 decider 里"好奇→搜索"用同一条线）
 ASK_ABOUT_CURIOSITY = 0.7
+
+OUTDOOR_HINT_HOURS = 10.0
+"""在家待满这么久（或者压根没出过门）就提醒她一句"可以出去走走"。"""
 # 别人的负面口吻在她这儿有多重，按**亲密度**缩放：路人几乎不往心里去，
 # 特别的人一句话顶别人几句。曲线是 `floor + (ceil - floor) * (档位比例 ^ 1.6)`，
 # 七档时的实际值大约是：敌意 0.20 / 冷淡 0.27 / 客气 0.42 / 熟人 0.63 /
 # 朋友 0.88 / 亲近 1.17 / 特别的人 1.50。
 TONE_INTIMACY_FLOOR = 0.2
-TONE_INTIMACY_CEIL = 1.5
+TONE_INTIMACY_CEIL = 1.15
+"""负面口吻按亲密度放大到几倍：路人 0.2，最亲近的人 1.15。
+
+以前是 1.5——配合"一句话吃三笔账"（口吻脉冲 + 基线漂移 + 模型自评），
+特别亲近的人一句重话能掉 0.20 效价，冷脸挂半天，聊天体验很差。
+"""
+
+NEGATIVE_VALENCE_ROUND_CAP = 0.10
+"""一轮对话里，负面情绪**最多**把效价压低这么多（含基线连带的那部分）。"""
+
+NEGATIVE_VALENCE_ROUND_WINDOW = 30.0
+"""两条负面在这么多秒内算"同一轮"（回复管线里前后脚发生）。"""
+
+NEGATIVE_TONE_FRESH_HOURS = 24.0
+"""连着被伤超过这么久就不再递减（新的账重新从"最疼"算起）。"""
+
+NEGATIVE_TONE_STREAK_SCALE = (1.0, 0.6, 0.35)
+"""连着被伤时每一笔的倍率：第一次最疼，之后越来越麻木。"""
+
+NEGATIVE_VALENCE_LOW_LINE = 0.45
+"""效价已经低于这条线（正在冷脸）：这一轮不再往下压，只记一笔账。"""
 
 DESIRE_TEASE_FLOOR = 0.3
 DESIRE_TEASE_CEIL = 1.6
@@ -6061,11 +6084,20 @@ class VirtualWorldEngine:
         # 扩展可以给这一下打折（例如"正演着那一场戏，他说的重话是玩闹"）：
         # 没扩展表态就是 1.0，一切照旧。
         scale = self.extensions.tone_scale(state, key)
+        if event == "negative_words":
+            # 连着被伤递减：第一次最疼，之后麻木一点（不然每轮都疼到同一个程度）
+            streak_scale = self._negative_streak_scale(state)
+            scale = scale * streak_scale if scale != 1.0 else streak_scale
         if scale != 1.0:
             magnitude = round(magnitude * scale, 4)
             if outcome is not None:
                 outcome.notes.append(f"这一轮的口吻脉冲按 {scale:g} 倍走")
+        before_valence = float(state.valence)
         self.dynamics.apply_event(state, event, magnitude=magnitude, now=self._now())
+        if event == "negative_words":
+            # 一句话最多让她掉这么多（含基线连带）：不然特别亲近的人一句重话
+            # 就能把她打进冷脸，还挂半天。
+            self._cap_negative_valence(state, before_valence)
         if key in ("hug", "comfort"):
             kind = self._comfort_pulse(state, key, user_id=user_id)
             if kind:
@@ -6113,9 +6145,12 @@ class VirtualWorldEngine:
     def _tone_magnitude(self, state: WorldState, event: str, user_id: str) -> float:
         """这一句话在她这儿有多重：**越亲近的人，伤她越深**。
 
-        路人怼她一句几乎不往心里去（0.2 倍），特别的人说一句顶别人几句（1.5 倍）。
+        路人怼她一句几乎不往心里去（0.2 倍），特别的人说一句顶得多一些（1.15 倍）。
         只对负面口吻（``negative_words``）加权：正面那几条本来就压得很小、还带"连着被哄会麻木"，
         再按亲密度放大反而会让熟人一句夸奖把她顶满。
+
+        "连着被伤会递减"不在这里算，见 :meth:`_negative_streak_scale`：
+        这里只回答"这句话按亲密度该有多重"。
         """
 
         if event != "negative_words":
@@ -6135,7 +6170,65 @@ class VirtualWorldEngine:
         index = max(0, min(int(getattr(view, "level_index", 0) or 0), len(levels) - 1))
         # 归一化到 0~1 再上一条幂曲线：低档更平（路人几乎没感觉），高档更陡
         ratio = index / (len(levels) - 1)
-        return round(TONE_INTIMACY_FLOOR + (TONE_INTIMACY_CEIL - TONE_INTIMACY_FLOOR) * ratio**1.6, 3)
+        return round(
+            TONE_INTIMACY_FLOOR + (TONE_INTIMACY_CEIL - TONE_INTIMACY_FLOOR) * ratio**1.6,
+            3,
+        )
+
+    def _negative_streak_scale(self, state: WorldState) -> float:
+        """连着被伤时这一笔打几折：第一次最疼，之后递减（隔一天重新算）。
+
+        一直戳同一处，人不该每次都疼到同一个程度。
+        """
+
+        now = self._now()
+        last = float(getattr(state, "negative_tone_at", 0.0) or 0.0)
+        streak = int(getattr(state, "negative_tone_streak", 0) or 0)
+        if not last or (now - last) > NEGATIVE_TONE_FRESH_HOURS * 3600.0:
+            streak = 0
+        state.negative_tone_streak = streak + 1
+        state.negative_tone_at = now
+        return NEGATIVE_TONE_STREAK_SCALE[
+            min(streak, len(NEGATIVE_TONE_STREAK_SCALE) - 1)
+        ]
+
+    def _cap_negative_valence(
+        self, state: WorldState, before: float, *, now: float | None = None
+    ) -> None:
+        """一轮里负面情绪最多把效价压低 ``NEGATIVE_VALENCE_ROUND_CAP``。
+
+        这一笔可能来自口吻脉冲、也可能来自主模型自己写的 ``valence_delta``；两笔
+        还会顺手把孤独 / 心潮推上去，从而**带低效价基线**——所以这里量的是
+        "看得见的效价掉了多少"，超出的部分补回 offset，等于这一句没那么伤。
+        已经低于 ``NEGATIVE_VALENCE_LOW_LINE``（正在冷脸）时一点不再往下压。
+        """
+
+        now = float(now if now is not None else self._now())
+        after = float(state.valence)
+        dropped = float(before) - after
+        if dropped <= 0:
+            return
+        last = float(getattr(state, "negative_valence_at", 0.0) or 0.0)
+        used = (
+            float(getattr(state, "negative_valence_sum", 0.0) or 0.0)
+            if last and (now - last) <= NEGATIVE_VALENCE_ROUND_WINDOW
+            else 0.0
+        )
+        budget = 0.0 if float(before) <= NEGATIVE_VALENCE_LOW_LINE else NEGATIVE_VALENCE_ROUND_CAP
+        allowed = max(0.0, budget - used)
+        if dropped > allowed:
+            excess = dropped - allowed
+            state.valence_offset = max(
+                -0.5, min(0.5, float(state.valence_offset or 0.0) + excess)
+            )
+            # 补回 offset 之后要把"看得见的效价"重算一遍，不然它还是掉下去的那个值
+            try:
+                self.dynamics.refresh(state, now=now)
+            except Exception:
+                pass
+            dropped = allowed
+        state.negative_valence_at = now
+        state.negative_valence_sum = used + dropped
 
     def note_open_topic(self, state: WorldState, ctx: Any, text: str) -> None:
         """记下"他没说完的事"。空字符串 = 这轮没有，什么都不做。
@@ -6240,9 +6333,13 @@ class VirtualWorldEngine:
             return
         # 这一轮聊下来的感受：记成"心情来源"，她下一轮就知道自己为什么这样
         cause = "刚才这几句聊得开心" if delta > 0 else "刚才这几句聊得不舒服"
+        before_valence = float(state.valence)
         self.dynamics.apply_event_delta(
             state, "valence", delta, now=self._now(), cause=cause, chat=True
         )
+        if delta < 0:
+            # 和口吻脉冲共用同一份额度：一轮里负面最多压这么多
+            self._cap_negative_valence(state, before_valence)
 
     # ---------------- 数值历史（给编辑器画曲线） ----------------
 
@@ -7830,12 +7927,21 @@ class VirtualWorldEngine:
             state.miss_push_count = 0
         return max(0, cap - int(state.miss_push_count or 0))
 
-    def _top_miss_candidate(self, state: WorldState) -> tuple[str, float] | None:
-        """现在最想找、而且今天还允许主动去找的那个人。"""
+    def _top_miss_candidate(
+        self, state: WorldState, *, eagerness: float = 1.0
+    ) -> tuple[str, float] | None:
+        """现在最想找、而且今天还允许主动去找的那个人。
+
+        ``eagerness``（1.0 = 平常）：她这会儿有多想主动找人。孤独感高、今天是"黏人"
+        的日子、或者很想被碰一碰时，这个数会大一点，门槛就跟着降——
+        原来那条"孤独 → 走去大厅喊一声"的规则删掉之后，就靠这里接住。
+        """
 
         threshold = float(
             getattr(self.world.profile, "miss_push_threshold", 0.70) or 0.70
         )
+        # 越想找他就越容易够线：门槛按下不设下限，但别低到"随便一点点就冲过去"
+        threshold = max(0.25, threshold / max(0.2, min(4.0, float(eagerness or 1.0))))
         best: tuple[str, float] | None = None
         for user_id, value in (state.miss or {}).items():
             try:
@@ -8111,7 +8217,12 @@ class VirtualWorldEngine:
             return False
         if self._miss_push_left(state) <= 0:
             return False
-        candidate = self._top_miss_candidate(state)
+        # 有多想主动找他：今天的基调、欲求，以及"孤独感偏高"（原来那条
+        # "走去大厅喊一声"的规则删掉之后，孤独就靠这里接住）
+        eagerness = self.decider.reach_out_eagerness(state)
+        if float(getattr(state, "loneliness", 0.0) or 0.0) > 0.7:
+            eagerness *= 1.4
+        candidate = self._top_miss_candidate(state, eagerness=eagerness)
         if candidate is None or self.llm is None:
             return False
         uid, score = candidate
@@ -8220,6 +8331,7 @@ class VirtualWorldEngine:
 
         parts = [self.miss_block(state)]
         parts.append(self._greet_hint(state))
+        parts.append(self._outdoor_hint(state))
         parts.append(self._heart_knot_block(state, ctx, autonomy=autonomy))
         parts.append(self._grudge_block(state, ctx, autonomy=autonomy))
         parts.append(self._own_topic_block(state, ctx, autonomy=autonomy))
@@ -8230,6 +8342,33 @@ class VirtualWorldEngine:
             parts.append(pending)
             state.pending_review = ""
         return "\n\n".join(part for part in parts if part)
+
+    def _outdoor_hint(self, state: WorldState) -> str:
+        """一直窝在家里时的一句提醒：想出去走走就直接 walk_to。
+
+        没有这一句她能在客厅连着待好几天——规则那条"出门"容易被别的动机挤掉，
+        大模型看着满满一屋子能做的事，也不会主动往外走。
+        """
+
+        if not self.world.is_home_zone(state.node_id):
+            return ""
+        now = self._now()
+        last = float(getattr(state, "last_outdoor_at", 0.0) or 0.0)
+        hours = (now - last) / 3600.0 if last else 0.0
+        if last and hours < OUTDOOR_HINT_HOURS:
+            return ""
+        said = float(getattr(state, "outdoor_hint_at", 0.0) or 0.0)
+        if said and (now - said) < OUTDOOR_HINT_HOURS:
+            # 说过一次就别每轮念：隔几个小时再说
+            return ""
+        span = f"已经 {int(hours)} 小时没出过门了" if last else "这两天一直在家里"
+        state.outdoor_hint_at = now
+        return (
+            f"你{span}——想出去走走就直接 `walk_to` 一个外面的地点"
+            "（街口 street_gate / 商场 mall / 小吃街 snacks / 公园公园大门 park_gate / "
+            "湖边 park_lake / 海滨步道 boardwalk…），一次写清目标就行；"
+            "在外面逛一逛、买点东西、看看新鲜的，比一直在家转圈有意思。"
+        )
 
     def _note_greet_candidate(
         self, state: WorldState, ctx: MessageContext, *, now: float
@@ -8496,6 +8635,9 @@ class VirtualWorldEngine:
             "# 你心里搁着的事\n"
             "这些不是任务、也不用去解决，只是你心里还惦记着——说话时会带出来一点："
             "要么语气淡一些，要么在合适的时机主动提一句。**别反复念叨、也别硬把话题拽过去**。\n"
+            "**但他要是直接问你「怎么了 / 谁惹你了 / 还在生气吗」，就照你的口气说出来**："
+            "不用一次说全，可以嘴硬、可以说一半、可以让他猜——但不能装没事，"
+            "也不能只用冷淡回答他。被问到了还什么都不说，那不是你的性格。\n"
             + "\n".join(lines)
         )
 
@@ -8680,7 +8822,9 @@ class VirtualWorldEngine:
         return (
             "# 你还记着他一笔账\n"
             "他有一件事到现在还没给你个说法。**你现在对他还气着**：说话可以短一点、"
-            "淡一点、可以带刺，但**别翻旧账、别每轮都提**，也别拿这件事去跟别人说。"
+            "淡一点、可以带刺，但**别翻旧账、别每轮都提**，也别拿这件事去跟别人说。\n"
+            "**不过他要是问起你为什么生气（或者主动道歉），就把这笔账说出来**："
+            "可以只给个理由、可以继续嘴硬，但不能一问三不知。闷着不说、只摆脸色不算本事。\n"
             "他要是道歉了、补上了，你心里那口气就松了——可以顺台阶下，也可以再嘴硬两句。\n"
             + "\n".join(lines)
         )
@@ -10345,6 +10489,9 @@ class VirtualWorldEngine:
             echo_marker = await self._event_marker(state)
             node = self.node(state.node_id) or self.node(self.default_node_id())
             state.world_time += 1
+            if not self.world.is_home_zone(state.node_id):
+                # 人就在外面：一直记着"最近出过门"，回家以后那句提醒才准
+                state.last_outdoor_at = self._now()
 
             # 正在做的动作被停用了：立刻停下（否则"停用"看起来没生效）
             current = state.current_action or {}
@@ -10641,6 +10788,9 @@ class VirtualWorldEngine:
                 state.node_id = target_node
                 # 换地方了：事件系统按"在这里待了多久"决定要不要出事，重新计时
                 state.node_since = self._now()
+                if not self.world.is_home_zone(target_node):
+                    # 出门了：记一笔，久不出去会想出去走走（见 _outdoor_hint）
+                    state.last_outdoor_at = self._now()
                 state.add_event("move", {"to": target_node})
                 # 特地走到一个新地方，落地后就地看看这里能做什么
                 if int(action.get("arrival_decide", 1)):
@@ -14666,13 +14816,16 @@ class VirtualWorldEngine:
 
         if definition is None:
             return 0.0
-        if not self.extensions.allows_desire_relief(state):
-            # 扩展说了"这回不算满足"（例如她正处在只会更想要的状态里）
+        intimacy = await self.desire_intimacy(state, definition)
+        if intimacy <= 0:
             return 0.0
-        weight = await self.desire_intimacy(state, definition)
-        if weight <= 0:
-            return 0.0
-        dropped = self.dynamics.satisfy_desire(state, weight)
+        # 扩展可以按"这一次是什么样的接触"给比例：0 = 一点都不解渴（只升温）
+        scale = self.extensions.contact_relief_scale(
+            definition, state, state.session_id
+        )
+        dropped = self.dynamics.satisfy_desire(
+            state, intimacy, scale=scale, now=self._now()
+        )
         if dropped <= 0:
             return 0.0
         if outcome is not None:
@@ -17979,11 +18132,13 @@ class VirtualWorldEngine:
     def echo_modes(self) -> dict[str, str]:
         """每个类型各自的显示方式：``full`` / ``compact``（``off`` 的不列出来）。"""
 
+        # 扩展注册的类型也算数：「调试输出」勾了它，就照它的方式发到群里
+        known = set(ECHO_EVENT_TYPES) | self.extensions.debug_event_types()
         modes: dict[str, str] = {}
         for name, mode in dict(getattr(self.world, "echo_modes", {}) or {}).items():
             key = str(name).strip()
             value = str(mode or "").strip().lower()
-            if key in ECHO_EVENT_TYPES and value in ("full", "compact"):
+            if key in known and value in ("full", "compact"):
                 modes[key] = value
         if modes:
             return modes
@@ -17991,10 +18146,19 @@ class VirtualWorldEngine:
         legacy = {
             str(name).strip()
             for name in (self.world.echo_types or [])
-            if str(name).strip() in ECHO_EVENT_TYPES
+            if str(name).strip() in known
         }
         fallback = "compact" if self.echo_compact() else "full"
         return {name: fallback for name in legacy}
+
+    def _ext_echo_icon(self, event_type: str) -> str:
+        """扩展注册的类型在调试输出里用什么图标。"""
+
+        key = str(event_type or "")
+        for item in self.extensions.debug_events():
+            if str(item.get("type") or "") == key:
+                return str(item.get("icon") or "•")
+        return "•"
 
     def echo_compact_for(self, event_type: str) -> bool:
         """这一类调试输出是不是精简模式。"""
@@ -18101,11 +18265,17 @@ class VirtualWorldEngine:
             if kind in DEBUG_ONLY_ECHO_TYPES and mode == "compact":
                 continue
             try:
-                line = render_event(item, self.world, compact=mode == "compact")
+                line = render_event(
+                    item,
+                    self.world,
+                    compact=mode == "compact",
+                    ext_render=self.extensions.debug_event_text,
+                )
             except Exception:
                 continue
             if line:
-                outcome.add_debug(f"{ECHO_EVENT_TYPES[kind]} {line}")
+                icon = ECHO_EVENT_TYPES.get(kind) or self._ext_echo_icon(kind)
+                outcome.add_debug(f"{icon} {line}".strip())
 
     def _log(self, level: str, message: str) -> None:
         if self.logger is None:
@@ -18162,6 +18332,7 @@ class VirtualWorldEngine:
                     },
                     self.world,
                     compact=self.echo_compact_for(event_type),
+                    ext_render=self.extensions.debug_event_text,
                 )
             except Exception:
                 line = ""

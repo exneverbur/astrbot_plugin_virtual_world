@@ -607,6 +607,13 @@ class WorldState:
     """上次用「她睡着了」的固定文案回话的时间（冷却用，0 表示没回过）。"""
     no_sleep_until: int = 0
     """刚被叫醒的保护期：世界时间在此之前，规则不再安排她回去睡。"""
+
+    last_outdoor_at: float = 0.0
+    """上一次在外面（不在家那一片）是什么时候：久了她会想出去走走。"""
+
+    outdoor_hint_at: float = 0.0
+    """上一次在提示词里提醒她"可以出去走走"是什么时候（别每轮都念）。"""
+
     cold_start_done: bool = False
     pending_memory: list[dict[str, Any]] = field(default_factory=list)
     """还没总结的对话片段：攒够条数、聊完、或她离开这个地点时，压成一条记忆。"""
@@ -696,6 +703,24 @@ class WorldState:
     llm_text_hour_marker: int = 0
     tool_param_count_hour: int = 0
     tool_param_hour_marker: int = 0
+    desire_relief_hour_sum: float = 0.0
+    """这一小时里"被亲昵卸掉的欲求"累计了多少（配合 ``desire_relief_hour_cap``）。"""
+
+    desire_relief_hour_marker: int = 0
+    """上面那个累计数属于哪个小时（换小时就清零）。"""
+
+    negative_valence_at: float = 0.0
+    """上一次"负面情绪压效价"是什么时候（同一轮里要合起来看）。"""
+
+    negative_valence_sum: float = 0.0
+    """这一轮负面已经压掉了多少效价（连着两笔也不会超上限）。"""
+
+    negative_tone_streak: int = 0
+    """连着被伤了几次（第一次最疼，之后递减）。"""
+
+    negative_tone_at: float = 0.0
+    """上一次被伤是什么时候（隔久了重新算"第一次"）。"""
+
     arrival_count_hour: int = 0
     arrival_hour_marker: int = 0
     pending_arrival: bool = False
@@ -864,6 +889,24 @@ class WorldState:
         except (TypeError, ValueError):
             self.desire_push_at = 0.0
         self.no_sleep_until = max(0, int(self.no_sleep_until))
+        try:
+            self.last_outdoor_at = max(0.0, float(self.last_outdoor_at or 0.0))
+        except (TypeError, ValueError):
+            self.last_outdoor_at = 0.0
+        try:
+            self.outdoor_hint_at = max(0.0, float(self.outdoor_hint_at or 0.0))
+        except (TypeError, ValueError):
+            self.outdoor_hint_at = 0.0
+        for name in ("negative_valence_at", "negative_tone_at"):
+            try:
+                setattr(self, name, max(0.0, float(getattr(self, name, 0.0) or 0.0)))
+            except (TypeError, ValueError):
+                setattr(self, name, 0.0)
+        try:
+            self.negative_valence_sum = max(0.0, float(self.negative_valence_sum or 0.0))
+        except (TypeError, ValueError):
+            self.negative_valence_sum = 0.0
+        self.negative_tone_streak = max(0, int(self.negative_tone_streak or 0))
         self.memory_flush_wanted = bool(self.memory_flush_wanted)
         self.wake_note_until = max(0, int(self.wake_note_until))
         self.sleep_started_at = max(0, int(self.sleep_started_at or 0))

@@ -118,6 +118,9 @@ DEFAULT_WORLD: dict[str, Any] = {
         "desire_relief": 0.08,
         "desire_relief_floor": 0.30,
         "desire_contact_warm": 0.005,
+        "desire_relief_from_contact": True,
+        "desire_relief_min_intimacy": 0.0,
+        "desire_relief_hour_cap": 0.0,
         "desire_tease": 0.05,
         "desire_low_energy_factor": 0.6,
         "desire_low_valence_factor": 0.2,
@@ -366,6 +369,7 @@ DEFAULT_WORLD: dict[str, Any] = {
     "zones": [
         {
             "id": "home",
+            "is_home": True,
             "name": "家中",
             "note": "她自己的小窝，安静、私密、什么都有。",
             "icon": "home",

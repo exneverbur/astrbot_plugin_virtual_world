@@ -790,6 +790,21 @@ class ProfileStore:
         data[group_id] = {"day": day, "people": people}
         raw.kv_set(AFFINITY_DAILY_KEY, data)
 
+    def drop_daily_people(self, group_id: str) -> bool:
+        """把这个组的"今天混过脸熟的人"整份清掉（通讯录清空时跟着走）。"""
+
+        key = str(group_id or "")
+        raw = self._kv_store()
+        if raw is None or not key:
+            return False
+        stored = raw.kv_get(AFFINITY_DAILY_KEY, {})
+        data = dict(stored) if isinstance(stored, dict) else {}
+        if key not in data:
+            return False
+        data.pop(key, None)
+        raw.kv_set(AFFINITY_DAILY_KEY, data)
+        return True
+
     @staticmethod
     def _day_key(now: float) -> str:
         return time.strftime("%Y-%m-%d", time.localtime(float(now)))

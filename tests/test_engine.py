@@ -17,6 +17,8 @@ from core.config_store import ConfigStore  # noqa: E402
 from core.db import AsyncDatabase  # noqa: E402
 from core.engine import (  # noqa: E402
     MessageContext,
+    NEGATIVE_VALENCE_ROUND_CAP,
+    TONE_INTIMACY_CEIL,
     TickOutcome,
     VirtualWorldEngine,
     _guess_duration_seconds,
@@ -915,15 +917,27 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
             unknown = self.engine._tone_magnitude(state, "negative_words", "404")
 
             # 实际落地的效果也要有差别（不只是算了个数）
+            # 先把心情放在"不挨着冷脸线"的位置：这两句各算一轮
+            state.valence = 0.7
+            state.valence_offset = 0.2
             before = float(state.valence)
             await self.engine._apply_tone_pulse(state, "attack", user_id="9")
             stranger_drop = before - float(state.valence)
+            # 这两句是"两轮"里的两句：把同轮上限与"连着被伤递减"归零再比，
+            # 比的才是"亲密度那一项"本身
+            state.negative_valence_at = 0.0
+            state.negative_valence_sum = 0.0
+            state.negative_tone_at = 0.0
+            state.negative_tone_streak = 0
             before = float(state.valence)
             await self.engine._apply_tone_pulse(state, "attack", user_id="7")
             close_drop = before - float(state.valence)
 
         self.assertLess(stranger, 0.5, "路人怼一句不该太往心里去")
-        self.assertGreater(close, 1.0, "亲近的人说她，比平时更疼")
+        # 亲近的人比路人疼得多；最特别的那一档最多也就 1.15 倍
+        # （以前是 1.5，配上"一句话吃三笔账"直接把人打进冷脸）
+        self.assertGreater(close, stranger * 2, "亲近的人说她，比路人疼得多")
+        self.assertLessEqual(close, TONE_INTIMACY_CEIL)
         self.assertLess(unknown, stranger, "连档案都没有的路人最轻")
         self.assertGreater(close_drop, stranger_drop)
         # 正面口吻不缩放：那几条本来就压得很小，还有"连着被哄会麻木"
@@ -931,6 +945,42 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 self.engine._tone_magnitude(state, "positive_words", "7"), 1.0
             )
+
+    async def test_one_round_of_negatives_is_capped(self):
+        """一轮里负面最多压这么多效价：连着被骂也不会一路掉到冷脸。"""
+
+        async with self.engine.session_state(SESSION) as state:
+            self.engine.profiles.touch(state.session_id, "7", "小红")
+            self.engine.profiles.note_bond(
+                state.session_id, "7", type="闺蜜", asserted_by="测试"
+            )
+            self.engine.profiles.adjust_affinity(state.session_id, "7", 60, reason="测试")
+            state.valence = 0.8
+            state.valence_offset = 0.3
+            state.negative_valence_at = 0.0
+            state.negative_valence_sum = 0.0
+            before = float(state.valence)
+            for _ in range(4):
+                await self.engine._apply_tone_pulse(state, "attack", user_id="7")
+            dropped = before - float(state.valence)
+        self.assertLessEqual(dropped, NEGATIVE_VALENCE_ROUND_CAP + 1e-6)
+        self.assertGreater(dropped, 0.0)
+
+    async def test_already_cold_line_is_not_pushed_further(self):
+        """已经在冷脸线上（效价 < 0.45）时，这一句不再往下压。"""
+
+        async with self.engine.session_state(SESSION) as state:
+            self.engine.profiles.touch(state.session_id, "7", "小红")
+            self.engine.profiles.note_bond(
+                state.session_id, "7", type="闺蜜", asserted_by="测试"
+            )
+            self.engine.profiles.adjust_affinity(state.session_id, "7", 60, reason="测试")
+            state.valence = 0.3
+            state.valence_offset = -0.2
+            state.negative_valence_at = 0.0
+            state.negative_valence_sum = 0.0
+            await self.engine._apply_tone_pulse(state, "attack", user_id="7")
+            self.assertGreaterEqual(float(state.valence), 0.3 - 1e-6)
 
     async def test_analyst_variant_appends_instead_of_replacing(self):
         """分析层是**补充**：原始信息一个不少，分析贴在最后，并写明"冲突以事实为准"。"""
@@ -2577,15 +2627,23 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(outcomes), 1)
 
     async def test_continuous_action_advances_and_finishes(self):
-        await self.set_state(loneliness=0.9, boredom=0.1, energy=0.6)
+        # 有点闲、人在卧室 → 规则会安排"去书房看会儿书"（走 2 tick，然后开始看）
+        await self.set_state(loneliness=0.2, boredom=0.5, energy=0.7, node_id="bedroom")
         await self.engine.maybe_decide(SESSION)
         state = await self.get_state()
         self.assertEqual((state.current_action or {}).get("type"), "walk_to")
-        # 书房 -> 大厅需要 1 tick
+        # 卧室 -> 书房需要 2 tick
+        await self.engine.tick()
         await self.engine.tick()
         state = await self.get_state()
-        self.assertEqual(state.node_id, "lobby")
-        self.assertIsNone(state.current_action)
+        self.assertEqual(state.node_id, "study")
+        # 到了就坐下看书（持续动作），再走一拍进度要往前动
+        self.assertEqual((state.current_action or {}).get("type"), "read")
+        started = int((state.current_action or {}).get("elapsed_ticks") or 0)
+        await self.engine.tick()
+        state = await self.get_state()
+        self.assertEqual((state.current_action or {}).get("type"), "read")
+        self.assertGreater(int((state.current_action or {}).get("elapsed_ticks") or 0), started)
 
     async def test_sleep_schedule_moves_bot_and_puts_it_to_sleep(self):
         self.clock.set_struct(datetime(2026, 9, 10, 23, 30))
@@ -2775,19 +2833,36 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
     # ---------------- S3：自主行为 ----------------
 
     async def test_autonomous_loneliness_makes_her_find_people_and_speak(self):
-        await self.set_state(loneliness=0.95, node_id="bedroom")
-        await self.engine.maybe_decide(SESSION)
-        state = await self.get_state()
-        self.assertEqual((state.current_action or {}).get("type"), "walk_to")
+        """孤独并进"主动找他"：想念还没到平时的门槛，孤独高也照样让她去找他。
 
-        await self.engine.tick()  # 抵达大厅
-        state = await self.get_state()
-        self.assertEqual(state.node_id, "lobby")
+        （原来那条"孤独 → 走到大厅喊一声"已经删了：说话是发到会话里的，
+          跟站在哪个房间无关。）
+        """
 
-        await self.engine.tick()  # 执行 say（由 LLM 生成文案）
-        self.assertIn("有人在吗？", self.messenger.flat_messages)
+        self._make_close_friend("42", affinity=40.0)
+        # 对照：不孤独的时候，0.55 够不着 0.70 的门槛
+        await self.set_state(
+            state="idle", current_action=None, current_plan=None, loneliness=0.2
+        )
+        async with self.engine.session_state(SESSION) as state:
+            state.miss = {"42": 0.55}
+        await self.engine.maybe_decide(SESSION, force=True)
+        self.assertEqual((await self.get_state()).miss_push_count, 0)
+
+        # 孤独高的时候：同样的想念就够了（引擎把门槛按意愿压下来）
+        await self.set_state(
+            state="idle", current_action=None, current_plan=None, loneliness=0.95
+        )
+        async with self.engine.session_state(SESSION) as state:
+            state.miss = {"42": 0.55}
+        self.llm.replies = [
+            '{"plan":[{"action":"say","messages":["一个人待着有点闷，你在吗"],'
+            '"send_to":"群 1001"}],"valid_until":1800,"reason":"想找他说句话"}'
+        ]
+        await self.engine.maybe_decide(SESSION, force=True)
         state = await self.get_state()
-        self.assertTrue(state.awaiting_reply)
+        self.assertEqual(state.miss_push_count, 1)
+        self.assertIn("一个人待着有点闷，你在吗", self.messenger.flat_messages)
 
     async def test_hourly_autonomous_limit(self):
         # 自己把额度定死：这条测的是"触顶就不动"，不该跟着默认值一起漂
@@ -7073,13 +7148,19 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(vision), 2)
 
     async def test_proactive_speech_is_blocked_after_a_reply(self):
-        """刚被搭话、她回完话之后，这段时间不再因为孤独感主动开口。"""
+        """刚被搭话、她回完话之后：群里正热闹也不接话（别和被动回复挤在一起）。"""
 
         self.engine.engagement.set_world(self.engine.world)
+        await self.engine.note_presence(
+            self.ctx(text="你们觉得这个周末去哪玩好", user_id="1", user_name="小明")
+        )
+        await self.engine.note_presence(
+            self.ctx(text="我觉得去爬山不错", user_id="2", user_name="小红")
+        )
+        await self.set_state(
+            loneliness=0.95, node_id="lobby", current_plan=None, current_action=None
+        )
         async with self.engine.session_state(SESSION) as state:
-            state.loneliness = 0.95  # 高到必然想找人
-            state.current_plan = None
-            state.current_action = None
             self.engine.engagement.note_passive_reply(state, tick_seconds=60.0)
             blocked_until = state.proactive_block_until
 
@@ -7087,23 +7168,26 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         outcome = await self.engine.maybe_decide(SESSION, force=True)
         state = await self.engine.load_state(SESSION, cold_start=False)
 
-        self.assertIsNone(state.current_plan, "冷却期内不该排「找人说话」的计划")
-        self.assertTrue(
-            any("不主动搭话" in note for note in (outcome.notes if outcome else [])),
-            outcome.notes if outcome else None,
-        )
+        self.assertIsNone(state.current_plan, "冷却期内不该排「主动开口」的计划")
+        self.assertNotIn("有人在吗？", self.messenger.flat_messages)
 
     async def test_proactive_speech_resumes_after_cooldown(self):
-        """冷却过去之后，孤独感又能让她找人说话。"""
+        """冷却过去之后，群里正热闹她又会接一句。"""
 
+        await self.engine.note_presence(
+            self.ctx(text="你们觉得这个周末去哪玩好", user_id="1", user_name="小明")
+        )
+        await self.engine.note_presence(
+            self.ctx(text="我觉得去爬山不错", user_id="2", user_name="小红")
+        )
+        await self.set_state(loneliness=0.95, node_id="lobby", current_plan=None)
         async with self.engine.session_state(SESSION) as state:
-            state.loneliness = 0.95
             state.proactive_block_until = int(state.world_time)  # 已经过期
 
         outcome = await self.engine.maybe_decide(SESSION, force=True)
         state = await self.engine.load_state(SESSION, cold_start=False)
-        self.assertIsNotNone(state.current_plan)
         self.assertIsNotNone(outcome)
+        self.assertIn("有人在吗？", self.messenger.flat_messages)
 
     async def test_generated_text_also_gets_the_session_directory(self):
         """"现写一句"这条路（say 没给文案 / 分享 / 单轮动作）也要带「你能说话的地方」。"""
@@ -7720,6 +7804,38 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(float(state.drowsy_started_at), 0.0)
             self.assertEqual(state.state, "idle")
 
+    async def test_she_is_reminded_to_go_out_after_too_long_inside(self):
+        """一直窝在家里：提示词里会提醒她可以出去走走（并给出能写的 id）。"""
+
+        await self.set_state(node_id="lobby")
+        state = await self.get_state()
+        state.last_outdoor_at = 0.0
+        text = self.engine._outdoor_hint(state)
+        self.assertIn("walk_to", text)
+        self.assertIn("在家", text)
+        # 人就在外面：不用提醒
+        state.node_id = "park_lake"
+        self.assertEqual(self.engine._outdoor_hint(state), "")
+        # 刚出过门：也不用提醒
+        state.node_id = "lobby"
+        state.last_outdoor_at = self.clock.now()
+        self.assertEqual(self.engine._outdoor_hint(state), "")
+
+    async def test_walking_outside_marks_the_time(self):
+        """走到外面就记一笔（回家以后那句"你好久没出门了"才准）。"""
+
+        await self.set_state(node_id="lobby")
+        async with self.engine.session_state(SESSION) as state:
+            state.last_outdoor_at = 0.0
+            await self.engine._finish_action(
+                state,
+                self.engine.node("lobby"),
+                TickOutcome(session_id=SESSION),
+                {"type": "walk_to", "target_node": "park_lake", "arrival_decide": 0},
+            )
+            self.assertEqual(state.node_id, "park_lake")
+            self.assertGreater(float(state.last_outdoor_at), 0.0)
+
     async def test_a_plan_never_queues_sleep_twice(self):
         """睡觉只排一步：临睡期里她每回一句都可能再排一次，计划不该堆成"睡觉 ×4"。"""
 
@@ -7965,7 +8081,8 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_interrupt_stops_continuous_action(self):
-        await self.set_state(loneliness=0.9, node_id="study")
+        # 有点闲 → 去书房看书（先走一段，正好有个持续动作可打断）
+        await self.set_state(loneliness=0.2, boredom=0.5, energy=0.7, node_id="bedroom")
         await self.engine.maybe_decide(SESSION)
         self.assertIsNotNone((await self.get_state()).current_action)
         interrupted = await self.engine.interrupt(SESSION)
@@ -9455,7 +9572,8 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("fly" in item for item in detail["warnings"]), detail["warnings"])
 
     async def test_plan_event_contains_steps_and_reason(self):
-        await self.set_state(loneliness=0.95, node_id="bedroom")
+        # 太无聊了 → 换个地方发呆（规则计划；第一条还是 walk_to）
+        await self.set_state(boredom=0.9, node_id="bedroom")
         await self.engine.maybe_decide(SESSION)
         events = await self.db.call("query_events", session_id=SESSION, limit=20)
         plans = [item for item in events if item["event_type"] == "plan"]
@@ -10533,6 +10651,8 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_being_held_settles_the_need(self):
         """抱抱做完要满足欲求；看书这种跟人无关的动作一点都不碰它。"""
 
+        # 这条测的是"打开日常亲昵解渴"那套老行为（默认是关着的）
+        self.engine.world.state_dynamics.desire_relief_from_contact = True
         async with self.engine.session_state(SESSION) as live:
             live.desire = 0.9
         state = await self.get_state()
@@ -10547,10 +10667,50 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertAlmostEqual(float(state.desire), before, places=6)
 
+    async def test_extension_can_say_a_touch_does_not_quench(self):
+        """扩展说"这一下不算解渴"（返回 0）时：抱一下只升温，不动欲求。"""
+
+        from core.extensions import ExtensionSpec
+
+        await self.set_state(node_id="study")
+        self.engine.extensions.register(
+            ExtensionSpec(
+                name="demo",
+                desire_relief=lambda definition, state, session_id, host: 0.0,
+            )
+        )
+        async with self.engine.session_state(SESSION) as live:
+            live.desire = 0.9
+        state = await self.get_state()
+        actions = self.engine.world.action_map()
+        dropped = await self.engine._satisfy_desire_from_action(state, actions["hug"])
+        self.assertEqual(dropped, 0.0)
+        self.assertGreaterEqual(float(state.desire), 0.9)
+
+    async def test_old_style_extension_hook_still_works(self):
+        """老写法 ``(state) -> bool`` 也认：False = 这一下不解渴。"""
+
+        from core.extensions import ExtensionSpec
+
+        await self.set_state(node_id="study")
+        self.engine.extensions.register(
+            ExtensionSpec(name="old", desire_relief=lambda state: False)
+        )
+        async with self.engine.session_state(SESSION) as live:
+            live.desire = 0.9
+        state = await self.get_state()
+        actions = self.engine.world.action_map()
+        self.assertEqual(
+            await self.engine._satisfy_desire_from_action(state, actions["hug"]), 0.0
+        )
+        self.assertGreaterEqual(float(state.desire), 0.9)
+
     async def test_a_plan_step_that_touches_her_settles_the_need(self):
         """走完整条执行链也要算数：瞬时动作（抱一下）在计划里做完就满足欲求。"""
 
         from core import planner as planner_module
+
+        self.engine.world.state_dynamics.desire_relief_from_contact = True
 
         async with self.engine.session_state(SESSION) as live:
             live.desire = 0.9
