@@ -261,6 +261,21 @@ class FrontendSyntaxTest(unittest.TestCase):
         )
         self.assertEqual(bad, [], f"这些提示带着改动过程的口吻，请改写：" + str(bad[:5]))
 
+    def test_state_labels_never_leak_a_bare_english_id(self) -> None:
+        """状态页那一行：内置状态有中文；动作自己写的 during.state 也要能翻译。"""
+
+        source = APP_JS.read_text("utf-8")
+        # 内置状态表里有临睡期
+        self.assertIn('{ key: "drowsy", label: "犯困了" }', source)
+        # 扩展给的状态优先，其次才是内置表与动作名推断
+        self.assertIn("function stateLabelOf(", source)
+        self.assertIn("data.extension_status", source)
+        self.assertIn("(item.during || {}).state", source)
+        # 两处显示状态的地方都走这个统一函数
+        self.assertEqual(
+            len(re.findall(r"stateLabelOf\(", source)), 3, "状态名要统一走 stateLabelOf"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

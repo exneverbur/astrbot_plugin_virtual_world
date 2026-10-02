@@ -1069,6 +1069,94 @@ class VirtualWorldEngine:
             return str(session_id)
         return allowed[0]
 
+    async def resolve_schedule_target(
+        self, state: WorldState, schedule: Any, session_id: str
+    ) -> str:
+        """日程的落点：勾了会话组就**让大模型挑**组里的哪个会话。
+
+        以前"勾组"等于落在组代表身上，用户看着就是"我说了落在组里，她却总是
+        发到那一个群"。现在勾组 = 把这句话交给组里的某一个会话，由她自己挑
+        （挑不动 / 没配模型时才回落到代表会话）。
+        勾了具体会话的照旧，不问模型。
+        """
+
+        picked = [str(item) for item in (getattr(schedule, "sessions", None) or [])]
+        group = self.group_of(session_id)
+        if not picked or group is None:
+            return self.schedule_target(schedule, session_id)
+        members = [str(item) for item in (group.sessions or [])]
+        group_picked = str(group.id) in picked
+        pinned = [item for item in picked if item in members]
+        if not group_picked or pinned or len(members) <= 1:
+            return self.schedule_target(schedule, session_id)
+        chosen = await self._pick_schedule_session(state, schedule, members)
+        return chosen or self.schedule_target(schedule, session_id)
+
+    async def _pick_schedule_session(
+        self, state: WorldState, schedule: Any, members: list[str]
+    ) -> str:
+        """这句话说给组里的哪一处：**由她自己（主模型）看着上下文决定**。
+
+        不走打杂模型：落点是她"开口说给谁听"的一部分，得带着人设和最近的
+        聊天上下文判断——谁刚跟她说过话、哪一处正热闹。挑不出来返回空串
+        （调用方回落到组代表）。
+        """
+
+        if self.llm is None:
+            return ""
+        labels = self.session_labels(state)
+        window = self.chat_window(state)
+        lines: list[str] = []
+        for index, item in enumerate(members):
+            label = labels.get(item) or self.session_label(item, state) or item
+            recent = ""
+            for row in reversed(window):
+                origin = str(row.get("origin") or state.session_id)
+                if origin != item:
+                    continue
+                text = " ".join(str(row.get("text") or "").split())
+                if not text:
+                    continue
+                who = str(row.get("name") or row.get("user_id") or "")
+                recent = f"{who}：「{_clip_text(text, 40)}」" if who else f"「{_clip_text(text, 40)}」"
+                break
+            lines.append(
+                f"{index + 1}. {label}"
+                + (f" —— 最近在这儿说：{recent}" if recent else " ——（最近没人在这儿说话）")
+            )
+        steps = "、".join(
+            self.prompts.action_label(step.type)
+            for step in (getattr(schedule, "action_chain", None) or [])
+            if getattr(step, "type", "")
+        )
+        persona = await self._persona_text(state.session_id)
+        system = (
+            (persona + "\n\n" if persona else "")
+            + "你正要按日程开口说一句话，得先决定这句话说给哪一处听。"
+            "只输出一个数字（上面列表里的编号），不要解释、不要标点。"
+        )
+        prompt = (
+            f"# 现在\n"
+            f"你在「{self._node_name(state.node_id)}」，现在 {self.local_now().strftime('%H:%M')}。\n\n"
+            f"# 日程到点了\n"
+            f"要做的事：{steps or '（没写具体动作）'}\n"
+            f"当初为什么排：{str(getattr(schedule, 'note', '') or '') or '（没写）'}\n\n"
+            f"# 你能说话的地方\n" + "\n".join(lines) + "\n\n"
+            "按你自己的判断挑一处：谁正等着你、哪一处更该听到这句话。只回编号。"
+        )
+        # 走主模型（带人设、带上下文），不是打杂模型
+        reply = await self._ask_llm(state.session_id, system, prompt)
+        if reply is None:
+            return ""
+        text = " ".join(str(reply).split())
+        digits = "".join(char for char in text if char.isdigit())
+        if not digits:
+            return ""
+        index = int(digits[:2]) - 1
+        if 0 <= index < len(members):
+            return members[index]
+        return ""
+
     def schedule_in_scope(self, schedule: Any, session_id: str) -> bool:
         """这条日程属不属于"这个她"。
 
@@ -4851,7 +4939,10 @@ class VirtualWorldEngine:
         """睡着被吵醒 / 起床气这几句临时说明（提示词用，过期自动失效）。"""
 
         notes: list[str] = []
-        if str(getattr(state, "state", "")) == STATE_DROWSY or state.drowsy_sleep_step:
+        # 只有真的在临睡期才说"困得不行"：只看那一步揣没揣着会出大问题——
+        # 她要是从别的路躺下了（被动回合里她自己说要睡），揣着的那一步没人清，
+        # 这句提示就会一直挂着，精力满着也会一天到晚说"我好困"。
+        if str(getattr(state, "state", "")) == STATE_DROWSY and not state.is_sleeping:
             # 临睡期：她已经困得不行了，只是还没躺下
             notes.append(
                 "你现在困得不行了（正要睡）：**说话短、断断续续、迷迷糊糊的**——"
@@ -5133,6 +5224,10 @@ class VirtualWorldEngine:
         state.current_action = None
         state.state = STATE_IDLE
         state.mood_override_until = 0
+        # 醒着以后不许再挂着"正要睡"：临睡期的记账、揣着的那一步一起清掉
+        state.drowsy_sleep_step = {}
+        state.drowsy_started_world_time = 0
+        state.drowsy_started_at = 0.0
         if config.clear_plan_on_wake:
             state.current_plan = None
         grace_minutes = max(0, int(config.wake_grace_minutes))
@@ -9534,7 +9629,8 @@ class VirtualWorldEngine:
                     if not self.schedule_in_scope(schedule, session_id):
                         # 这条日程是别的会话 / 别的组的事
                         continue
-                    target = self.schedule_target(schedule, session_id)
+                    # 勾了会话组 = 让她自己挑组里的哪一处说（见 resolve_schedule_target）
+                    target = await self.resolve_schedule_target(state, schedule, session_id)
                     label = schedule.id
                     if schedule.action_chain:
                         names = [
@@ -9675,8 +9771,11 @@ class VirtualWorldEngine:
         if not schedule.enabled and not force:
             return {"ok": False, "reason": f"日程「{schedule.id}」是停用状态"}
 
-        # 手动跑也认这条日程自己的落点（勾了私聊就发私聊）
-        outcome = TickOutcome(session_id=self.schedule_target(schedule, session_id))
+        # 手动跑也认这条日程自己的落点（勾了私聊就发私聊；勾了组就让她自己挑一处）
+        outlook = await self.load_state(session_id, cold_start=False)
+        outcome = TickOutcome(
+            session_id=await self.resolve_schedule_target(outlook, schedule, session_id)
+        )
         outcome.place = outcome.session_id
         async with self.session_state(session_id) as state:
             if not force and not self._conditions_ok(state, schedule.conditions):
@@ -11718,6 +11817,13 @@ class VirtualWorldEngine:
 
         fresh = [self._step_payload(item, outcome.home(), kind) for item in rest]
         plan = state.current_plan if isinstance(state.current_plan, dict) else None
+        # 「睡觉 / 小睡」排第二遍没有意义：临睡期里她每回一句都可能再排一次，
+        # 计划里就会堆成"睡觉 ×4"（真到了点也只该睡一觉）。
+        fresh, dropped = self._dedupe_queued_steps(
+            fresh, list((plan or {}).get("steps") or []) + carried
+        )
+        if dropped:
+            outcome.notes.append(f"「睡觉」这一类动作已经排过了，重复的 {dropped} 步丢掉")
         if plan is None:
             state.current_plan = create_plan(
                 steps=fresh + carried,
@@ -11738,6 +11844,38 @@ class VirtualWorldEngine:
             )
         if note:
             outcome.notes.append(note)
+
+    DEDUPE_ACTION_IDS = ("sleep", "nap")
+    """这些动作"做一次就够了"：同一份计划里排第二遍没有意义。
+
+    临睡期里她每回一句话就可能再排一次「睡觉」，计划很快就堆成"睡觉 ×4"。
+    """
+
+    def _dedupe_queued_steps(
+        self,
+        steps: list[dict[str, Any]],
+        existing: list[dict[str, Any]] | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """把"排第二遍没意义"的动作去掉，返回 ``(留下的步骤, 丢掉几个)``。"""
+
+        seen = {
+            str(item.get("action") or "")
+            for item in (existing or [])
+            if isinstance(item, dict)
+        }
+        kept: list[dict[str, Any]] = []
+        dropped = 0
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            action_id = str(step.get("action") or "")
+            if action_id in self.DEDUPE_ACTION_IDS:
+                if action_id in seen:
+                    dropped += 1
+                    continue
+                seen.add(action_id)
+            kept.append(step)
+        return kept, dropped
 
     async def _execute_actions(
         self,
@@ -11799,6 +11937,56 @@ class VirtualWorldEngine:
                     {
                         "action": action.type,
                         "note": f"「{definition.name or action.type}」已停用",
+                    },
+                    outcome=outcome,
+                )
+                continue
+            if (
+                definition.id in self.DEDUPE_ACTION_IDS
+                and str(state.state) == STATE_DROWSY
+                and autonomous
+            ):
+                # 临睡期里她自己又排了一次睡觉：那一觉已经揣在临睡期里了。
+                # 再走一遍要么又排一个"睡觉"进计划（堆成四个），要么当场躺下
+                # （好好的临睡期就被跳过了）——两种都不对，直接跳过并留痕。
+                outcome.notes.append(
+                    f"她已经在临睡期里了，「{definition.name or definition.id}」这一步跳过"
+                )
+                await self._log_event(
+                    state,
+                    "skip",
+                    {
+                        "action": definition.id,
+                        "note": "已经在临睡期里（那一觉揣在临睡期里了），不再排一次",
+                    },
+                    outcome=outcome,
+                )
+                continue
+            if (
+                definition.id in self.DEDUPE_ACTION_IDS
+                and autonomous
+                and not skip_drowsy
+                and int(state.world_time or 0) < int(state.no_sleep_until or 0)
+            ):
+                # 刚被叫醒 / 刚睡醒的保护期里她自己不再睡回去（规则决策那边本来就拦着，
+                # 大模型这一路也得拦）——不然"叫醒她"等于没叫，精力满满也一直躺着。
+                left = max(
+                    0,
+                    int(
+                        (int(state.no_sleep_until) - int(state.world_time))
+                        * self.tick_seconds
+                        // 60
+                    ),
+                )
+                outcome.notes.append(
+                    f"刚醒没多久（还有 {left} 分钟保护期），这次不睡"
+                )
+                await self._log_event(
+                    state,
+                    "skip",
+                    {
+                        "action": definition.id,
+                        "note": f"刚醒的保护期里（还剩 {left} 分钟），这一步不睡",
                     },
                     outcome=outcome,
                 )
@@ -12030,13 +12218,21 @@ class VirtualWorldEngine:
         pending = [item for item in pending if item not in instant]
         if not pending:
             return
+        tail = carried if carried is not None else self._plan_remaining_steps(active_plan(state))
+        steps, dropped = self._dedupe_queued_steps(
+            [self._step_payload(item, outcome.home()) for item in pending], tail
+        )
+        if dropped:
+            outcome.notes.append(f"「睡觉」这一类动作已经排过了，重复的 {dropped} 步丢掉")
+        if not steps:
+            return
         await self._log_event(
             state,
             "plan",
             {
                 "reason": f"为了做「{definition.name or definition.id}」先移动过去",
                 "source": "auto_travel",
-                "steps": [{"action": item.type} for item in pending],
+                "steps": [{"action": item.get("action")} for item in steps],
             },
             outcome=outcome,
         )
@@ -12048,9 +12244,8 @@ class VirtualWorldEngine:
         if state.current_action is None:
             return
         # 她自己原来没做完的安排接在后面：主人这一轮的要求先做，再回去做她自己的事
-        tail = carried if carried is not None else self._plan_remaining_steps(active_plan(state))
         state.current_plan = create_plan(
-            steps=[self._step_payload(item, outcome.home()) for item in pending] + tail,
+            steps=steps + tail,
             world_time=state.world_time,
             valid_for=self.world.limits.plan_valid_duration,
             reason=f"到了{self._node_name(target_node)}之后要做的事",
@@ -14878,6 +15073,12 @@ class VirtualWorldEngine:
                 state.sleep_noise_at = 0.0
                 state.sleep_noise_count = 0
                 state.sleep_named_count = 0
+                # 真的躺下了：临睡期里揣着的那一步就此消化掉。
+                # 不清的话它会留到醒来以后，提示词里那句"你困得不行了"会一直挂着
+                # （精力满着也整天说困），而且当天再也进不了临睡期。
+                state.drowsy_sleep_step = {}
+                state.drowsy_started_world_time = 0
+                state.drowsy_started_at = 0.0
             previous = state.current_action if isinstance(state.current_action, dict) else None
             if previous and str(previous.get("type") or "") != definition.id:
                 self.dynamics.apply_event(state, "interrupted", now=self._now())
@@ -17410,6 +17611,8 @@ class VirtualWorldEngine:
             "node_id": state.node_id,
             "node_name": node.name if node else "",
             "state": state.state,
+            # 扩展想显示的状态（例如"兴奋中"）：只给编辑器看，不进群名片
+            "extension_status": self.extensions.status_text(state, session_id),
             "mood": state.mood,
             # 今天的基调（每天掷一次）：只调各条曲线的快慢，界面上说清是哪一种
             "day_mood": {

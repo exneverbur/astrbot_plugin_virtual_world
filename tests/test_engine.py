@@ -289,6 +289,64 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
                 PRIVATE_SESSION,
             )
 
+    async def test_schedule_landing_in_a_group_is_chosen_by_her(self):
+        """日程落点勾了「组」：由她挑组里的哪一处说，不再一律落在组代表。"""
+
+        from types import SimpleNamespace
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION], main=SESSION)
+        schedule = SimpleNamespace(
+            id="s1", sessions=["team"], action_chain=[], note="睡前道个晚安"
+        )
+        # 打杂 / 判断模型都不给：这一句必须由主模型（她自己）看着上下文决定
+        self.engine.helper_llm = None
+        self.engine.judge_llm = None
+        self.llm.replies = ["2"]
+        async with self.engine.session_state(SESSION) as state:
+            target = await self.engine.resolve_schedule_target(state, schedule, SESSION)
+        self.assertEqual(target, PRIVATE_SESSION)
+        # 挑的时候把组里的几处都告诉了她（用她能看懂的名字，不是会话 id），
+        # 还带上"最近谁在哪一处说话"
+        prompt = self.llm.calls[-1]["prompt"]
+        self.assertIn("按你自己的判断挑一处", prompt)
+        self.assertIn("群 1001", prompt)
+        self.assertIn("私聊 2692047521", prompt)
+        self.assertIn("你能说话的地方", prompt)
+
+    async def test_schedule_landing_falls_back_when_she_cannot_choose(self):
+        """她挑不出来（没模型 / 回的不是编号）就回落到代表会话，不能空着不发。"""
+
+        from types import SimpleNamespace
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION], main=SESSION)
+        schedule = SimpleNamespace(
+            id="s1", sessions=["team"], action_chain=[], note=""
+        )
+        self.llm.replies = ["我也不太确定"]
+        async with self.engine.session_state(SESSION) as state:
+            target = await self.engine.resolve_schedule_target(state, schedule, SESSION)
+        self.assertEqual(target, SESSION)
+
+        self.engine.llm = None
+        async with self.engine.session_state(SESSION) as state:
+            target = await self.engine.resolve_schedule_target(state, schedule, SESSION)
+        self.assertEqual(target, SESSION)
+
+    async def test_schedule_landing_pinned_to_one_chat_never_asks(self):
+        """单勾了组里某个会话：照勾的来，不用问模型。"""
+
+        from types import SimpleNamespace
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION], main=SESSION)
+        schedule = SimpleNamespace(
+            id="s2", sessions=[PRIVATE_SESSION], action_chain=[], note=""
+        )
+        self.llm.replies = []
+        async with self.engine.session_state(SESSION) as state:
+            target = await self.engine.resolve_schedule_target(state, schedule, SESSION)
+        self.assertEqual(target, PRIVATE_SESSION)
+        self.assertEqual(self.llm.calls, [])
+
     async def test_promising_to_say_it_elsewhere_actually_goes_there(self):
         """私聊里答应"去群里说晚安"：那条 say 必须真的发到群里，不能只在私聊口头答应。"""
 
@@ -7608,6 +7666,179 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
             notes = " ".join(self.engine.sleep_notes(state))
         self.assertIn("困得不行", notes)
         self.assertIn("迷迷糊糊", notes)
+
+    async def test_a_stale_pocketed_step_does_not_keep_her_sleepy(self):
+        """老存档里可能留着一个"揣着的睡觉"：只要不在临睡期，就别说她困。"""
+
+        await self.set_state(node_id="bedroom", energy=0.95)
+        async with self.engine.session_state(SESSION) as state:
+            state.state = "idle"
+            state.drowsy_sleep_step = {"type": "sleep"}
+            notes = " ".join(self.engine.sleep_notes(state))
+        self.assertNotIn("困得不行", notes)
+
+    async def test_lying_down_clears_the_pocketed_drowsy_step(self):
+        """她从别的路躺下（被动回合里说睡）：临睡期那笔账要一起清掉，别挂一天。"""
+
+        await self.set_state(node_id="bedroom", energy=0.95)
+        async with self.engine.session_state(SESSION) as state:
+            state.state = STATE_DROWSY
+            state.drowsy_sleep_step = {"type": "sleep"}
+            state.drowsy_started_at = self.clock.now()
+            outcome = TickOutcome(session_id=SESSION)
+            await self.engine._execute_actions(
+                state,
+                self.engine.node("bedroom"),
+                outcome,
+                [PlannedAction(type="sleep", duration=28800)],
+                depth=0,
+                autonomous=False,
+            )
+            # 直接躺下（他明说了要她睡，不再走临睡期）
+            self.assertEqual(state.state, STATE_SLEEPING)
+            self.assertEqual(state.drowsy_sleep_step, {})
+            self.assertEqual(int(state.drowsy_started_world_time), 0)
+            self.assertEqual(float(state.drowsy_started_at), 0.0)
+            # 醒来以后也不许再说"困得不行"
+            state.state = "idle"
+            state.current_action = None
+            notes = " ".join(self.engine.sleep_notes(state))
+        self.assertNotIn("困得不行", notes)
+
+    async def test_waking_up_clears_the_drowsy_bookkeeping(self):
+        """叫醒 / 自己醒来都把临睡期那笔账清干净。"""
+
+        await self.set_state(node_id="bedroom")
+        async with self.engine.session_state(SESSION) as state:
+            state.state = STATE_DROWSY
+            state.drowsy_sleep_step = {"type": "sleep"}
+            state.drowsy_started_at = self.clock.now()
+            self.engine._wake_up_state(
+                state, MessageContext(session_id=SESSION, user_name="你", text="")
+            )
+            self.assertEqual(state.drowsy_sleep_step, {})
+            self.assertEqual(float(state.drowsy_started_at), 0.0)
+            self.assertEqual(state.state, "idle")
+
+    async def test_a_plan_never_queues_sleep_twice(self):
+        """睡觉只排一步：临睡期里她每回一句都可能再排一次，计划不该堆成"睡觉 ×4"。"""
+
+        kept, dropped = self.engine._dedupe_queued_steps(
+            [
+                {"action": "sleep"},
+                {"action": "sleep"},
+                {"action": "nap"},
+                {"action": "say"},
+            ],
+            [{"action": "sleep"}],
+        )
+        # 睡觉只留一步；小睡是另一个动作，不算重复
+        self.assertEqual([item["action"] for item in kept], ["nap", "say"])
+        # 计划里已经有一个睡觉，新来的两个都丢掉
+        self.assertEqual(dropped, 2)
+        # 同一个动作排两次（不是睡觉）照旧留着：那是她自己写的两步
+        kept, dropped = self.engine._dedupe_queued_steps(
+            [{"action": "say"}, {"action": "say"}], []
+        )
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(dropped, 0)
+
+    async def test_travel_for_sleep_does_not_stack_sleeps(self):
+        """不在卧室时她连排两次睡觉：只该排一步（先走过去，再睡一觉）。"""
+
+        await self.set_state(node_id="study", energy=0.9)
+        self.llm.replies = []
+        async with self.engine.session_state(SESSION) as state:
+            outcome = TickOutcome(session_id=SESSION)
+            await self.engine._execute_actions(
+                state,
+                self.engine.node("study"),
+                outcome,
+                [
+                    PlannedAction(type="sleep", duration=28800),
+                    PlannedAction(type="sleep", duration=28800),
+                ],
+                depth=0,
+                autonomous=True,
+            )
+            steps = [item.get("action") for item in (state.current_plan or {}).get("steps", [])]
+            # 计划里是"到了卧室之后要做的事"：只留一步睡觉；走的那一步是当前动作
+            self.assertEqual(steps, ["sleep"], steps)
+            self.assertEqual(str((state.current_action or {}).get("type")), "walk_to")
+
+    async def test_sleep_asked_again_while_drowsy_is_skipped(self):
+        """临睡期里她自己又排一次睡觉：跳过（那一觉已经揣在临睡期里了）。"""
+
+        await self.set_state(node_id="bedroom")
+        async with self.engine.session_state(SESSION) as state:
+            state.state = STATE_DROWSY
+            state.drowsy_sleep_step = {"type": "sleep"}
+            outcome = TickOutcome(session_id=SESSION)
+            await self.engine._execute_actions(
+                state,
+                self.engine.node("bedroom"),
+                outcome,
+                [PlannedAction(type="sleep", duration=28800)],
+                depth=0,
+                autonomous=True,
+            )
+            self.assertEqual(state.state, STATE_DROWSY)
+            self.assertIsNone(state.current_action)
+            self.assertTrue(state.drowsy_sleep_step)
+        self.assertTrue(any("临睡期" in note for note in outcome.notes), outcome.notes)
+
+    async def test_being_told_to_sleep_while_drowsy_still_lies_down(self):
+        """他明说"去睡吧"时照睡：临睡期只拦她自己重复排的那一步。"""
+
+        await self.set_state(node_id="bedroom")
+        async with self.engine.session_state(SESSION) as state:
+            state.state = STATE_DROWSY
+            state.drowsy_sleep_step = {"type": "sleep"}
+            outcome = TickOutcome(session_id=SESSION)
+            await self.engine._execute_actions(
+                state,
+                self.engine.node("bedroom"),
+                outcome,
+                [PlannedAction(type="sleep", duration=28800)],
+                depth=0,
+                autonomous=False,
+            )
+            # 没被保护期拦下（她真的走了"该睡就睡"这条路）
+            self.assertIn(state.state, (STATE_DROWSY, STATE_SLEEPING))
+            self.assertEqual(str((state.current_action or {}).get("type")), "sleep")
+
+    async def test_she_cannot_put_herself_back_to_sleep_right_after_waking(self):
+        """刚醒的保护期里她自己不再睡回去：规则那边拦着，大模型这一路也要拦。"""
+
+        await self.set_state(node_id="bedroom", energy=0.95)
+        async with self.engine.session_state(SESSION) as state:
+            state.no_sleep_until = int(state.world_time) + 12
+            outcome = TickOutcome(session_id=SESSION)
+            await self.engine._execute_actions(
+                state,
+                self.engine.node("bedroom"),
+                outcome,
+                [PlannedAction(type="sleep", duration=28800)],
+                depth=0,
+                autonomous=True,
+            )
+            self.assertIsNone(state.current_action)
+            self.assertNotEqual(state.state, STATE_SLEEPING)
+        self.assertTrue(any("保护期" in note for note in outcome.notes), outcome.notes)
+
+        # 他明说让她睡（被动回合）时照睡，别把人也一起拦住
+        async with self.engine.session_state(SESSION) as state:
+            outcome = TickOutcome(session_id=SESSION)
+            await self.engine._execute_actions(
+                state,
+                self.engine.node("bedroom"),
+                outcome,
+                [PlannedAction(type="sleep", duration=28800)],
+                depth=0,
+                autonomous=False,
+            )
+            # 没被保护期拦下：她真的走了"该睡就睡"那条路（先是临睡期）
+            self.assertIn(state.state, (STATE_DROWSY, STATE_SLEEPING))
 
     async def test_goodnight_and_goodmorning_are_her_choice(self):
         """晚安 / 早安：想发就发（发到哪由她挑），不想发就什么都不发；一天各问一次。"""

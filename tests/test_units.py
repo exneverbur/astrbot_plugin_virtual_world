@@ -1863,6 +1863,14 @@ class TestNickname(unittest.TestCase):
             "小鲸鱼 | 在书房",
         )
 
+    def test_drowsy_shows_a_chinese_word(self):
+        """临睡期：名片写「犯困了」，别退回"在客厅"（也别漏出 drowsy 这种英文）。"""
+
+        state = WorldState(session_id="s1", state="drowsy", bot_base_nickname="小鲸鱼")
+        self.assertEqual(
+            compute_nickname(self.world, state, self.lobby), "小鲸鱼 | 犯困了"
+        )
+
     def test_legacy_maps_still_work_as_fallback(self):
         """老配置里的「状态 / 地点 → 文案」两张表还认，只是不再出现在编辑器里。"""
 
@@ -3546,6 +3554,31 @@ class ExtensionHostTest(unittest.IsolatedAsyncioTestCase):
         empty = ExtensionHost()
         self.assertEqual([], empty.action_groups())
         self.assertEqual(set(), empty.owned_actions())
+
+    def test_status_text_is_optional_and_extension_driven(self):
+        """扩展可以给编辑器一行自己的状态文案（"兴奋中"）；没人给就空着。"""
+
+        state = WorldState(session_id="s1")
+        empty = ExtensionHost()
+        self.assertEqual("", empty.status_text(state, "s1"))
+
+        host = ExtensionHost()
+        host.register(
+            ExtensionSpec(
+                name="demo",
+                status_text=lambda state, session_id, host: "兴奋中",
+            )
+        )
+        self.assertEqual("兴奋中", host.status_text(state, "s1"))
+
+        # 抛错的扩展不能把状态页带崩
+        broken = ExtensionHost()
+
+        def _boom(state, session_id, host):
+            raise RuntimeError("坏了")
+
+        broken.register(ExtensionSpec(name="bad", status_text=_boom))
+        self.assertEqual("", broken.status_text(state, "s1"))
 
     async def test_touch_is_only_forwarded_when_someone_wants_it(self):
         """「他碰了她哪儿」是个**通用**字段：没人声明时主插件完全不知道它存在。"""

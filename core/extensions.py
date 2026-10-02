@@ -240,6 +240,13 @@ class ExtensionSpec:
     panel: Callable[[Any, "ExtensionHost"], dict] | None = None
     """给设置页 / 面板看的只读数据：``(state, host) -> dict``。"""
 
+    status_text: Callable[[Any, str, "ExtensionHost"], str] | None = None
+    """面板上「她现在的状态」显示成什么：``(state, session_id, host) -> str``。
+
+    只影响编辑器里那一行，**不进群名片**——例如亲密扩展在戏里时可以显示
+    「兴奋中」，但外人看到的群名片不该跟着变。空串 = 交给主插件自己算。
+    """
+
     on_action: Callable[[Any, Any, str, "ExtensionHost"], str] | None = None
     """某个动作真的开始做了：``(definition, state, session_id, host) -> 想说的话``。
 
@@ -525,6 +532,21 @@ class ExtensionHost:
             except Exception:
                 out[spec.name] = {}
         return out
+
+    def status_text(self, state: Any, session_id: str = "") -> str:
+        """扩展想在编辑器里显示的「她现在的状态」（不进群名片）。"""
+
+        for spec in self.specs.values():
+            hook = getattr(spec, "status_text", None)
+            if hook is None:
+                continue
+            try:
+                text = str(hook(state, session_id, self) or "").strip()
+            except Exception:
+                continue
+            if text:
+                return text
+        return ""
 
     def action_note(self, definition: Any, state: Any, session_id: str = "") -> str:
         """某个动作真的做起来了：让扩展记一笔（返回她想顺口说的那句）。"""

@@ -488,12 +488,33 @@ const STATES = [
   { key: "awakening", label: "刚醒" },
   { key: "sleeping", label: "睡觉" },
   { key: "napping", label: "小睡" },
+  { key: "drowsy", label: "犯困了" },
   { key: "staring", label: "发呆" },
   { key: "searching", label: "上网" },
   { key: "reading", label: "看书" },
   { key: "walking", label: "移动中" },
   { key: "thinking", label: "沉思" },
 ];
+
+/**
+ * 状态显示名：内置状态用内置中文；动作自己写的「执行期间状态标识」
+ * （例如 watching）用「<动作名>中」，实在认不出来才退回原样——
+ * 状态页不该出现让人看不懂的英文标识。
+ */
+function stateLabelOf(stateId, data) {
+  const key = String(stateId || "");
+  if (!key) return "";
+  const known = STATES.find((item) => item.key === key);
+  if (known) return known.label;
+  // 扩展给的（"兴奋中"这种）优先于任何推断
+  const fromExtension = String((data && data.extension_status) || "").trim();
+  if (fromExtension && key === String((data && data.state) || "")) return fromExtension;
+  const action = (actions() || []).find(
+    (item) => String((item.during || {}).state || "") === key,
+  );
+  if (action) return `${action.name || action.id}中`;
+  return key;
+}
 
 const CATEGORIES = [
   { key: "instant", label: "瞬时动作", hint: "立刻完成，不占用时间（例如说话、抱抱）" },
@@ -3471,6 +3492,8 @@ function bindButtons() {
     if (saveActionDraft()) closeActionDrawer();
   });
   $("schedule-add").addEventListener("click", addSchedule);
+  // 「立即执行用哪个会话」也决定落点里能勾哪些：换了就重画表单
+  $("schedule-session").addEventListener("change", () => renderScheduleForm());
   $("session-add").addEventListener("click", addSession);
   $("group-add").addEventListener("click", addGroup);
   $("memory-search").addEventListener("click", loadMemories);
@@ -3770,12 +3793,16 @@ function renderSessionSelects() {
  *
  * ``withMembers``：连组里的成员会话也一起列（日程的落点需要——勾组是把话落在组代表那里，
  * 想指定"就说给这个群听"得能单独勾到它）。
+ * ``onlyFor``：只列"这个会话那一组"的东西（它自己那个组 + 组里的会话）。
+ * 日程的落点用它——落点只在"她这一处"里挑，跨组选了也没意义。
  */
-function scopeOptions({ withMembers = false } = {}) {
+function scopeOptions({ withMembers = false, onlyFor = "" } = {}) {
   const options = [];
   const grouped = new Set();
   const ownerOf = new Map();
+  const scopeOwner = onlyFor ? groupOwning(onlyFor) : null;
   groups().forEach((group) => {
+    if (onlyFor && (!scopeOwner || String(group.id) !== String(scopeOwner.id))) return;
     (group.sessions || []).forEach((id) => {
       grouped.add(id);
       ownerOf.set(id, group);
@@ -3788,6 +3815,11 @@ function scopeOptions({ withMembers = false } = {}) {
   });
   ui.sessions.forEach((session) => {
     const owner = ownerOf.get(session.session_id);
+    if (onlyFor) {
+      const belongs = owner && scopeOwner && String(owner.id) === String(scopeOwner.id);
+      const isSelf = String(session.session_id) === String(onlyFor);
+      if (!belongs && !isSelf) return;
+    }
     if (owner && !withMembers) return;
     options.push({
       value: session.session_id,
@@ -3798,6 +3830,17 @@ function scopeOptions({ withMembers = false } = {}) {
     });
   });
   return options;
+}
+
+/** 这个会话属于哪个组（没进组返回 null）。 */
+function groupOwning(sessionId) {
+  const wanted = String(sessionId || "");
+  if (!wanted) return null;
+  return (
+    groups().find((group) =>
+      (group.sessions || []).some((id) => String(id) === wanted),
+    ) || null
+  );
 }
 
 const PLAN_SOURCES = {
@@ -5855,7 +5898,9 @@ async function refreshStatus() {
   try {
     const data = await apiGet("state", { session: sessionId });
     ui.status = data;
-    const stateLabel = (STATES.find((item) => item.key === data.state) || {}).label || data.state;
+    // 扩展想显示的状态优先（例如亲密扩展在戏里时说"兴奋中"）：
+    // 这是编辑器里的一行字，群名片不受影响
+    const stateLabel = stateLabelOf(data.state, data);
     renderHero(data, stateLabel);
     renderStatusSections(data, stateLabel);
     renderToolWarnings();
@@ -9527,19 +9572,21 @@ function renderScheduleForm() {
     ),
   );
 
-  // 这条日程的话说给谁（会话 / 会话组）：勾了就落在那儿，不勾就各跑各的
+  // 这条日程的话说给谁（会话 / 会话组）：只在"她这一组"里挑
+  const scopeFor = $("schedule-session") ? $("schedule-session").value : "";
   form.appendChild(
     pickerField(
       "落点（会话 / 会话组）",
       schedule.sessions || [],
-      scopeOptions({ withMembers: true }),
+      scopeOptions({ withMembers: true, onlyFor: scopeFor }),
       (chosen) => {
         schedule.sessions = chosen;
         renderScheduleForm();
       },
       {
         hint:
-          "勾了哪个，这条日程说的话就发到那儿；勾组 = 落在组代表，也可以单勾组里的某个会话。留空 = 各自跑。",
+          "只列她这一组：勾组 = 她自己挑组里的哪一处说，" +
+          "单勾会话 = 就发那一处；留空 = 各自跑。",
         empty: "（每个会话各自跑）",
       },
     ),
@@ -9652,8 +9699,7 @@ function renderSessionList() {
       (item) => item.session_id === session.session_id,
     );
     if (position) {
-      const stateLabel =
-        (STATES.find((item) => item.key === position.state) || {}).label || position.state;
+      const stateLabel = stateLabelOf(position.state, position);
       info.appendChild(
         el(
           "div",
