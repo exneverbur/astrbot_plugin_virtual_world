@@ -1648,15 +1648,15 @@ class TestMainImport(unittest.TestCase):
 
         session = "aiocqhttp:GroupMessage:probe-images-once"
         plugin, _context, calls = self._image_plugin(session)
-        urls = [f"https://img/once/{index}.jpg" for index in (1, 2)]
+        # 四张图：最近 3 张发给主模型，最早那张转成文字；转一次就该记住
+        urls = [f"https://img/once/{index}.jpg" for index in (1, 2, 3, 4)]
 
         async def drive():
-            # 群里发了两张图，但聊天记录里只带最近一张：最早那张会被转成文字
             for index, url in enumerate(urls, start=1):
                 await plugin.on_any_message(
                     self._photo(f"第{index}张", url, session=session)
                 )
-            for text in ("这张是啥", "还有别的不"):
+            for text in ("这几张是啥", "还有别的不"):
                 event = _GateEvent(text, session=session)
                 await plugin.on_llm_request(event, _GateRequest(text))
             return calls
@@ -1667,6 +1667,64 @@ class TestMainImport(unittest.TestCase):
         self.assertEqual(captions[0].get("image_urls"), [urls[0]])
         plugin.db.raw.close()
 
+    def test_the_newest_images_in_the_record_are_the_ones_attached(self):
+        """最近 3 张（跨消息算）发给主模型，编号按时间序；更旧的那张只转述。"""
+
+        session = "aiocqhttp:GroupMessage:probe-images-newest"
+        plugin, _context, calls = self._image_plugin(session)
+        urls = [f"https://img/newest/{index}.jpg" for index in range(1, 5)]
+
+        async def drive():
+            # 前三条消息各带一张图，第四条 @ 她但不带图：最近 3 张 = urls[1:]
+            for index, url in enumerate(urls[:3], start=1):
+                await plugin.on_any_message(
+                    self._photo(f"第{index}张", url, session=session)
+                )
+            ask = _GateEvent("这几张是啥", session=session)
+            await plugin.on_llm_request(ask, _GateRequest("这几张是啥"))
+            return ask
+
+        asyncio.run(drive())
+        self.assertEqual(calls[-1].get("image_urls"), urls[:3])
+        self.assertEqual(
+            [item for item in self._caption_calls(calls)], [], "三张都发出去了，不该转述"
+        )
+        prompt = calls[-1]["system_prompt"]
+        self.assertIn("（见图1）", prompt)
+        self.assertIn("（见图2）", prompt)
+        self.assertIn("（见图3）", prompt)
+        plugin.db.raw.close()
+
+    def test_a_caption_disappears_once_the_image_is_attached(self):
+        """已经转述过的图，后来又被直接发给主模型看时：那条转述不再念出来。"""
+
+        session = "aiocqhttp:GroupMessage:probe-images-caption-drop"
+        plugin, _context, calls = self._image_plugin(session, inline="never")
+        url = "https://img/drop/1.jpg"
+
+        async def first():
+            await plugin.on_any_message(self._photo("看这张", [url], session=session))
+            ask = _GateEvent("这张是啥", session=session)
+            await plugin.on_llm_request(ask, _GateRequest("这张是啥"))
+
+        asyncio.run(first())
+        self.assertFalse(calls[-1].get("image_urls"), "看不见图：这一轮只给文字")
+        self.assertIn("（图片：", calls[-1]["system_prompt"])
+
+        # 现在让主模型能看图：同一张图这次直接附过去，转述就不该再出现
+        plugin.engine.world.context.chat_image_inline = "always"
+
+        async def second():
+            ask = _GateEvent("再看一下", session=session)
+            await plugin.on_llm_request(ask, _GateRequest("再看一下"))
+
+        asyncio.run(second())
+        self.assertEqual(calls[-1].get("image_urls"), [url])
+        prompt = calls[-1]["system_prompt"]
+        self.assertIn("（见图1）", prompt)
+        self.assertNotIn("（图片：", prompt)
+        plugin.db.raw.close()
+
     def test_chat_log_images_are_attached_for_a_multimodal_model(self):
         """主模型能吃图时：聊天记录里最近的图跟着请求发过去，并标上编号。"""
 
@@ -1674,7 +1732,6 @@ class TestMainImport(unittest.TestCase):
             session="aiocqhttp:GroupMessage:probe-chat-images"
         )
         plugin.engine.world.context.chat_image_inline = "always"
-        plugin.engine.world.context.chat_image_max = 1
         plugin.engine.world.reply_style.merge_wait_seconds = 0.05
         calls: list[dict] = []
 
@@ -2083,6 +2140,114 @@ class TestMainImport(unittest.TestCase):
         finally:
             module.request.query = original_query
             module.request._json = {}
+            plugin.db.raw.close()
+
+    def test_picture_notes_are_numbered_and_cleaned(self):
+        """图片注解要有编号；转述其实是"没看清"时别把机器字段塞进提示词。"""
+
+        module = self.module
+        # 收图那一步是中性说法：编号留到准备回复时（`_reply_images`）再给
+        self.assertEqual(module._images_head(2), "这条消息带了 2 张图片")
+        self.assertEqual(module._images_head(0), "")
+
+        self.assertEqual(
+            module.readable_caption("无法查看图片｜其它｜文字模糊/部分可辨"),
+            "这张图没读清楚（转述模型没看清画面）",
+        )
+        keep = "一只橘猫趴在窗台上｜照片｜无"
+        self.assertEqual(module.readable_caption(keep), keep)
+
+    def test_astrbot_persona_is_not_passed_through(self):
+        """AstrBot 的「人格设定」不再混进「其他插件提供的上下文」。"""
+
+        module = self.module
+        raw = (
+            "你是群里的助手。\n"
+            "# Persona Instructions\n\n"
+            "你是小助手，说话可爱一点。\n\n"
+            "# 记忆插件\n"
+            "他昨天提到过在改插件。"
+        )
+        out = module._drop_persona_instructions(raw)
+        self.assertNotIn("你是小助手", out)
+        self.assertIn("记忆插件", out)
+        self.assertIn("他昨天提到过在改插件", out)
+        # 没有人格那一段时：原样返回
+        self.assertEqual(
+            module._drop_persona_instructions("  只有别的插件写的东西  "),
+            "只有别的插件写的东西",
+        )
+
+    def test_nickname_edit_covers_the_group_chats_only(self):
+        """改名片写的是「她这一组里的群」：别的会话组一个字都不碰。"""
+
+        session = "aiocqhttp:GroupMessage:probe-card-a"
+        sibling = "aiocqhttp:GroupMessage:probe-card-b"
+        outsider = "aiocqhttp:GroupMessage:probe-card-c"
+        plugin, _context, _session = self._plugin_with_session(session=session)
+        for item in (sibling, outsider):
+            plugin.store.add_session(item, session_type="group", platform="aiocqhttp")
+        raw = plugin.store.raw_sessions()
+        raw["groups"] = [
+            {
+                "id": "team",
+                "name": "同一个她",
+                "sessions": [session, sibling],
+                "main_session": session,
+            }
+        ]
+        plugin.store.save_sessions(raw)
+        plugin.engine.reload_config()
+
+        calls: list[tuple[str, str]] = []
+
+        class _Card:
+            ok = True
+            reason = ""
+            card = ""
+
+        async def fake_set_group_card(session_id, card):
+            calls.append((str(session_id), str(card)))
+            return _Card()
+
+        plugin.messenger.set_group_card = fake_set_group_card
+        try:
+            changed, failed, _reason = asyncio.run(
+                plugin._apply_card_to_group(sibling, "新名字")
+            )
+            self.assertEqual(sorted(item[0] for item in calls), sorted([session, sibling]))
+            self.assertEqual(changed, 2)
+            self.assertEqual(failed, 0)
+            self.assertTrue(all(item[1] == "新名字" for item in calls))
+        finally:
+            plugin.db.raw.close()
+
+    def test_commands_never_enter_her_context(self):
+        """指令不进她的上下文：唤醒前缀被框架摘掉之后也得认出来。
+
+        `/vw event h 在浴室` 走到插件手里只剩 `vw event h 在浴室`
+        （AstrBot 在唤醒检查那一步就摘掉了 `/`），所以光看开头认不出来——
+        靠框架塞的 `handlers_parsed_params` 认。
+        """
+
+        session = "aiocqhttp:GroupMessage:probe-command"
+        plugin, _context, _session = self._plugin_with_session(session=session)
+        module = self.module
+        try:
+            command = _GateEvent("vw event h 在浴室", session=session)
+            command.set_extra("handlers_parsed_params", {"cmd_vw": {}})
+            self.assertTrue(module._is_command_event(command))
+            self.assertFalse(plugin._should_expect_reply(command))
+
+            # 带前缀写、但没有框架标记：一样算指令
+            prefixed = _GateEvent("/vw event h 在浴室", session=session)
+            self.assertTrue(module._is_command_event(prefixed))
+
+            # 普通消息：照常进上下文、照常回
+            plain = _GateEvent("在干嘛呀", session=session)
+            self.assertFalse(module._is_command_event(plain))
+            self.assertTrue(plugin._should_expect_reply(plain))
+        finally:
             plugin.db.raw.close()
 
     def test_saving_schedules_with_null_sessions_succeeds(self):

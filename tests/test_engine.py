@@ -512,7 +512,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("看看腿" in item for item in echoed), echoed)
 
     async def test_elsewhere_chat_lines_are_merged_too(self):
-        """「你在别处同时听到的」也得合并：同一个人连着说的并成一行，会话标签只写一次。"""
+        """「你在别处同时听到的」也归到一处：同一个人连着说的几句排在一起，会话标签只写一次。"""
 
         self.add_group(sessions=[SESSION, PRIVATE_SESSION])
         self.set_session_note(PRIVATE_SESSION, "主人")
@@ -553,11 +553,60 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
             state.chat_seq = 3
 
         prompt = await self.engine.preview_autonomous_prompt(SESSION)
-        lines = [line for line in prompt.splitlines() if "谁让你帮这种忙啦" in line]
-        self.assertEqual(len(lines), 1, lines)
-        self.assertIn(" / 给我老实待着", lines[0])
+        head = [line for line in prompt.splitlines() if "谁让你帮这种忙啦" in line]
+        self.assertEqual(len(head), 1, head)
+        # 连着说的几句各占一行（缩进两格），不拼成「a / b / c」
+        self.assertIn("谁让你帮这种忙啦\n  给我老实待着", prompt)
         # 会话标签只写一次，不是每行都重复
-        self.assertEqual(lines[0].count("〔私聊"), 1, lines[0])
+        self.assertEqual(head[0].count("〔私聊"), 1, head[0])
+
+    async def test_merged_lines_put_each_message_on_its_own_line(self):
+        """同一个人连着说的几句要分行写，不拼成「a / b / c」。
+
+        拼成一行时模型会读成"他把同一件事重复说了几遍"
+        ——真机上就出过：群里三条关于鼠标的消息，她回一句「A9 Plus 连发三遍」。
+        """
+
+        now = self.engine._now()
+        async with self.engine.session_state(SESSION) as state:
+            state.recent_chat = [
+                {
+                    "user_id": "9",
+                    "name": "华为硕士版电脑",
+                    "text": "atk的a9puls",
+                    "at": now - 6,
+                    "is_self": False,
+                    "seq": 1,
+                    "world_time": state.world_time,
+                },
+                {
+                    "user_id": "9",
+                    "name": "华为硕士版电脑",
+                    "text": "有使用痕迹的",
+                    "at": now - 4,
+                    "is_self": False,
+                    "seq": 2,
+                    "world_time": state.world_time,
+                },
+                {
+                    "user_id": "9",
+                    "name": "华为硕士版电脑",
+                    "text": "atk的a9plus",
+                    "at": now - 2,
+                    "is_self": False,
+                    "seq": 3,
+                    "world_time": state.world_time,
+                },
+            ]
+            state.chat_seq = 3
+
+        prompt = await self.engine.preview_autonomous_prompt(SESSION)
+        head = [line for line in prompt.splitlines() if "atk的a9puls" in line]
+        self.assertEqual(len(head), 1, head)
+        self.assertNotIn(" / ", head[0])
+        self.assertNotIn("（连发", prompt)
+        # 后面两句各占一行、缩进两格，仍看得出属于同一个人
+        self.assertIn("atk的a9puls\n  有使用痕迹的\n  atk的a9plus", prompt)
 
     async def test_a_schedule_that_lands_in_private_echoes_there(self):
         """日程落点勾了私聊：它的回显（🧩 指令那行）也发私聊，别跑到她存档的群里。"""
@@ -1548,6 +1597,9 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         """想念不是固定节拍：刚聊完要随机等一段，等够了才涨。"""
 
         boss = "2692047521"
+        # 这条测的是"冷却"本身：把「熟到哪一档才会想他」放开，
+        # 免得刚建档（客气档）的人被挡在想念之外
+        self.engine.world.profile.miss_min_level = 0
         self.engine.world.profile.miss_growth_per_min = 0.5
         await self.engine.handle_incoming(
             self.ctx(text="在吗", user_id=boss, user_name="不相疑")
@@ -1578,6 +1630,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         """想念里的"多久"看的是他多久没跟她说话，不是他在群里露没露面。"""
 
         boss = "2692047521"
+        self.engine.world.profile.miss_min_level = 0  # 同上：这条不管档位
         await self.engine.handle_incoming(
             self.ctx(text="在吗", user_id=boss, user_name="不相疑")
         )
@@ -1686,6 +1739,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         """越孤独越容易想起某个人：同样没人找她，孤独满的时候涨得明显更快。"""
 
         boss = "2692047521"
+        self.engine.world.profile.miss_min_level = 0  # 这条测"孤独加成"，不管档位
         self.engine.world.profile.miss_growth_per_min = 0.01
         await self.engine.handle_incoming(
             self.ctx(text="在吗", user_id=boss, user_name="不相疑")
@@ -6566,6 +6620,36 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("7", state.miss)
         self.assertNotIn("8", state.miss)
 
+    async def test_only_people_she_knows_are_missed(self):
+        """想念是熟起来之后的事：还停在「客气」的人不该出现在「你有点想他们了」里。"""
+
+        self.engine.profiles.touch(SESSION, "42", "刚认识的")
+        self.engine.profiles.adjust_affinity(SESSION, "42", 5, reason="混脸熟")  # 客气档
+        self._make_close_friend("43", affinity=40.0)  # 朋友档
+        async with self.engine.session_state(SESSION) as state:
+            state.miss = {"42": 0.95, "43": 0.95}
+            block = self.engine.miss_block(state)
+            # 主动找人那条路也一样：不够熟的人选不中，熟的那个照样能选中
+            candidate = self.engine._top_miss_candidate(state)
+            self.assertIsNotNone(candidate)
+            self.assertNotEqual(candidate[0], "42")
+            state.miss.pop("43")
+            self.assertIsNone(self.engine._top_miss_candidate(state))
+
+        self.assertNotIn("刚认识的", block)
+        self.assertIn("小明", block)
+
+    async def test_the_miss_floor_can_be_turned_off(self):
+        """``miss_min_level = 0`` 时退回老行为：想念够线就写。"""
+
+        self.engine.world.profile.miss_min_level = 0
+        self.engine.profiles.touch(SESSION, "42", "刚认识的")
+        self.engine.profiles.adjust_affinity(SESSION, "42", 5, reason="混脸熟")
+        async with self.engine.session_state(SESSION) as state:
+            state.miss = {"42": 0.95}
+            block = self.engine.miss_block(state)
+        self.assertIn("刚认识的", block)
+
     async def test_proactive_contact_quota_follows_the_level(self):
         """「每天最多主动找他几次」按级别算：陌生人 0 次（不主动动手），朋友 2 次。"""
 
@@ -6837,7 +6921,11 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kept[-1], urls[-1])
 
     async def test_image_captions_are_attached_to_their_own_message(self):
-        """转述挂回当初发这张图的那条记录上，不会蹭到最新那条消息的注解里。"""
+        """转述挂回当初发这张图的那条记录上（单独存一份），不会蹭到别条消息里。
+
+        单独存一份是为了"这张图后来又直接发给主模型看了"时能**不再念一遍**转述
+        （渲染时才决定写不写，见 ``prompt._render_rows``）。
+        """
 
         await self.engine.handle_incoming(
             self.ctx(text="看这张", chat_images=["https://img/1.jpg"])
@@ -6848,8 +6936,16 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(attached, 1)
         state = await self.engine.load_state(SESSION, cold_start=False)
-        texts = [str(item.get("text") or "") for item in state.recent_chat]
-        self.assertTrue(any("看这张" in text and "橘猫" in text for text in texts), texts)
+        items = [
+            item for item in state.recent_chat if "看这张" in str(item.get("text") or "")
+        ]
+        self.assertTrue(items, state.recent_chat)
+        self.assertEqual(
+            dict(items[0].get("captions") or {}).get("https://img/1.jpg"),
+            "一只橘猫趴在键盘上",
+        )
+        # 正文没被拼上"（图片：…）"：要不要写出来，渲染的时候看这张图有没有附过去
+        self.assertNotIn("图片：", str(items[0].get("text") or ""))
 
     async def test_chat_images_come_from_the_record_in_time_order(self):
         """聊天记录里的图按时间取最近的几张，编号从小到大 = 从早到晚。"""

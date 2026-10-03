@@ -3282,7 +3282,7 @@ class TestPromptBuilder(unittest.TestCase):
         self.assertIn(":", fresh)
 
     def test_consecutive_lines_from_the_same_person_merge(self):
-        """同一个人连着说的几句合并成一行，读起来才像对话。"""
+        """同一个人连着说的几句归到一条、各占一行，读起来才像对话。"""
 
         blocks = self.builder.chat_blocks(
             [
@@ -3291,7 +3291,9 @@ class TestPromptBuilder(unittest.TestCase):
             ]
         )
         joined = "\n".join(blocks)
-        self.assertIn("在吗 / 帮我看个东西", joined)
+        # 各占一行（缩进两格），不再拼成「在吗 / 帮我看个东西」
+        self.assertIn("在吗\n  帮我看个东西", joined)
+        self.assertNotIn("在吗 / 帮我看个东西", joined)
         self.assertEqual(joined.count("小明(42)"), 1)
 
     def test_her_recent_replies_are_listed_for_style_avoidance(self):

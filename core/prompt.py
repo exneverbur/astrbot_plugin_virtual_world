@@ -327,6 +327,37 @@ def lean_prompt(text: str) -> str:
     return "\n".join(kept)
 
 
+_CAPTION_BLIND_MARKERS = (
+    "无法查看图片",
+    "无法查看",
+    "看不到图",
+    "看不清图片",
+    "看不清",
+    "看不出来",
+    "无法识别",
+    "无法读取",
+    "无法辨认",
+    "没有图片",
+    "图片无法显示",
+)
+
+
+def readable_caption(text: str) -> str:
+    """转述结果其实是"没看清"时，换成一句人话。
+
+    弱一点的多模态模型经常照格式回一句「无法查看图片｜其它｜文字模糊/部分可辨」——
+    原样塞进提示词既占地方，又容易让她以为"这张图里没什么东西"。
+    """
+
+    body = " ".join(str(text or "").split())
+    if not body:
+        return ""
+    head = body.split("｜")[0].split("|")[0].strip()
+    if len(head) <= 24 and any(marker in head for marker in _CAPTION_BLIND_MARKERS):
+        return "这张图没读清楚（转述模型没看清画面）"
+    return body
+
+
 def _fingerprint(text: str) -> str:
     """给一句话算个"指纹"：只留字母数字，用来干掉提示词里的重复行。"""
 
@@ -1325,6 +1356,14 @@ class PromptBuilder:
                     # 这条带的图这一次直接发给主模型看了：标上编号，方便和图对照
                     marks_used = True
                     text = f"{text}（见{'、'.join(labels)}）"
+                # 没随这次请求发过去的图：把它的转述写出来（已经发过去的就不重复念了）
+                blind = [
+                    str(value).strip()
+                    for ref, value in dict(item.get("captions") or {}).items()
+                    if str(ref) not in marks and str(value).strip()
+                ]
+                if blind:
+                    text = f"{text}（图片：{'；'.join(blind)}）"
                 # 同一条消息被两个钩子各记一次时，这里只留一行：
                 # 提示词里同一句话出现两三遍，模型会以为对方反复说了同样的话。
                 # 按**正文**算指纹：两份分别是"带注释"和"不带注释"时也要认出来
@@ -1350,7 +1389,10 @@ class PromptBuilder:
                         piece = f"→ {labels}：{piece}"
                     piece += _addressing_hint(one)
                     pieces.append(piece)
-                body = " / ".join(pieces)
+                # 同一个人连着说的分几行写：拼成一行（「a / b / c」）时模型会
+                # 误读成"他把同一件事重复说了好几遍"（真机上回过「A9 Plus 连发三遍」）。
+                # 后面几句缩进两格，看起来仍属于同一条。
+                body = "\n  ".join(pieces)
                 name = str(item.get("name") or item.get("user_id") or "").strip()
                 if item.get("internal"):
                     # 插件写的"她身上发生的事"：标出来，免得被当成群里谁说的话
@@ -1378,12 +1420,21 @@ class PromptBuilder:
                 text = clip_line(item.get("text"), back_chars)
                 if not text:
                     continue
+                # 别处的图不会随这次请求发过去（编号只发给本会话的），转述照旧写出来
+                blind = [
+                    str(value).strip()
+                    for value in dict(item.get("captions") or {}).values()
+                    if str(value).strip()
+                ]
+                if blind:
+                    text = f"{text}（图片：{'；'.join(blind)}）"
                 prepared.append((item, text))
             texts = {id(row_item): row_text for row_item, row_text in prepared}
             for group in group_chat_items([item for item, _text in prepared]):
                 item = group[-1]
                 first = group[0]
-                text = " / ".join(texts.get(id(one), "") for one in group)
+                # 同上：连着说的几句各占一行，别拼成「a / b / c」
+                text = "\n  ".join(texts.get(id(one), "") for one in group)
                 origin = _origin(item)
                 where = label_map.get(origin, origin)
                 name = str(item.get("name") or item.get("user_id") or "").strip()

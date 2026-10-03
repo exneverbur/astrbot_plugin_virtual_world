@@ -87,7 +87,14 @@ from .pathfinding import find_path, nearest_node, path_ticks
 from .planner import active_plan, advance, create_plan, peek_step
 from .consolidate import Consolidator
 from .profile import ProfileStore
-from .prompt import WEEKDAY_NAMES, PromptBuilder, clock_text, lean_prompt, period_of
+from .prompt import (
+    WEEKDAY_NAMES,
+    PromptBuilder,
+    clock_text,
+    lean_prompt,
+    period_of,
+    readable_caption,
+)
 from .timeline import render_event
 from .ports import CardResult, ToolCallResult
 from .state import (
@@ -7789,7 +7796,7 @@ class VirtualWorldEngine:
         return float(now) + low + (high - low) * float(self.miss_rng.random())
 
     def _miss_ignored(self, view: Any) -> bool:
-        """这个人值不值得惦记：负面关系 / 负好感不算。"""
+        """这个人值不值得惦记：负面关系 / 负好感 / 还没熟到那一档，都不算。"""
 
         if float(getattr(view, "affinity", 0.0) or 0.0) < 0:
             return True
@@ -7797,6 +7804,14 @@ class VirtualWorldEngine:
             bond = self.world.profile.bond_by_name(str(name))
             if bond is not None and bool(getattr(bond, "negative", False)):
                 return True
+        # 想念是熟起来之后的事（默认「熟人」起）：刚认识的人不该出现在
+        # 「你有点想他们了」里，也不该让她主动去找
+        try:
+            floor = int(getattr(self.world.profile, "miss_min_level", 3) or 0)
+        except (TypeError, ValueError):
+            floor = 3
+        if floor > 0 and int(getattr(view, "level_index", 0) or 0) < floor:
+            return True
         return False
 
     @staticmethod
@@ -8294,12 +8309,17 @@ class VirtualWorldEngine:
         rows.sort(reverse=True)
         lines: list[str] = []
         for _score, user_id in rows[:limit]:
-            profile = self.profiles.profile(state.session_id, user_id)
-            if profile is None:
+            view = self.profiles.view(state.session_id, user_id)
+            if view is None or self._miss_ignored(view):
                 continue
-            payload = dict(profile.get("payload") or {})
+            profile = self.profiles.profile(state.session_id, user_id)
+            payload = dict((profile or {}).get("payload") or {})
             names = [str(item) for item in (payload.get("names") or []) if str(item)]
-            name = names[-1] if names else str(payload.get("qq_name") or user_id)
+            name = (
+                names[-1]
+                if names
+                else str(getattr(view, "name", "") or payload.get("qq_name") or user_id)
+            )
             idle = self._miss_idle_text(state, user_id, profile)
             where = self._person_places(state, user_id)
             body = f"- {name}"
@@ -9144,16 +9164,18 @@ class VirtualWorldEngine:
                 hits = [ref for ref in refs if ref in captions]
                 if not hits:
                     continue
-                texts = []
+                stored = dict(item.get("captions") or {})
                 for ref in hits:
-                    text = str(captions.pop(ref) or "").strip()
+                    text = readable_caption(str(captions.pop(ref) or ""))
                     if text:
-                        texts.append(text)
+                        # 这条消息里第几张图：跟「图1/图2」的编号对齐
+                        index = refs.index(ref) + 1
+                        label = f"第{index}张：" if len(refs) > 1 else ""
+                        stored[ref] = f"{label}{text}"
                         attached += 1
-                if not texts:
-                    continue
-                body = str(item.get("text") or "").rstrip()
-                item["text"] = f"{body}（图片：{'；'.join(texts)}）".strip()
+                # 转述**单独存一份**，不拼进正文：这一轮真把图发给主模型时，
+                # 渲染会跳过它（"已经转述过"的那份就不再重复念一遍）。
+                item["captions"] = stored
         return attached
 
     async def note_vision(

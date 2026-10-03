@@ -3812,7 +3812,8 @@ async function saveNickname() {
       action: "set_nickname",
       text,
     });
-    toast(result.ok ? "群名片已改" : result.reason || "改名片失败");
+    // 这一组里的每个群都会改一遍，回执里说清改了几个
+    toast(result.ok ? result.note || "群名片已改" : result.reason || "改名片失败");
     refreshStatus();
   } catch (error) {
     toast(error.message || "改名片失败");
@@ -13599,25 +13600,6 @@ function renderSettings() {
       {},
     ),
   );
-  if ((world.context.chat_image_inline || "auto") !== "never") {
-    contextSection._fields.appendChild(
-      inputField(
-        "聊天记录最多带几张图",
-        num(world.context.chat_image_max, 1),
-        (value) =>
-          (world.context.chat_image_max = Math.max(
-            1,
-            Math.round(num(value, 1)),
-          )),
-        {
-        hint:
-          "按时间取最近几张。带过去的图会在聊天记录里标成「（见图1）」，没带过去的旧图转述成文字。",
-          type: "number",
-          min: 1,
-        },
-      ),
-    );
-  }
   form.appendChild(contextSection);
 
   /* --- 用户画像与睡眠整理 --- */
@@ -13750,6 +13732,13 @@ function renderSettings() {
       "miss_limit",
       3,
       "超过阈值的按想念程度取前几名。",
+      "1",
+    ],
+    [
+      "熟到哪一档才会想他",
+      "miss_min_level",
+      3,
+      "关系档位下标，3 = 熟人（默认）：还停在「客气」的人不会出现在想念里；0 = 不限。",
       "1",
     ],
     [

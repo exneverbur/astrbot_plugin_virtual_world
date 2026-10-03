@@ -60,7 +60,7 @@ from .core.models import (
 )
 from .core.nickname import compute_nickname
 from .core.ports import CardResult, LLMReply, PokeResult, ToolCallResult, ToolInfo
-from .core.prompt import clip_line, prompt_section_index
+from .core.prompt import clip_line, prompt_section_index, readable_caption
 from .core.state import FORWARD_SUMMARY_MARK
 from .core.timeline import build_timeline
 
@@ -365,6 +365,55 @@ def _is_command(text: str) -> bool:
 
     stripped = (text or "").lstrip()
     return bool(stripped) and stripped[0] in "/!！.。"
+
+
+_ASTRBOT_PERSONA_HEAD = "# Persona Instructions"
+
+
+def _drop_persona_instructions(text: str) -> str:
+    """把 AstrBot 拼进来的「# Persona Instructions」那一段摘掉。
+
+    AstrBot 在 `build_agent` 里就把「人格设定」追加到 ``req.system_prompt``
+    （`astrbot/core/astr_main_agent.py`），而插件自己已经按 ``persona.mode``
+    把人设放进了她的提示词——再带一遍等于同一份人设出现两次，
+    「其他插件提供的上下文」那一节还会把 AstrBot 那份原样念给她听。
+
+    其余插件写进 system_prompt 的内容（上下文理解、记忆…）原样保留。
+    """
+
+    body = str(text or "")
+    index = body.find(_ASTRBOT_PERSONA_HEAD)
+    if index < 0:
+        return body.strip()
+    head = body[:index].rstrip()
+    tail = body[index + len(_ASTRBOT_PERSONA_HEAD) :]
+    # 人设那一段一直写到下一个一级标题（`# xxx`）为止
+    stop = None
+    match = re.search(r"(?m)^#\s", tail)
+    if match:
+        stop = match.start()
+    rest = tail[stop:] if stop is not None else ""
+    return (head + "\n" + rest.lstrip("\n")).strip()
+
+
+def _is_command_event(event: Any) -> bool:
+    """这条消息是不是一条插件指令（`/vw …`、`/help` …）。
+
+    AstrBot 在"唤醒检查"那一步就把唤醒前缀从 ``message_str`` 里摘掉了
+    （`/vw event h` 到了插件手里只剩 `vw event h`），所以光看开头是不是 `/` 认不出来。
+    框架会把**命中的指令参数**塞进 ``handlers_parsed_params``，用它来认最准。
+    """
+
+    try:
+        if event.get_extra("handlers_parsed_params"):
+            return True
+    except Exception:
+        pass
+    try:
+        text = str(event.get_message_str() or "")
+    except Exception:
+        text = ""
+    return _is_command(text)
 
 
 _IMAGE_COMPONENT_NAMES = (
@@ -1142,6 +1191,19 @@ def _caption_prefix(caption: str) -> str:
             cut = min(cut, index)
     prefix = text[:cut].strip(" ｜|，,。;；")
     return prefix or text
+
+
+def _images_head(count: int) -> str:
+    """这条消息带了几张图（收图那一步写进留档的中性说法）。
+
+    交付决策在准备回复时才做（`_reply_images`），所以这里**不写编号、也不承诺**
+    "会一起发给你"——那一步会再给一句带编号的说明。
+    """
+
+    total = max(0, int(count or 0))
+    if total <= 0:
+        return ""
+    return f"这条消息带了 {total} 张图片"
 
 
 def _strip_image_index(text: str) -> str:
@@ -2703,7 +2765,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "exneverbur",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v2.1.4",
+    "v2.1.5",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -3046,6 +3108,7 @@ class VirtualWorldPlugin(Star):
         *,
         sources: list[str] | None = None,
         summarize_forward: bool = False,
+        image_labels: dict[str, str] | None = None,
     ) -> str:
         """给消息补上模型看不到的部分：图片里有什么、这是不是一条转发。
 
@@ -3076,7 +3139,11 @@ class VirtualWorldPlugin(Star):
         sticker = _sticker_note(event)
         if sticker:
             notes.append(sticker)
-        notes.extend(await self._annotate_images(event, text, sources=sources))
+        notes.extend(
+            await self._annotate_images(
+                event, text, sources=sources, labels=image_labels
+            )
+        )
         if not notes:
             return text
         return f"{text}\n［{'；'.join(notes)}］".strip()
@@ -3151,11 +3218,16 @@ class VirtualWorldPlugin(Star):
         text: str,
         *,
         sources: list[str] | None = None,
+        labels: dict[str, str] | None = None,
     ) -> list[str]:
         """图片这一段的处理：转了述就写描述，没配转述模型就交给多模态主模型。
 
         图片本来在消息里是看不见的，出了任何岔子都要留下一条日志——
         否则用户只会看到"模型好像没看到图"，却没有任何线索。
+
+        ``labels``：**准备回复时**才有的编号（``图片地址 -> 图1``，见 `_reply_images`）。
+        给了它就说明交付决策已经做完了，这里只负责把"这一条消息的图是第几号"讲清楚，
+        不再自己转述一遍。
         """
 
         components = _image_components(event)
@@ -3168,6 +3240,19 @@ class VirtualWorldPlugin(Star):
             return []
         session_id = event.unified_msg_origin
         sources = resolved
+        if labels is not None:
+            mine = [str(labels[str(url)]) for url in sources if str(url) in labels]
+            if not mine:
+                # 这条消息的图这一轮没交给主模型看（比如被转述了）：转述那句由
+                # `_reply_images` 的 notes 交回来，这里不重复说
+                return []
+            listed = "、".join(mine)
+            if len(mine) >= len(sources):
+                return [f"这条消息带了 {len(mine)} 张图片，就是{listed}，已经一起发给你了"]
+            return [
+                f"这条消息带了 {len(sources)} 张图片，其中 {listed} 已经一起发给你，"
+                "其余几张只有文字描述"
+            ]
         vision = getattr(self, "vision", None)
         if not sources:
             detail = "收到图片但拿不到可用地址"
@@ -3188,12 +3273,11 @@ class VirtualWorldPlugin(Star):
 
         captions: list[str] = []
         if vision is None or not vision.enabled:
-            return [f"这条消息带了 {len(sources)} 张图片，图片会一起发给你"]
+            return [_images_head(len(sources))]
         # 收到的图**现在就**看看是不是已经超过「一次带几张」的上限了：
         # 超出的那几张（先来的）立刻转成文字，不等调主模型那一刻。
         notes = await self._caption_overflow(event, sources)
-        head = f"这条消息带了 {len(sources)} 张图片，会一起发给你"
-        return [head, *notes]
+        return [_images_head(len(sources)), *notes]
 
     async def _caption_overflow(
         self, event: AstrMessageEvent, sources: list[str]
@@ -3229,18 +3313,19 @@ class VirtualWorldPlugin(Star):
     async def _reply_images(
         self, event: AstrMessageEvent, sources: list[str]
     ) -> tuple[list[str], dict[str, str], list[str]]:
-        """这一轮直接交给模型看的图、聊天记录里那几张图的编号，以及要转成文字的那几张。
+        """这一轮直接交给模型看的图、它们的编号（``图1``/``图2``…），以及要转成文字的那几张。
 
-        转述只在这里做，而且只转"不会随这次请求交给主模型"的那几张：
+        **规则**：发送范围（这次真的会进提示词的聊天记录）里**最近的 ``image_max`` 张图**
+        都交给主模型看——不管它是这一条消息带的、还是前面几条带的，按时间序编号 图1/图2/…，
+        和附件顺序一一对应；比它们更旧、但仍在发送范围内的图只以文字转述出现
+        （被压成概览的老图压根不在这个范围里，不用管）。
 
-        - 主模型能吃图：最多带 ``image_max`` 张过去，**超出的旧图**（先来的那几张）
-          打包转述一次，描述挂回它们各自那条聊天记录；
-        - 主模型看不见图：这一轮该给她看的图全部打包转述一次（一条消息一次 →
-          一整轮一次），转完只交文字，不再附图；
-        - 没配转述模型：这条消息自己的图 + 「自上次回复以来收到的图」都发过去。
+        - 主模型看不见图时：这几张全部转述成文字（一次打包），不附图；
+        - **没配转述模型**时：主模型看不看得见都照样附图（否则这些图就彻底没了）；
+        - 已经转述过的图这次被附上了：它的转述不再渲染出来（见
+          ``engine.attach_image_captions`` 与 ``prompt._render_rows``）。
 
-        三种情况下"转述"都只发生一次：图片本来就要交给主模型看时再转述一遍，
-        等于同一张图看两遍（白花钱），连发几张还会连着调好几次。
+        转述只发生一次：本来就要交给主模型看的图不会再转述一遍（白花钱）。
         """
 
         session_id = event.unified_msg_origin
@@ -3248,6 +3333,7 @@ class VirtualWorldPlugin(Star):
         cap = max(1, int(context.image_max))
         vision = getattr(self, "vision", None)
         captioned = bool(vision is not None and vision.enabled)
+        mode = str(getattr(context, "chat_image_inline", "auto") or "auto").lower()
         inline = await self._chat_images_inline(session_id)
         pending = await self.engine.take_pending_images(session_id)
         # 按时间排好（先来的在前）：被搭话的那几条消息里的图排前面，最新那张在最后
@@ -3256,42 +3342,31 @@ class VirtualWorldPlugin(Star):
                 [str(ref).strip() for ref in [*pending, *sources] if str(ref).strip()]
             )
         )
-        # 这一轮"看得到"的全部图（旧的在前、最新那张在最后）：
-        # 留档里更早的图也算，它们同样占"这一轮看了几张"的账
-        history = await self.engine.chat_images_for_reply(session_id, PENDING_IMAGE_KEEP)
+        # 「发送范围里」的图 = 这次真的会进提示词的聊天记录里的图（被压成概览的早就不在这里了，
+        # 那种不用管）。取其中**最近的 ``image_max`` 张**交给主模型看，**不管它是这一条消息带的
+        # 还是前面几条带的**——编号按时间序 图1/图2/…，和附件顺序一一对应。
+        window = await self.engine.chat_images_for_reply(session_id, PENDING_IMAGE_KEEP)
         all_urls = list(
             dict.fromkeys(
                 [
                     *[
                         str(item.get("url") or "").strip()
-                        for item in history
+                        for item in window
                         if str(item.get("url") or "").strip()
                     ],
                     *own,
                 ]
             )
         )
-        # 会被交给主模型的那几张：这一轮被搭话的那几张优先，剩下的名额给留档里更早的图
-        own_refs = own[-cap:]
-        room = max(0, cap - len(own_refs))
-        # 留档里的图另有上限（``chat_image_max``）：附太多旧图会把她这次要看的东西冲淡
-        want = min(max(1, int(context.chat_image_max)), room)
-        picks = history[-want:] if (inline and want) else []
-        refs: list[str] = []
-        marks: dict[str, str] = {}
-        for item in picks:
-            url = str(item.get("url") or "").strip()
-            if url and url not in refs:
-                refs.append(url)
-                marks[url] = f"图{len(marks) + 1}"
-        for ref in own_refs:
-            if ref not in refs:
-                refs.append(ref)
-        refs = refs[:cap]
-        marks = {url: label for url, label in marks.items() if url in refs}
-        if captioned and not inline:
-            # 主模型看不见图：这一轮的所有图都转成文字（一次打包），也就不附图了
-            refs, marks = [], {}
+        # 附件 = 这些图里**最近的 cap 张**（`all_urls` 已经是时间序），编号按同一顺序：
+        # 第 i 张就是 图i，和附件顺序一一对应。
+        # 显式关掉（``never``）就一张都不附；检测不出主模型能不能看图、又没配转述模型时，
+        # 照样附过去（否则这些图就彻底没人看了）
+        attach = bool(inline) or (not captioned and mode != "never")
+        refs: list[str] = list(all_urls[-cap:]) if attach else []
+        marks: dict[str, str] = {
+            url: f"图{index}" for index, url in enumerate(refs, start=1)
+        }
         notes: list[str] = []
         if captioned:
             dropped = [
@@ -3352,18 +3427,24 @@ class VirtualWorldPlugin(Star):
             )
             return ["有几张图没能转述成功，只当看过了（已记进日志）"]
         here = {str(item).strip() for item in (sources or [])}
+        # 这条消息里的第几张：编号要跟「图1/图2」对得上，不能按"这次转述了几张"重排
+        order = {
+            str(url).strip(): index + 1
+            for index, url in enumerate(sources or [])
+            if str(url).strip()
+        }
         notes: list[str] = []
         elsewhere: dict[str, str] = {}
         for url, caption in pairs:
+            text = readable_caption(caption)
+            if not text:
+                continue
             if url in here:
-                notes.append(caption)
+                notes.append(f"图{order.get(url, len(notes) + 1)}：{text}")
             else:
-                elsewhere[url] = caption
+                elsewhere[url] = text
         attached = await self.engine.attach_image_captions(session_id, elsewhere)
         self.engine.mark_images_captioned([url for url, _text in pairs])
-        notes = [
-            f"图片{index + 1}：{text}" for index, text in enumerate(notes) if text
-        ]
         await self.engine.note_vision(
             session_id,
             ok=True,
@@ -3474,7 +3555,7 @@ class VirtualWorldPlugin(Star):
         """
 
         text = str(event.get_message_str() or "")
-        if _is_command(text):
+        if _is_command(text) or _is_command_event(event):
             return False
         return bool(
             event.is_wake_up() or _is_at_bot(event) or event.is_private_chat()
@@ -3552,6 +3633,9 @@ class VirtualWorldPlugin(Star):
             return
         if self.retired:
             return
+        if _is_command_event(event):
+            # 指令不进她的上下文，也不让她回话（`/vw event h 在浴室` 这种只让她照做）
+            return
         session_id = event.unified_msg_origin
         if not self.engine.is_enabled(session_id):
             return
@@ -3564,10 +3648,16 @@ class VirtualWorldPlugin(Star):
             event.get_message_str() or ""
         )
         sources = await _image_sources(event)
-        user_text = await self._annotate_message(
-            event, user_text, sources=sources, summarize_forward=True
-        )
+        # 先决定"这一轮把哪几张图交给主模型看"（编号也在这儿定），
+        # 再拼注解——这样注解里的"就是图2、图3"和聊天记录里的编号是同一套
         image_urls, image_marks, image_notes = await self._reply_images(event, sources)
+        user_text = await self._annotate_message(
+            event,
+            user_text,
+            sources=sources,
+            summarize_forward=True,
+            image_labels=image_marks,
+        )
         if image_notes:
             user_text = f"{user_text}\n［{'；'.join(image_notes)}］".strip()
         ctx = MessageContext(
@@ -3582,7 +3672,10 @@ class VirtualWorldPlugin(Star):
             group_name=_group_name(event),
             persona_id=_event_persona_id(event),
             # 其他插件（上下文理解、图片转文字、记忆…）写进 system_prompt 的内容原样带过去
-            other_context=(getattr(req, "system_prompt", "") or "").strip(),
+            # （AstrBot 自己的「人格设定」除外：她的人设由插件这边给，见 _drop_persona_instructions）
+            other_context=_drop_persona_instructions(
+                getattr(req, "system_prompt", "") or ""
+            ),
             image_urls=image_urls,
             chat_images=sources,
             image_marks=image_marks,
@@ -4249,6 +4342,9 @@ class VirtualWorldPlugin(Star):
             return
         if event.get_sender_id() and event.get_sender_id() == event.get_self_id():
             return
+        if _is_command_event(event):
+            # 指令不进她的上下文：不登记待回、不留档、不进记忆，也不该由她回话
+            return
         # 「连发合并」要在这里就登记：落到 on_llm_request 那一钩时，同一会话的
         # 上一条回复可能还占着管线（AstrBot 里那条管线是串行的），等她登记时
         # 早就过了安静期，两条消息就各回一次了。
@@ -4670,19 +4766,24 @@ class VirtualWorldPlugin(Star):
                 state.bot_current_nickname = text
                 state.bot_base_nickname = text
                 state.bot_nickname_locked = True
-                card = await self.engine.messenger.set_group_card(session_id, text)
-                if not card.ok:
-                    return f"已记录为「{text}」并锁定，但改名片失败：{card.reason}"
-                return f"已把群名片设为「{text}」并锁定。"
+                changed, failed, reason = await self._apply_card_to_group(session_id, text)
+                if not changed:
+                    return f"已记录为「{text}」并锁定，但改名片失败：{reason}"
+                note = f"已把 {changed} 个群的群名片设为「{text}」并锁定。"
+                if failed:
+                    note += f"（{failed} 个没改成：{reason}）"
+                return note
             if sub in ("reset", "重置"):
                 state.bot_nickname_locked = False
                 state.bot_current_nickname = state.bot_base_nickname
                 if state.bot_base_nickname:
-                    card = await self.engine.messenger.set_group_card(
+                    changed, failed, reason = await self._apply_card_to_group(
                         session_id, state.bot_base_nickname
                     )
-                    if not card.ok:
-                        return f"已解锁，但恢复原名失败：{card.reason}"
+                    if not changed:
+                        return f"已解锁，但恢复原名失败：{reason}"
+                    if failed:
+                        return f"已解锁并改回原名（{changed} 个群，{failed} 个没改成：{reason}）"
                 return "已恢复原名并解锁。"
         return "用法：/vw nickname status|lock|unlock|set <文本>|reset"
 
@@ -6211,9 +6312,20 @@ class VirtualWorldPlugin(Star):
                 state.bot_current_nickname = text
                 state.bot_base_nickname = text
                 state.bot_nickname_locked = True
-            result = await self.messenger.set_group_card(session_id, text)
+            changed, failed, reason = await self._apply_card_to_group(session_id, text)
+            ok = changed > 0
+            note = f"已改 {changed} 个群的群名片"
+            if failed:
+                note += f"，{failed} 个没改成（{reason or '没说明原因'}）"
             return json_response(
-                {"ok": result.ok, "reason": result.reason, "card": result.card}
+                {
+                    "ok": ok,
+                    "reason": "" if ok else (reason or "这个会话没有能改的群名片"),
+                    "card": text,
+                    "changed": changed,
+                    "failed": failed,
+                    "note": note,
+                }
             )
         if action in ("lock_nickname", "unlock_nickname", "reset_nickname"):
             async with self.engine.session_state(session_id) as state:
@@ -6229,9 +6341,15 @@ class VirtualWorldPlugin(Star):
                     return error_response("还不知道她原来的名片，先在群里让她说过话")
                 state.bot_nickname_locked = True
                 state.bot_current_nickname = base
-            result = await self.messenger.set_group_card(session_id, base)
-            note = "已改回原名" if result.ok else f"改回原名失败：{result.reason}"
-            return json_response({"ok": result.ok, "note": note})
+            changed, failed, reason = await self._apply_card_to_group(session_id, base)
+            if changed:
+                note = f"已改回原名（{changed} 个群）"
+                if failed:
+                    note += f"，{failed} 个没改成（{reason or '没说明原因'}）"
+                return json_response({"ok": True, "note": note})
+            return json_response(
+                {"ok": False, "note": f"改回原名失败：{reason or '这个会话没有能改的群名片'}"}
+            )
         if action == "refresh_nickname":
             return json_response(await self.engine.refresh_nickname(session_id))
         if action == "reset_state":
@@ -6244,12 +6362,46 @@ class VirtualWorldPlugin(Star):
             return json_response({"ok": True, **result})
         if action == "nickname":
             snapshot = await self.engine.load_state(session_id, cold_start=False)
-            cards = self.engine.messenger
-            ok = await cards.set_group_card(
-                session_id, snapshot.bot_current_nickname or snapshot.bot_base_nickname
+            changed, failed, reason = await self._apply_card_to_group(
+                session_id,
+                snapshot.bot_current_nickname or snapshot.bot_base_nickname,
             )
-            return json_response({"ok": ok})
+            return json_response(
+                {"ok": bool(changed), "changed": changed, "failed": failed, "reason": reason}
+            )
         return error_response(f"未知动作：{action}")
+
+    async def _apply_card_to_group(self, session_id: str, card: str) -> tuple[int, int, str]:
+        """把名片写到「她这一组里的所有群」。
+
+        返回 ``(改成功几个群, 失败几个, 最后一次失败原因)``。
+
+        - **只在当前会话组里改**：别的会话组是另一个她，一个字都不碰
+          （老版本是从哪个会话点的就只改那一个群，从私聊点还会直接报"这不是群聊"）；
+        - 私聊没有群名片，跳过；当前会话自己就是群、又没进组时就改它自己。
+        """
+
+        targets = [
+            str(item)
+            for item in self.engine.group_sessions(session_id)
+            if ":GroupMessage:" in str(item) and self.engine.is_enabled(str(item))
+        ]
+        if not targets:
+            result = await self.messenger.set_group_card(session_id, card)
+            if result.ok:
+                return 1, 0, ""
+            return 0, 1, str(result.reason or "")
+        changed = 0
+        failed = 0
+        reason = ""
+        for target in targets:
+            result = await self.messenger.set_group_card(target, card)
+            if result.ok:
+                changed += 1
+            else:
+                failed += 1
+                reason = str(result.reason or reason)
+        return changed, failed, reason
 
     async def api_states(self):
         guard = self._guard()
