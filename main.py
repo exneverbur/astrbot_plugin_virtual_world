@@ -169,6 +169,59 @@ def _is_soft_wake(event: Any) -> bool:
         return False
 
 
+def _router_float(value: Any) -> float:
+    """路由给的分数（拿不到就当 0）。"""
+
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _router_view(event: Any) -> dict:
+    """意图路由放行时交过来的事前判定（拿不到 / 形状不对就是空 dict）。
+
+    路由在重投那一刻把**整批**判定挂在事件上（见它的 README「交给她的事前判定」）：
+    ``batch`` 按到达顺序列出这一批每一条，含被合并成一次回复、正文根本没进请求的
+    那几条，``released`` 标出真正放行的。价值在于「这句是不是冲她说的」这件事
+    **回复之前**就有答案了——不用等她回完再让主模型自己猜（那是 ``addressing``，
+    见 :meth:`Engine._mark_reply_addressing`）。
+
+    这里只做形状校验和取值：判定本身是路由给的，本插件不重新解释。
+    """
+
+    try:
+        raw = event.get_extra("intent_router_decision", None)
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    rows = raw.get("batch")
+    if not isinstance(rows, list):
+        return {}
+    batch: list[dict] = []
+    for entry in rows:
+        if not isinstance(entry, dict):
+            continue
+        batch.append(
+            {
+                "sender": str(entry.get("sender") or ""),
+                "sender_id": str(entry.get("sender_id") or ""),
+                "message_id": str(entry.get("message_id") or ""),
+                "text": str(entry.get("text") or ""),
+                "released": bool(entry.get("released")),
+                "worth": bool(entry.get("worth")),
+                "directed": bool(entry.get("directed")),
+                "to": str(entry.get("to") or ""),
+                "reply_score": _router_float(entry.get("reply_score")),
+                "reason": str(entry.get("reason") or ""),
+            }
+        )
+    if not batch:
+        return {}
+    return {"policy": str(raw.get("policy") or ""), "batch": batch}
+
+
 def _group_name(event: Any) -> str:
     """平台报的群名（拿不到就返回空串，提示词里就只显示群号 / 备注）。"""
 
@@ -2829,7 +2882,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "exneverbur",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v2.1.6",
+    "v2.1.7",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -3755,6 +3808,8 @@ class VirtualWorldPlugin(Star):
             addressing=_addressing_kind(
                 _at_targets(event), _reply_target(event), str(event.get_self_id() or "")
             ),
+            # 意图路由放行时交过来的事前判定（这批里哪几条是冲她说的）
+            router=_router_view(event),
         )
 
         # 睡觉时的门禁：没被明确叫醒就只回固定文案（或保持安静），
@@ -4366,6 +4421,7 @@ class VirtualWorldPlugin(Star):
             # 记下这条消息带的图片，等下次回复时一起给多模态主模型
             image_urls=list(sources),
             chat_images=list(sources),
+            router=_router_view(event),
         )
         if not await self.engine.should_block_sleep(ctx):
             return
@@ -4436,6 +4492,8 @@ class VirtualWorldPlugin(Star):
                     _reply_target(event),
                     str(event.get_self_id() or ""),
                 ),
+                # 意图路由放行时交过来的事前判定：记档时就按事件身份认领给对应那几条
+                router=_router_view(event),
             )
         )
 

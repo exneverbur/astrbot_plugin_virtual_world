@@ -1539,6 +1539,124 @@ class TestChatRecordDedupe(unittest.TestCase):
         state.note_chat(user_id="42", name="小明", text="亲亲", now=100.0 + 180)
         self.assertEqual(len(state.recent_chat), 2)
 
+    def test_the_same_words_in_another_session_are_not_swallowed(self):
+        """同一个人在群里说「在吗」、又在私聊里说「在吗」：是两件事。
+
+        组里的群和私聊共用一份留档，兜底去重只看"谁 + 说了什么"的话，
+        后一条会被当成重复吞掉——她就再也不知道他在另一个地方也叫过她。
+        """
+
+        state = self._state()
+        state.note_chat(
+            user_id="42", name="小明", text="在吗", now=100.0, origin="group:1"
+        )
+        state.note_chat(
+            user_id="42", name="小明", text="在吗", now=100.5, origin="private:42"
+        )
+        self.assertEqual(len(state.recent_chat), 2)
+        self.assertEqual(
+            [item["origin"] for item in state.recent_chat], ["group:1", "private:42"]
+        )
+
+    def test_another_user_saying_the_same_words_is_kept(self):
+        """同一个群里两个人各自说「在吗」：不能并成一条。"""
+
+        state = self._state()
+        state.note_chat(user_id="42", name="小明", text="在吗", now=100.0)
+        state.note_chat(user_id="7", name="小红", text="在吗", now=100.5)
+        self.assertEqual(len(state.recent_chat), 2)
+
+    def test_her_own_repeat_is_not_confused_with_his(self):
+        """她自己说「在吗」和他说「在吗」不是同一条（is_self 也进兜底比较）。"""
+
+        state = self._state()
+        state.note_chat(user_id="42", name="小明", text="在吗", now=100.0)
+        state.note_chat(
+            user_id="__self__", name="她", text="在吗", now=100.5, is_self=True
+        )
+        self.assertEqual(len(state.recent_chat), 2)
+
+    def test_one_event_recorded_by_two_hooks_is_deduped_by_identity(self):
+        """两个钩子各记一次同一条消息：有事件身份时就按身份认，只留一条。"""
+
+        state = self._state()
+        state.note_chat(
+            user_id="42", name="小明", text="在吗", now=100.0,
+            origin="group:1", message_id="m-1",
+        )
+        state.note_chat(
+            user_id="42", name="小明", text="在吗（被管线改写过的文本）", now=100.4,
+            origin="group:1", message_id="m-1",
+        )
+        self.assertEqual(len(state.recent_chat), 1)
+
+    def test_note_chat_returns_the_row_it_recorded(self):
+        """`note_chat` 要把刚记下的那条还回来，去重命中时返回 None。"""
+
+        state = self._state()
+        first = state.note_chat(user_id="42", name="小明", text="在吗", now=100.0)
+        self.assertIsNotNone(first)
+        self.assertIs(first, state.recent_chat[-1])
+        self.assertEqual(first["text"], "在吗")
+        # 判为重复：没有再记，所以没有东西可以标来源
+        self.assertIsNone(state.note_chat(user_id="42", name="小明", text="在吗", now=100.2))
+        self.assertIsNone(state.note_chat(user_id="42", name="小明", text="   ", now=100.3))
+        self.assertEqual(len(state.recent_chat), 1)
+
+
+class TestLegacyGlobalChatFields(unittest.TestCase):
+    """老存档的全局 chat_summary / chat_note / chat_preview 只属于建档的那个会话。
+
+    从前三个访问器无条件回落全局字段：组里另一个会话问"刚才在聊什么"，
+    拿到的是建档会话的旧备忘——她会把别处说过的事讲成"我们刚才在这儿聊的"。
+    """
+
+    OLD = "aiocqhttp:GroupMessage:1"
+    OTHER = "aiocqhttp:PrivateMessage:42"
+
+    def _legacy_state(self) -> WorldState:
+        return WorldState.from_payload(
+            {
+                "chat_summary": "老存档的全局摘要",
+                "chat_summary_at": 123.0,
+                "chat_note": "老存档的全局备忘",
+                "chat_preview": "老存档的全局预览",
+                # 存档里同一个会话组还有另一个会话
+                "session_activity": {},
+            },
+            self.OLD,
+        )
+
+    def test_only_the_owning_session_may_fall_back_to_the_old_globals(self):
+        state = self._legacy_state()
+        self.assertEqual(state.chat_summary, "老存档的全局摘要")
+        self.assertEqual(state.chat_note_text(self.OLD), "老存档的全局备忘")
+        self.assertEqual(state.chat_preview_text(self.OLD), "老存档的全局预览")
+        # 建档会话自己读得到（不传 session_id 就是它）
+        self.assertEqual(state.chat_note_text(), "老存档的全局备忘")
+        self.assertEqual(state.chat_preview_text(), "老存档的全局预览")
+
+    def test_another_session_gets_nothing_from_the_old_globals(self):
+        state = self._legacy_state()
+        self.assertEqual(state.chat_note_text(self.OTHER), "")
+        self.assertEqual(state.chat_preview_text(self.OTHER), "")
+
+    def test_another_session_reads_its_own_row_when_it_has_one(self):
+        state = self._legacy_state()
+        state.chat_notes[self.OTHER] = {"text": "私聊里在聊猫", "at": 0.0}
+        state.chat_previews[self.OTHER] = {"text": "私聊这边刚回过一句", "at": 0.0}
+        self.assertEqual(state.chat_note_text(self.OTHER), "私聊里在聊猫")
+        self.assertEqual(state.chat_preview_text(self.OTHER), "私聊这边刚回过一句")
+        # 建档会话那边不受影响
+        self.assertEqual(state.chat_note_text(self.OLD), "老存档的全局备忘")
+
+    def test_from_payload_migrates_the_globals_onto_the_owning_session(self):
+        state = self._legacy_state()
+        self.assertEqual(state.chat_notes[self.OLD]["text"], "老存档的全局备忘")
+        self.assertEqual(state.chat_previews[self.OLD]["text"], "老存档的全局预览")
+        self.assertNotIn(self.OTHER, state.chat_notes)
+        self.assertNotIn(self.OTHER, state.chat_previews)
+
 
 class TestDirtyStringLists(unittest.TestCase):
     """编辑器偶尔会把 null 写进多选框（选项没有 id 时），保存不该因此整份失败。"""
@@ -3436,6 +3554,93 @@ class TestPromptBuilder(unittest.TestCase):
         # 引用的是她
         self.assertIn("→ 引用 她：你怎么看", blob)
 
+    def test_the_router_verdict_speaks_up_when_nobody_at_her(self):
+        """没 @ 她时替她点一句：意图路由的事前判定（事后那份 addressing 由主模型给）。"""
+
+        blocks = self.builder.chat_blocks(
+            [
+                {
+                    "user_id": "7",
+                    "name": "牛佳晨",
+                    "text": "你倒是说啊",
+                    "at": 100.0,
+                    "router_directed": True,
+                    "router_to": "机器人",
+                    "router_reason": "在问她",
+                },
+                {
+                    "user_id": "8",
+                    "name": "小明",
+                    "text": "晚上吃什么",
+                    "at": 100.0,
+                    "router_directed": False,
+                    "router_to": "大家",
+                    "router_reason": "在问大家",
+                },
+                {
+                    "user_id": "9",
+                    "name": "小红",
+                    "text": "别理他",
+                    "at": 100.0,
+                    "router_directed": False,
+                    "router_to": "42",
+                    "router_reason": "在叫别人",
+                },
+                {
+                    "user_id": "10",
+                    "name": "小刚",
+                    "text": "那个谁",
+                    "at": 100.0,
+                    "router_directed": False,
+                    "router_to": "不确定",
+                    "router_reason": "没看准",
+                },
+            ]
+        )
+        blob = "\n".join(blocks)
+        self.assertIn("（意图路由判定这句是冲你说的）", blob)
+        self.assertIn("（意图路由判定这句不是在跟你说话）", blob)
+        self.assertIn("（意图路由判定这句是冲 42 说的）", blob)
+        # 路由自己说"不确定"时不许替它把话说死
+        self.assertIn("（意图路由不确定这句是不是冲你说的）", blob)
+
+    def test_the_router_verdict_never_talks_over_the_model(self):
+        """结构化 @ / 引用、以及主模型回完标的那份更硬：有就不叠路由那句。"""
+
+        blocks = self.builder.chat_blocks(
+            [
+                {
+                    "user_id": "7",
+                    "name": "牛佳晨",
+                    "text": "你倒是说啊",
+                    "at": 100.0,
+                    "addressing": "me",
+                    "router_directed": True,
+                    "router_to": "机器人",
+                },
+                {
+                    "user_id": "8",
+                    "name": "小明",
+                    "text": "我去买咖啡",
+                    "at": 100.0,
+                    "addressing": "others",
+                    "router_directed": True,
+                    "router_to": "机器人",
+                },
+            ]
+        )
+        blob = "\n".join(blocks)
+        self.assertNotIn("意图路由判定", blob)
+        self.assertIn("（这句是冲别人说的，不是在问你）", blob)
+
+    def test_a_session_without_the_router_says_nothing_extra(self):
+        """没装路由的会话：记录里压根没有这几个字段，渲染结果一个字都不该多。"""
+
+        blocks = self.builder.chat_blocks(
+            [{"user_id": "7", "name": "牛佳晨", "text": "早上好", "at": 100.0}]
+        )
+        self.assertNotIn("意图路由判定", "\n".join(blocks))
+
     def test_answered_lines_keep_the_short_background_limit(self):
         """已经回过的那批只当背景：仍然按短上限（默认 100 字）处理。"""
 
@@ -3454,10 +3659,12 @@ class TestPromptBuilder(unittest.TestCase):
         self.assertLess(len(body), self.builder.world.context.chat_line_chars)
 
     def test_chat_records_respect_the_total_budget(self):
-        """整段聊天记录有总字数预算，而且它是**硬上限**：超了先丢最早的背景。
+        """整段聊天记录有总字数预算：超了先丢最早的背景（背景类按此上限整条丢）。
 
-        背景（已经回过话的那批）只吃「还没回过的那几条」用剩的额度——
-        她这一轮真正要读、要回的是后者。放不下就整条丢，并标明丢了几条。
+        `chat_total_chars` 不是**绝对**硬上限：预算先给「这一轮要读要回的原文」
+        与那行「刚聊过什么」概览（见 :meth:`chat_blocks`），必要时会略微超出。
+        背景（已经回过话的那批 / 别处的 / 更早的概览）只吃它们用剩的额度——
+        她这一轮真正要读、要回的是前者。放不下就整条丢，并标明丢了几条。
         """
 
         context = self.builder.world.context
@@ -3619,6 +3826,53 @@ class TestPromptBuilder(unittest.TestCase):
         self.assertIn("没有人接", system)
         self.assertIn("别重新解释同一件事", system)
         self.assertNotIn("接着你往下说的多半是对你说的", system)
+
+    def test_her_own_last_line_beats_an_older_mention(self):
+        """最后一句是她自己说的时，「她说完没人接」比"这几条里有人 @ 你"更准。
+
+        更早那条 @ 是历史命中：拿它去盖"没人接"，模型会以为那是冲她来的，
+        于是追着自己刚说的那句重新解释一遍。
+        """
+
+        rows = [
+            {
+                "user_id": "1",
+                "name": "不相疑",
+                "text": "在吗\n［这条消息 @ 了：你（凶猛蓝色虎鲸💢(9)）］",
+                "is_self": False,
+            },
+            {
+                "user_id": "__self__",
+                "name": "她",
+                "text": "我在书房翻配置呢",
+                "is_self": True,
+            },
+        ]
+        joined = "\n".join(self.builder.chat_blocks(rows, mine_names=["凶猛蓝色虎鲸"]))
+        self.assertIn("没有人接", joined)
+        self.assertNotIn("是对你说的", joined)
+
+    def test_an_older_mention_still_wins_when_she_did_not_speak_last(self):
+        """最后一条不是她说的：@ 仍然优先（那确实是冲她来的）。"""
+
+        rows = [
+            {
+                "user_id": "1",
+                "name": "不相疑",
+                "text": "在吗\n［这条消息 @ 了：你（凶猛蓝色虎鲸💢(9)）］",
+                "is_self": False,
+            },
+            {
+                "user_id": "__self__",
+                "name": "她",
+                "text": "我在书房翻配置呢",
+                "is_self": True,
+            },
+            {"user_id": "2", "name": "大狗", "text": "我也想问", "is_self": False},
+        ]
+        joined = "\n".join(self.builder.chat_blocks(rows, mine_names=["凶猛蓝色虎鲸"]))
+        self.assertIn("是对你说的", joined)
+        self.assertNotIn("没有人接", joined)
 
     def test_consolidate_rules_keep_her_own_small_talk_out_of_facts(self):
         """睡眠整理：她自己普通的回复 / 寒暄不算新事实，不许包装成用户的画像。"""

@@ -11462,15 +11462,6 @@ function renderSettings() {
     }),
   );
   basic._fields.appendChild(
-    el(
-      "p",
-      "muted",
-      "被 @ 时的回复方式固定为「接管回复」：插件自己调模型、按 JSON 动作执行并发送，" +
-        "主人格不重复回复；模型出错时这一条就不回，不会交给主人格顶替。" +
-        "（主人格是另一个人设，顶下来会让她突然换了个说法，所以不再提供别的选项。）",
-    ),
-  );
-  basic._fields.appendChild(
     checkboxField(
       "要求先写推理草稿（reasoning）",
       world.reasoning_enabled !== false,

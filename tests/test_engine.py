@@ -3968,6 +3968,279 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(group_chat_items(elsewhere)), 12)
         self.assertGreaterEqual(len(elsewhere), 1)
 
+    async def test_only_the_owner_session_falls_back_to_the_old_global_fields(self):
+        """老存档那份全局摘要 / 备忘 / 预览的主人是建档会话：别的会话问它必须给空。"""
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION])
+        async with self.engine.session_state(SESSION) as state:
+            # 升级前的老存档形态：只有全局字段，没有按会话的那几份
+            state.chat_summary = "很久以前群里聊过的事"
+            state.chat_summary_at = 12345.0
+            state.chat_note = "老存档里刚才在聊什么"
+            state.chat_preview = "老存档里她刚回应过的那批"
+
+            # 问的就是建档的那个会话：照着回落
+            self.assertEqual(
+                self.engine.chat_summary_for(state, SESSION), "很久以前群里聊过的事"
+            )
+            self.assertEqual(
+                self.engine.chat_note_for(state, SESSION), "老存档里刚才在聊什么"
+            )
+            self.assertEqual(
+                self.engine.chat_preview_for(state, SESSION),
+                "老存档里她刚回应过的那批",
+            )
+            # 同世界的另一个会话没写过这几样：必须读空，不能借来当成自己的
+            self.assertEqual(self.engine.chat_summary_for(state, PRIVATE_SESSION), "")
+            self.assertEqual(self.engine.chat_note_for(state, PRIVATE_SESSION), "")
+            self.assertEqual(self.engine.chat_preview_for(state, PRIVATE_SESSION), "")
+
+    async def test_the_summary_map_and_the_reader_agree_on_legacy_data(self):
+        """提示词用的 map 和编辑器用的 for 对老存档必须一个口径（都是建档会话的）。"""
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION])
+        async with self.engine.session_state(SESSION) as state:
+            state.chat_summary = "老存档摘要"
+            state.chat_summary_at = 100.0
+
+            self.assertEqual(
+                self.engine.chat_summary_map(state), {SESSION: "老存档摘要"}
+            )
+            self.assertEqual(self.engine.chat_summary_for(state, SESSION), "老存档摘要")
+            self.assertEqual(self.engine.chat_summary_for(state, PRIVATE_SESSION), "")
+
+    async def test_migrated_legacy_fields_land_on_their_own_session(self):
+        """迁移（老 payload 读进来）之后，老字段也只归建档会话，别人读不到。"""
+
+        legacy = {
+            "session_id": SESSION,
+            "chat_summary": "升级前的旧摘要",
+            "chat_summary_at": 42.0,
+            "chat_note": "升级前的旧备忘",
+            "chat_preview": "升级前的旧预览",
+        }
+        state = WorldState.from_payload(legacy, SESSION)
+
+        self.assertEqual(self.engine.chat_summary_for(state, SESSION), "升级前的旧摘要")
+        self.assertEqual(self.engine.chat_note_for(state, SESSION), "升级前的旧备忘")
+        self.assertEqual(self.engine.chat_preview_for(state, SESSION), "升级前的旧预览")
+        self.assertEqual(self.engine.chat_summary_for(state, PRIVATE_SESSION), "")
+        self.assertEqual(self.engine.chat_note_for(state, PRIVATE_SESSION), "")
+        self.assertEqual(self.engine.chat_preview_for(state, PRIVATE_SESSION), "")
+
+    async def test_directed_speech_takes_the_window_of_the_session_it_speaks_to(self):
+        """定向发言（预览 / 续说）按**目标会话**取额度，不是按代表会话。"""
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION])
+        self.set_context(chat_lines=3, chat_elsewhere_lines=1)
+        now = self.engine._now()
+        async with self.engine.session_state(SESSION) as state:
+            # 群里 10 组、私聊 6 组（间隔超过合并窗口 → 各算一行）
+            for index in range(10):
+                state.note_chat(
+                    user_id="7",
+                    name="小明",
+                    text=f"群里第{index}句",
+                    now=now - 3600 + index * 350,
+                    keep=200,
+                    origin=SESSION,
+                )
+            for index in range(6):
+                state.note_chat(
+                    user_id="9",
+                    name="主人",
+                    text=f"私聊第{index}句",
+                    now=now - 3000 + index * 350,
+                    keep=200,
+                    origin=PRIVATE_SESSION,
+                )
+            to_private = self.engine.chat_window(state, PRIVATE_SESSION)
+            here = [item for item in to_private if item.get("origin") == PRIVATE_SESSION]
+            elsewhere = [item for item in to_private if item.get("origin") == SESSION]
+
+        self.assertEqual(len(group_chat_items(here)), 3, "私聊自己拿满 3 行额度")
+        self.assertEqual(len(group_chat_items(elsewhere)), 1, "群里的只占别处的额度")
+
+        prompt = await self.engine.preview_autonomous_prompt(PRIVATE_SESSION)
+        self.assertIn("私聊第5句", prompt)
+        self.assertLessEqual(
+            prompt.count("群里第"), 1, "定向给私聊发言时，群里的话不该占本会话额度"
+        )
+
+    async def test_the_replied_preview_only_covers_what_was_actually_answered(self):
+        """「你刚回应过的那批」= 这一轮真的处理过的事件；发送期间新到的不算。"""
+
+        async with self.engine.session_state(SESSION) as state:
+            now = self.engine._now()
+            state.note_chat(
+                user_id="7",
+                name="小明",
+                text="第一句：这一轮答的就是它",
+                now=now - 30,
+                keep=200,
+                origin=SESSION,
+                message_id="m-1",
+            )
+            answered = {str(state.recent_chat[-1]["event_key"])}
+            # 她答话这会儿才到的第二条
+            state.note_chat(
+                user_id="7",
+                name="小明",
+                text="第二句：她开口之后才到的",
+                now=now - 1,
+                keep=200,
+                origin=SESSION,
+                message_id="m-2",
+            )
+
+            self.engine.mark_chat_replied(state, SESSION, keys=answered)
+            preview = self.engine.chat_preview_for(state, SESSION)
+            self.assertIn("第一句", preview)
+            self.assertNotIn(
+                "第二句", preview, "发送期间新到的消息不该进「你刚回应过的那批」"
+            )
+            until, seq = self.engine._watermark(state, SESSION)
+            fresh = [
+                str(item.get("text"))
+                for item in state.recent_chat
+                if chat_item_is_fresh(item, replied_until=until, replied_seq=seq)
+            ]
+
+        self.assertEqual(
+            fresh, ["第二句：她开口之后才到的"], "水位线只该推到这一轮实际处理的范围"
+        )
+
+    async def test_clear_chat_context_also_drops_the_topic_note_and_the_preview(self):
+        """清空上下文要连「刚才在聊什么」「刚回应过的那批」一起清；风格记忆保留。"""
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION])
+        async with self.engine.session_state(SESSION) as state:
+            self.engine.note_chat_note(state, "群里刚才在聊周末去哪", SESSION)
+            self.engine.note_chat_note(state, "私聊里在闹别扭", PRIVATE_SESSION)
+            state.chat_previews = {
+                SESSION: {"text": "你刚回应过的那批（群里）", "at": self.engine._now()},
+                PRIVATE_SESSION: {
+                    "text": "你刚回应过的那批（私聊）",
+                    "at": self.engine._now(),
+                },
+            }
+            state.note_chat(
+                user_id="7", name="小明", text="群里的一句", now=self.engine._now(),
+                keep=50, origin=SESSION,
+            )
+            state.note_reply("我刚才说过的一句", session_id=SESSION)
+
+        result = await self.engine.clear_chat_context(SESSION)
+        self.assertEqual(result["removed"], 1)
+        async with self.engine.session_state(SESSION) as state:
+            self.assertEqual(self.engine.chat_note_for(state, SESSION), "")
+            self.assertEqual(self.engine.chat_preview_for(state, SESSION), "")
+            # 别的会话的那几份不受影响
+            self.assertEqual(
+                self.engine.chat_note_for(state, PRIVATE_SESSION), "私聊里在闹别扭"
+            )
+            self.assertEqual(
+                self.engine.chat_preview_for(state, PRIVATE_SESSION),
+                "你刚回应过的那批（私聊）",
+            )
+            # 风格记忆（别重复自己的句式）故意保留
+            self.assertEqual(
+                [str(item.get("text")) for item in state.recent_replies],
+                ["我刚才说过的一句"],
+            )
+
+    async def test_this_rounds_batch_is_shown_once_and_text_is_not_deduped(self):
+        """本轮 batch 每个事件在提示词里只出现一遍；正文相同的**别的**事件一条都不吞。"""
+
+        async with self.engine.session_state(SESSION) as state:
+            now = self.engine._now()
+            # 留档：① 正是本轮要答的那条 ②③ 两条同文的别的（不同人 / 不同 id）事件
+            state.note_chat(
+                user_id="7", name="小明", text="今晚吃什么呀", now=now - 40,
+                keep=200, origin=SESSION, message_id="m-1",
+            )
+            state.note_chat(
+                user_id="8", name="小红", text="在吗", now=now - 30,
+                keep=200, origin=SESSION, message_id="m-2",
+            )
+            state.note_chat(
+                user_id="9", name="小刚", text="在吗", now=now - 20,
+                keep=200, origin=SESSION, message_id="m-3",
+            )
+            batch = [
+                {
+                    "user_id": "7",
+                    "user_name": "小明",
+                    "text": "今晚吃什么呀",
+                    "origin": SESSION,
+                    "message_id": "m-1",
+                    "wall_at": now - 40,
+                    "trigger": True,
+                }
+            ]
+            entries = self.engine.reply_batch_entries(
+                batch, chat_rows=list(state.recent_chat)
+            )
+            context = self.engine.chat_context_for_reply(
+                state, self.ctx(), exclude_entries=entries
+            )
+            system = self.engine.prompts.build_autonomous_system_prompt(
+                persona_text="测试人格",
+                state=state,
+                node=self.engine.node(state.node_id),
+                available_tools=self.engine.available_tools(),
+                recent_chat=context,
+                session_directory=self.engine.session_directory(state),
+                current_session=SESSION,
+                session_labels=self.engine.session_labels(state),
+            )
+            user = self.engine.prompts.build_reply_user_prompt(
+                entries=entries,
+                is_private=False,
+                addressing="direct",
+                from_session=self.engine.reply_place(state, SESSION),
+            )
+
+        self.assertEqual(user.count("今晚吃什么呀"), 1, "本轮要回的那条只该出现一遍")
+        self.assertNotIn(
+            "今晚吃什么呀", system, "本轮要回的那条不该同时在背景里再出现一遍"
+        )
+        # 同文的两条**别的**事件都还在：绝不按正文做全局去重
+        self.assertEqual(system.count("在吗"), 2)
+
+    async def test_tagging_the_origin_only_labels_the_record_that_was_added(self):
+        """来源在"新增成功"时定：去重没记下东西时一个字都不能改（以前会改错人）。"""
+
+        async with self.engine.session_state(SESSION) as state:
+            now = self.engine._now()
+            recorded = state.note_chat(
+                user_id="42", name="小明", text="在吗", now=now, keep=50
+            )
+            self.engine._tag_chat_origin(state, SESSION, recorded)
+            self.assertEqual(state.recent_chat[-1]["origin"], SESSION)
+
+            # 同一个事件被另一个钩子又记一次：没有新增，来源不能被改写
+            self.assertIsNone(
+                state.note_chat(
+                    user_id="42", name="小明", text="在吗", now=now + 0.2, keep=50
+                )
+            )
+            self.engine._tag_chat_origin(state, PRIVATE_SESSION, None)
+            self.assertEqual(state.recent_chat[-1]["origin"], SESSION)
+
+            # 不在留档里的对象（已经被裁掉了）：一个字都不改
+            stranger = {"user_id": "9", "text": "别人的一句"}
+            self.assertIsNone(
+                self.engine._tag_chat_origin(state, PRIVATE_SESSION, stranger)
+            )
+            self.assertNotIn("origin", stranger)
+
+            # 老调用方（不给 item）：只有"最后一条真的是刚记的"（序号追平）才敢标
+            state.note_chat(user_id="7", name="小红", text="新的一句", now=now + 1)
+            state.chat_seq += 1  # 之后又有东西进来，最后一条不再是刚记的那条
+            self.assertIsNone(self.engine._tag_chat_origin(state, PRIVATE_SESSION))
+            self.assertNotIn("origin", state.recent_chat[-1])
+
     async def test_answered_chat_survives_the_time_window(self):
         """已经回过话的那批不受时间窗限制：聊过一个小时，她也接得上刚说过的话。"""
 
@@ -5637,6 +5910,254 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
             # 没判（或判成不确定）时不动它
             self.engine._mark_reply_addressing(state, self.ctx(user_id="42"), "")
             self.assertEqual(str(state.recent_chat[-1].get("addressing")), "me")
+
+    async def test_the_router_verdict_lands_on_every_message_it_judged(self):
+        """路由的重投只带最后一条，判定却是整批给的：按事件身份认领回每一条留档。"""
+
+        for index, text in enumerate(("晚上吃什么", "随便", "你倒是说啊"), start=1):
+            await self.engine.note_presence(
+                self.ctx(
+                    user_id="42",
+                    user_name="小明",
+                    text=text,
+                    message_id=f"m-{index}",
+                    event_id=f"e-{index}",
+                )
+            )
+        await self.engine.note_presence(
+            self.ctx(
+                user_id="42",
+                user_name="小明",
+                text="你倒是说啊",
+                message_id="m-3",
+                event_id="e-3",
+                router={
+                    "policy": "latest",
+                    "batch": [
+                        {
+                            "message_id": "m-1",
+                            "sender_id": "42",
+                            "directed": False,
+                            "to": "大家",
+                            "reason": "在跟别人聊",
+                        },
+                        {
+                            "message_id": "m-2",
+                            "sender_id": "42",
+                            "directed": False,
+                            "to": "大家",
+                            "reason": "在跟别人聊",
+                        },
+                        {
+                            "message_id": "m-3",
+                            "sender_id": "42",
+                            "directed": True,
+                            "to": "机器人",
+                            "reason": "冲她说的",
+                        },
+                    ],
+                },
+            )
+        )
+
+        state = await self.get_state()
+        rows = {
+            str(item.get("message_id")): item
+            for item in state.recent_chat
+            if item.get("message_id")
+        }
+        self.assertIs(rows["m-1"].get("router_directed"), False)
+        self.assertEqual(str(rows["m-1"].get("router_to")), "大家")
+        self.assertEqual(str(rows["m-1"].get("router_reason")), "在跟别人聊")
+        self.assertIs(rows["m-3"].get("router_directed"), True)
+        self.assertEqual(str(rows["m-3"].get("router_to")), "机器人")
+        # 只标注、不下结论：要不要回、回什么仍然是主模型自己的事
+        for key in ("m-1", "m-2", "m-3"):
+            self.assertNotIn("addressing", rows[key])
+
+    async def test_the_router_verdict_never_overwrites_the_model_verdict(self):
+        """两个钩子会各记一次同一条消息：事后那份 addressing 不能被路由判定顶掉。"""
+
+        await self.engine.note_presence(
+            self.ctx(
+                user_id="42",
+                user_name="小明",
+                text="你倒是说啊",
+                message_id="m-9",
+                event_id="e-9",
+            )
+        )
+        async with self.engine.session_state(SESSION) as state:
+            self.engine._mark_reply_addressing(state, self.ctx(user_id="42"), "me")
+        # 路由的重投会再走一遍旁观钩子：这条被身份去重挡下（不新增记录），但判定要盖上
+        await self.engine.note_presence(
+            self.ctx(
+                user_id="42",
+                user_name="小明",
+                text="你倒是说啊",
+                message_id="m-9",
+                event_id="e-9",
+                router={
+                    "batch": [
+                        {
+                            "message_id": "m-9",
+                            "sender_id": "42",
+                            "directed": False,
+                            "to": "大家",
+                            "reason": "在跟别人聊",
+                        }
+                    ]
+                },
+            )
+        )
+
+        state = await self.get_state()
+        rows = [item for item in state.recent_chat if item.get("message_id") == "m-9"]
+        self.assertEqual(len(rows), 1, "身份去重之后不该多出一条")
+        self.assertEqual(str(rows[0].get("addressing")), "me")
+        self.assertIs(rows[0].get("router_directed"), False)
+        self.assertEqual(str(rows[0].get("router_to")), "大家")
+
+    async def test_without_event_identity_the_verdict_is_matched_by_text(self):
+        """老平台给不出事件身份：按「谁说的 + 正文」认，认不唯一就不认。"""
+
+        await self.engine.note_presence(self.ctx(user_id="42", text="你倒是说啊"))
+        await self.engine.note_presence(
+            self.ctx(
+                user_id="42",
+                text="你倒是说啊",
+                router={
+                    "batch": [
+                        {
+                            "message_id": "",
+                            "sender_id": "42",
+                            "text": "你倒是说啊",
+                            "directed": True,
+                            "to": "机器人",
+                            "reason": "冲她说的",
+                        }
+                    ]
+                },
+            )
+        )
+        state = await self.get_state()
+        self.assertIs(state.recent_chat[-1].get("router_directed"), True)
+        self.assertEqual(str(state.recent_chat[-1].get("router_to")), "机器人")
+
+        # 同一句话两个人说过、路由那边也没给发言人：认不出是哪条，宁可不标
+        await self.engine.note_presence(self.ctx(user_id="7", text="在吗"))
+        await self.engine.note_presence(self.ctx(user_id="8", text="在吗"))
+        await self.engine.note_presence(
+            self.ctx(
+                user_id="7",
+                text="在吗",
+                router={
+                    "batch": [
+                        {
+                            "message_id": "",
+                            "sender_id": "",
+                            "text": "在吗",
+                            "directed": True,
+                            "to": "机器人",
+                            "reason": "冲她说的",
+                        }
+                    ]
+                },
+            )
+        )
+        state = await self.get_state()
+        ambiguous = [item for item in state.recent_chat if item.get("text") == "在吗"]
+        self.assertEqual(len(ambiguous), 2)
+        for item in ambiguous:
+            self.assertNotIn("router_directed", item)
+
+    async def test_router_verdict_needs_a_batch_to_do_anything(self):
+        """空 dict / 没有 batch：一条都不该盖（没装路由的实例就是这条路）。"""
+
+        await self.engine.note_presence(
+            self.ctx(
+                user_id="42",
+                text="你倒是说啊",
+                message_id="m-1",
+                event_id="e-1",
+                router={},
+            )
+        )
+        state = await self.get_state()
+        self.assertNotIn("router_directed", state.recent_chat[-1])
+
+    async def test_the_earlier_lines_borrow_the_verdict_from_the_archive(self):
+        """并进这一轮的早几条是在判定之前登记的：判定要借留档那份才画得出来。
+
+        真机上「本轮 batch」里那几条就是这样——判定随最后一条一起到达，它们自己
+        那条待回记录里什么都没有；留档那条则被 `_stamp_router_view` 补盖过。
+        自己带了判定时不借（触发那条就是这么来的）。
+        """
+
+        origin = SESSION
+        archived = [
+            {
+                "user_id": "42",
+                "name": "小明",
+                "is_self": False,
+                "text": "先问一句",
+                "origin": origin,
+                "message_id": "m-early",
+                "event_id": "",
+                "at": 0.0,
+                "router_directed": False,
+                "router_to": "别人",
+                "router_reason": "在跟别人聊",
+            },
+            {
+                "user_id": "42",
+                "name": "小明",
+                "is_self": False,
+                "text": "你说呢",
+                "origin": origin,
+                "message_id": "m-late",
+                "event_id": "",
+                "at": 0.0,
+                # 留档上是旧的（比如已经过时的判定），记录自己那份更硬
+                "router_directed": False,
+                "router_to": "别人",
+            },
+        ]
+        batch = [
+            {
+                "user_id": "42",
+                "user_name": "小明",
+                "text": "先问一句",
+                "origin": origin,
+                "message_id": "m-early",
+                "event_id": "",
+                "at": 0.0,
+                "arrival_order": 1,
+            },
+            {
+                "user_id": "42",
+                "user_name": "小明",
+                "text": "你说呢",
+                "origin": origin,
+                "message_id": "m-late",
+                "event_id": "",
+                "at": 0.0,
+                "arrival_order": 2,
+                "trigger": True,
+                "router_directed": True,
+                "router_to": "机器人",
+                "router_reason": "冲她说的",
+            },
+        ]
+        entries = self.engine.reply_batch_entries(batch, chat_rows=archived)
+        self.assertEqual(len(entries), 2)
+        self.assertIs(entries[0].get("router_directed"), False)
+        self.assertEqual(entries[0].get("router_to"), "别人")
+        self.assertIs(entries[1].get("router_directed"), True)
+        self.assertEqual(entries[1].get("router_to"), "机器人")
+        # 借判定绝不能顺手把 addressing 也写出来（这一层是主模型回完后自己标的）
+        self.assertEqual(entries[0].get("addressing"), "")
+        self.assertEqual(entries[1].get("addressing"), "")
 
     async def test_a_hug_helps_more_when_she_is_really_low(self):
         """她真的低落时，被安抚走的是另一条通道：不占当天聊天额度，也不会被连着哄磨没。"""

@@ -2527,6 +2527,107 @@ class TestAddressingInfo(unittest.TestCase):
         self.assertEqual(self.module._addressing_kind([], {}, "10001"), "")
 
 
+class TestRouterDecisionHandoff(unittest.TestCase):
+    """意图路由交过来的事前判定：形状不对就当没有，认下来就原样带下去。
+
+    路由在重投那一刻把**整批**判定挂在事件上，本插件只做形状校验和取值，
+    不重新解释判定本身（它的含义以路由的 README 为准）。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.module = load_plugin_module()
+
+    class Ev:
+        def __init__(self, extra: Any) -> None:
+            self._extra = extra
+
+        def get_extra(self, key, default=None):
+            if key == "intent_router_decision":
+                return self._extra
+            return default
+
+    def test_a_real_payload_is_carried_over(self):
+        view = self.module._router_view(
+            self.Ev(
+                {
+                    "umo": "aiocqhttp:GroupMessage:1",
+                    "policy": "latest",
+                    "at": 1710.0,
+                    "batch": [
+                        {
+                            "sender": "小明",
+                            "sender_id": "42",
+                            "message_id": "m-1",
+                            "text": "晚上吃什么",
+                            "released": False,
+                            "worth": False,
+                            "directed": False,
+                            "to": "大家",
+                            "reply_score": 0.2,
+                            "reason": "在跟别人聊",
+                        },
+                        {
+                            "sender": "小明",
+                            "sender_id": "42",
+                            "message_id": "m-2",
+                            "text": "你倒是说啊",
+                            "released": True,
+                            "worth": True,
+                            "directed": True,
+                            "to": "机器人",
+                            "reply_score": 0.9,
+                            "reason": "冲她说的",
+                        },
+                    ],
+                }
+            )
+        )
+        self.assertEqual(view["policy"], "latest")
+        self.assertEqual(
+            [row["message_id"] for row in view["batch"]], ["m-1", "m-2"]
+        )
+        # 整批都留着：被合并掉、正文没进请求的那几条也要有判定
+        self.assertFalse(view["batch"][0]["released"])
+        self.assertFalse(view["batch"][0]["directed"])
+        self.assertTrue(view["batch"][1]["released"])
+        self.assertTrue(view["batch"][1]["directed"])
+        self.assertEqual(view["batch"][1]["to"], "机器人")
+
+    def test_junk_is_ignored_instead_of_crashing(self):
+        for extra in (
+            None,
+            "nope",
+            17,
+            {},
+            {"batch": "nope"},
+            {"batch": []},
+            {"batch": [1, 2, "x"]},
+            ["not", "a", "dict"],
+        ):
+            self.assertEqual(self.module._router_view(self.Ev(extra)), {}, extra)
+
+    def test_a_broken_score_does_not_sink_the_row(self):
+        view = self.module._router_view(
+            self.Ev(
+                {
+                    "batch": [
+                        {"message_id": "m-1", "reply_score": "abc", "to": None}
+                    ]
+                }
+            )
+        )
+        self.assertEqual(view["batch"][0]["reply_score"], 0.0)
+        self.assertEqual(view["batch"][0]["to"], "")
+        self.assertEqual(view["batch"][0]["message_id"], "m-1")
+
+    def test_an_event_without_get_extra_is_not_an_error(self):
+        class Bare:
+            pass
+
+        self.assertEqual(self.module._router_view(Bare()), {})
+
+
 class TestExtensionScopes(unittest.TestCase):
     """扩展页的「会话」选择器：会话组优先，组里的成员不再单独出现。"""
 

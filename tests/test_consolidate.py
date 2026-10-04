@@ -19,6 +19,7 @@ from core.profile import ProfileStore  # noqa: E402
 from core.prompt import PromptBuilder  # noqa: E402
 
 SESSION = "aiocqhttp:GroupMessage:1001"
+PRIVATE = f"aiocqhttp:PrivateMessage:{2692047521}"
 USER = "2692047521"
 
 
@@ -369,6 +370,85 @@ class ConsolidateTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不相疑", lines[0])
         self.assertIn(USER, lines[0])
         self.assertIn("忘了吃早饭", lines[0])
+
+    async def test_chat_lines_carry_where_each_line_was_said(self):
+        """整理素材要带来源：群和私聊共用一个世界，不标"这是哪儿说的"会揉成一件事。"""
+
+        records = [
+            {**self._chat()[0], "origin": SESSION},
+            {**self._chat()[1], "origin": PRIVATE, "text": "私聊里我才说：其实我有点怕"},
+        ]
+        labels = {SESSION: "群 1001「夜班吐槽群」", PRIVATE: "私聊 2692047521"}
+        lines = self.consolidator.chat_lines(records, session_labels=labels)
+        self.assertIn("群 1001「夜班吐槽群」", lines[0])
+        self.assertIn("私聊 2692047521", lines[1])
+        # 群和私聊两种来源同时出现在材料里（一行一个来源，不按会话过滤素材）
+        self.assertEqual(len(lines), 2)
+
+    async def test_chat_lines_fall_back_to_a_readable_label(self):
+        """引擎没传标签时也要能给个人话来源（按会话 id 现推），不能空着。"""
+
+        records = [{**self._chat()[0], "origin": SESSION}]
+        lines = self.consolidator.chat_lines(records)
+        self.assertIn("群 1001", lines[0])
+
+    async def test_memory_lines_carry_where_the_memory_came_from(self):
+        """已有记忆也要带来源：同组另一个会话里记下的，折叠时不能当成这里的。"""
+
+        self.memory.remember(
+            session_id=SESSION,
+            persona_id="",
+            node_id="study",
+            content="他喜欢在群里聊吃的",
+            memory_type="event",
+            weight=0.8,
+        )
+        self.memory.remember(
+            session_id=PRIVATE,
+            persona_id="",
+            node_id="study",
+            content="他在私聊里说过怕黑",
+            memory_type="event",
+            weight=0.8,
+        )
+        labeled = Consolidator(
+            world=self.world,
+            memory=self.memory,
+            profiles=self.profiles,
+            prompts=self.prompts,
+            sessions_of=lambda _session_id: [SESSION, PRIVATE],
+            session_label=lambda session_id: {
+                SESSION: "群 1001",
+                PRIVATE: "私聊 2692047521",
+            }.get(str(session_id), str(session_id)),
+        )
+        lines = labeled.memory_lines(SESSION)
+        blob = "\n".join(lines)
+        self.assertIn("群 1001", blob)
+        self.assertIn("私聊 2692047521", blob)
+        self.assertIn("怕黑", blob)
+
+    async def test_dry_run_prompt_shows_both_sources(self):
+        """整理提示词里要能看到来源（群和私聊同时出现），模型才知道哪句在哪儿说的。"""
+
+        async def llm(_system: str, _prompt: str) -> str:
+            return json.dumps({"memories": [], "dream": ""}, ensure_ascii=False)
+
+        records = [
+            {**self._chat()[0], "origin": SESSION},
+            {**self._chat()[1], "origin": PRIVATE, "text": "私聊里我才说：其实我有点怕"},
+        ]
+        result = await self.consolidator.run(
+            session_id=SESSION,
+            llm=llm,
+            chat_records=records,
+            session_labels={SESSION: "群 1001", PRIVATE: "私聊 2692047521"},
+            current_session=SESSION,
+            dry_run=True,
+        )
+        user_prompt = str(result.preview.get("user") or "")
+        self.assertIn("群 1001", user_prompt)
+        self.assertIn("私聊 2692047521", user_prompt)
 
 
 if __name__ == "__main__":

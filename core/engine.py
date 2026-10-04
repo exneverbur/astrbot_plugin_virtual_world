@@ -503,6 +503,19 @@ class MessageContext:
     addressing: str = ""
     """这句是冲谁说的：``me``（点了她）/ ``others``（在叫别人）/ 空（看不出来）。"""
 
+    router: dict = field(default_factory=dict)
+    """意图路由交过来的**事前**判定：``{"policy": ..., "batch": [...]}``（空 = 没有）。
+
+    ``batch`` 里每条是 ``{"sender", "sender_id", "message_id", "text", "released",
+    "worth", "directed", "to", "reply_score", "reason"}``，按到达顺序列出这一批的
+    **每一条**（含被合并成一次回复、正文没进请求的那几条），``directed`` 就是路由
+    判断模型答的「这句是不是冲她说的」。
+
+    和 ``addressing`` 的区别：``addressing`` 是主模型**回完之后**自己标的（只认
+    结构化的 @ 与引用），这个在收到消息的那一刻就有，所以能提前给被合并掉的那几条
+    作证；两边都不覆盖对方，记录里各占一个字段。
+    """
+
     raw_text: str = ""
     """注解**之前**的原文（``text`` 是注解之后、真正给模型看的文本）。
 
@@ -997,6 +1010,8 @@ class VirtualWorldEngine:
             memory=self.memory,
             profiles=self.profiles,
             sessions_of=self.group_sessions,
+            # 整理材料要标来源会话（群 / 私聊）：用和人话提示词同一套标签口径
+            session_label=self.session_label,
         )
         self.decider = Decider(
             world,
@@ -4039,7 +4054,7 @@ class VirtualWorldEngine:
             profile_text = self.profile_block(state)
         limit = max(1, min(8, int(concurrency or 3)))
         gate = asyncio.Semaphore(limit)
-        recent_chat = self.chat_window(state)
+        recent_chat = self.chat_window(state, session_id)
 
         async def one(
             index: int, item: dict[str, Any], prev_analysis: str = ""
@@ -6050,6 +6065,144 @@ class VirtualWorldEngine:
                 pass
         return False
 
+    ROUTER_LOOKBACK = 12
+    """盖路由判定时往回复查几条留档：一批默认 5 条，宽一点够用，又不会乱认到旧消息。"""
+
+    @staticmethod
+    def _router_row_fields(row: dict | None) -> dict[str, Any]:
+        """路由判定 → 留档字段（认不出就是空 dict）。
+
+        认两种来源：路由给的那一行原始判定（键是 ``directed`` / ``to`` / ``reason``），
+        或者**已经盖过章的留档**（键是 ``router_directed`` / ``router_to`` /
+        ``router_reason``，渲染时要原样带出去）。两样都没有——比如一条普通聊天记录——
+        就返回空 dict，绝不凭空写一个"不是在跟你说话"。
+
+        只写路由自己的字段，**绝不碰** ``addressing``：那个是主模型回完之后自己标的
+        （见 :meth:`_mark_reply_addressing`），事后会无条件覆盖，两边各占各的。
+        """
+
+        if not isinstance(row, dict):
+            return {}
+        if "directed" in row:
+            directed = bool(row.get("directed"))
+            to_value, reason_value = row.get("to"), row.get("reason")
+        elif "router_directed" in row:
+            directed = bool(row.get("router_directed"))
+            to_value, reason_value = row.get("router_to"), row.get("router_reason")
+        else:
+            return {}
+        fields: dict[str, Any] = {"router_directed": directed}
+        to = " ".join(str(to_value or "").split())
+        if to:
+            fields["router_to"] = to[:40]
+        reason = " ".join(str(reason_value or "").split())
+        if reason:
+            fields["router_reason"] = reason[:160]
+        return fields
+
+    @staticmethod
+    def _router_row_for(ctx: MessageContext) -> dict[str, Any] | None:
+        """ctx 上那份判定里属于**这条消息**的那一条（认不出就是 None）。"""
+
+        view = ctx.router if isinstance(ctx.router, dict) else {}
+        rows = view.get("batch") if isinstance(view.get("batch"), list) else []
+        key = str(ctx.message_id or "").strip()
+        if key:
+            for row in rows:
+                if (
+                    isinstance(row, dict)
+                    and str(row.get("message_id") or "").strip() == key
+                ):
+                    return row
+        if len(rows) == 1 and isinstance(rows[0], dict):
+            return rows[0]
+        return None
+
+    @staticmethod
+    def _router_line_matches(row: dict, item: dict) -> bool:
+        """老平台没有事件身份时，一条判定算不算这条留档的「谁说的 + 正文」。
+
+        正文可能被留档那一步掐短、或带上注释尾巴，所以不比逐字：一边是另一边的
+        开头也算同一条（短的那边至少 4 个字）；发言人给得出就必须对得上。
+        """
+
+        def same_line(left: Any, right: Any) -> bool:
+            left = chat_core_text(str(left or ""))
+            right = chat_core_text(str(right or ""))
+            if not left or not right:
+                return False
+            if left == right:
+                return True
+            short, long = (left, right) if len(left) <= len(right) else (right, left)
+            return len(short) >= 4 and long.startswith(short)
+
+        if not same_line(row.get("text"), item.get("text")):
+            return False
+        uid = str(item.get("user_id") or "")
+        sender = str(row.get("sender_id") or "")
+        return not uid or not sender or sender == uid
+
+    def _stamp_router_view(
+        self, state: WorldState, ctx: MessageContext, recorded: dict | None = None
+    ) -> int:
+        """按事件身份把意图路由的事前判定盖到对应留档上；返回盖了几条。
+
+        路由一次给的是**整批**判定，而它重投的只有最后一条：前面几条早在到达时就
+        留过档了（本插件旁观钩子的优先级比路由高，先记）。所以这里不新建记录，
+        只用 ``message_id`` 认领已有那几条补一段标注——正文根本没进这一轮请求的
+        那几条，也就只有这份判定能说明它们冲谁说。
+
+        实在拿不到事件身份（老平台）才退回「谁说的 + 正文」，而且**必须认得唯一**：
+        同一句话两个人说过就不猜，宁可不标。
+        """
+
+        view = ctx.router if isinstance(ctx.router, dict) else {}
+        rows = view.get("batch") if isinstance(view.get("batch"), list) else []
+        if not rows:
+            return 0
+        index: dict[str, dict] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("message_id") or "").strip()
+            if not key:
+                continue
+            old = index.get(key)
+            # 同一条被发了两次（理论上不该有）：以真正放行的那条为准
+            if old is None or (row.get("released") and not old.get("released")):
+                index[key] = row
+        history = [
+            item
+            for item in list(state.recent_chat or [])[-self.ROUTER_LOOKBACK :]
+            if isinstance(item, dict)
+        ]
+        stamped = 0
+        for item in history:
+            key = str(item.get("message_id") or "").strip()
+            row = index.get(key) if key else None
+            if row is None:
+                continue
+            item.update(self._router_row_fields(row))
+            stamped += 1
+        if index:
+            return stamped
+        # 一条身份都对不上：只可能是老平台，按正文认——一条判定只认一条留档
+        claimed: set[int] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            candidates = [
+                item
+                for item in history
+                if id(item) not in claimed and self._router_line_matches(row, item)
+            ]
+            if len(candidates) != 1:
+                continue
+            candidates[0].update(self._router_row_fields(row))
+            claimed.add(id(candidates[0]))
+            stamped += 1
+        return stamped
+
     def _mark_reply_addressing(
         self, state: WorldState, ctx: MessageContext, addressing: str
     ) -> str:
@@ -6965,6 +7118,9 @@ class VirtualWorldEngine:
             }
         # 这条是触发者：渲染时它的名字/身份决定"这句是冲谁说的"那一层
         record["trigger"] = True
+        # 意图路由的事前判定跟着触发者走（留档那条由 _note_presence 盖，
+        # 待回队列这条在这儿盖，渲染时两边都看得到）
+        record.update(self._router_row_fields(self._router_row_for(ctx)))
         return [record]
 
     def reply_batch_entries(
@@ -7025,6 +7181,14 @@ class VirtualWorldEngine:
                     "at_targets": list(record.get("at_targets") or []),
                     "reply_to": dict(record.get("reply_to") or {}),
                     "addressing": str(record.get("addressing") or ""),
+                    # 意图路由的事前判定（没装路由 / 那条没判定就没有这几个键）：
+                    # 待回队列里那几条是**判定之前**登记的，自己没这份数据，就借留档
+                    # 那一份——`_stamp_router_view` 在触发那条到达时已经把整批的判定
+                    # 补盖到留档上了（没有留档时才真的没有）。
+                    **(
+                        self._router_row_fields(record)
+                        or self._router_row_fields(row)
+                    ),
                     "images": list(images),
                     "captions": dict(captions),
                     "is_trigger": bool(record.get("trigger")),
@@ -7456,7 +7620,7 @@ class VirtualWorldEngine:
             # 模型才知道自己刚用了什么说法，才能被要求换一种。
             # 已经即时发出去的那几句也算她说过（不然她刚说"等我两分钟"就不记得了）。
             for message in outcome.said_messages():
-                state.note_chat(
+                recorded = state.note_chat(
                     user_id="__self__",
                     name=state.bot_current_nickname or state.bot_base_nickname or "你",
                     text=message,
@@ -7467,8 +7631,9 @@ class VirtualWorldEngine:
                 )
                 state.note_reply(message, session_id=ctx.session_id)
                 self.note_dialogue(state, text=message, is_self=True)
-                # 这句话是在哪个会话里说的：留档只有一份，来源要标出来
-                self._tag_chat_origin(state, ctx.session_id)
+                # 这句话是在哪个会话里说的：留档只有一份，来源要标出来。
+                # 用 note_chat 的返回值定位那一条（重复没记时是 None → 什么都不改）
+                self._tag_chat_origin(state, ctx.session_id, recorded)
             # 水位线不在这里推进：改成**确实发出去之后**由发送方通知
             # （见 main.py 里的 mark_chat_replied_by_session）。这样被丢弃的、
             # 或发送失败的回复不会把"这批消息已经回过"记下来，下一轮还会看到它们。
@@ -7658,7 +7823,7 @@ class VirtualWorldEngine:
         if not self.is_plugin_command(ctx.text):
             # 插件自己的指令（/vw …）不算"群里说的话"：它是管理入口，不是有人在跟她讲话。
             # 不挡的话她会把「/vw event 逛街被跟了」当成"主人讲给我听的事"。
-            state.note_chat(
+            recorded = state.note_chat(
                 user_id=ctx.user_id or "unknown",
                 name=ctx.user_name,
                 text=ctx.text,
@@ -7669,7 +7834,7 @@ class VirtualWorldEngine:
                 message_id=ctx.message_id,
                 event_id=ctx.event_id,
             )
-            self._tag_chat_origin(state, ctx.session_id)
+            self._tag_chat_origin(state, ctx.session_id, recorded)
         self._note_session_activity(state, ctx)
         state.last_user_activity_at = now
         self.engagement.on_user_replied(state)
@@ -8153,6 +8318,10 @@ class VirtualWorldEngine:
             ),
             mode=mode,
             chat_records=records,
+            # 素材带来源标签：群和私聊共用一个世界，不标出"这是哪儿说的"，
+            # 模型会把两处的对话压成同一件事（记忆还是各存各的，只是标签不同）
+            session_labels=self.session_labels(state),
+            current_session=session_id,
             persona_text=await self._persona_text(session_id),
             pending=self._consolidate_pending(state),
             dry_run=dry_run,
@@ -9578,7 +9747,7 @@ class VirtualWorldEngine:
         # 旁观这条钩子也会收到每一句话：指令（``/vw …``）在这儿同样得挡住，
         # 不然它会从这条路溜进她的聊天记录——她就会一本正经地回一句"你怎么又敲这指令"。
         if self._passes_safety(ctx.text) and not self.is_plugin_command(ctx.text):
-            state.note_chat(
+            recorded = state.note_chat(
                 user_id=ctx.user_id,
                 name=ctx.user_name,
                 text=ctx.text,
@@ -9592,7 +9761,9 @@ class VirtualWorldEngine:
                 message_id=ctx.message_id,
                 event_id=ctx.event_id,
             )
-            self._tag_chat_origin(state, ctx.session_id)
+            self._tag_chat_origin(state, ctx.session_id, recorded)
+            # 意图路由放行时交过来的事前判定：按事件身份盖到这一批对应的留档上
+            self._stamp_router_view(state, ctx, recorded)
         state.last_user_activity_at = self._now()
         if ctx.is_wake:
             # 有人 @她，就算一次有效互动
@@ -11698,6 +11869,8 @@ class VirtualWorldEngine:
         persona_text = await self._persona_text(state.session_id)
         _cell, say_limit, style_text = self.style_for(state, state.session_id)
         blocked_actions = self._hidden_actions(state)
+        # 续说落在哪个会话里：它同时决定"取哪一份聊天窗口"和"当前会话是谁"
+        home = outcome.home()
         system_prompt = self.prompts.build_autonomous_system_prompt(
             persona_text=persona_text,
             state=state,
@@ -11711,13 +11884,16 @@ class VirtualWorldEngine:
             ),
             engagement_hint=self.engagement.hint(state),
             max_messages=say_limit,
-            recent_chat=self.chat_window(state),
+            # 取窗口的会话必须**和 current_session 是同一个**：不然这里按代表会话
+            # 的额度取（目标会话的话被挤进"别处听到的"），她续说时聊的根本不是
+            # 自己刚在说话的那个地方，已回应过的历史也补不齐。
+            recent_chat=self.chat_window(state, home),
             reasoning=bool(self.world.reasoning_enabled),
             style_block=style_text,
             hidden_actions=blocked_actions,
             session_directory=self.session_directory(state),
             # 她此刻是在哪个会话里说话：这里/别处的划分、水位线都按它算
-            current_session=outcome.home(),
+            current_session=home,
             session_labels=self.session_labels(state),
             profile_text=self.profile_block(state),
             extra_notes=[note for note in [self.extra_reminders(state)] if note],
@@ -12127,6 +12303,9 @@ class VirtualWorldEngine:
             ),
             engagement_hint=self.engagement.hint(state),
             max_messages=say_limit,
+            # 计划轮**没有**明确目标会话（她还没决定说给谁）：故意不传 session_id，
+            # 按代表会话取一份窗口、别处的当背景——这就是"全组视图"的语义。
+            # 别照抄这条到定向入口上（那些地方必须传目标会话，见 chat_window 的说明）。
             recent_chat=self.chat_window(state),
             mode="plan",
             reasoning=bool(self.world.reasoning_enabled),
@@ -16393,7 +16572,9 @@ class VirtualWorldEngine:
             available_tools=self.available_tools(),
             engagement_hint=self.engagement.hint(state),
             max_messages=say_limit,
-            recent_chat=self.chat_window(state),
+            # 这一轮是要说给 current（定向会话）听的：窗口也必须按它取，
+            # 否则目标会话的话可能只落进"别处听到的"，本会话的上下文反而是代表会话的。
+            recent_chat=self.chat_window(state, current),
             reasoning=bool(self.world.reasoning_enabled),
             style_block=style_text,
             profile_text=self.profile_block(state),
@@ -17198,6 +17379,15 @@ class VirtualWorldEngine:
         「最多带几行」是**按会话各自算**的：这里那一份取 `chat_lines` 行，
         别处同时听到的取 `chat_elsewhere_lines` 行。以前是在所有会话的留档上一起取
         "最近 N 行"，于是私聊聊得多的时候，群里刚说的话会被挤出去。
+
+        ``session_id`` 就是"这一轮要说给谁听 / 她的这句话落在哪儿"：
+        **凡是有明确目标的定向入口（回复、续说、定向自主发言、测评、自主提示词预览）
+        都必须传目标会话**，让 `current_session` 和这里取的是同一份——
+        不传就等于按代表会话（``state.session_id``）取，目标会话的话可能只落进
+        "别处听到的"那一块，她也会觉得"我明明在那边说话，上下文却是这边的"。
+        没有明确目标的**全组视图**入口（例如 :meth:`_ask_llm_for_plan` 那种
+        "她自己决定下一步做什么"的计划轮）才故意不传：那一轮她还没决定在哪儿说，
+        所以按代表会话取一份、别处的当背景，正是想要的语义。
         """
 
         config = self.world.decider
@@ -17408,6 +17598,37 @@ class VirtualWorldEngine:
         now = self._now()
         target = str(session_id or state.session_id)
         previous, previous_seq = self._watermark(state, target)
+        if keys is not None:
+            # 只算"这一轮真的回过"的那几条：本轮之后才到的消息留在水位线外。
+            # **预览必须和它同源**：下面这几条是这一轮真的处理过的事件集合，
+            # 发送期间新到的消息不算，否则下一轮的「你刚回应过的那批」里会冒出
+            # 她根本没看过的新话——她会当成"我刚才回过这个"。
+            answered = [
+                item
+                for item in state.recent_chat
+                if str(item.get("origin") or state.session_id) == target
+                and str(item.get("event_key") or "") in keys
+            ]
+            preview = _summarize_batch(answered)
+            if preview:
+                # 按会话存：群里回的那批不该跑到私聊里当"刚聊过的"
+                state.chat_previews = {
+                    **dict(state.chat_previews or {}),
+                    target: {"text": preview, "at": now},
+                }
+            if not answered:
+                return
+            bound_seq = max([int(item.get("seq") or 0) for item in answered] or [0])
+            bound_at = max([float(item.get("at") or 0.0) for item in answered] or [0.0])
+            self._set_watermark(
+                state,
+                target,
+                until=max(previous, bound_at),
+                seq=max(previous_seq, bound_seq),
+            )
+            return
+        # 老调用方（没给 keys）：沿用"推到本会话此刻最新那条"的老行为，
+        # 预览也还是这个会话里全部没回应过的消息——它没法知道哪几条真的处理了。
         batch = [
             item
             for item in state.recent_chat
@@ -17422,30 +17643,10 @@ class VirtualWorldEngine:
         ]
         preview = _summarize_batch(batch)
         if preview:
-            # 按会话存：群里回的那批不该跑到私聊里当"刚聊过的"
             state.chat_previews = {
                 **dict(state.chat_previews or {}),
                 target: {"text": preview, "at": now},
             }
-        if keys is not None:
-            # 只算"这一轮真的回过"的那几条：本轮之后才到的消息留在水位线外
-            answered = [
-                item
-                for item in state.recent_chat
-                if str(item.get("origin") or state.session_id) == target
-                and str(item.get("event_key") or "") in keys
-            ]
-            if not answered:
-                return
-            bound_seq = max([int(item.get("seq") or 0) for item in answered] or [0])
-            bound_at = max([float(item.get("at") or 0.0) for item in answered] or [0.0])
-            self._set_watermark(
-                state,
-                target,
-                until=max(previous, bound_at),
-                seq=max(previous_seq, bound_seq),
-            )
-            return
         _, seq_now = self._watermark(state, target)
         # 水位线推到"这个会话里最新那条"：跨会话的水位线不能互相顶掉
         session_seq = max(
@@ -17616,13 +17817,21 @@ class VirtualWorldEngine:
         return self.chat_summary_for(state, state.session_id)
 
     def chat_summary_for(self, state: WorldState, session_id: str) -> str:
-        """某个会话"更早聊过的"那一段（分会话存；老存档只有全局那份）。"""
+        """某个会话"更早聊过的"那一段（分会话存；老存档只有全局那份）。
+
+        老存档那份全局摘要的**主人是 ``state.session_id``**（和
+        :meth:`chat_summary_map`、``clear_chat_context`` 的口径一致）：
+        只有问的就是它才回落。别的会话没有自己的摘要时返回空串——
+        把存档会话的旧摘要当成这里的，她会把在别处说过的事讲成“我们刚才在这儿聊的”。
+        """
 
         key = str(session_id or state.session_id or "")
         entry = dict((state.chat_summaries or {}).get(key) or {})
         text = str(entry.get("text") or "").strip()
         if text:
             return text
+        if key != str(state.session_id or ""):
+            return ""
         return str(state.chat_summary or "").strip()
 
     def chat_summary_map(self, state: WorldState) -> dict[str, str]:
@@ -17655,6 +17864,15 @@ class VirtualWorldEngine:
         """清空**这个会话**的群聊留档与摘要（调试用：想看她"第一次听到"的反应时很有用）。
 
         会话组里别的群 / 私聊的留档与摘要不受影响——它们本来就是分开记的。
+
+        清的是**这个会话的上下文**：留档（``recent_chat`` / ``chat_dropped``）、
+        「更早聊过的」摘要（``chat_summaries[target]`` 与老字段 ``chat_summary``）、
+        「刚才在聊什么」（``chat_notes[target]``）和「她刚回应过的那批」
+        （``chat_previews[target]``）。后两个也是**分会话上下文**：留着的话
+        下一轮提示词里还会写着"上一轮你们在聊：…"，看起来就像清空没生效。
+
+        ``recent_replies`` **故意不清**：它是"别重复自己的句式"的**风格记忆**，
+        不是会话上下文——清掉之后她会把刚说过的口头禅、称呼原样再说一遍。
         """
 
         async with self.session_state(session_id) as state:
@@ -17674,9 +17892,22 @@ class VirtualWorldEngine:
                 for key, value in dict(state.chat_summaries or {}).items()
                 if str(key) != target
             }
+            # 会话上下文的小尾巴：不留的话"清空上下文"之后她还记得刚才在聊什么
+            state.chat_notes = {
+                key: value
+                for key, value in dict(state.chat_notes or {}).items()
+                if str(key) != target
+            }
+            state.chat_previews = {
+                key: value
+                for key, value in dict(state.chat_previews or {}).items()
+                if str(key) != target
+            }
             if target == str(state.session_id):
-                # 老字段（全局摘要）就是这个会话的，一起清掉
+                # 老字段（全局摘要 / 全局备忘 / 全局预览）就是这个会话的，一起清掉
                 state.chat_summary = ""
+                state.chat_note = ""
+                state.chat_preview = ""
             await self._log_event(
                 state,
                 "context",
@@ -18086,7 +18317,7 @@ class VirtualWorldEngine:
 
         note = " ".join(str(label or "").split())[:40]
         text = f"［我发了一张图片：{note}］" if note else "［我发了一张图片］"
-        state.note_chat(
+        recorded = state.note_chat(
             user_id="__self__",
             name=state.bot_current_nickname or state.bot_base_nickname or "你",
             text=text,
@@ -18095,21 +18326,47 @@ class VirtualWorldEngine:
             is_self=True,
             origin=session_id or state.session_id,
         )
-        self._tag_chat_origin(state, session_id or state.session_id)
+        self._tag_chat_origin(state, session_id or state.session_id, recorded)
 
-    def _tag_chat_origin(self, state: WorldState, session_id: str) -> None:
+    def _tag_chat_origin(
+        self,
+        state: WorldState,
+        session_id: str,
+        item: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         """给刚记下的那条留档标上"在哪儿说的"。
 
         分过组的会话共用同一份留档，别的地方说的话要标出来源——
         提示词里她才知道那句不是当前这个群里说的。
+
+        ``item``：``state.note_chat(...)`` 的返回值（**刚记下的那一条**）。
+        判定为重复而没记时它返回 ``None``，这时**一个字都不能改**——
+        以前无条件改 ``recent_chat[-1]``，去重命中时被改的是上一条（很可能是
+        别的会话的记录），于是当前会话凭空多出一条"在这儿说过的话"。
+        没传 ``item`` 时退回"最后一条"，但会先确认它**真的就是刚记下的那条**：
+        序号等于当前的 ``chat_seq``，而且**还没有来源**（已经标过的说明它早就
+        记下过了，这次调用很可能只是去重命中）。对不上就不动，
+        免得又回到"改错人"的老毛病上。
         """
 
-        if not state.recent_chat:
-            return
-        item = state.recent_chat[-1]
         origin = str(session_id or state.session_id)
-        item["origin"] = origin
-        item.pop("via", None)
+        target = item
+        if target is not None:
+            if not any(entry is target for entry in state.recent_chat):
+                return None
+        else:
+            if not state.recent_chat:
+                return None
+            last = state.recent_chat[-1]
+            if int(last.get("seq") or -1) != int(state.chat_seq or 0):
+                return None
+            if str(last.get("origin") or ""):
+                # 已经有来源：不是"这次刚记下、还没标"的那条（去重命中时就是这个样子）
+                return None
+            target = last
+        target["origin"] = origin
+        target.pop("via", None)
+        return target
 
     def session_labels(self, state: WorldState) -> dict[str, str]:
         """通讯录里每个会话怎么称呼：渲染"你在别处听到的"时用。"""
@@ -18245,7 +18502,7 @@ class VirtualWorldEngine:
                 # 自己说过的话也进聊天上下文：模型才知道"刚才那句是我说的"，
                 # 并被要求换一种说法，避免每轮都用同一个句式开场。
                 for message in said:
-                    state.note_chat(
+                    recorded = state.note_chat(
                         user_id="__self__",
                         name=state.bot_current_nickname or state.bot_base_nickname or "你",
                         text=message,
@@ -18257,7 +18514,7 @@ class VirtualWorldEngine:
                     state.note_reply(message, session_id=outcome.session_id)
                     self.note_dialogue(state, text=message, is_self=True)
                     # 这句是在哪个会话里说的（留档只有一份，来源要标出来）
-                    self._tag_chat_origin(state, outcome.session_id)
+                    self._tag_chat_origin(state, outcome.session_id, recorded)
                 for target, messages in routed.items():
                     await self._log_event(
                         state,
@@ -18270,7 +18527,7 @@ class VirtualWorldEngine:
                         },
                     )
                     for message in messages:
-                        state.note_chat(
+                        recorded = state.note_chat(
                             user_id="__self__",
                             name=state.bot_current_nickname
                             or state.bot_base_nickname
@@ -18283,7 +18540,7 @@ class VirtualWorldEngine:
                         )
                         state.note_reply(message, session_id=target)
                         self.note_dialogue(state, text=message, is_self=True)
-                        self._tag_chat_origin(state, target)
+                        self._tag_chat_origin(state, target, recorded)
             # 调试用的动作回显不算"她说过的话"：不进聊天上下文、不计无人回应保护
         sent = False
         # Send each default result exactly once per selected concrete destination.
@@ -18777,7 +19034,8 @@ class VirtualWorldEngine:
             ),
             engagement_hint=self.engagement.hint(state),
             max_messages=say_limit,
-            recent_chat=self.chat_window(state),
+            # 预览和实跑必须同源：窗口也用 session_id 这个目标会话取
+            recent_chat=self.chat_window(state, session_id),
             reasoning=bool(self.world.reasoning_enabled),
             style_block=style_text,
             # 预览要和实跑一致：自主提示词里也要有"你能说话的地方"

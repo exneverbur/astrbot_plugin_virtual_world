@@ -1234,7 +1234,7 @@ class WorldState:
         addressing: str = "",
         message_id: str = "",
         event_id: str = "",
-    ) -> None:
+    ) -> dict[str, Any] | None:
         """记录一条群聊内容（用于判断"大家在聊什么"）。
 
         ``images`` 是这条消息带的图片地址：留着是为了「聊天记录里的图直接交给
@@ -1249,11 +1249,16 @@ class WorldState:
         ``internal``：插件自己写进去的"她身上发生的事"（事件的结果）。
         它不是谁说的话，也不该被当成"还没回的消息"——渲染时会标出来，
         水位线判定也会直接跳过它。
+
+        返回**刚记下的那条**（dict，就是 ``recent_chat`` 里那一个对象）；
+        判定为重复而没记时返回 ``None``。调用方要补标来源/身份时用返回值，
+        不要假定"最后一条就是刚记的"——去重命中的情况下最后一条是旧的那条，
+        照着改会把别的会话的记录改到当前会话头上。
         """
 
         clean = (text or "").strip()
         if not clean:
-            return
+            return None
         # 同一条消息可能同时经过"旁观监听"和"LLM 请求"两个钩子，去重避免上下文里重复出现。
         #
         # 有事件身份（平台 message_id / 监听侧生成的内部 id）时**只按身份去重**：
@@ -1265,18 +1270,29 @@ class WorldState:
         if key:
             for item in reversed(self.recent_chat[-8:]):
                 if str(item.get("event_key") or "") == key:
-                    return
+                    return None
         else:
-            # 老路径（拿不到身份）：退回到"同一个人、短时间内、内容基本一样"的有限兜底。
-            # 两个钩子拿到的文本可能差一点点（一个带 @ 前缀、一个被管线改写过），
-            # 所以这里不是逐字比较。
+            # 老路径（拿不到身份）：退回到"**同一个会话、同一个人**、短时间内、
+            # 内容基本一样"的有限兜底。两个钩子拿到的文本可能差一点点
+            # （一个带 @ 前缀、一个被管线改写过），所以这里不是逐字比较。
+            #
+            # 来源是这条兜底必须比的一项：同一个人在私聊里说「在吗」、又在群里说
+            # 「在吗」，是两件事（组里的会话共用一份留档）；只看"同一个人 + 同正文"
+            # 会把后一条吞掉，她就再也不知道他在群里也叫过她。
+            # 归一化用 ``origin or self.session_id``，和 :meth:`_trim_chat` 分桶、
+            # :meth:`chat_group_key` 的口径一致（老条目没有 origin 就算建档会话）。
+            source = str(origin or self.session_id or "")
             for item in reversed(self.recent_chat[-4:]):
                 if str(item.get("user_id")) != str(user_id):
+                    continue
+                if bool(item.get("is_self")) != bool(is_self):
+                    continue
+                if str(item.get("origin") or self.session_id or "") != source:
                     continue
                 age = now - float(item.get("at", 0))
                 old = str(item.get("text") or "")
                 if age <= _CHAT_DEDUPE_SECONDS and _same_chat_text(old, clean):
-                    return
+                    return None
                 # 一份带注释、一份不带（例如「亲亲」和「亲亲［这条消息 @ 了：你（…）］」）：
                 # 把注释切掉再比一次。上面那条规则要求最少 4 个字，短消息靠它认不出来，
                 # 于是同一句话会存两遍，她就会以为对方说了两次。
@@ -1286,7 +1302,7 @@ class WorldState:
                     and (trimmed_old != old or trimmed_new != clean)
                     and _same_chat_text(trimmed_old, trimmed_new)
                 ):
-                    return
+                    return None
                 break
         limit = (
             _FORWARD_TEXT_CHARS if FORWARD_SUMMARY_MARK in clean else _CHAT_TEXT_CHARS
@@ -1348,6 +1364,7 @@ class WorldState:
             wanted = bool(getattr(self, "buffer_dropped_chat", buffer_dropped))
             if wanted:
                 self.chat_dropped = [*self.chat_dropped, *dropped][-CHAT_DROPPED_KEEP:]
+        return item
 
     def _trim_chat(self, keep: int) -> list[dict[str, Any]]:
         """留档超上限时裁掉最早的那几条，**按会话各自裁**。
@@ -1438,8 +1455,12 @@ class WorldState:
     ) -> str:
         """这个会话「刚才在聊什么」：模型上一轮顺手写的那句背景。
 
-        ``max_minutes`` 之后就不再算"刚才"（0 = 不限）；老存档里只有一份全局的，
-        这里当回落。提示词和编辑器都用这一个实现，免得两处口径不一样。
+        ``max_minutes`` 之后就不再算"刚才"（0 = 不限）。老存档里只有一份全局的
+        （``chat_note``），**那份的主人是 ``self.session_id``**：只有问的就是它才
+        回落（和 :meth:`from_payload` 的迁移口径、``chat_summary_map`` 一致），
+        别的会话缺自己的条目时返回空串——把别的会话的旧备忘当成这里的，
+        她会以为"刚才在这儿聊的事"其实是在别处说的。
+        提示词和编辑器都用这一个实现，免得两处口径不一样。
         """
 
         target = str(session_id or self.session_id or "")
@@ -1449,7 +1470,8 @@ class WorldState:
             at = float(entry.get("at") or 0.0)
         except (TypeError, ValueError):
             at = 0.0
-        if not text:
+        if not text and target == str(self.session_id or ""):
+            # 老存档的全局字段只属于建档的那个会话
             text = str(self.chat_note or "").strip()
             at = 0.0
         if not text:
@@ -1459,13 +1481,20 @@ class WorldState:
         return text
 
     def chat_preview_text(self, session_id: str = "") -> str:
-        """这个会话「她刚回应过的那批」的概览（留档被裁掉时的兜底背景）。"""
+        """这个会话「她刚回应过的那批」的概览（留档被裁掉时的兜底背景）。
+
+        老存档那份全局 ``chat_preview`` 的主人同样是 ``self.session_id``：
+        只有问的就是它才回落，别的会话没有自己的预览时返回空串
+        （否则她会把"我在别处刚回过的那批"当成这里的上下文）。
+        """
 
         target = str(session_id or self.session_id or "")
         entry = dict((self.chat_previews or {}).get(target) or {})
         text = str(entry.get("text") or "").strip()
         if text:
             return text
+        if target != str(self.session_id or ""):
+            return ""
         return str(self.chat_preview or "").strip()
 
     def note_reply(self, text: str, *, keep: int = 6, session_id: str = "") -> None:

@@ -257,6 +257,30 @@ def _addressing_hint(item: dict[str, Any]) -> str:
     return ""
 
 
+def _router_hint(item: dict[str, Any]) -> str:
+    """意图路由的**事前**判定：回复之前就知道这句是不是冲她说的。
+
+    和 :func:`_addressing_hint` 分开：那个是主模型回完之后自己标的（只认 @ 和引用），
+    这个在消息到达时就由意图路由的判断模型给出来了——一批里被合并掉、正文根本没进
+    请求的那几条，只有这份判定能说明它们冲谁说。已经有 ``addressing`` 时不叠一句
+    （结构化的 @ / 引用更硬），两边都留空就不写。
+    """
+
+    if "router_directed" not in item:
+        return ""
+    if str(item.get("addressing") or ""):
+        return ""
+    to = " ".join(str(item.get("router_to") or "").split())
+    if item.get("router_directed"):
+        return "　（意图路由判定这句是冲你说的）"
+    if to and to not in ("机器人", "不确定", "大家", "所有人"):
+        return f"　（意图路由判定这句是冲 {to} 说的）"
+    if to == "不确定":
+        # 路由自己都说没看准：别替它把话说死成"不是在跟你说话"
+        return "　（意图路由不确定这句是不是冲你说的）"
+    return "　（意图路由判定这句不是在跟你说话）"
+
+
 def _field(obj: Any, name: str, default: Any = None) -> Any:
     """取字段：既认 ``PersonView`` 这种对象，也认引擎拼好的 dict。"""
 
@@ -1267,6 +1291,7 @@ class PromptBuilder:
         seen: set[str] | None = None,
         now: datetime | None = None,
         forward_short: bool = True,
+        current_session: str = "",
     ) -> tuple[list[str], bool]:
         """把聊天记录渲染成一行行（同一个人连着说的并成一行）。
 
@@ -1284,6 +1309,9 @@ class PromptBuilder:
         ``forward_short``：转发摘要要不要改写成短前缀 ``（转发：…）``。背景（群聊
         记录，一行挤很多条）要短；本轮 batch 里那条是**她正在读、正要回的消息**，
         注解原样保留（正文内容一样，只是标记不换写法）。
+
+        ``current_session``：这条记录是"说给哪个会话听的"。只在拿不到事件身份的
+        老条目上用到（见下面的去重指纹）：缺失来源的老条目算当前会话。
 
         返回 ``(行列表, 这一次有没有用上图片编号)``。
         """
@@ -1330,12 +1358,20 @@ class PromptBuilder:
             # **有事件身份就按身份认**：正文一样的两条是用户真的说了两遍，
             # 按正文算指纹会把合法重复一起吞掉（而且这个 `seen` 还被 answered 和
             # fresh 共用）。只有拿不到身份的老存档才退回按正文算指纹。
+            #
+            # 老存档这条路也要带上**来源**：组里的会话共用一份留档，同一个人在群里
+            # 说「在吗」、又在私聊里说「在吗」是两件事，只按"谁在说 + 说了什么"算
+            # 指纹会把后一条当成重复行删掉（缺失来源的老条目算当前会话，和
+            # ``state._trim_chat`` / ``chat_group_key`` 的口径一致）。
             identity = str(item.get("event_key") or "")
-            fingerprint = (
-                identity
-                if identity
-                else f"{item.get('is_self')}:{_fingerprint(chat_core_text(text))}"
-            )
+            if identity:
+                fingerprint = identity
+            else:
+                source = str(item.get("origin") or current_session or "")
+                fingerprint = (
+                    f"{source}|{item.get('user_id') or item.get('name') or ''}"
+                    f"|{bool(item.get('is_self'))}|{_fingerprint(chat_core_text(text))}"
+                )
             if fingerprint in seen:
                 continue
             seen.add(fingerprint)
@@ -1354,7 +1390,7 @@ class PromptBuilder:
                 if labels:
                     # 一条消息里可能有好几句（同一个人连发），箭头要跟着自己那一句
                     piece = f"→ {labels}：{piece}"
-                piece += _addressing_hint(one)
+                piece += _addressing_hint(one) or _router_hint(one)
                 pieces.append(piece)
             # 同一个人连着说的分几行写：拼成一行（「a / b / c」）时模型会
             # 误读成"他把同一件事重复说了好几遍"（真机上回过「A9 Plus 连发三遍」）。
@@ -1467,7 +1503,12 @@ class PromptBuilder:
 
             nonlocal marks_used
             lines, used = self.render_chat_rows(
-                rows, line_chars, marks=marks, seen=seen, now=now
+                rows,
+                line_chars,
+                marks=marks,
+                seen=seen,
+                now=now,
+                current_session=current,
             )
             marks_used = marks_used or used
             return lines
@@ -1575,15 +1616,19 @@ class PromptBuilder:
             not item.get("is_self") for item in fresh[last_self_at + 1 :]
         )
         spoke = last_self_at >= 0
-        if mentioned:
-            address_line = "这几条里有人 @ 你 / 叫了你的名字：其中有话是对你说的。\n"
-        elif last_is_self:
+        # 「最后一条是她自己说的」比"这几条里有人 @ 你"更具体，所以先判：
+        # 她刚说完没人接的时候，@ 是更早的历史命中——拿它去盖"没人接"，
+        # 模型会以为那句话是对她说的，于是追着自己那一句重新解释一遍。
+        # 最后一条不是她说的时，mention 仍然优先（那确实是冲她来的）。
+        if last_is_self:
             address_line = (
                 "这几条的最后一句是**你自己刚说的**，之后没有人接："
                 "这不是新的对话输入，别把它当成有人在跟你说话，"
                 "也别重新解释同一件事；\n"
                 "要接就接别人的话，没人接就换点别的说，或者先安静着。\n"
             )
+        elif mentioned:
+            address_line = "这几条里有人 @ 你 / 叫了你的名字：其中有话是对你说的。\n"
         elif spoke and other_after_last_self:
             address_line = (
                 "这几条里你刚说过话：接着你往下说的多半是对你说的；"
@@ -2540,6 +2585,7 @@ class PromptBuilder:
             marks=image_marks,
             now=moment,
             forward_short=False,
+            current_session=from_session,
         )
         # 聊天记录格式：谁说的、几点说的、@ / 引用了谁，全在行里。
         # 不再写「（紧接着又说：…）」——那是把几个人合并成一个人的说法，

@@ -23,6 +23,25 @@ from .profile import ProfileStore
 REVIEW_STEPS = (1.0, 3.0, 7.0, 30.0)
 """间隔重复：一条值得记住的事，隔多久回访一次（天）。"""
 
+
+def _fallback_session_label(session_id: str) -> str:
+    """没有引擎侧标签时的兜底：「群 123」/「私聊 456」。
+
+    整理模型要能看出「这句话是在哪儿说的」——组里的群和私聊共用一份留档，
+    不标来源的话它会把两个地方的话揉成一件"当面发生的事"。
+    """
+
+    text = str(session_id or "").strip()
+    if not text:
+        return "说不清是哪儿"
+    number = text.split(":")[-1] or text
+    kind = ""
+    for mark, name in (("PrivateMessage", "私聊"), ("FriendMessage", "私聊"), ("GroupMessage", "群")):
+        if mark in text:
+            kind = name
+            break
+    return f"{kind} {number}" if kind else f"会话 {number}"
+
 DREAM_TYPE = "dream"
 """梦：低权重的记忆，只进"想起"那一段，不进画像。"""
 
@@ -93,12 +112,16 @@ class Consolidator:
         profiles: ProfileStore,
         prompts: Any = None,
         sessions_of: Callable[[str], list[str]] | None = None,
+        session_label: Callable[[str], str] | None = None,
     ) -> None:
         self.world = world
         self.memory = memory
         self.profiles = profiles
         self.prompts = prompts
         self._sessions_of = sessions_of or (lambda session_id: [session_id])
+        # 「这是在哪儿说的 / 这条记忆是哪儿的」：默认按 id 现推一个人话标签，
+        # 引擎会传自己的 session_label 进来（群 123「名字」/ 私聊 456）。
+        self._session_label = session_label or _fallback_session_label
 
     def set_world(self, world: Any) -> None:
         self.world = world
@@ -106,10 +129,21 @@ class Consolidator:
     # ---------------- 输入 ----------------
 
     def chat_lines(
-        self, records: list[dict[str, Any]], *, limit: int = 400
+        self,
+        records: list[dict[str, Any]],
+        *,
+        limit: int = 400,
+        session_labels: dict[str, str] | None = None,
+        current_session: str = "",
     ) -> list[str]:
-        """这段时间的原始聊天记录（带时间、谁说的）；**这是整理的上下文**。"""
+        """这段时间的原始聊天记录（带时间、谁说的、**在哪说的**）；这是整理的上下文。
 
+        素材**不按会话过滤**（组里的话共享同一段经历），但必须标出来源：
+        少了一条来源标签，模型会把"私聊里说的悄悄话"和"群里当众说的话"
+        压成同一条要点，以后再拿出来用就说错地方了。
+        """
+
+        labels = dict(session_labels or {})
         rows: list[str] = []
         for item in records:
             text = " ".join(str(item.get("text") or "").split())
@@ -120,17 +154,34 @@ class Consolidator:
             stamp = time.strftime(
                 "%m-%d %H:%M", time.localtime(float(item.get("at") or 0.0))
             )
+            where = str(item.get("origin") or current_session or "")
             tag = "（她自己）" if item.get("is_self") else f"（QQ {uid}）" if uid else ""
-            rows.append(f"[{stamp}] {who}{tag}: {text}")
+            rows.append(f"[{stamp}·{self._where(where, labels)}] {who}{tag}: {text}")
         return rows[-max(1, int(limit)) :]
 
-    def memory_lines(self, session_id: str, *, limit: int = 120) -> list[str]:
-        """现有记忆（只给相关的、最近的）：带 id，让模型按 id 合并或折叠。"""
+    def _where(self, session_id: str, labels: dict[str, str]) -> str:
+        """来源会话的人话标签（引擎给的优先，缺了按 id 现推）。"""
+
+        key = str(session_id or "")
+        known = str(labels.get(key) or "")
+        if known:
+            return known
+        return self._session_label(key)
+
+    def memory_lines(
+        self,
+        session_id: str,
+        *,
+        limit: int = 120,
+        session_labels: dict[str, str] | None = None,
+    ) -> list[str]:
+        """现有记忆（只给相关的、最近的）：带 id 与**来源会话**，让模型按 id 合并或折叠。"""
 
         rows = self.memory.db.query_memories(
             session_ids=self._sessions_of(session_id),
             limit=max(1, int(limit)),
         )
+        labels = dict(session_labels or {})
         lines: list[str] = []
         for item in rows:
             stamp = time.strftime(
@@ -139,8 +190,10 @@ class Consolidator:
             tier = "要点" if str(item.get("tier")) == "gist" else "原文"
             people = ",".join(str(entry) for entry in (item.get("participants") or []))
             tail = f"（{people}）" if people else ""
+            where = self._where(str(item.get("session_id") or ""), labels)
             lines.append(
-                f"#{item['id']} [{stamp}·{tier}] {str(item.get('content') or '')[:120]}{tail}"
+                f"#{item['id']} [{stamp}·{tier}·{where}] "
+                f"{str(item.get('content') or '')[:120]}{tail}"
             )
         return lines
 
@@ -199,6 +252,8 @@ class Consolidator:
         pending: list[str] | None = None,
         now: float | None = None,
         dry_run: bool = False,
+        session_labels: dict[str, str] | None = None,
+        current_session: str = "",
     ) -> ConsolidateResult:
         """跑一次整理。``llm(system, prompt)`` 由调用方提供（独立整理模型）。
 
@@ -214,10 +269,21 @@ class Consolidator:
         max_items = 12 if result.mode == "full" else 6
         records = list(chat_records or [])
         known = self.known_ids(session_id, records)
+        here = str(current_session or session_id or "")
         system, prompt = self.prompts.build_consolidate_prompt(
             persona_text=persona_text,
-            chat_lines=self.chat_lines(records),
-            memories=self.memory_lines(session_id) if result.mode == "full" else [],
+            # 素材带来源标签（群 / 私聊）：模型才知道"这是哪里说的话"，
+            # 免得把两处的对话压成同一件事。素材本身不按会话过滤。
+            chat_lines=self.chat_lines(
+                records,
+                session_labels=session_labels,
+                current_session=here,
+            ),
+            memories=(
+                self.memory_lines(session_id, session_labels=session_labels)
+                if result.mode == "full"
+                else []
+            ),
             profiles=self.profile_lines(session_id),
             pending=list(pending or []),
             date_text=time.strftime("%Y-%m-%d", time.localtime(stamp)),
