@@ -1848,19 +1848,21 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
             self.ctx(session_id=PRIVATE_SESSION, text="私聊里说的事", user_name="主人")
         )
         async with self.engine.session_state(PRIVATE_SESSION) as state:
-            injection = self.engine.prompts.build_injection(
-                state,
+            prompt = self.engine.prompts.build_autonomous_system_prompt(
+                persona_text="",
+                state=state,
                 node=self.engine.node(state.node_id) or self.engine.node(self.node_id),
+                available_tools={},
                 recent_chat=self.engine.chat_window(state),
                 current_session=PRIVATE_SESSION,
                 session_labels=self.engine.session_labels(state),
             )
         # 私聊里说的话属于「这里」，群里那句只当「别处」的背景
-        here = injection.split("你在别处同时听到的")[0]
+        here = prompt.split("你在别处同时听到的")[0]
         self.assertIn("私聊里说的事", here)
         self.assertNotIn("群里聊两句", here)
-        self.assertIn("你在别处同时听到的", injection)
-        self.assertIn("小米粥群", injection.split("你在别处同时听到的")[1])
+        self.assertIn("你在别处同时听到的", prompt)
+        self.assertIn("小米粥群", prompt.split("你在别处同时听到的")[1])
 
     async def test_her_recent_lines_carry_where_she_said_them(self):
         """「你最近说过的话」也要标出是在哪个会话说的。"""
@@ -2251,9 +2253,16 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("你在别处同时听到的", auto)
         self.assertIn("私聊里的那句", auto)
 
-        inject = await self.engine.preview_injection(SESSION)
-        self.assertIn("你在别处同时听到的", inject)
-        self.assertNotIn("私聊里的那句", inject.split("你在别处同时听到的")[0])
+        inject = await self.engine.preview_last_reply_request(SESSION)
+        self.assertIn("还没有接管回复的记录", inject)
+
+        # 真回一轮之后，调试入口给的就是**实际发出去的那一份**：不是另拼一个预览
+        self.llm.replies = ['{"actions":[{"type":"say","messages":["嗯"]}]}']
+        outcome = await self.engine.handle_reply(self.ctx(text="群里的那句"))
+        self.assertTrue(outcome.ok, outcome.error)
+        seen = await self.engine.preview_last_reply_request(SESSION)
+        self.assertIn("你在别处同时听到的", seen)
+        self.assertNotIn("私聊里的那句", seen.split("你在别处同时听到的")[0])
 
     async def test_this_message_carries_where_it_came_from(self):
         """多会话时，当前这条消息要写明来自哪个会话。"""
@@ -2616,7 +2625,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         rows = self.engine.memory.db.query_memories(session_id=SESSION, limit=50)
         return [row for row in rows if row["type"] == "interaction"]
 
-    # ---------------- S1：注入模式 ----------------
+    # ---------------- S1：接管这一轮的处理与记录 ----------------
 
     async def test_non_whitelisted_session_is_ignored(self):
         injection = await self.engine.handle_incoming(
@@ -2624,21 +2633,29 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(injection)
 
-    async def test_whitelisted_session_gets_world_context(self):
-        injection = await self.engine.handle_incoming(self.ctx())
-        self.assertIsNotNone(injection)
-        assert injection is not None
-        self.assertIn("书房", injection)
-        self.assertIn("虚拟世界状态", injection)
-        # 注入模式不接管回复：不带 JSON 输出协议
-        self.assertNotIn('"actions"', injection)
+    async def test_whitelisted_session_is_handled_by_the_plugin(self):
+        """白名单会话：handle_incoming 只回「这条归我管」，世界认知由接管提示词负责。"""
+
+        handled = await self.engine.handle_incoming(self.ctx())
+        self.assertEqual(handled, "takeover")
+        # 世界认知不再由这里返回（它在接管提示词里，见提示词分层那几个用例）
+        self.assertNotIn("虚拟世界状态", handled)
+        self.assertNotIn('"actions"', handled)
 
     async def test_cold_start_note_appears_only_once(self):
-        first = await self.engine.handle_incoming(self.ctx())
-        second = await self.engine.handle_incoming(self.ctx())
-        assert first is not None and second is not None
-        self.assertIn("刚从沉睡中苏醒", first)
-        self.assertNotIn("刚从沉睡中苏醒", second)
+        """冷启动那句提示只在她醒来的第一轮出现，之后不再提。"""
+
+        await self.engine.handle_incoming(self.ctx())
+        self.llm.replies = ['{"actions":[{"type":"say","messages":["嗯"]}]}']
+        first = await self.engine.handle_reply(self.ctx())
+        self.assertTrue(first.ok, first.error)
+        self.assertIn("刚从沉睡中苏醒", str(self.llm.calls[-1]["system_prompt"]))
+
+        await self.engine.handle_incoming(self.ctx())
+        self.llm.replies = ['{"actions":[{"type":"say","messages":["嗯"]}]}']
+        second = await self.engine.handle_reply(self.ctx())
+        self.assertTrue(second.ok, second.error)
+        self.assertNotIn("刚从沉睡中苏醒", str(self.llm.calls[-1]["system_prompt"]))
 
     async def test_user_message_updates_state_and_records_memory(self):
         await self.engine.handle_incoming(self.ctx(text="我今天有点难过", mood_signal="negative"))
@@ -3675,9 +3692,12 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(state.recent_chat), 4)
 
-        # 摘要会出现在提示词里
-        injection = await self.engine.preview_injection(SESSION)
-        self.assertIn("更早聊过的", injection)
+        # 摘要会出现在提示词里：看**实际发出去的那一轮**的原文
+        self.llm.replies = ['{"actions":[{"type":"say","messages":["嗯"]}]}']
+        outcome = await self.engine.handle_reply(self.ctx(text="在吗"))
+        self.assertTrue(outcome.ok, outcome.error)
+        request = await self.engine.preview_last_reply_request(SESSION)
+        self.assertIn("更早聊过的", request)
 
     async def test_summaries_are_kept_per_session(self):
         """群聊和私聊的「更早聊过的」各自成段：压缩只喂本会话的内容。"""
@@ -6718,6 +6738,41 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         state = await self.get_state()
         self.assertEqual(state.miss_push_count, 0)
 
+    async def test_miss_push_still_fires_when_her_own_line_came_last(self):
+        """最后一句是她自己说的，也不影响"想他想到不行了"这条主动找人路径。"""
+
+        self._make_close_friend("42", affinity=40.0)
+        await self.set_state(
+            state="idle", current_action=None, current_plan=None, loneliness=0.9
+        )
+        async with self.engine.session_state(SESSION) as state:
+            state.note_chat(
+                user_id="__self__",
+                name="小鲸鱼",
+                text="我刚才一个人嘀咕了一句",
+                now=self.engine._now(),
+                is_self=True,
+            )
+            state.miss = {"42": 0.95}
+        # 只有她自己的话：不算"群里在聊"（插话那条路该关着）
+        self.assertFalse(self.engine.group_is_chatting(await self.get_state()))
+        self.llm.replies = [
+            '{"plan":[{"action":"say","messages":["突然有点想你了"],"send_to":"群 1001"}],'
+            '"valid_until":1800,"reason":"想他了就去找他说一句"}'
+        ]
+        outcome = await self.engine.maybe_decide(SESSION, force=True)
+        self.assertIsNotNone(outcome)
+        self.assertTrue(
+            any("特别想" in str(item.get("prompt") or "") for item in self.llm.calls),
+            "软推那一轮应该把「想他」交代清楚",
+        )
+        state = await self.get_state()
+        self.assertEqual(state.miss.get("42", 0.0), 0.0)
+        self.assertEqual(state.miss_push_count, 1)
+        self.assertIn("突然有点想你了", self.messenger.flat_messages)
+        events = await self.db.call("query_events", session_id=SESSION, limit=20)
+        self.assertTrue(any(item["event_type"] == "miss_push" for item in events))
+
     async def test_schedule_actions_add_list_and_remove(self):
         """日程三件套：她自己加的日程能加、能看、能删；用户配置的删不掉。"""
 
@@ -7057,7 +7112,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_guess_duration_seconds("随便歇会儿"), 0)
 
     async def test_prompt_previews_show_the_state_slot(self):
-        """调试页那两个预览要和实跑一致：状态槽（今日穿搭这类）必须看得到。"""
+        """调试预览要和实跑一致：状态槽（今日穿搭这类）必须看得到。"""
 
         now = self.engine._now()
         async with self.engine.session_state(SESSION) as state:
@@ -7071,14 +7126,17 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
             }
         self.engine.reload_config()
 
-        for mode in ("inject", "autonomous"):
-            text = (
-                await self.engine.preview_injection(SESSION)
-                if mode == "inject"
-                else await self.engine.preview_autonomous_prompt(SESSION)
-            )
-            self.assertIn("今日穿搭", text, mode)
-            self.assertIn("白色卫衣配灰裤子", text, mode)
+        auto = await self.engine.preview_autonomous_prompt(SESSION)
+        self.assertIn("今日穿搭", auto)
+        self.assertIn("白色卫衣配灰裤子", auto)
+
+        # 接管这条路：调试入口给的是实际发出去的那一轮，状态槽同样要能看到
+        self.llm.replies = ['{"actions":[{"type":"say","messages":["嗯"]}]}']
+        outcome = await self.engine.handle_reply(self.ctx(text="今天穿什么"))
+        self.assertTrue(outcome.ok, outcome.error)
+        request = await self.engine.preview_last_reply_request(SESSION)
+        self.assertIn("今日穿搭", request)
+        self.assertIn("白色卫衣配灰裤子", request)
 
     async def test_state_slot_recorded_by_a_command_action_reaches_the_prompt(self):
         """指令型动作配了状态槽：结果留在状态里，下一轮提示词和预览都看得到。"""
@@ -7121,8 +7179,11 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
             self.assertIn("outfit", state.external_state)
             self.assertEqual(state.external_state["outfit"]["text"], "白色卫衣配灰裤子")
 
+        self.llm.replies = ['{"actions":[{"type":"say","messages":["嗯"]}]}']
+        outcome = await self.engine.handle_reply(self.ctx(text="今天穿什么"))
+        self.assertTrue(outcome.ok, outcome.error)
         for text in (
-            await self.engine.preview_injection(SESSION),
+            await self.engine.preview_last_reply_request(SESSION),
             await self.engine.preview_autonomous_prompt(SESSION),
         ):
             self.assertIn("今日穿搭", text)
@@ -8195,12 +8256,13 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_being_called_awake_interrupts_sleep(self):
         await self.set_state(state="sleeping", current_action={"type": "sleep", "duration_ticks": 10})
-        injection = await self.engine.handle_incoming(self.ctx(text="醒醒，别睡了"))
+        handled = await self.engine.handle_incoming(self.ctx(text="醒醒，别睡了"))
         state = await self.get_state()
         self.assertEqual(state.state, "idle")
         self.assertIsNone(state.current_action)
-        assert injection is not None
-        self.assertIn("被叫醒", injection)
+        self.assertEqual(handled, "takeover")
+        # 「刚被叫醒」那句提示要留给这一轮真正组装提示词用（取走即失效）
+        self.assertIn("被叫醒", "".join(self.engine._incoming_notes.get(SESSION, [])))
 
     # ---------------- 睡觉时的门禁 ----------------
 
@@ -8987,6 +9049,39 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(outcome)
         self.assertNotIn("有人在吗？", self.messenger.flat_messages)
 
+    async def test_her_own_lines_alone_are_not_a_group_conversation(self):
+        """窗口里只有她自己说的话：不算"群里在聊"，这一轮也不该插话。"""
+
+        async with self.engine.session_state(SESSION) as state:
+            for index in range(3):
+                state.note_chat(
+                    user_id="__self__",
+                    name="小鲸鱼",
+                    text=f"我自己的第{index}句",
+                    now=self.engine._now(),
+                    is_self=True,
+                )
+        state = await self.get_state()
+        self.assertFalse(self.engine.group_is_chatting(state))
+        # 她自己那几句仍然留在上下文里（防重复、接话都要靠它），只是不算"别人在聊"
+        self.assertTrue(
+            any(item.get("is_self") for item in self.engine.chat_context(state))
+        )
+
+        # 孤独感拉到插话门槛之上跑一轮正常决策：可以想别的，
+        # 但不许生成插话计划（last_interject_at 只有插话步骤才会被写）
+        await self.set_state(loneliness=0.9, node_id="lobby")
+        outcome = await self.engine.maybe_decide(SESSION)
+        self.assertIsNotNone(outcome)
+        state = await self.get_state()
+        self.assertEqual(state.last_interject_at, 0)
+
+        # 换成两条别人的消息，同一条判断就为真（默认门槛是 2 条）
+        await self.engine.note_presence(self.ctx(text="今天中午吃什么好呢", user_id="1", user_name="小明"))
+        await self.engine.note_presence(self.ctx(text="我想吃面", user_id="2", user_name="小红"))
+        state = await self.get_state()
+        self.assertTrue(self.engine.group_is_chatting(state))
+
     async def test_same_message_is_not_recorded_twice(self):
         """同一条消息会同时经过两个钩子，聊天上下文里不能重复出现。"""
 
@@ -9208,7 +9303,7 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("小明", rows[0]["content"])
 
     async def test_takeover_falls_back_when_llm_unavailable(self):
-        """没有可用模型/调用失败时返回 ok=False，交给调用方降级为注入。"""
+        """没有可用模型/调用失败时返回 ok=False：这一条就不回了，不换人答。"""
 
         self.engine.llm = None
         outcome = await self.engine.handle_reply(self.ctx(text="在吗"))
@@ -9780,8 +9875,15 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         snapshot = await self.engine.snapshot(SESSION)
         self.assertEqual(snapshot["clock_text"], "2026-09-15（周二）14:03 —— 下午")
         await self.set_state(node_id="study")
-        injection = await self.engine.preview_injection(SESSION)
-        self.assertIn(f"现在是：{snapshot['clock_text']}", injection)
+        prompt = await self.engine.preview_autonomous_prompt(SESSION)
+        self.assertIn(f"现在是：{snapshot['clock_text']}", prompt)
+
+        # 接管路径实际发出去的那一份也要有同一行
+        self.llm.replies = ['{"actions":[{"type":"say","messages":["嗯"]}]}']
+        outcome = await self.engine.handle_reply(self.ctx(text="几点了"))
+        self.assertTrue(outcome.ok, outcome.error)
+        request = await self.engine.preview_last_reply_request(SESSION)
+        self.assertIn(f"现在是：{snapshot['clock_text']}", request)
 
     async def test_world_time_is_tick_count_times_tick_length(self):
         await self.set_state(world_time=2455)
@@ -10092,6 +10194,411 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         await self.engine.tick()
         # 手动那次 1 条 + 到点正常触发 1 条
         self.assertEqual(self.messenger.flat_messages.count("到点这句"), 2)
+
+    # ---------------- 日程落点（落点解析 / 锁定 / 广播） ----------------
+
+    def stub_landing_choice(self, choice: str) -> None:
+        """让「挑落点」这一步回答固定编号，其余模型调用照旧用排好的回复。
+
+        整轮 tick 里除了挑落点还有别的模型调用，直接排 ``self.llm.replies``
+        会被它们先吃掉，这条用例就不稳了——按提示词分流才测得准。
+        """
+
+        from core.ports import LLMReply
+
+        class _LandingLLM(StubLLM):
+            async def generate(self, **kwargs):
+                if "按你自己的判断挑一处" in str(kwargs.get("prompt") or ""):
+                    self.calls.append(dict(kwargs))
+                    return LLMReply(text=choice, ok=True)
+                return await super().generate(**kwargs)
+
+        self.llm = _LandingLLM()
+        self.engine.llm = self.llm
+
+    def add_draw_action(self, images: list[str] | None = None) -> None:
+        """挂一个「画一张」的工具型动作：正文和图片都由假工具交回来。"""
+
+        self.tools._tools = {"text2img": "画图"}
+        self.tools.results = {"text2img": "画好了"}
+        self.tools.images = {"text2img": list(images or ["https://img/1.png"])}
+        raw = self.store.raw_world()
+        raw["actions"] = [item for item in raw["actions"] if item.get("id") != "draw_pic"]
+        raw["actions"].append(
+            {
+                "id": "draw_pic",
+                "name": "画图",
+                "category": "instant",
+                "llm_level": "tool",
+                "tool_names": ["text2img"],
+                "scope": "global",
+                "visible": False,
+            }
+        )
+        self.store.save_world(raw)
+        self.engine.reload_config()
+
+    def schedule_outcome(self, outcomes, schedule_id: str) -> TickOutcome:
+        """从 tick 的返回里挑出这条日程那一份 outcome。"""
+
+        return next(
+            item
+            for item in outcomes
+            if any(f"日程 {schedule_id}" in note for note in item.notes)
+        )
+
+    async def test_schedule_landing_with_only_a_group_sends_to_exactly_one_chat(self):
+        """日程只勾了会话组：落点是她挑的那一个会话，只发一处（不是一次发一片）。"""
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION, OTHER_SESSION], main=SESSION)
+        self.add_schedule(
+            id="group_only",
+            time="12:00",
+            sessions=["team"],
+            action_chain=[{"type": "say", "messages": ["给这一组的"]}],
+        )
+        self.stub_landing_choice("2")
+        self.clock.set_struct(datetime(2026, 9, 15, 12, 0))
+        outcome = self.schedule_outcome(await self.engine.tick(), "group_only")
+
+        # 挑出来的就是第 2 个落点（私聊），不是组代表
+        self.assertEqual(outcome.session_id, PRIVATE_SESSION)
+        # 勾组 = 她在组内挑一处：没有第二个落点要被广播
+        self.assertEqual(outcome.broadcast_targets, [])
+        # 锁的是"组里每一处都允许她开口"（她挑的那一处当然在里面）
+        self.assertEqual(
+            sorted(outcome.locked_targets),
+            sorted([SESSION, PRIVATE_SESSION, OTHER_SESSION]),
+        )
+        self.assertEqual([item[0] for item in self.messenger.sent], [PRIVATE_SESSION])
+        self.assertEqual(self.messenger.flat_messages.count("给这一组的"), 1)
+        self.assertEqual(self.messenger.flat_images, [])
+        # 挑的时候确实带着"你能说话的地方"问过她
+        picking = [
+            str(call.get("prompt") or "")
+            for call in self.llm.calls
+            if "按你自己的判断挑一处" in str(call.get("prompt") or "")
+        ]
+        self.assertEqual(len(picking), 1, self.llm.calls)
+        self.assertIn("你能说话的地方", picking[0])
+
+    async def test_schedule_pinned_to_one_chat_keeps_text_and_images_together(self):
+        """只勾一个具体会话：正文和图片都只发到那一个会话，别处一张都不发。"""
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION], main=SESSION)
+        self.add_draw_action(["https://img/pinned.png"])
+        self.add_schedule(
+            id="only_private",
+            time="12:00",
+            sessions=[PRIVATE_SESSION],
+            action_chain=[
+                {"type": "say", "messages": ["只给私聊的正文"]},
+                {"type": "draw_pic", "intent": "画一张"},
+            ],
+        )
+        self.clock.set_struct(datetime(2026, 9, 15, 12, 0))
+        outcome = self.schedule_outcome(await self.engine.tick(), "only_private")
+
+        self.assertEqual(outcome.session_id, PRIVATE_SESSION)
+        self.assertEqual(outcome.broadcast_targets, [])
+        self.assertEqual(outcome.locked_targets, [PRIVATE_SESSION])
+        self.assertEqual([item[0] for item in self.messenger.sent], [PRIVATE_SESSION])
+        self.assertIn("只给私聊的正文", self.messenger.flat_messages)
+        self.assertEqual(
+            self.messenger.sent_images,
+            [(PRIVATE_SESSION, ["https://img/pinned.png"])],
+        )
+        self.assertNotIn(SESSION, [item[0] for item in self.messenger.sent])
+        self.assertNotIn(SESSION, [item[0] for item in self.messenger.sent_images])
+
+    async def test_schedule_pinned_to_two_chats_runs_the_chain_once_and_sends_both(self):
+        """勾两个具体会话：动作链只跑一次，正文和图片两个会话都收到。"""
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION], main=SESSION)
+        self.add_draw_action(["https://img/both.png"])
+        self.add_schedule(
+            id="both_chats",
+            time="12:00",
+            sessions=[SESSION, PRIVATE_SESSION],
+            action_chain=[
+                {"type": "say", "messages": ["两个落点都该看到"]},
+                {"type": "draw_pic", "intent": "画一张"},
+            ],
+        )
+        runs: list[str] = []
+        original = self.engine._run_chain
+
+        async def counted(state, chain, outcome, *, depth):
+            runs.append(outcome.session_id)
+            return await original(state, chain, outcome, depth=depth)
+
+        self.engine._run_chain = counted
+        try:
+            self.clock.set_struct(datetime(2026, 9, 15, 12, 0))
+            outcomes = await self.engine.tick()
+        finally:
+            self.engine._run_chain = original
+        outcome = self.schedule_outcome(outcomes, "both_chats")
+
+        # 一次执行：不是每个落点各跑一遍动作链
+        self.assertEqual(len(runs), 1, runs)
+        self.assertEqual(sorted(outcome.locked_targets), sorted([SESSION, PRIVATE_SESSION]))
+        got_text = {
+            session
+            for session, messages in self.messenger.sent
+            if "两个落点都该看到" in messages
+        }
+        self.assertEqual(got_text, {SESSION, PRIVATE_SESSION})
+        self.assertEqual(
+            {item[0] for item in self.messenger.sent_images},
+            {SESSION, PRIVATE_SESSION},
+        )
+        self.assertEqual(
+            self.messenger.flat_images,
+            ["https://img/both.png", "https://img/both.png"],
+        )
+
+    async def test_schedule_send_to_cannot_escape_a_single_target_lock(self):
+        """只勾一个会话时，她写的 send_to 也不许把这句话改发到组里别处。"""
+
+        from types import SimpleNamespace
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION, OTHER_SESSION], main=SESSION)
+        schedule = SimpleNamespace(id="pinned", sessions=[PRIVATE_SESSION])
+        locked = self.engine.schedule_lock_targets(schedule, SESSION)
+        self.assertEqual(locked, [PRIVATE_SESSION])
+
+        outcome = TickOutcome(session_id=PRIVATE_SESSION)
+        outcome.locked_targets = locked
+        outcome.speech_home = PRIVATE_SESSION
+        async with self.engine.session_state(SESSION) as state:
+            await self.engine._execute_actions(
+                state,
+                self.engine.node(state.node_id),
+                outcome,
+                [
+                    PlannedAction(
+                        type="say",
+                        messages=["这句想溜到别的群"],
+                        send_to=OTHER_SESSION,
+                    ),
+                    PlannedAction(
+                        type="say",
+                        messages=["这句在允许范围里"],
+                        send_to=PRIVATE_SESSION,
+                    ),
+                ],
+                depth=0,
+                autonomous=False,
+            )
+        # 越界那句被拦下，且说明里点出"忽略未选中的 send_to"
+        self.assertTrue(
+            any("日程落点限制：忽略未选中的 send_to" in note for note in outcome.notes),
+            outcome.notes,
+        )
+        self.assertTrue(
+            any("不在她能说话的地方里" in note for note in outcome.notes),
+            outcome.notes,
+        )
+        await self.engine._deliver(outcome)
+        self.assertEqual([item[0] for item in self.messenger.sent], [PRIVATE_SESSION])
+        self.assertNotIn("这句想溜到别的群", self.messenger.flat_messages)
+        self.assertIn("这句在允许范围里", self.messenger.flat_messages)
+
+    async def test_schedule_send_to_cannot_escape_a_multi_target_lock(self):
+        """勾了两个会话时同理：send_to 指向没勾的第三个会话，这句不发，别处照常。"""
+
+        from types import SimpleNamespace
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION, OTHER_SESSION], main=SESSION)
+        schedule = SimpleNamespace(id="two_chats", sessions=[PRIVATE_SESSION, SESSION])
+        locked = self.engine.schedule_lock_targets(schedule, SESSION)
+        self.assertEqual(sorted(locked), sorted([SESSION, PRIVATE_SESSION]))
+
+        outcome = TickOutcome(session_id=SESSION)
+        outcome.locked_targets = locked
+        outcome.broadcast_targets = [PRIVATE_SESSION]
+        outcome.speech_home = SESSION
+        async with self.engine.session_state(SESSION) as state:
+            await self.engine._execute_actions(
+                state,
+                self.engine.node(state.node_id),
+                outcome,
+                [
+                    PlannedAction(
+                        type="say",
+                        messages=["越界到第三个会话的那句"],
+                        send_to=OTHER_SESSION,
+                    ),
+                    PlannedAction(
+                        type="say",
+                        messages=["锁定范围内的那句"],
+                        send_to=PRIVATE_SESSION,
+                    ),
+                ],
+                depth=0,
+                autonomous=False,
+            )
+        self.assertTrue(
+            any("日程落点限制：忽略未选中的 send_to" in note for note in outcome.notes),
+            outcome.notes,
+        )
+        await self.engine._deliver(outcome)
+        self.assertNotIn("越界到第三个会话的那句", self.messenger.flat_messages)
+        self.assertIn("锁定范围内的那句", self.messenger.flat_messages)
+        self.assertEqual([item[0] for item in self.messenger.sent], [PRIVATE_SESSION])
+
+    async def test_schedule_landing_is_the_same_for_tick_and_manual_run(self):
+        """「到点真跑」与「编辑器里试跑」必须解析出同一个落点和同一组广播目标。"""
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION], main=SESSION)
+        self.add_schedule(
+            id="same_landing",
+            time="12:00",
+            sessions=["team"],
+            action_chain=[{"type": "say", "messages": ["同一个落点"]}],
+        )
+        self.stub_landing_choice("2")
+        self.clock.set_struct(datetime(2026, 9, 15, 12, 0))
+        ticked = self.schedule_outcome(await self.engine.tick(), "same_landing")
+
+        delivered: list[TickOutcome] = []
+        original = self.engine._deliver
+
+        async def spy(outcome):
+            delivered.append(outcome)
+            return await original(outcome)
+
+        self.engine._deliver = spy
+        try:
+            result = await self.engine.run_schedule_now(SESSION, "same_landing")
+        finally:
+            self.engine._deliver = original
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(len(delivered), 1, delivered)
+        manual = delivered[0]
+
+        self.assertEqual(ticked.session_id, PRIVATE_SESSION)
+        self.assertEqual(manual.session_id, ticked.session_id)
+        self.assertEqual(manual.broadcast_targets, ticked.broadcast_targets)
+        self.assertEqual(manual.broadcast_targets, [])
+        self.assertEqual(manual.locked_targets, ticked.locked_targets)
+
+    async def test_schedule_broadcast_keeps_going_when_one_target_fails(self):
+        """两个落点里有一个发不出去：另一个照发，notes 里点名是哪个落点失败的。"""
+
+        class _FailingOne(StubMessenger):
+            async def send_text(self, session_id: str, messages: list[str]) -> bool:
+                self.sent.append((session_id, list(messages)))
+                return session_id != PRIVATE_SESSION
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION], main=SESSION)
+        self.engine.messenger = _FailingOne()
+        self.add_schedule(
+            id="one_fails",
+            time="12:00",
+            sessions=[SESSION, PRIVATE_SESSION],
+            action_chain=[{"type": "say", "messages": ["两个落点都要试"]}],
+        )
+        self.clock.set_struct(datetime(2026, 9, 15, 12, 0))
+        outcome = self.schedule_outcome(await self.engine.tick(), "one_fails")
+
+        # 两个落点都试过了（失败的也留下痕迹），失败不拖累另一个
+        self.assertEqual(
+            sorted(item[0] for item in self.engine.messenger.sent),
+            sorted([SESSION, PRIVATE_SESSION]),
+        )
+        self.assertIn("两个落点都要试", self.engine.messenger.flat_messages)
+        self.assertTrue(
+            any(
+                f"发到 {PRIVATE_SESSION} 失败：平台没有接收" in note
+                for note in outcome.notes
+            ),
+            outcome.notes,
+        )
+
+    async def test_mixed_group_and_chat_selection_is_normalized_with_a_warning(self):
+        """旧存档里「会话组 + 具体会话」混着存：保存前只留组 id，并回一句人话提示。"""
+
+        from types import SimpleNamespace
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION], main=SESSION)
+        mixed = {
+            "id": "s1",
+            "time": "12:00",
+            "sessions": ["team", PRIVATE_SESSION],
+            "action_chain": [{"type": "say", "messages": ["混选"]}],
+        }
+        pure = {
+            "id": "s2",
+            "time": "13:00",
+            "sessions": [PRIVATE_SESSION, SESSION],
+            "action_chain": [{"type": "say", "messages": ["只勾会话"]}],
+        }
+        cleaned, warnings = self.engine.normalize_schedule_sessions(
+            {"schedules": [mixed, pure]}
+        )
+
+        # 混选那条只剩组 id；纯会话那条原样返回（不制造无谓的 diff）
+        self.assertEqual(cleaned["schedules"][0]["sessions"], ["team"])
+        self.assertIs(cleaned["schedules"][1], pure)
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("日程 s1", warnings[0])
+        self.assertIn("同时勾了会话组和具体会话", warnings[0])
+        self.assertIn("已按会话组保存", warnings[0])
+
+        # 运行时读到旧的混选配置（没走过保存接口）也按同一规则解析
+        runtime = SimpleNamespace(id="s1", sessions=["team", PRIVATE_SESSION])
+        self.assertEqual(self.engine.schedule_sessions_of(runtime), ["team"])
+        self.assertEqual(
+            sorted(self.engine.schedule_lock_targets(runtime, SESSION)),
+            sorted([SESSION, PRIVATE_SESSION]),
+        )
+        self.assertEqual(self.engine.schedule_targets(runtime, SESSION), [])
+
+    async def test_command_prompt_tells_the_model_it_is_a_parameter_compiler(self):
+        """指令参数提示词：只当编译器填参数，不许拿"我是 AI / 没有实体"来拒答。"""
+
+        system, prompt = self.engine.prompts.build_command_prompt(
+            command="/拍照",
+            hint="画面主体、服装、环境、镜头",
+            intent="给自己拍一张今天的自拍",
+        )
+        self.assertTrue(system.startswith("你是指令参数编译器"), system)
+        self.assertIn("也不要以人工智能、没有实体、无法执行或拒绝参与为理由回应", system)
+        # 出现"拒答"的地方只有"不要拒答"这一种说法
+        self.assertEqual(system.count("拒答"), 1)
+        self.assertIn("不要拒答", system)
+        self.assertIn("要触发的指令：/拍照", prompt)
+        self.assertIn("她的意图：给自己拍一张今天的自拍", prompt)
+
+    async def test_schedule_pinned_to_a_disabled_chat_falls_back_to_the_running_session(self):
+        """勾中的会话被停用 / 从白名单删掉：不能还往那儿发，回落到执行会话。"""
+
+        self.add_group(sessions=[SESSION, PRIVATE_SESSION], main=SESSION)
+        raw = self.store.raw_sessions()
+        for item in raw["sessions"]:
+            if item.get("session_id") == PRIVATE_SESSION:
+                item["enabled"] = False
+        self.store.save_sessions(raw)
+        self.engine.reload_config()
+        self.assertFalse(self.engine.is_enabled(PRIVATE_SESSION))
+
+        self.add_schedule(
+            id="pinned_gone",
+            time="12:00",
+            sessions=[PRIVATE_SESSION],
+            action_chain=[{"type": "say", "messages": ["她还在不在"]}],
+        )
+        self.clock.set_struct(datetime(2026, 9, 15, 12, 0))
+        outcome = self.schedule_outcome(await self.engine.tick(), "pinned_gone")
+
+        # 停用的落点收不到：落回执行会话，也没有别的广播目标
+        self.assertEqual(outcome.session_id, SESSION)
+        self.assertEqual(outcome.broadcast_targets, [])
+        self.assertEqual(outcome.locked_targets, [SESSION])
+        self.assertEqual([item[0] for item in self.messenger.sent], [SESSION])
+        self.assertEqual(self.messenger.flat_messages.count("她还在不在"), 1)
 
     async def test_run_schedule_now_reports_unknown_or_blocked(self):
         self.add_schedule(
@@ -10670,6 +11177,33 @@ class EngineTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("没有人点名找你", prompt)
         self.assertNotIn("对你说", prompt)
         self.assertIn("最近在聊什么", system)
+
+    async def test_her_line_then_a_reply_keeps_the_pickup_hint(self):
+        """她说完之后有人接上：记录里留着她那句，提示语还是"接着你往下说"。"""
+
+        async with self.engine.session_state(SESSION) as state:
+            state.note_chat(
+                user_id="__self__",
+                name="小鲸鱼",
+                text="我在书房翻配置呢",
+                now=self.engine._now(),
+                is_self=True,
+            )
+        await self.engine.note_presence(
+            self.ctx(text="那你继续", user_id="1", user_name="小明", is_mentioned=False)
+        )
+        state = await self.get_state()
+        system = self.engine.prompts.build_autonomous_system_prompt(
+            persona_text="你是温柔少女",
+            state=state,
+            node=self.engine.node(state.node_id),
+            available_tools={},
+            recent_chat=self.engine.chat_context(state),
+            current_session=SESSION,
+        )
+        self.assertIn("我在书房翻配置呢", system)
+        self.assertIn("接着你往下说的多半是对你说的", system)
+        self.assertNotIn("这不是新的对话输入", system)
 
     async def test_speech_density_hint_appears_after_talking_a_lot(self):
         state = await self.get_state()

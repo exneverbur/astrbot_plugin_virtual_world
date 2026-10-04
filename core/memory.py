@@ -382,9 +382,16 @@ class MemoryEngine:
                     or item.get("persona_id") == persona_id
             )
         if mode == SCOPE_GLOBAL:
+            # 「全局」只表示**放宽会话作用域**（哪个群的记忆都算），不是"绕过后面的筛选"。
+            # 以前这里 `return _dedupe(rows)` 提前返回，把下面按 memory_type 的过滤和
+            # wanted_nodes 的地点过滤整个跳过了：于是"回忆厨房"会把书房的事也捞出来、
+            # 按类型筛选也失效。现在只把行收进来，后面几道过滤器一视同仁地过。
             for scope in (SCOPE_GLOBAL, SCOPE_GROUP, SCOPE_PERSONA, SCOPE_GROUP_PERSONA):
-                rows.extend(self.db.query_memories(scope=scope, limit=500))
-            return _dedupe(rows)
+                rows.extend(
+                    self.db.query_memories(
+                        scope=scope, memory_type=memory_type or None, limit=500
+                    )
+                )
 
         if mode in (SCOPE_GROUP, SCOPE_GROUP_PERSONA) and scoped:
             rows.extend(

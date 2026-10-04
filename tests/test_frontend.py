@@ -286,6 +286,85 @@ class FrontendSyntaxTest(unittest.TestCase):
         # 筛选里要把注册过的类型并进数据库里出现过的那些
         self.assertIn("...EXT_DEBUG_TYPES", source)
 
+    def test_only_the_schedule_landing_picker_forbids_mixing_groups_with_chats(
+        self,
+    ) -> None:
+        """日程落点选择器传了 exclusiveValues（组 id），别的多选选择器一个都没传。
+
+        「会话组 + 具体会话」互斥只对日程落点成立：联系人 / 记忆 / 状态 / 地图
+        那些多选控件要是也互斥起来，用户就选不了多项了。
+        """
+
+        source = APP_JS.read_text("utf-8")
+        lines = [line.strip() for line in source.splitlines() if "exclusiveValues" in line]
+        self.assertEqual(
+            lines,
+            [
+                # 通用选择器：默认不互斥
+                "exclusiveValues = [],",
+                "exclusiveValues: pickerValues(exclusiveValues),",
+                "if (on && pickerState.exclusiveValues.length) {",
+                "const exclusive = new Set(pickerState.exclusiveValues.map((item) => String(item)));",
+                # 多选字段只负责把选项透传下去
+                "exclusiveValues: opts.exclusiveValues || [],",
+                # 唯一真正传值的地方
+                "exclusiveValues: groups().map((item) => item.id),",
+            ],
+            "exclusiveValues 只该出现在选择器骨架和日程落点这一处",
+        )
+        # 这一处确实是「日程落点」：它管的字段是 schedule.sessions
+        anchor = source.index("exclusiveValues: groups().map((item) => item.id)")
+        call = source.rindex("pickerField(", 0, anchor)
+        self.assertIn("schedule.sessions", source[call:anchor])
+        # 断言不能空转：多选控件本来就有一堆调用点
+        self.assertGreaterEqual(source.count("pickerField("), 8)
+
+    def test_generic_multi_select_keeps_its_default_and_still_picks_many(self) -> None:
+        """通用多选默认不互斥（exclusiveValues 空数组），多选本身没被改坏。"""
+
+        source = APP_JS.read_text("utf-8")
+        open_picker = _grab_function(source, "openPicker")
+        self.assertIn("exclusiveValues = [],", open_picker)
+        self.assertIn("exclusiveValues: pickerValues(exclusiveValues),", open_picker)
+        field = _grab_function(source, "pickerField")
+        self.assertIn("exclusiveValues: opts.exclusiveValues || [],", field)
+        self.assertIn("multi: opts.multi !== false,", field)
+
+        # 真跑一遍：没有互斥值时两项都留下；给了互斥值（组 id）就轮不到具体会话
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("没有 node，跳过这一条")
+        script = (
+            "let pickerState = null;\n"
+            'function $(id) { return { textContent: "" }; }\n'
+            + _grab_function(source, "togglePick")
+            + "\n"
+            "pickerState = { multi: true, chosen: new Set(), exclusiveValues: [] };\n"
+            'togglePick("p1", true); togglePick("p2", true);\n'
+            "const many = [...pickerState.chosen];\n"
+            'pickerState = { multi: true, chosen: new Set(), exclusiveValues: ["team"] };\n'
+            'togglePick("team", true); togglePick("p1", true);\n'
+            "const exclusive = [...pickerState.chosen];\n"
+            "console.log(JSON.stringify({ many, exclusive }));\n"
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".cjs", delete=False, encoding="utf-8"
+        ) as handle:
+            handle.write(script)
+            path = handle.name
+        try:
+            done = subprocess.run(
+                [node, path], capture_output=True, text=True, encoding="utf-8", timeout=30
+            )
+        finally:
+            Path(path).unlink(missing_ok=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        data = json.loads(done.stdout.strip().splitlines()[-1])
+        # 没配互斥：多选照旧能选两项
+        self.assertEqual(data["many"], ["p1", "p2"])
+        # 配了互斥（组 id "team"）：勾具体会话会把组挤掉，不会两组并存
+        self.assertEqual(data["exclusive"], ["p1"])
+
 
 def _grab_function(source: str, name: str) -> str:
     """把 app.js 里某个函数的源码抠出来（按括号配平，参数里的解构也认）。"""

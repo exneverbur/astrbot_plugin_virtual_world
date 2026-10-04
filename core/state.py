@@ -151,6 +151,27 @@ def chat_group_key(item: dict[str, Any]) -> tuple[str, str]:
     return who, str(item.get("origin") or "")
 
 
+def chat_event_key(
+    origin: str, message_id: str = "", event_id: str = ""
+) -> str:
+    """一条消息的**事件身份**：同一个事件在哪儿都是这一个字符串。
+
+    优先平台 ``message_id``（``origin|m:<id>``）；平台不给 message_id 时用
+    监听侧生成、存在 event extra 里的内部 id（``origin|e:<id>``）。两样都没有
+    就返回空串——**空串表示"不知道身份"**，调用方必须退回到保守的兜底规则，
+    绝不能拿正文当身份（正文一样的两条是用户真的说了两遍）。
+    """
+
+    where = str(origin or "").strip()
+    mid = str(message_id or "").strip()
+    if mid:
+        return f"{where}|m:{mid}"
+    eid = str(event_id or "").strip()
+    if eid:
+        return f"{where}|e:{eid}"
+    return ""
+
+
 def group_chat_items(
     items: list[dict[str, Any]], *, gap_seconds: float = CHAT_MERGE_GAP_SECONDS
 ) -> list[list[dict[str, Any]]]:
@@ -183,8 +204,14 @@ def take_last_chat_groups(
     """
 
     rows = list(items or [])
-    if limit <= 0 or not rows:
+    if not rows:
         return rows
+    if limit <= 0:
+        # **0 = 关闭**：配置里写 0 的意思是"这一类一条都别带进提示词"，
+        # 以前这里把 0 当成"不限制"、原样返回全部——于是把额度调成 0 反而
+        # 带进去最多，用户以为关掉了其实开到最大。要"不限制"请传负数以外的
+        # 大数（配置项本身有默认值，缺省不是 0）。
+        return []
     groups = group_chat_items(rows)
     return [item for group in groups[-limit:] for item in group]
 
@@ -1205,6 +1232,8 @@ class WorldState:
         at: Any = None,
         reply_to: Any = None,
         addressing: str = "",
+        message_id: str = "",
+        event_id: str = "",
     ) -> None:
         """记录一条群聊内容（用于判断"大家在聊什么"）。
 
@@ -1225,27 +1254,40 @@ class WorldState:
         clean = (text or "").strip()
         if not clean:
             return
-        # 同一条消息可能同时经过"旁观监听"和"LLM 请求"两个钩子，去重避免上下文里重复出现
-        # （两个钩子拿到的文本可能差一点点：一个带 @ 前缀、一个被管线改写过，
-        #   所以不是逐字比较，而是"同一个人、短时间内、内容基本一样"。）
-        for item in reversed(self.recent_chat[-4:]):
-            if str(item.get("user_id")) != str(user_id):
-                continue
-            age = now - float(item.get("at", 0))
-            old = str(item.get("text") or "")
-            if age <= _CHAT_DEDUPE_SECONDS and _same_chat_text(old, clean):
-                return
-            # 一份带注释、一份不带（例如「亲亲」和「亲亲［这条消息 @ 了：你（…）］」）：
-            # 把注释切掉再比一次。上面那条规则要求最少 4 个字，短消息靠它认不出来，
-            # 于是同一句话会存两遍，她就会以为对方说了两次。
-            trimmed_old, trimmed_new = chat_core_text(old), chat_core_text(clean)
-            if (
-                age <= _CHAT_DEDUPE_ANNOTATED_SECONDS
-                and (trimmed_old != old or trimmed_new != clean)
-                and _same_chat_text(trimmed_old, trimmed_new)
-            ):
-                return
-            break
+        # 同一条消息可能同时经过"旁观监听"和"LLM 请求"两个钩子，去重避免上下文里重复出现。
+        #
+        # 有事件身份（平台 message_id / 监听侧生成的内部 id）时**只按身份去重**：
+        # 正文一样的两条是用户真的说了两遍，按正文删会把合法重复吞掉
+        # （"他把同一句话说三遍"的错觉有一半就是这么来的）。
+        key = chat_event_key(
+            str(origin or self.session_id or ""), message_id, event_id
+        )
+        if key:
+            for item in reversed(self.recent_chat[-8:]):
+                if str(item.get("event_key") or "") == key:
+                    return
+        else:
+            # 老路径（拿不到身份）：退回到"同一个人、短时间内、内容基本一样"的有限兜底。
+            # 两个钩子拿到的文本可能差一点点（一个带 @ 前缀、一个被管线改写过），
+            # 所以这里不是逐字比较。
+            for item in reversed(self.recent_chat[-4:]):
+                if str(item.get("user_id")) != str(user_id):
+                    continue
+                age = now - float(item.get("at", 0))
+                old = str(item.get("text") or "")
+                if age <= _CHAT_DEDUPE_SECONDS and _same_chat_text(old, clean):
+                    return
+                # 一份带注释、一份不带（例如「亲亲」和「亲亲［这条消息 @ 了：你（…）］」）：
+                # 把注释切掉再比一次。上面那条规则要求最少 4 个字，短消息靠它认不出来，
+                # 于是同一句话会存两遍，她就会以为对方说了两次。
+                trimmed_old, trimmed_new = chat_core_text(old), chat_core_text(clean)
+                if (
+                    age <= _CHAT_DEDUPE_ANNOTATED_SECONDS
+                    and (trimmed_old != old or trimmed_new != clean)
+                    and _same_chat_text(trimmed_old, trimmed_new)
+                ):
+                    return
+                break
         limit = (
             _FORWARD_TEXT_CHARS if FORWARD_SUMMARY_MARK in clean else _CHAT_TEXT_CHARS
         )
@@ -1291,6 +1333,14 @@ class WorldState:
         refs = _chat_image_refs(images)
         if refs:
             item["images"] = refs
+        # 事件身份留一份：渲染和「这轮要回的那批」排除历史里的同一条时按它认，
+        # 不再靠正文（正文一样的两条是两件事）。
+        if key:
+            item["event_key"] = key
+            if str(message_id or "").strip():
+                item["message_id"] = str(message_id).strip()
+            if str(event_id or "").strip():
+                item["event_id"] = str(event_id).strip()
         self.recent_chat.append(item)
         self.chat_seq = int(self.chat_seq) + 1
         dropped = self._trim_chat(keep)

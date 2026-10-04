@@ -1564,6 +1564,19 @@ class TestMainImport(unittest.TestCase):
             and item.get("image_urls")
         ]
 
+    @staticmethod
+    def _whole_request(call: dict) -> str:
+        """整份请求：系统提示词 + 用户消息。
+
+        「本轮要回的那一批」现在写在**用户消息**里（和聊天背景共用同一个渲染器），
+        所以聊天记录里的图编号、图转述也跟着落在那边——断言要看整份请求，
+        不然会把"这一批搬了位置"误判成"信息丢了"。
+        """
+
+        return "\n".join(
+            str(call.get(key) or "") for key in ("system_prompt", "prompt")
+        )
+
     def test_the_fourth_image_captions_the_first_right_away(self):
         """收到第 4 张时就把第 1 张转掉：不等被叫到、更不等调主模型。"""
 
@@ -1689,7 +1702,7 @@ class TestMainImport(unittest.TestCase):
         self.assertEqual(
             [item for item in self._caption_calls(calls)], [], "三张都发出去了，不该转述"
         )
-        prompt = calls[-1]["system_prompt"]
+        prompt = self._whole_request(calls[-1])
         self.assertIn("（见图1）", prompt)
         self.assertIn("（见图2）", prompt)
         self.assertIn("（见图3）", prompt)
@@ -1709,7 +1722,7 @@ class TestMainImport(unittest.TestCase):
 
         asyncio.run(first())
         self.assertFalse(calls[-1].get("image_urls"), "看不见图：这一轮只给文字")
-        self.assertIn("（图片：", calls[-1]["system_prompt"])
+        self.assertIn("（图片：", self._whole_request(calls[-1]))
 
         # 现在让主模型能看图：同一张图这次直接附过去，转述就不该再出现
         plugin.engine.world.context.chat_image_inline = "always"
@@ -1720,7 +1733,7 @@ class TestMainImport(unittest.TestCase):
 
         asyncio.run(second())
         self.assertEqual(calls[-1].get("image_urls"), [url])
-        prompt = calls[-1]["system_prompt"]
+        prompt = self._whole_request(calls[-1])
         self.assertIn("（见图1）", prompt)
         self.assertNotIn("（图片：", prompt)
         plugin.db.raw.close()
@@ -1766,7 +1779,7 @@ class TestMainImport(unittest.TestCase):
         ask = asyncio.run(drive())
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].get("image_urls"), ["https://img/1.jpg"])
-        self.assertIn("（见图1）", calls[0]["system_prompt"])
+        self.assertIn("（见图1）", self._whole_request(calls[0]))
         self.assertEqual(len(ask.sent), 1)
         plugin.db.raw.close()
 
@@ -2574,60 +2587,31 @@ class TestExtensionScopes(unittest.TestCase):
                 handle.close()
 
 
-class TestInjectWorldState(unittest.TestCase):
-    """注入模式：世界状态要挂到用户消息那一侧，别把 system prompt 每轮都改一遍。"""
+class TestReplyModeMigration(unittest.TestCase):
+    """旧的 `reply_mode=inject` 要**静默迁到 takeover**：老存档不能让插件起不来。"""
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.module = load_plugin_module()
 
-    class _Req:
-        def __init__(self, system_prompt: str = "") -> None:
-            self.system_prompt = system_prompt
-            self.extra_user_content_parts: list = []
+    def _world(self, **overrides):
+        from core.models import WorldConfig
 
-    def _inject(self, req, injection: str) -> str:
-        return self.module.VirtualWorldPlugin._inject_world_state(
-            self, req, injection
-        )
+        return WorldConfig(**overrides)
 
-    def test_world_state_goes_to_the_user_side(self):
-        req = self._Req("主人格提示词")
-        where = self._inject(req, "世界状态：她在书房，心情一般")
-        self.assertEqual(where, "user")
-        # system prompt 只多了那段固定说明：跨轮一字不差，缓存前缀才不会被切断
-        self.assertIn("主人格提示词", req.system_prompt)
-        self.assertIn(self.module.INJECT_STUB.strip(), req.system_prompt)
-        self.assertNotIn("她在这个书房", req.system_prompt)
-        self.assertNotIn("世界状态：她在书房", req.system_prompt)
-        # 真正会变的那一大段在用户消息那一侧
-        self.assertEqual(len(req.extra_user_content_parts), 1)
-        part = req.extra_user_content_parts[0]
-        text = part.get("text") if isinstance(part, dict) else getattr(part, "text", "")
-        self.assertEqual(text, "世界状态：她在书房，心情一般")
+    def test_inject_migrates_to_takeover(self):
+        world = self._world(reply_mode="inject")
+        self.assertEqual(world.reply_mode, "takeover")
 
-    def test_system_prompt_stays_identical_across_turns(self):
-        first = self._Req("主人格提示词")
-        self._inject(first, "第一轮的状态：t=1")
-        second = self._Req("主人格提示词")
-        self._inject(second, "第二轮的状态：t=2")
-        self.assertEqual(first.system_prompt, second.system_prompt)
+    def test_garbage_reply_mode_migrates_to_takeover(self):
+        world = self._world(reply_mode="INJECT")
+        self.assertEqual(world.reply_mode, "takeover")
 
-    def test_old_astrbot_without_extra_parts_falls_back(self):
-        class _Old:
-            def __init__(self) -> None:
-                self.system_prompt = "主人格提示词"
-
-        req = _Old()
-        where = self._inject(req, "世界状态：她在书房")
-        self.assertEqual(where, "system")
-        self.assertIn("世界状态：她在书房", req.system_prompt)
-
-    def test_the_same_injection_is_not_added_twice(self):
-        req = self._Req("主人格提示词")
-        self._inject(req, "状态")
-        self.assertEqual(self._inject(req, "状态"), "user（已在）")
-        self.assertEqual(len(req.extra_user_content_parts), 1)
+    def test_the_old_injection_helpers_are_gone(self):
+        # 注入模式整条路都删了：固定桩、内部方法、构建器都不该留半截
+        self.assertFalse(hasattr(self.module, "INJECT_STUB"))
+        self.assertFalse(hasattr(self.module, "_text_part"))
+        self.assertFalse(hasattr(self.module.VirtualWorldPlugin, "_inject_world_state"))
 
 
 class TestImageExtraction(unittest.TestCase):

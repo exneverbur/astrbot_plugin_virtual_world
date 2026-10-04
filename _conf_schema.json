@@ -1,7 +1,7 @@
 {
   "enabled": {
     "description": "启用插件",
-    "hint": "插件总开关。关掉后不监听消息、不注入、不推进世界时钟。",
+    "hint": "插件总开关。关掉后不监听消息、不接管回复、不推进世界时钟。",
     "obvious_hint": true,
     "type": "bool",
     "default": true

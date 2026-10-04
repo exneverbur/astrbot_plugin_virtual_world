@@ -2106,12 +2106,24 @@ class WorldConfig(Permissive):
     admin_ids: list[str] = Field(default_factory=list)
     """改用管理指令的 QQ 号（可多人）。AstrBot 自己的管理员始终可以执行。"""
 
-    reply_mode: Literal["takeover", "inject"] = "takeover"
-    """被 @（或消息走到大模型）时的处理方式。
+    reply_mode: Literal["takeover"] = "takeover"
+    """被 @（或消息走到大模型）时的处理方式：**只保留接管**。
 
-    - ``takeover``：本插件接管这次回复，自己调大模型、按 JSON 动作执行并发送，同时阻止主人格重复回复；
-    - ``inject``：只追加世界认知，由主人格用自然语言回复。
+    插件调大模型、按 JSON 动作执行并发送，然后阻止主人格重复回复——
+    「只注入世界认知、交主人格回复」那条路已经在 v2.2 移除：主人格是另一个人设，
+    顶上来会让用户看到「她」突然换了个说法。老配置里的 ``inject`` 读到时会自动迁到
+    ``takeover``（见 :meth:`_migrate_reply_mode`），不报错、也不会再进那条分支。
     """
+
+    @field_validator("reply_mode", mode="before")
+    @classmethod
+    def _migrate_reply_mode(cls, value: Any) -> str:
+        """老配置 / 手工改坏的配置一律迁到 ``takeover``，绝不让插件退化成注入模式。"""
+
+        text = str(value or "").strip().lower()
+        if text != "takeover":
+            return "takeover"
+        return text
 
     @field_validator("echo_types", mode="before")
     @classmethod

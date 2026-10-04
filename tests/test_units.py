@@ -2966,14 +2966,20 @@ class TestPromptBuilder(unittest.TestCase):
         state.node_since = 1_700_000_000.0 + 200 * 60
         self.assertEqual(dynamics.dwell_factor(state), 1.0)
 
-    def test_injection_contains_scene_and_state(self):
+    def test_takeover_prompt_contains_scene_and_state(self):
         state = WorldState(session_id="s1", node_id="study", energy=0.42, mood="好奇")
-        text = self.builder.build_injection(state, node=self.world.node_map()["study"])
+        text = self.builder.build_autonomous_system_prompt(
+            persona_text="",
+            state=state,
+            node=self.world.node_map()["study"],
+            available_tools={},
+        )
         self.assertIn("书房", text)
         self.assertIn("精力 0.42", text)
         self.assertIn("0~1", text)
-        self.assertIn("虚拟世界状态", text)
-        self.assertNotIn("actions", text)
+        self.assertIn("运行时状态", text)
+        # 接管这条路要她自己产出 JSON 动作，所以格式层一定在（注入模式才没有）
+        self.assertIn('"actions"', text)
 
     def test_duration_is_asked_for_in_the_actions_that_let_her_choose(self):
         """「睡多久她自己定」的动作要把范围写在动作那一行，并告诉她写 duration。"""
@@ -3448,13 +3454,39 @@ class TestPromptBuilder(unittest.TestCase):
         self.assertLess(len(body), self.builder.world.context.chat_line_chars)
 
     def test_chat_records_respect_the_total_budget(self):
-        """整段聊天记录有总字数预算：超了先丢最早的背景，不丢还没回过的那几条。"""
+        """整段聊天记录有总字数预算，而且它是**硬上限**：超了先丢最早的背景。
+
+        背景（已经回过话的那批）只吃「还没回过的那几条」用剩的额度——
+        她这一轮真正要读、要回的是后者。放不下就整条丢，并标明丢了几条。
+        """
 
         context = self.builder.world.context
-        context.chat_total_chars = 250
+        context.chat_line_chars = 120
         chat = [
             {
-                # 每条换个人，免得被"同一个人连着说的并成一行"
+                "user_id": "42",
+                "name": "小明",
+                "text": "旧消息" + "啊" * 300,
+                "at": 10.0,
+            },
+        ]
+        fresh_one = {"user_id": "7", "name": "阿May", "text": "最新的这句", "at": 99.0}
+        # 预算只够"这一轮要读的那条"，背景那条整类放不下
+        context.chat_total_chars = 300
+        joined = "\n".join(self.builder.chat_blocks([*chat, fresh_one], replied_until=15.0))
+        self.assertLessEqual(len(joined), context.chat_total_chars)
+        self.assertIn("最新的这句", joined)
+        # 丢的是背景（已经回过话的那批），不是这一轮要读要回的
+        self.assertNotIn("这里刚聊过的", joined)
+        self.assertNotIn("旧消息", joined)
+
+    def test_chat_records_always_keep_the_newest_line(self):
+        """预算小到装不下一行时：保住最新那一条（宁可略微超出，也不能什么都不给）。"""
+
+        context = self.builder.world.context
+        context.chat_total_chars = 400
+        chat = [
+            {
                 "user_id": str(100 + index),
                 "name": f"群友{index}",
                 "text": f"旧消息{index}" + "啊" * 60,
@@ -3463,13 +3495,9 @@ class TestPromptBuilder(unittest.TestCase):
             for index in range(6)
         ]
         chat.append({"user_id": "7", "name": "阿May", "text": "最新的这句", "at": 99.0})
-        blocks = self.builder.chat_blocks(chat, replied_until=15.0)
-        joined = "\n".join(blocks)
+        joined = "\n".join(self.builder.chat_blocks(chat, replied_until=15.0))
         self.assertIn("最新的这句", joined)
-        self.assertIn("已省略", joined)
-        # 丢的是最早的背景，最新的那条旧消息还在
         self.assertNotIn("旧消息0", joined)
-        self.assertIn("旧消息5", joined)
 
     def test_forward_summary_line_keeps_its_own_limit(self):
         """转发摘要本身是压过的：这一行不该跟着聊天记录掐到 100 字。"""
@@ -3532,6 +3560,80 @@ class TestPromptBuilder(unittest.TestCase):
         )
         self.assertIn("是对你说的", "\n".join(mine))
 
+    def test_chat_blocks_say_her_own_line_got_no_reply(self):
+        """她自己说完、没人接：要说清"这不是新输入"，别让她追着自己的话再解释一遍。"""
+
+        rows = [
+            {"user_id": "1", "name": "不相疑", "text": "在忙吗", "is_self": False},
+            {
+                "user_id": "__self__",
+                "name": "她",
+                "text": "在书房翻配置",
+                "is_self": True,
+            },
+        ]
+        joined = "\n".join(self.builder.chat_blocks(rows, mine_names=["凶猛蓝色虎鲸"]))
+        self.assertIn("没有人接", joined)
+        self.assertIn("别重新解释同一件事", joined)
+        self.assertNotIn("接着你往下说的多半是对你说的", joined)
+        # 她自己的那一行仍然留在记录里，只是提示语变了
+        self.assertIn("在书房翻配置", joined)
+
+        # 她说过话、别人接着往下说：还是原来那句"接着你往下说"，不能说成没人答
+        with_reply = "\n".join(
+            self.builder.chat_blocks(
+                [
+                    {
+                        "user_id": "__self__",
+                        "name": "她",
+                        "text": "在书房翻配置",
+                        "is_self": True,
+                    },
+                    {"user_id": "1", "name": "不相疑", "text": "那你继续", "is_self": False},
+                ],
+                mine_names=["凶猛蓝色虎鲸"],
+            )
+        )
+        self.assertIn("接着你往下说的多半是对你说的", with_reply)
+        self.assertNotIn("没有人接", with_reply)
+
+    def test_autonomous_prompt_says_her_line_got_no_reply(self):
+        """同样的三态判断要真的进到自主提示词里（public entry point）。"""
+
+        system = self.builder.build_autonomous_system_prompt(
+            persona_text="你是温柔少女。",
+            state=WorldState(session_id="s1", node_id="study"),
+            node=self.world.node_map()["study"],
+            available_tools={},
+            recent_chat=[
+                {"user_id": "1", "name": "不相疑", "text": "在忙吗", "is_self": False},
+                {
+                    "user_id": "__self__",
+                    "name": "她",
+                    "text": "在书房翻配置",
+                    "is_self": True,
+                },
+            ],
+            current_session="s1",
+        )
+        self.assertIn("没有人接", system)
+        self.assertIn("别重新解释同一件事", system)
+        self.assertNotIn("接着你往下说的多半是对你说的", system)
+
+    def test_consolidate_rules_keep_her_own_small_talk_out_of_facts(self):
+        """睡眠整理：她自己普通的回复 / 寒暄不算新事实，不许包装成用户的画像。"""
+
+        system, _ = self.builder.build_consolidate_prompt(
+            persona_text="你是温柔少女。",
+            chat_lines=["她: 早呀", "小明: 早"],
+            memories=["她记得昨天聊过天气"],
+            profiles=["小明：住武汉"],
+            pending=[],
+            date_text="2024-01-01",
+        )
+        self.assertIn("不算新事实", system)
+        self.assertIn("别包装成关于用户的事实", system)
+
     def test_bot_name_list_covers_nickname_variants(self):
         """昵称带表情/后缀时也要认得出来（「凶猛蓝色虎鲸💢」→「凶猛蓝色虎鲸」）。"""
 
@@ -3557,7 +3659,12 @@ class TestPromptBuilder(unittest.TestCase):
             node_id="study",
             last_reasoning={"env": "书房", "intent": "继续看书"},
         )
-        text = self.builder.build_injection(state, node=self.world.node_map()["study"])
+        text = self.builder.build_autonomous_system_prompt(
+            persona_text="",
+            state=state,
+            node=self.world.node_map()["study"],
+            available_tools={},
+        )
         self.assertIn("继续看书", text)
 
     def test_runtime_layer_shows_what_she_is_busy_with(self):
@@ -3580,7 +3687,12 @@ class TestPromptBuilder(unittest.TestCase):
             },
             recent_events=[{"kind": "move", "detail": {"to": "study"}}],
         )
-        text = self.builder.build_injection(state, node=self.world.node_map()["study"])
+        text = self.builder.build_autonomous_system_prompt(
+            persona_text="",
+            state=state,
+            node=self.world.node_map()["study"],
+            available_tools={},
+        )
         self.assertIn("你手头的事", text)
         self.assertIn("正在走去书房", text)
         self.assertIn("说话", text)
@@ -3640,9 +3752,11 @@ class TestPromptBuilder(unittest.TestCase):
 
     def test_engagement_hint_is_rendered(self):
         state = WorldState(session_id="s1", node_id="window")
-        text = self.builder.build_injection(
-            state,
+        text = self.builder.build_autonomous_system_prompt(
+            persona_text="",
+            state=state,
             node=self.world.node_map()["window"],
+            available_tools={},
             engagement_hint="你最近连续 2 次主动说话都没人回应。",
         )
         self.assertIn("没人回应", text)

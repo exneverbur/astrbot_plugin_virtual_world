@@ -2049,6 +2049,7 @@ function openPicker({
   col1 = "名称",
   col2 = "说明",
   onConfirm,
+  exclusiveValues = [],
 }) {
   pickerState = {
     // 兜底再洗一遍：别的入口直接调 openPicker 时也不会带进没有 id 的条目
@@ -2056,6 +2057,7 @@ function openPicker({
     chosen: new Set(pickerValues(selected)),
     multi,
     onConfirm,
+    exclusiveValues: pickerValues(exclusiveValues),
     collapsed: {},
     cursor: "",
     group: "",
@@ -2192,6 +2194,13 @@ function pickRow(item) {
 function togglePick(id, on) {
   if (!pickerState) return;
   if (!pickerState.multi) pickerState.chosen.clear();
+  if (on && pickerState.exclusiveValues.length) {
+    const exclusive = new Set(pickerState.exclusiveValues.map((item) => String(item)));
+    const isExclusive = exclusive.has(String(id));
+    for (const chosen of pickerState.chosen) {
+      if (exclusive.has(String(chosen)) !== isExclusive) pickerState.chosen.delete(chosen);
+    }
+  }
   if (on) pickerState.chosen.add(id);
   else pickerState.chosen.delete(id);
   const list = $("modal-list");
@@ -2532,6 +2541,7 @@ function pickerField(label, values, items, onChange, opts = {}) {
       multi: opts.multi !== false,
       col1: opts.col1 || "名称",
       col2: opts.col2 || "说明",
+      exclusiveValues: opts.exclusiveValues || [],
       onConfirm: (chosen) => onChange(chosen),
     });
   });
@@ -3354,7 +3364,7 @@ function bindButtons() {
     $("debug-copy").addEventListener("click", () => {
       const text = String(ui.debugPrompt || "");
       if (!text) {
-        toast("先点一次「预览注入内容」或「预览自主提示词」");
+        toast("先点一次「预览接管请求」或「预览自主提示词」");
         return;
       }
       copyText(text);
@@ -3611,7 +3621,7 @@ function bindButtons() {
   });
   $("pwd-save").addEventListener("click", savePassword);
   $("restore-default").addEventListener("click", restoreDefault);
-  $("debug-inject").addEventListener("click", () => loadPrompt("inject"));
+  $("debug-inject").addEventListener("click", () => loadPrompt("takeover"));
   $("preset-save").addEventListener("click", saveCurrentAsPreset);
   $("preset-import").addEventListener("click", importPreset);
   $("preset-new-default").addEventListener("click", newDefaultPreset);
@@ -9683,14 +9693,17 @@ function renderScheduleForm() {
       schedule.sessions || [],
       scopeOptions({ withMembers: true, onlyFor: scopeFor }),
       (chosen) => {
-        schedule.sessions = chosen;
+        // Groups and individual destinations are mutually exclusive here only.
+        const groupIds = new Set(groups().map((item) => String(item.id)));
+        const pickedGroups = chosen.filter((item) => groupIds.has(String(item)));
+        schedule.sessions = pickedGroups.length ? pickedGroups : chosen;
         renderScheduleForm();
       },
       {
         hint:
-          "只列她这一组：勾组 = 她自己挑组里的哪一处说，" +
-          "单勾会话 = 就发那一处；留空 = 各自跑。",
+          "组与单个会话不能混选：勾组 = 大模型在组内挑一处；勾会话 = 固定发到所选会话；留空 = 各自跑。",
         empty: "（每个会话各自跑）",
+        exclusiveValues: groups().map((item) => item.id),
       },
     ),
   );
@@ -11449,27 +11462,12 @@ function renderSettings() {
     }),
   );
   basic._fields.appendChild(
-    pillsField(
-      "被 @ 时的回复方式",
-      world.reply_mode || "takeover",
-      [
-        {
-          key: "takeover",
-          label: "接管回复（推荐）",
-          hint: "插件自己调模型、按 JSON 动作执行并发送，主人格不重复回复；模型出错时交回主人格。",
-        },
-        {
-          key: "inject",
-          label: "仅注入状态",
-          hint: "只把她的处境追加给主人格，由主人格照常用自然语言回复。",
-        },
-      ],
-      (value) => {
-        world.reply_mode = value;
-        renderSettings();
-        applyPronoun($("app"));
-      },
-      { hint: "决定「消息走到大模型」时由谁负责回复。" },
+    el(
+      "p",
+      "muted",
+      "被 @ 时的回复方式固定为「接管回复」：插件自己调模型、按 JSON 动作执行并发送，" +
+        "主人格不重复回复；模型出错时这一条就不回，不会交给主人格顶替。" +
+        "（主人格是另一个人设，顶下来会让她突然换了个说法，所以不再提供别的选项。）",
     ),
   );
   basic._fields.appendChild(
@@ -14309,7 +14307,7 @@ function renderSettings() {
   /* --- 内容安全 --- */
   const safety = settingsSection(
     "内容安全与隐私",
-    "命中屏蔽词的消息不会进入世界（也不会注入提示词）。",
+    "命中屏蔽词的消息不会进入世界（也不会进她的提示词）。",
     "用户还可以在群里用 /vw forget me 删除关于自己的记忆。",
   );
   const safetyFull = el("div", "full");
@@ -15378,7 +15376,7 @@ function renderDebugOutput(data, mode) {
 
   const summary = $("debug-summary");
   if (summary) {
-    const label = mode === "autonomous" ? "自主提示词" : "注入内容";
+    const label = mode === "autonomous" ? "自主提示词" : "接管请求（上一轮实际发出的）";
     summary.textContent = `${label} · ${Number(data.chars || prompt.length)} 字符`;
   }
 

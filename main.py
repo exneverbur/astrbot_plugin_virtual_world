@@ -1,10 +1,12 @@
 """AstrBot 虚拟世界插件（Star 入口）。
 
 两条互斥的路径：
-- **注入模式**：用户 @Bot 时，AstrBot 主人格正常回复，本插件只把「她此刻在哪、什么状态、
-  想起什么」追加进 system_prompt，并顺带按区域裁剪可用工具（`on_llm_request`）。
-- **接管模式**：自主行为（日程、发呆、搜索、主动搭话）由插件自己调 LLM 并用 JSON 约束输出，
-  自己发送消息。自己发起的调用按协程打标记，绝不会被自己重复注入 / 接管。
+- **接管回复**（默认，也是唯一一种回复方式）：用户 @Bot 时本插件把整轮接过来，
+  自己组装提示词、自己调 LLM、自己执行动作并发送，然后 `stop_event()` 阻止主人格重复回复；
+  顺带按区域裁剪可用工具（`on_llm_request`）。她说不出来或模型出错时这一条就不回了，
+  只写日志——**不会交回主人格**。
+- **自主行为**：日程、发呆、搜索、主动搭话由插件自己调 LLM 并用 JSON 约束输出，自己发送消息。
+  自己发起的调用按协程打标记，绝不会被自己重复接管。
 
 配置热加载、Web 编辑器、状态与记忆都在 core/ 里实现，本文件只做 AstrBot 适配。
 """
@@ -87,6 +89,9 @@ PRESENCE_PRIORITY = 190
 REPLY_TURN_WAIT_SECONDS = 25.0
 # 事件上挂的「这条消息已经在待回队列里了」标记（连发合并用）
 VW_INCOMING_EXTRA = "vw_incoming_record"
+# 平台不给 message_id 时，同一条消息的**稳定内部事件 id** 挂在这里：
+# 旁观监听和 LLM 请求两个钩子拿到的是同一个 event 对象，因此复用同一个 id。
+VW_EVENT_ID_EXTRA = "vw_event_id"
 TOKEN_TTL_SECONDS = 24 * 3600
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_SECONDS = 300
@@ -250,28 +255,6 @@ def _mention_note(event: Any) -> str:
     return note
 
 
-INJECT_STUB = (
-    "\n\n# 你自己的世界（由「虚拟世界」提供）\n"
-    "你按它给的时间、地点和状态说话；不要向用户解释地图、规则、数值或任何系统设定，"
-    "也不要复述这段说明。\n"
-)
-"""注入模式留在 system prompt 里的那几句：**每轮一字不差**，才不打断前缀缓存。
-
-真正每轮都变的世界状态走 ``extra_user_content_parts``（见 ``_inject_world_state``）。
-"""
-
-
-def _text_part(text: str):
-    """一个 text 内容块：新版本 AstrBot 用 ``TextPart``，拿不到就退回纯 dict。"""
-
-    try:
-        from astrbot.core.agent.message import TextPart
-
-        return TextPart(text=text)
-    except Exception:
-        return {"type": "text", "text": text}
-
-
 def _at_label(name: str, qq: str) -> str:
     """@ 目标的标签：名字和号码尽量都给，但别写成 ``2829449702(2829449702)``。"""
 
@@ -282,6 +265,87 @@ def _at_label(name: str, qq: str) -> str:
     if not clean_qq or clean_name == clean_qq:
         return clean_name
     return f"{clean_name}({clean_qq})"
+
+
+def _message_id(event: Any) -> str:
+    """平台给的消息 id（拿不到就是空串）。
+
+    这个 id 只用来**认"是不是同一个事件"**，不参与"这个平台支不支持某功能"的判定，
+    所以不像 ``_quote_target`` 那样先按平台名挡一道。
+    """
+
+    message_obj = getattr(event, "message_obj", None)
+    return str(getattr(message_obj, "message_id", "") or "").strip()
+
+
+def _stable_event_id(event: Any) -> str:
+    """没有平台 message_id 时，为这条消息生成一个**稳定**的内部事件 id。
+
+    存在 event extra 里：旁观监听和 LLM 请求两个钩子拿到的是同一个 event 对象，
+    所以两边拿到的是同一个 id——正文被注解改过也不会变成"另一条消息"。
+    """
+
+    getter = getattr(event, "get_extra", None)
+    if callable(getter):
+        try:
+            existing = str(getter(VW_EVENT_ID_EXTRA, "") or "")
+        except Exception:
+            existing = ""
+        if existing:
+            return existing
+    created = f"{int(time.time_ns())}-{id(event)}"
+    setter = getattr(event, "set_extra", None)
+    if callable(setter):
+        try:
+            setter(VW_EVENT_ID_EXTRA, created)
+        except Exception:
+            return created
+    return created
+
+
+def _incoming_identity(event: Any, raw_text: str) -> dict:
+    """一条消息的事件身份 + 结构化标注（登记待回队列、写留档都用它）。
+
+    有平台 ``message_id`` 时按 ``origin + message_id`` 认同一个事件；没有就用
+    :func:`_stable_event_id` 生成的内部 id。``raw_text`` 是注解**之前**的原文——
+    事件身份认的是这条消息本身，注解（图片说明 / @ / 转发摘要）改不了它。
+    """
+
+    message_id = _message_id(event)
+    event_id = "" if message_id else _stable_event_id(event)
+    targets = _at_targets(event)
+    reply_to = _reply_target(event)
+    self_id = ""
+    getter = getattr(event, "get_self_id", None)
+    if callable(getter):
+        try:
+            self_id = str(getter() or "")
+        except Exception:
+            self_id = ""
+    sender_id = ""
+    getter = getattr(event, "get_sender_id", None)
+    if callable(getter):
+        try:
+            sender_id = str(getter() or "")
+        except Exception:
+            sender_id = ""
+    sender_name = ""
+    getter = getattr(event, "get_sender_name", None)
+    if callable(getter):
+        try:
+            sender_name = str(getter() or "")
+        except Exception:
+            sender_name = ""
+    return {
+        "message_id": message_id,
+        "event_id": event_id,
+        "user_id": sender_id,
+        "user_name": sender_name,
+        "raw_text": str(raw_text or ""),
+        "at_targets": targets,
+        "reply_to": reply_to,
+        "addressing": _addressing_kind(targets, reply_to, self_id),
+    }
 
 
 def _at_targets(event: Any) -> list[dict]:
@@ -2765,7 +2829,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "exneverbur",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v2.1.5",
+    "v2.1.6",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -3537,7 +3601,7 @@ class VirtualWorldPlugin(Star):
     def in_self_initiated_call(self) -> bool:
         """当前这条协程是不是"我们自己正在调模型"的那一条。
 
-        按协程判断（而不是"只要有调用在跑"）：我们自己的请求依旧不会被自己注入 / 接管，
+        按协程判断（而不是"只要有调用在跑"）：我们自己的请求依旧不会被自己重复接管，
         但同一时间到达的真人消息走的是另一条协程，照常处理。
         """
 
@@ -3605,15 +3669,16 @@ class VirtualWorldPlugin(Star):
             if acquired:
                 lock.release()
 
-    # ================= 回复路径（接管 / 注入） =================
+    # ================= 回复路径（接管） =================
 
     @filter.on_llm_request(priority=LLM_HOOK_PRIORITY)
     async def on_llm_request(self, event: AstrMessageEvent, req) -> None:
         """消息走到大模型时触发。
 
-        - ``reply_mode=takeover``（默认）：本插件接管这次回复，自己调模型、按 JSON 动作执行并发送，
-          然后 ``stop_event()`` 阻止主人格重复回复；
-        - 接管失败（没配模型 / 调用出错 / 模型没给动作）时自动降级为注入模式，用户仍然会收到回复；
+        - 本插件接管这次回复，自己调大模型、按 JSON 动作执行并发送，然后 ``stop_event()``
+          阻止主人格重复回复；
+        - **接管失败（没配模型 / 调用出错 / 模型没给动作）就不回这一条**：绝不交回主人格——
+          那是另一个人设，顶下来用户会看到「她」突然换了个说法；
         - 如果消息在这之前已经被别的插件处理掉（事件已 stop、或根本没走到大模型），我们什么都不做。
         """
 
@@ -3647,6 +3712,9 @@ class VirtualWorldPlugin(Star):
         user_text = (getattr(req, "prompt", "") or "").strip() or (
             event.get_message_str() or ""
         )
+        # 注解**之前**的原文：ctx.text 是注解后的文本，事件身份认的是这条消息本身
+        raw_text = event.get_message_str() or ""
+        identity = _incoming_identity(event, raw_text)
         sources = await _image_sources(event)
         # 先决定"这一轮把哪几张图交给主模型看"（编号也在这儿定），
         # 再拼注解——这样注解里的"就是图2、图3"和聊天记录里的编号是同一套
@@ -3665,6 +3733,9 @@ class VirtualWorldPlugin(Star):
             user_id=event.get_sender_id(),
             user_name=event.get_sender_name(),
             text=user_text,
+            raw_text=raw_text,
+            message_id=str(identity.get("message_id") or ""),
+            event_id=str(identity.get("event_id") or ""),
             is_wake=bool(event.is_wake_up()),
             is_mentioned=_is_at_bot(event) or bool(event.is_private_chat()),
             is_soft_wake=_is_soft_wake(event),
@@ -3705,204 +3776,178 @@ class VirtualWorldPlugin(Star):
             event.stop_event()
             return
 
-        injection = await self.engine.handle_incoming(ctx)
-        if not injection:
-            return  # 会话未启用或命中内容安全，本插件完全不干预
+        # 会话没启用 / 命中内容安全：本插件完全不干预，交给宿主
+        if not await self.engine.handle_incoming(ctx):
+            return
 
-        # ---- 接管模式：自己回复，并阻止主人格重复回复 ----
-        if (self.engine.world.reply_mode or "takeover") == "takeover":
-            # AstrBot 会在「准备调模型」时发一次这个钩子（贴表情的小插件靠它开始处理）。
-            # 我们自己调模型，这里补一遍；被拦下就整条消息都不接管。
-            if await self._fire_hook(event, "OnWaitingLLMRequestEvent"):
+        # ---- 接管回复：自己调模型、自己发，然后阻止主人格重复回复 ----
+        # AstrBot 会在「准备调模型」时发一次这个钩子（贴表情的小插件靠它开始处理）。
+        # 我们自己调模型，这里补一遍；被拦下就整条消息都不接管。
+        if await self._fire_hook(event, "OnWaitingLLMRequestEvent"):
+            event.stop_event()
+            return
+        # 同一条会话同一时间只跑一条接管：连发的第二条会排队，
+        # 等前一条说完再开口，这样它能看到对方刚说过什么
+        # 排队期间如果前一条还在调模型、而且这条来得够快，会被**并进那一次回复**，
+        # 那就轮到自己时直接跳过（不能同一句话答两遍）
+        # 「收到消息」那一刻就登记过了（见 on_any_message）：这里只取回来，
+        # 拿不到（老事件 / 被别的插件重建过）就补登记一条
+        incoming = event.get_extra(VW_INCOMING_EXTRA, None)
+        if not isinstance(incoming, dict):
+            incoming = self.engine.register_incoming(
+                session_id,
+                ctx.text,
+                identity={
+                    **_incoming_identity(event, ctx.raw_text or ctx.text),
+                    "model_text": ctx.text,
+                },
+            )
+        else:
+            # 监听侧登记的那条要补成"LLM 请求看到的样子"（注解后的正文、
+            # 图片说明等），但**事件身份不变**——所以这里只刷新正文和缺的字段
+            self.engine.refresh_incoming(
+                incoming,
+                ctx.text,
+                identity={
+                    **_incoming_identity(event, ctx.raw_text or ctx.text),
+                    "model_text": ctx.text,
+                },
+            )
+        # 按当前区域裁一层宿主工具（`tool_filter_enabled` 关着就什么都不做）。
+        # 放在调模型之前：宿主是在这个钩子之后才装配工具的，裁完她这一轮就看不到
+        # 这个地点不该有的动作。
+        await self._trim_tools(session_id, req)
+        async with self._reply_turn(session_id):
+            if self.engine.was_absorbed(incoming):
+                if self.debug:
+                    self.logger.info(
+                        f"[virtual_world] 这条被合并进上一次回复了，不单独回 session={session_id}"
+                    )
                 event.stop_event()
                 return
-            # 同一条会话同一时间只跑一条接管：连发的第二条会排队，
-            # 等前一条说完再开口，这样它能看到对方刚说过什么
-            # 排队期间如果前一条还在调模型、而且这条来得够快，会被**并进那一次回复**，
-            # 那就轮到自己时直接跳过（不能同一句话答两遍）
-            # 「收到消息」那一刻就登记过了（见 on_any_message）：这里只取回来，
-            # 拿不到（老事件 / 被别的插件重建过）就补登记一条
-            incoming = event.get_extra(VW_INCOMING_EXTRA, None)
-            if not isinstance(incoming, dict):
-                incoming = self.engine.register_incoming(session_id, ctx.text)
-            async with self._reply_turn(session_id):
-                if self.engine.was_absorbed(incoming):
-                    if self.debug:
-                        self.logger.info(
-                            f"[virtual_world] 这条被合并进上一次回复了，不单独回 session={session_id}"
-                        )
-                    event.stop_event()
-                    return
-                outcome = await self.engine.handle_reply(
-                    ctx, history=list(getattr(req, "contexts", None) or [])
+            outcome = await self.engine.handle_reply(
+                ctx, history=list(getattr(req, "contexts", None) or [])
+            )
+            echo = list(getattr(outcome, "debug_messages", []) or [])
+            # 这一轮工具 / 指令生成出来的图（生图动作走的就是这里）
+            made_images = list(getattr(outcome, "images", []) or [])
+            # 她这一轮要说的话：当前会话一份，另外可能还有"只说给别处"的
+            routed = {
+                str(key): list(value)
+                for key, value in (getattr(outcome, "routed", {}) or {}).items()
+                if list(value)
+            }
+            routed_images = {
+                str(key): list(value)
+                for key, value in (getattr(outcome, "routed_images", {}) or {}).items()
+                if list(value)
+            }
+            # 慢动作之前她已经说的那几句已经当场发出去了（见 _send_live_say）：
+            # 这一轮算成立，但只发"还没发出去的部分"
+            live_lines = [
+                str(item)
+                for item in (getattr(outcome, "live_messages", []) or [])
+                if str(item).strip()
+            ]
+            pending_lines = [
+                str(item) for item in (outcome.messages or []) if str(item).strip()
+            ]
+            if outcome.ok and (pending_lines or live_lines or routed or routed_images):
+                # 先让别的插件的回复钩子过一遍（它们可能在回复里读写标记）
+                # 钩子看的是她这一轮说过的**全部**话（含已经发出去的那几句），
+                # 不然"等我两分钟"之后再接结果时，靠标记工作的插件会少读到前半句
+                heard = live_lines + pending_lines
+                bridged = await self._bridge_reply_hooks(
+                    event,
+                    heard,
+                    str(getattr(outcome, "tail", "") or ""),
                 )
-                echo = list(getattr(outcome, "debug_messages", []) or [])
-                # 这一轮工具 / 指令生成出来的图（生图动作走的就是这里）
-                made_images = list(getattr(outcome, "images", []) or [])
-                # 她这一轮要说的话：当前会话一份，另外可能还有"只说给别处"的
-                routed = {
-                    str(key): list(value)
-                    for key, value in (getattr(outcome, "routed", {}) or {}).items()
-                    if list(value)
-                }
-                routed_images = {
-                    str(key): list(value)
-                    for key, value in (getattr(outcome, "routed_images", {}) or {}).items()
-                    if list(value)
-                }
-                # 慢动作之前她已经说的那几句已经当场发出去了（见 _send_live_say）：
-                # 这一轮算成立，但只发"还没发出去的部分"
-                live_lines = [
-                    str(item)
-                    for item in (getattr(outcome, "live_messages", []) or [])
-                    if str(item).strip()
-                ]
-                pending_lines = [
-                    str(item) for item in (outcome.messages or []) if str(item).strip()
-                ]
-                if outcome.ok and (pending_lines or live_lines or routed or routed_images):
-                    # 先让别的插件的回复钩子过一遍（它们可能在回复里读写标记）
-                    # 钩子看的是她这一轮说过的**全部**话（含已经发出去的那几句），
-                    # 不然"等我两分钟"之后再接结果时，靠标记工作的插件会少读到前半句
-                    heard = live_lines + pending_lines
-                    bridged = await self._bridge_reply_hooks(
+                if len(bridged) == len(heard):
+                    bridged = bridged[len(live_lines) :]
+                else:
+                    # 钩子改了条数：位置对不上，就用原样的"还没发的部分"
+                    bridged = list(pending_lines)
+                # 再按换行拆段：一段一条消息，别把好几句挤成一坨；
+                # 调试回显按它实际发生的位置插进去（先调工具、再说话，群里也是这个顺序）
+                payload = self._merge_with_echo(bridged, outcome, echo)
+                sent_ok = True
+                if payload or made_images:
+                    await self._send_reply(
                         event,
-                        heard,
-                        str(getattr(outcome, "tail", "") or ""),
+                        payload,
+                        # 前面已经即时说过话时，这一条是接着往下讲，不再引用触发她的那条
+                        quote=not live_lines,
+                        quote_mode_hint=str(getattr(outcome, "quote_hint", "") or ""),
+                        images=made_images,
                     )
-                    if len(bridged) == len(heard):
-                        bridged = bridged[len(live_lines) :]
-                    else:
-                        # 钩子改了条数：位置对不上，就用原样的"还没发的部分"
-                        bridged = list(pending_lines)
-                    # 再按换行拆段：一段一条消息，别把好几句挤成一坨；
-                    # 调试回显按它实际发生的位置插进去（先调工具、再说话，群里也是这个顺序）
-                    payload = self._merge_with_echo(bridged, outcome, echo)
-                    if payload or made_images:
-                        await self._send_reply(
-                            event,
-                            payload,
-                            # 前面已经即时说过话时，这一条是接着往下讲，不再引用触发她的那条
-                            quote=not live_lines,
-                            quote_mode_hint=str(getattr(outcome, "quote_hint", "") or ""),
-                            images=made_images,
-                        )
-                    # 说给别处的那些：逐条投到那个会话（不带引用——那条消息不在这里）
-                    for target, texts in routed.items():
-                        try:
-                            await self.messenger.send_text(target, list(texts))
-                        except Exception as exc:
-                            self.logger.debug(
-                                f"[virtual_world] 发到 {target} 失败：{exc}"
-                            )
-                    for target, refs in routed_images.items():
-                        try:
-                            await self.messenger.send_images(target, list(refs))
-                        except Exception as exc:
-                            self.logger.debug(
-                                f"[virtual_world] 发图到 {target} 失败：{exc}"
-                            )
-                    # 真发出去了才算"回过这批消息"（水位线在这里推进）
+                # 说给别处的那些：逐条投到那个会话（不带引用——那条消息不在这里）
+                # 投失败的目标**不算回过话**：水位线不推进，它下一轮还会被当成新的
+                failed_targets: set[str] = set()
+                for target, texts in routed.items():
                     try:
-                        await self.engine.mark_chat_replied_by_session(session_id)
-                        # 别处那几句也一样：她在那边也算回应过了
-                        for target in list(routed) + list(routed_images):
-                            await self.engine.mark_chat_replied_by_session(target)
+                        await self.messenger.send_text(target, list(texts))
+                    except Exception as exc:
+                        failed_targets.add(target)
+                        sent_ok = False
+                        self.logger.warning(
+                            f"[virtual_world] 发到 {target} 失败：{exc}"
+                        )
+                for target, refs in routed_images.items():
+                    try:
+                        await self.messenger.send_images(target, list(refs))
+                    except Exception as exc:
+                        failed_targets.add(target)
+                        sent_ok = False
+                        self.logger.warning(
+                            f"[virtual_world] 发图到 {target} 失败：{exc}"
+                        )
+                # 真发出去了才算"回过这批消息"（水位线在这里推进）
+                # 本轮实际处理到哪几条由引擎按 batch 边界定，不是"提交时最新那条"
+                for target in [session_id, *(list(routed) + list(routed_images))]:
+                    if target in failed_targets:
+                        continue  # 没发出去的那边不算回应过
+                    try:
+                        await self.engine.mark_reply_batch_replied(target)
                     except Exception as exc:
                         self.logger.debug(f"[virtual_world] 推进水位线失败：{exc}")
-                    # 「发完了」也要补一遍：靠它摘掉"处理中"标记的插件才不会一直挂着
-                    await self._fire_hook(event, "OnAfterMessageSentEvent")
-                    if self.debug:
-                        self.logger.info(
-                            f"[virtual_world] 接管回复 {session_id}："
-                            f"reasoning={outcome.reasoning} "
-                            f"messages={live_lines + pending_lines}"
-                        )
-                    event.stop_event()
-                    return
-                if str(getattr(outcome, "error", "")) == REPLY_INTERRUPTED:
-                    # 这一轮被新消息打断：作废，不补一句也不交给主人格——
-                    # 新那条自己的回复管线马上会接手（它能看到刚才这几条）。
-                    if echo:
-                        await self._send_reply(event, echo)
-                    event.stop_event()
-                    return
-                if str(getattr(outcome, "error", "")) == REPLY_MUTED:
-                    # 本小时被动回复触顶：接管但静默（连调试回显也不发）
-                    event.stop_event()
-                    return
-                # 接管没成功：**这一条就不回了**（不交回主人格——那是另一个人设，
-                # 顶下来的话用户会看到"她"突然换了个说法）。调试回显照样发，
-                # 原因写进日志页，方便排查到底是模型挂了还是没给出动作。
-                if echo or made_images:
-                    await self._send_reply(event, echo, images=made_images)
-                    await self._fire_hook(event, "OnAfterMessageSentEvent")
-                await self._note_takeover_fallback(session_id, outcome)
+                if not sent_ok:
+                    self.logger.warning(
+                        f"[virtual_world] {session_id}：有目标没收到，"
+                        "水位线只推了真正送到的那些"
+                    )
+                # 「发完了」也要补一遍：靠它摘掉"处理中"标记的插件才不会一直挂着
+                await self._fire_hook(event, "OnAfterMessageSentEvent")
+                if self.debug:
+                    self.logger.info(
+                        f"[virtual_world] 接管回复 {session_id}："
+                        f"reasoning={outcome.reasoning} "
+                        f"messages={live_lines + pending_lines}"
+                    )
                 event.stop_event()
                 return
-
-        # ---- 注入模式：只把世界认知写进主人格的提示词，不接管回复 ----
-        if self.extension_host.installed():
-            try:
-                state = await self.engine.load_state(session_id, cold_start=False)
-                layer = self.engine._extension_prompt(state, session_id)
-                if layer:
-                    injection = f"{injection}\n\n{layer}"
-            except Exception as exc:
-                self.logger.debug(f"[virtual_world] 扩展提示词没加上：{exc}")
-        try:
-            where = self._inject_world_state(req, injection)
-            if self.debug:
-                head = str(getattr(req, "system_prompt", "") or "")
-                self.logger.info(
-                    f"[virtual_world] 注入 {session_id}（{where}，状态 {len(injection)} 字）"
-                    f"｜system_prompt 指纹 {hashlib.sha1(head.encode('utf-8')).hexdigest()[:10]}"
-                    f"（{len(head)} 字，跨轮应保持不变）：\n{injection}"
-                )
-        except Exception as exc:
-            self.logger.warning(f"[virtual_world] 注入提示词失败：{exc}")
-        # 注入模式下主人格会替她说话，同样算"已经回应过这批群聊"
-        try:
-            await self.engine.mark_chat_replied_by_session(session_id)
-        except Exception:
-            pass
-        # 注入模式不会自己发消息，但门禁（被叫醒等）攒下的回显要补上
-        echo = self.engine.take_pending_echo(session_id)
-        if echo:
-            await self._send_reply(event, echo)
-        await self._trim_tools(session_id, req)
-
-    def _inject_world_state(self, req, injection: str) -> str:
-        """把世界状态挂到**这一轮的用户消息**上，而不是 system prompt 的尾巴。
-
-        前缀缓存按 token 前缀命中。世界状态里带着时间、位置、心情、日程、聊天记录，
-        每轮都不一样；追加到 system prompt 末尾等于把分叉点钉在那里——它后面的
-        **整段历史**都再也命中不了缓存（历史越长，浪费越大）。
-        AstrBot 的 ``extra_user_content_parts`` 会被拼进最后那条 user 消息
-        （它自己就是这么放引用消息和图片说明的），system 与历史因此保持一字不变。
-
-        返回"注到哪儿了"，方便日志里核对（``user`` = 走的新路，``system`` = 老版本兜底）。
-        """
-
-        current = str(getattr(req, "system_prompt", "") or "")
-        if INJECT_STUB.strip() and INJECT_STUB.strip() not in current:
-            req.system_prompt = current + INJECT_STUB
-        parts = getattr(req, "extra_user_content_parts", None)
-        if parts is None:
-            # 老版本 AstrBot 没这个字段：退回原来的写法（牺牲缓存，但不丢功能）
-            req.system_prompt = str(getattr(req, "system_prompt", "") or "") + injection
-            return "system"
-        for part in list(parts):
-            dumped = part if isinstance(part, dict) else getattr(part, "text", "")
-            if isinstance(dumped, dict):
-                dumped = dumped.get("text")
-            if str(dumped or "") == injection:
-                return "user（已在）"
-        parts.append(_text_part(injection))
-        return "user"
+            if str(getattr(outcome, "error", "")) == REPLY_INTERRUPTED:
+                # 这一轮被新消息打断：作废，不补一句也不交给主人格——
+                # 新那条自己的回复管线马上会接手（它能看到刚才这几条）。
+                if echo:
+                    await self._send_reply(event, echo)
+                event.stop_event()
+                return
+            if str(getattr(outcome, "error", "")) == REPLY_MUTED:
+                # 本小时被动回复触顶：接管但静默（连调试回显也不发）
+                event.stop_event()
+                return
+            # 接管没成功：**这一条就不回了**（不交回主人格——那是另一个人设，
+            # 顶下来的话用户会看到"她"突然换了个说法）。调试回显照样发，
+            # 原因写进日志页，方便排查到底是模型挂了还是没给出动作。
+            if echo or made_images:
+                await self._send_reply(event, echo, images=made_images)
+                await self._fire_hook(event, "OnAfterMessageSentEvent")
+            await self._note_takeover_fallback(session_id, outcome)
+            event.stop_event()
+            return
 
     async def _trim_tools(self, session_id: str, req) -> None:
-        """按当前区域裁剪 req.func_tool。"""
+        """按当前区域裁剪 req.func_tool（`tool_filter_enabled` 关着就直接返回）。"""
 
         if not self.engine.world.tool_filter_enabled:
             return
@@ -4350,26 +4395,36 @@ class VirtualWorldPlugin(Star):
         # 早就过了安静期，两条消息就各回一次了。
         if self._should_expect_reply(event):
             try:
+                raw_text = event.get_message_str() or ""
                 event.set_extra(
                     VW_INCOMING_EXTRA,
-                    self.engine.register_incoming(session_id, event.get_message_str() or ""),
+                    self.engine.register_incoming(
+                        session_id,
+                        raw_text,
+                        identity=_incoming_identity(event, raw_text),
+                    ),
                 )
             except Exception as exc:
                 self.logger.debug(f"[virtual_world] 登记待回消息失败：{exc}")
         self._remember_event(event)
         sources = await _image_sources(event)
+        raw_text = event.get_message_str() or ""
         text = await self._annotate_message(
             event,
-            event.get_message_str() or "",
+            raw_text,
             sources=sources,
             summarize_forward=self._should_expect_reply(event),
         )
+        identity = _incoming_identity(event, raw_text)
         await self.engine.note_presence(
             MessageContext(
                 session_id=session_id,
                 user_id=event.get_sender_id(),
                 user_name=event.get_sender_name(),
                 text=text,
+                raw_text=raw_text,
+                message_id=str(identity.get("message_id") or ""),
+                event_id=str(identity.get("event_id") or ""),
                 is_wake=bool(event.is_wake_up()),
                 is_private=bool(event.is_private_chat()),
                 group_name=_group_name(event),
@@ -4795,7 +4850,7 @@ class VirtualWorldPlugin(Star):
         if sub in ("on", "开"):
             self.debug = True
             self.engine.debug = True
-            return "调试模式已开启（注入内容与动作校验会写入日志）。"
+            return "调试模式已开启（接管详情与动作校验会写入日志）。"
         if sub in ("off", "关"):
             self.debug = False
             self.engine.debug = False
@@ -4839,7 +4894,7 @@ class VirtualWorldPlugin(Star):
                 f"AstrBot 已注册工具：{sorted(available)}"
             )
         if sub in ("prompt", "提示词"):
-            return await self._prompt_report(session_id, "inject")
+            return await self._prompt_report(session_id, "takeover")
         if sub in ("autoprompt", "自主提示词"):
             return await self._prompt_report(session_id, "autonomous")
         if sub in ("tick", "推进"):
@@ -4869,9 +4924,9 @@ class VirtualWorldPlugin(Star):
             name = "prompt_autonomous.txt"
             label = "自主提示词"
         else:
-            text = await self.engine.preview_injection(session_id)
-            name = "prompt_inject.txt"
-            label = "注入内容"
+            text = await self.engine.preview_last_reply_request(session_id)
+            name = "prompt_takeover.txt"
+            label = "接管请求（上一轮实际发出去的原文）"
         path = Path(self.store.data_dir) / name
         try:
             path.write_text(text, encoding="utf-8")
@@ -4882,7 +4937,7 @@ class VirtualWorldPlugin(Star):
         for item in prompt_section_index(text):
             lines.append(f"· {item['title']}：{item['chars']} 字符")
         lines.append(f"完整内容已写入：{written}")
-        lines.append("（编辑器「调试 → 预览注入内容 / 预览自主提示词」里能看全文）")
+        lines.append("（编辑器「调试 → 预览接管请求 / 预览自主提示词」里能看全文）")
         return "\n".join(lines)
 
     async def _handle_session_command(self, event: AstrMessageEvent, rest: list[str]) -> str:
@@ -5991,13 +6046,21 @@ class VirtualWorldPlugin(Star):
         # 工具 / 指令型步骤缺「想干什么」时，让内容生成模型补一句写进配置：
         # 运行时就不用再猜，也不会因为缺意图被跳过。
         schedules, filled = await self.engine.fill_schedule_intents(schedules)
+        # 落点归一化：旧存档里「会话组 + 具体会话」混着存的，保存前统一成一种，
+        # 并把"我替你按什么存了"作为人话提示交回编辑器（不静默丢用户的选择）。
+        schedules, landing_warnings = self.engine.normalize_schedule_sessions(schedules)
         try:
             warnings = self.store.save_schedules(schedules)
         except ValidationError as exc:
             return self._save_error("日程", exc)
         self.engine.reload_config()
         return json_response(
-            {"ok": True, "warnings": warnings, "filled": filled, "schedules": schedules}
+            {
+                "ok": True,
+                "warnings": [*landing_warnings, *warnings],
+                "filled": filled,
+                "schedules": schedules,
+            }
         )
 
     async def api_put_sessions(self):
@@ -6645,14 +6708,14 @@ class VirtualWorldPlugin(Star):
         if guard is not None:
             return guard
         session_id = request.query.get("session", "") or ""
-        mode = request.query.get("mode", "inject") or "inject"
+        mode = request.query.get("mode", "takeover") or "takeover"
         if not session_id:
             return error_response("缺少 session 参数")
         session_id = self._scope(session_id)
         if mode == "autonomous":
             text = await self.engine.preview_autonomous_prompt(session_id)
         else:
-            text = await self.engine.preview_injection(session_id)
+            text = await self.engine.preview_last_reply_request(session_id)
         return json_response(
             {
                 "prompt": text,

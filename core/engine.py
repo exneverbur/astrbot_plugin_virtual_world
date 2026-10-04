@@ -4,8 +4,9 @@
 因此可以在没有 AstrBot 的环境里完整测试。
 
 职责边界：
-- 注入模式（被 @ 时）：只产出「世界认知」文本交给主人格，不接管回复；
-- 接管模式（自主行为）：自己调 LLM、自己发消息。两条路径互斥。
+- 接管回复（被 @ 时）：自己组装提示词、自己调 LLM、自己执行动作并发送；
+- 自主行为（日程、发呆、主动搭话）：同样自己调 LLM、自己发消息。
+  两条路径互斥，接管失败不交回主人格。
 """
 
 from __future__ import annotations
@@ -105,6 +106,8 @@ from .state import (
     STATE_SLEEPING,
     STATE_WALKING,
     WorldState,
+    chat_core_text,
+    chat_event_key,
     chat_item_is_fresh,
     group_chat_items,
     take_last_chat_groups,
@@ -188,6 +191,9 @@ INTERRUPT_STREAK_MAX = 3
 INTERRUPT_STREAK_WINDOW_SECONDS = 180.0
 REPLY_INTERRUPTED = "被新消息打断：这一次生成作废"
 """``handle_reply`` 的 ``error`` 标记：这轮被新消息打断，调用方不要再补一句。"""
+
+PROMPT_SNAPSHOT_KEEP = 3
+"""留几份"实际发出去的请求"（只读调试用，全在内存里）。"""
 
 REPLY_MUTED = "本小时被动回复已达上限：这一条不回"
 """``handle_reply`` 的 ``error`` 标记：配额用尽，接管但静默（不落回主人格）。"""
@@ -301,6 +307,18 @@ class TickOutcome:
 
     routed_images: dict[str, list[str]] = field(default_factory=dict)
     """同上，按会话分开的图片。"""
+
+    broadcast_targets: list[str] = field(default_factory=list)
+    """日程一次执行后，默认文本和图片还要复制到的具体会话。"""
+
+    locked_targets: list[str] = field(default_factory=list)
+    """日程这一轮的「允许落点」全集：勾了具体会话 = 那几个；勾了会话组 = 组里全部成员。
+
+    只有日程（``run_schedules`` / ``run_schedule_now``）会设置它。锁上之后，动作模型
+    写的 ``send_to`` 必须落在集合里，否则这句话不发（见 ``_speech_target``）——不然
+    「只勾了一个私聊」的日程会被那句 ``send_to`` 改发到没勾的会话去。
+    空 list = 没锁 = 普通回复 / 事件 / 主动开口照旧，不受任何落点限制。
+    """
 
     speech_home: str = ""
     """这一轮"她正在跟谁说话"：没写 ``send_to`` 的话（动作文案、续说）默认落这儿。
@@ -484,6 +502,25 @@ class MessageContext:
 
     addressing: str = ""
     """这句是冲谁说的：``me``（点了她）/ ``others``（在叫别人）/ 空（看不出来）。"""
+
+    raw_text: str = ""
+    """注解**之前**的原文（``text`` 是注解之后、真正给模型看的文本）。
+
+    事件身份认的是这条消息本身，不认正文：图片说明 / @ / 转发摘要都会改
+    ``text``，改不动 ``raw_text``，也改不动下面两个 id。
+    """
+
+    message_id: str = ""
+    """平台给的消息 id（拿得到就用它认"是不是同一个事件"）。"""
+
+    event_id: str = ""
+    """平台不给 message_id 时，由监听侧生成、存在 event extra 里的稳定内部 id。"""
+
+    @property
+    def event_key(self) -> str:
+        """这条消息的事件身份键（两样 id 都没有时是空串）。"""
+
+        return chat_event_key(self.session_id, self.message_id, self.event_id)
 
 
 @dataclass
@@ -793,6 +830,24 @@ class VirtualWorldEngine:
         self._interrupt_streak: dict[str, tuple[int, float]] = {}
         """刚进来的消息（可能被合并进正在进行的那次回复）：会话 -> [{text, at, absorbed}]。"""
 
+        self._replied_batch_keys: dict[str, set[str]] = {}
+        """本轮**实际处理过**的事件身份：会话 -> {event_key}。
+
+        水位线只能推到这一批的边界（见 :meth:`mark_reply_batch_replied`）。以前是在
+        "发出去之后"按**当时最新**的序号推，于是她说话这会儿新到的消息会被一起标成
+        "已回应"，下一轮就再也看不见了。
+        """
+
+        self._prompt_snapshots: list[dict[str, Any]] = []
+        """最近几次"实际发出去的完整请求"（只读调试用，见 :meth:`preview_last_reply_request`）。"""
+
+        self._incoming_notes: dict[str, list[str]] = {}
+        """handle_incoming 攒下的临时提示（冷启动、"刚被叫醒"这类）：会话 -> [提示]。
+
+        收到消息时先记下，等这一轮真正组装提示词（``handle_reply``）时取走，
+        取走即失效——这些提示只该出现一次。
+        """
+
         self._silent_followup = 0
         """大于 0 时，动作完成后不触发"续说"。
 
@@ -1075,29 +1130,166 @@ class VirtualWorldEngine:
             picked.append(key)
         return picked
 
-    def schedule_target(self, schedule: Any, session_id: str) -> str:
-        """这条日程落在哪个会话里说。
+    @staticmethod
+    def dedupe_session_refs(values: Any) -> list[str]:
+        """一串落点说法去掉空值与重复（顺序保持）。"""
 
-        ``sessions`` 从"在哪几个会话触发"变成"落点"：勾了私聊，她的日程就发私聊；
-        勾了会话组，就落在那一组的代表会话里；勾多个时优先当前会话，其次列表里的第一个。
+        picked: list[str] = []
+        for item in list(values or []):
+            text = str(item or "").strip()
+            if text and text not in picked:
+                picked.append(text)
+        return picked
+
+    @classmethod
+    def schedule_session_ids(cls, schedule: Any) -> list[str]:
+        """日程的 ``sessions`` 摊平成一串会话 / 会话组 id（去重、去掉空值）。
+
+        既认日程对象（``ScheduleDef``），也认配置里那条还没解析成对象的 dict
+        ——保存前的归一化拿到的就是 dict。
         """
 
-        picked = [str(item) for item in (getattr(schedule, "sessions", None) or [])]
+        if isinstance(schedule, dict):
+            raw = schedule.get("sessions")
+        else:
+            raw = getattr(schedule, "sessions", None)
+        return cls.dedupe_session_refs(raw or [])
+
+    def canonical_schedule_sessions(self, sessions: Any) -> list[str]:
+        """日程落点归一化：**组 id 与具体会话不共存**（跟前端选择器同一条规则）。
+
+        前端（``pages/world_editor/app.js`` 的日程落点选择器）把两者做成了互斥：
+        勾了组就只存组 id，否则只存具体会话。可旧存档 / 手工改过的配置文件里
+        两种 id 会同时躺着，运行时读到的就是一份自相矛盾的落点。统一在这里收口：
+        只要含组 id，就只保留组 id（组 = 让大模型在组内挑一处，具体会话作废）。
+
+        要认得出"哪个 id 是会话组"，所以这里是实例方法（``group_by_id``）。
+        """
+
+        picked = self.dedupe_session_refs(sessions)
+        groups = [item for item in picked if self.group_by_id(item) is not None]
+        return groups or picked
+
+    def schedule_sessions_of(self, schedule: Any) -> list[str]:
+        """这条日程实际生效的落点：过一遍归一化。"""
+
+        return self.canonical_schedule_sessions(self.schedule_session_ids(schedule))
+
+    def normalize_schedule_sessions(self, schedules: Any) -> tuple[Any, list[str]]:
+        """保存前把旧存档里的混合落点洗成一种，并给出人话提示。
+
+        返回 ``(洗好的数据, 提示)``——提示会并进接口的 ``warnings`` 交回给编辑器。
+        一条都不需要洗时原样返回（连 dict 都不重建），不制造无谓的 diff。
+        """
+
+        items = (schedules or {}).get("schedules") if isinstance(schedules, dict) else None
+        if not isinstance(items, list):
+            return schedules, []
+        warnings: list[str] = []
+        cleaned: list[Any] = []
+        changed = False
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                cleaned.append(item)
+                continue
+            raw_picked = self.schedule_session_ids(item)
+            kept = self.canonical_schedule_sessions(raw_picked)
+            if kept == raw_picked:
+                cleaned.append(item)
+                continue
+            changed = True
+            schedule_id = str(item.get("id") or "第 %d 条" % (index + 1))
+            try:
+                labels = "、".join(
+                    str(self.group_by_id(ref).name or ref)
+                    if self.group_by_id(ref) is not None
+                    else ref
+                    for ref in kept[:4]
+                )
+            except Exception:
+                labels = "、".join(kept[:4])
+            warnings.append(
+                f"日程 {schedule_id} 同时勾了会话组和具体会话，已按会话组保存（{labels}）"
+            )
+            cleaned.append({**item, "sessions": kept})
+        if not changed:
+            return schedules, []
+        return {**schedules, "schedules": cleaned}, warnings
+
+    def schedule_candidates(self, schedule: Any, session_id: str) -> list[str]:
+        """这条日程能落在哪几个**具体会话**上（已过滤掉失效 / 停用 / 不在组里的）。
+
+        勾了会话组：返回 []——组是「让她自己在组内挑一处」（见
+        ``resolve_schedule_target``），不是一次发一片，所以没有"候选广播目标"一说。
+        没配组 / 没勾：空 list 交给调用方回落到执行会话。
+        """
+
+        picked = self.schedule_sessions_of(schedule)
+        group = self.group_of(session_id)
+        if not picked or group is None:
+            return []
+        if str(group.id) in picked:
+            return []
+        members = {str(item) for item in (group.sessions or [])}
+        return [item for item in picked if item in members and self.is_enabled(item)]
+
+    def schedule_lock_targets(self, schedule: Any, session_id: str) -> list[str]:
+        """日程这一轮的允许落点集合（写进 ``TickOutcome.locked_targets``）。
+
+        - 勾了具体会话：锁 = 那几个启用中的具体会话（一个都没启用 = 不锁）；
+        - 勾了会话组：锁 = 组里全部启用中的成员（她挑哪一处都在集合里）；
+        - 什么都没勾：不锁（保持"每个会话各自跑"的老行为）。
+        """
+
+        picked = self.schedule_sessions_of(schedule)
+        group = self.group_of(session_id)
+        if not picked or group is None:
+            return []
+        members = [str(item) for item in (group.sessions or [])]
+        if str(group.id) in picked:
+            locked = [item for item in members if self.is_enabled(item)]
+            return locked or [str(session_id)]
+        candidates = self.schedule_candidates(schedule, session_id)
+        return candidates or [str(session_id)]
+
+    def schedule_targets(self, schedule: Any, session_id: str) -> list[str]:
+        """这条日程这一轮要发到的**全部具体落点**（主目标 + 广播目标）。
+
+        勾了会话组：返回空——组 = 由她在组内挑一处，不是一次发一片。
+        勾了具体会话：返回所有启用中的那几处；一个可用的都没有就回落到执行会话。
+        """
+
+        picked = self.schedule_sessions_of(schedule)
+        group = self.group_of(session_id)
+        if not picked or group is None:
+            return [str(session_id)]
+        if str(group.id) in picked:
+            return []
+        return self.schedule_candidates(schedule, session_id) or [str(session_id)]
+
+    def schedule_target(self, schedule: Any, session_id: str) -> str:
+        """这条日程的**主落点**落在哪个会话里说。
+
+        勾了具体会话：只在**启用中的**具体会话里挑（当前会话优先，其次列表第一个）；
+        没有可用的具体会话就回落到执行会话——以前这里不查 ``is_enabled``，会挑到一个
+        已经从白名单里删掉的会话，那句话就发进了一个不存在的群。
+        勾了会话组 / 什么都没勾：按当前会话（组内的具体挑法见 ``resolve_schedule_target``）。
+        """
+
+        picked = self.schedule_sessions_of(schedule)
         if not picked:
             return str(session_id)
         group = self.group_of(session_id)
         if group is None:
             return str(session_id)
-        members = {str(member) for member in (group.sessions or [])}
         if str(group.id) in picked:
-            # 勾的是这一组：落在组代表（也就是这一轮的会话）
             return str(session_id)
-        allowed = [item for item in picked if item in members]
-        if not allowed:
+        candidates = self.schedule_candidates(schedule, session_id)
+        if not candidates:
             return str(session_id)
-        if str(session_id) in allowed:
+        if str(session_id) in candidates:
             return str(session_id)
-        return allowed[0]
+        return candidates[0]
 
     async def resolve_schedule_target(
         self, state: WorldState, schedule: Any, session_id: str
@@ -1110,14 +1302,20 @@ class VirtualWorldEngine:
         勾了具体会话的照旧，不问模型。
         """
 
-        picked = [str(item) for item in (getattr(schedule, "sessions", None) or [])]
+        picked = self.schedule_sessions_of(schedule)
         group = self.group_of(session_id)
         if not picked or group is None:
             return self.schedule_target(schedule, session_id)
-        members = [str(item) for item in (group.sessions or [])]
         group_picked = str(group.id) in picked
-        pinned = [item for item in picked if item in members]
-        if not group_picked or pinned or len(members) <= 1:
+        pinned = self.schedule_candidates(schedule, session_id)
+        if not group_picked or pinned:
+            return self.schedule_target(schedule, session_id)
+        members = [
+            str(item)
+            for item in (group.sessions or [])
+            if self.is_enabled(str(item))
+        ]
+        if len(members) <= 1:
             return self.schedule_target(schedule, session_id)
         chosen = await self._pick_schedule_session(state, schedule, members)
         return chosen or self.schedule_target(schedule, session_id)
@@ -1193,7 +1391,7 @@ class VirtualWorldEngine:
         勾了会话组就按组算；勾了具体会话就按组里的成员算；什么都没勾 = 每个她都要跑。
         """
 
-        picked = [str(item) for item in (getattr(schedule, "sessions", None) or [])]
+        picked = self.schedule_sessions_of(schedule)
         if not picked:
             return True
         group = self.group_of(session_id)
@@ -5269,7 +5467,7 @@ class VirtualWorldEngine:
         # 群名片要立刻从「睡觉中」改回来，所以顺手把冷却清零
         state.last_nickname_update_at = 0.0
         state.add_event("wake_up", {"by": ctx.user_id})
-        # 「刚被叫醒」这句提示：接管模式和注入模式都会用到，写在状态里统一取
+        # 「刚被叫醒」这句提示：接管这一轮会用到，写在状态里统一取
         state.wake_note = self._wake_note_text(ctx)
         state.wake_note_until = int(state.world_time) + 2
 
@@ -5385,10 +5583,12 @@ class VirtualWorldEngine:
             return SleepReply(mode="template", messages=[text], reason="她在睡觉")
 
     async def handle_incoming(self, ctx: MessageContext) -> str | None:
-        """处理一条用户消息，返回需要注入的「世界认知」文本。
+        """处理一条用户消息：非空 = **这条归插件管**，None = 不归我管。
 
-        - 不在白名单 / 内容安全拦截 -> 返回 None（完全不影响主人格的正常回复）；
-        - 计数与状态更新在这里完成，但**不接管回复**。
+        - 不在白名单 / 内容安全拦截 -> 返回 None（本插件完全不干预，交给宿主；
+          接管失败也不会回落成"主人格替她答"）；
+        - 计数、状态、日志、"待总结"缓冲这些副作用都在这里完成；
+        - 提示词不在这里拼：接管路径自己组装（见 :meth:`handle_reply`）。
         """
 
         if not self.is_enabled(ctx.session_id):
@@ -5403,12 +5603,10 @@ class VirtualWorldEngine:
                 node = self.node(state.node_id)
 
             extra_notes, woke = self._record_user_message(state, ctx)
-            density = self.speech_density_hint(state)
-            if density:
-                extra_notes.append(density)
-            missing = self.extra_reminders(state, ctx=ctx)
-            if missing:
-                extra_notes.append(missing)
+            if extra_notes:
+                # 「刚被叫醒 / 冷启动」这类临时提示要等真正组装提示词时才写得进去
+                # （接管路径在 handle_reply 里组装）：先按会话存着，取走即失效。
+                self._incoming_notes[ctx.session_id] = list(extra_notes)
             # 刚被搭话（她马上要回一句）：接下来一段时间别再因为孤独感主动开口
             self.engagement.note_passive_reply(state, tick_seconds=self.tick_seconds)
             if woke:
@@ -5422,33 +5620,6 @@ class VirtualWorldEngine:
                     outcome=echo,
                 )
                 self._queue_echo(ctx.session_id, echo.debug_messages)
-
-            memories = self.memory.recall(
-                session_id=state.session_id,
-                persona_id=ctx.persona_id,
-                node_id=state.node_id,
-                focus_user=ctx.user_id,
-                limit=self.world.limits.max_think_memory,
-            )
-            injection = self.prompts.build_injection(
-                state,
-                node=node,
-                memories=memories,
-                engagement_hint=self.engagement.hint(state),
-                extra_notes=extra_notes,
-                focus_user=ctx.user_name or ctx.user_id,
-                recent_chat=self.chat_window(state),
-                profile_text=self.profile_block(state, ctx),
-                samples=self.voice_sample_lines(
-                    state,
-                    ctx.session_id,
-                    signal=self.tone_signal(state, ctx.text),
-                ),
-                hidden_actions=self._hidden_actions(state, ctx.session_id),
-                **await self.runtime_notes(state.session_id),
-            )
-            if ctx.other_context:
-                injection += f"\n\n# 其他插件提供的上下文\n{ctx.other_context}"
 
             # 把这次对话放进"待总结"缓冲：一段聊完或她离开这个地点时，
             # 才让模型把它压成一条记忆（逐条存「谁说了什么」没有信息量）。
@@ -5471,11 +5642,7 @@ class VirtualWorldEngine:
                 persona_id=ctx.persona_id,
                 place=ctx.session_id,
             )
-            # 扩展层（装了扩展才有）：只在它自己允许的会话里加
-            layer = self._extension_prompt(state, ctx.session_id)
-            if layer:
-                injection = f"{injection}\n\n{layer}"
-            return injection
+            return "takeover"
 
     # ---------------- 对话记忆：攒片段，再总结 ----------------
 
@@ -6465,11 +6632,22 @@ class VirtualWorldEngine:
 
         return self.state_key(session_id)
 
-    def register_incoming(self, session_id: str, text: str) -> dict[str, Any]:
+    def register_incoming(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        identity: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """记下"这条消息刚进来"。
 
         如果她正在为前一条调模型，这条可能会被**并进那一次回复**（窗口很短），
         调用方拿到这个记录后，排队轮到自己时要问一句 :meth:`was_absorbed`。
+
+        ``identity``（可选）带这条消息的**事件身份**：``message_id`` / ``event_id``
+        / ``user_id`` / ``user_name`` / ``raw_text`` / ``at_targets`` / ``reply_to``
+        / ``addressing`` / ``images`` / ``wall_at``。有身份时同事件只登记一条，
+        依据是身份而不是正文——正文一样的两条是用户真的说了两遍，不能被吞。
         """
 
         scope = self.merge_scope(session_id)
@@ -6478,23 +6656,62 @@ class VirtualWorldEngine:
             for item in self._pending_replies.get(scope, [])
             if not item.get("absorbed") and not item.get("picked")
         ]
-        key = " ".join(str(text or "").split())
+        info = dict(identity or {})
+        origin = str(session_id or "")
+        message_id = str(info.get("message_id") or "").strip()
+        event_id = str(info.get("event_id") or "").strip()
+        event_key = chat_event_key(origin, message_id, event_id)
+        text_value = str(text or "")
         now = time.monotonic()
-        # 同一条消息被两个钩子（或重注入的副本）各记一次时只留一条：
+        # 同一条消息被两个钩子（或同一个事件被记了两次）各记一次时只留一条：
         # 留两条的话提示词里会出现"对方把同一句话说了两遍"。
         for item in reversed(queue):
-            if str(item.get("session") or "") != str(session_id or ""):
+            if str(item.get("session") or "") != origin:
                 continue
-            if " ".join(str(item.get("text") or "").split()) != key:
+            item_key = self.event_key_of(item)
+            if event_key:
+                # 有身份：**只按身份**认同一个事件（正文一样也不当同一条）
+                if item_key == event_key:
+                    return item
+                continue
+            if item_key:
+                # 队列里那条有身份、这条没有：认不出来就别猜
+                continue
+            # 两样都没有（老路径）：退回到"同一个人、短时间内、内容基本一样"的有限兜底
+            if str(item.get("user_id") or "") and str(info.get("user_id") or ""):
+                if str(item.get("user_id")) != str(info.get("user_id")):
+                    break
+            if " ".join(str(item.get("text") or "").split()) != " ".join(
+                text_value.split()
+            ):
                 break
             if now - float(item.get("at") or 0.0) <= MERGE_WINDOW_SECONDS:
                 return item
             break
+        seq = int(getattr(self, "_incoming_seq", 0) or 0) + 1
+        self._incoming_seq = seq
         record = {
-            "text": str(text or ""),
+            # ``text`` 是"给模型看的正文"（注解后），老调用方都读这个键
+            "text": text_value,
+            # 注解前的原文：事件身份认的是消息本身，注解改不了它
+            "raw_text": str(info.get("raw_text") or text_value),
+            "model_text": str(info.get("model_text") or text_value),
             # 这条是从哪个会话来的：合并只认同一个会话的连发
             # （跨会话并成一条会在群里答私聊的话），跨会话靠"按她分锁"串行就够
-            "session": str(session_id or ""),
+            "session": origin,
+            "origin": origin,
+            "message_id": message_id,
+            "event_id": event_id,
+            "user_id": str(info.get("user_id") or ""),
+            "user_name": str(info.get("user_name") or ""),
+            # 到达顺序：batch 按它排（``at`` 是单调钟，只用来算窗口/安静期）
+            "arrival_order": seq,
+            "seq": seq,
+            "wall_at": float(info.get("wall_at") or self._now()),
+            "at_targets": list(info.get("at_targets") or []),
+            "reply_to": dict(info.get("reply_to") or {}),
+            "addressing": str(info.get("addressing") or ""),
+            "images": list(info.get("images") or []),
             "at": now,
             "absorbed": False,
             "picked": False,
@@ -6502,6 +6719,59 @@ class VirtualWorldEngine:
         queue.append(record)
         self._pending_replies[scope] = queue[-8:]
         return record
+
+    def refresh_incoming(
+        self,
+        record: dict[str, Any] | None,
+        text: str,
+        *,
+        identity: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """把监听侧登记的那条记录补全成 LLM hook 看到的样子。
+
+        预处理（图片说明、转发摘要、@ 注解）会改正文，所以这里更新 ``text`` /
+        ``model_text`` / ``raw_text`` 和身份里**能补的**字段；``message_id`` /
+        ``event_id`` / ``arrival_order`` / ``at`` **只增不改**——事件身份绝不能
+        因为正文被注解过就变成另一条消息。
+        """
+
+        if not isinstance(record, dict):
+            return record
+        info = dict(identity or {})
+        value = str(text or "")
+        if value:
+            record["text"] = value
+            record["model_text"] = value
+        raw = str(info.get("raw_text") or "")
+        if raw:
+            record["raw_text"] = raw
+        for field_name in ("message_id", "event_id", "user_id", "user_name"):
+            if not str(record.get(field_name) or "").strip() and str(
+                info.get(field_name) or ""
+            ).strip():
+                record[field_name] = str(info[field_name]).strip()
+        for field_name in ("at_targets", "reply_to", "addressing", "images"):
+            incoming = info.get(field_name)
+            if not record.get(field_name) and incoming:
+                record[field_name] = (
+                    dict(incoming) if isinstance(incoming, dict) else list(incoming)
+                )
+        return record
+
+    @staticmethod
+    def event_key_of(record: dict[str, Any] | None) -> str:
+        """一条待回记录 / 留档条目的事件身份（两样 id 都没有时是空串）。"""
+
+        if not isinstance(record, dict):
+            return ""
+        stored = str(record.get("event_key") or "").strip()
+        if stored:
+            return stored
+        return chat_event_key(
+            str(record.get("origin") or record.get("session") or ""),
+            str(record.get("message_id") or ""),
+            str(record.get("event_id") or ""),
+        )
 
     @staticmethod
     def was_absorbed(record: dict[str, Any] | None) -> bool:
@@ -6514,18 +6784,35 @@ class VirtualWorldEngine:
         session_id: str,
         started_at: float,
         *,
+        exclude_keys: set[str] | None = None,
         exclude_text: str = "",
         window: float | None = None,
+        limit: int = MERGE_MAX_TEXTS,
     ) -> list[dict[str, Any]]:
-        """调用期间到达、且还在窗口内的新消息（会被并进这次请求）。"""
+        """调用期间到达、且还在窗口内的新消息（会被并进这次请求）。
+
+        ``exclude_keys``：事件身份键——**这一轮正在答的那条（以及已经进了 batch 的）
+        按身份排除**，不再拿正文比（触发消息被注解过、正文和 ``ctx.text`` 对不上时，
+        拿正文比会把它当成"调用期间新来的"，于是同一句话被答两遍）。
+
+        返回的记录会标 ``picked=True``（同一轮里不会再被捞第二次）。**最多返回
+        ``limit`` 条**：超出的留在队列里（``picked`` / ``absorbed`` 都不动），
+        各自那一轮的钩子会照常把它们当触发消息处理，不会被丢掉。
+        """
 
         scope = self.merge_scope(session_id)
-        limit = float(MERGE_WINDOW_SECONDS if window is None else window)
+        budget = max(0, int(limit))
+        if budget <= 0:
+            return []
+        window_seconds = float(MERGE_WINDOW_SECONDS if window is None else window)
         queue = self._pending_replies.get(scope) or []
         picked: list[dict[str, Any]] = []
+        keys = {str(item) for item in (exclude_keys or set()) if str(item)}
         current = " ".join(str(exclude_text or "").split())
         origin = str(session_id or "")
         for item in queue:
+            if len(picked) >= budget:
+                break
             if item.get("absorbed") or item.get("picked"):
                 continue
             if str(item.get("session") or "") != origin:
@@ -6533,11 +6820,17 @@ class VirtualWorldEngine:
             text = str(item.get("text") or "").strip()
             if not text:
                 continue
-            if current and " ".join(text.split()) == current:
-                # 这一轮正在答的就是它：别把它当成"调用期间新来的"（否则她会答两遍）
+            item_key = self.event_key_of(item)
+            if item_key:
+                if item_key in keys:
+                    # 这一轮正在答的就是它：别把它当成"调用期间新来的"（否则她会答两遍）
+                    item["picked"] = True
+                    continue
+            elif current and " ".join(text.split()) == current:
+                # 老路径（两边都没身份）才拿正文兜底
                 item["picked"] = True
                 continue
-            if float(item.get("at") or 0.0) - float(started_at) > limit:
+            if float(item.get("at") or 0.0) - float(started_at) > window_seconds:
                 continue
             item["picked"] = True  # 只可能被并进一次，别被下一轮又捞出来
             picked.append(item)
@@ -6583,6 +6876,162 @@ class VirtualWorldEngine:
                 queue.append(record)
         queue.sort(key=lambda item: float(item.get("at") or 0.0))
         self._pending_replies[scope] = queue[-8:]
+
+    # ---- 本轮 batch：唯一的数据源（排序 / 去重 / 渲染 / 释放都看它） ----
+
+    @staticmethod
+    def _record_text(record: dict[str, Any] | None) -> str:
+        """一条待回记录"给模型看的正文"（注解后的那份）。"""
+
+        if not isinstance(record, dict):
+            return ""
+        return str(record.get("model_text") or record.get("text") or "")
+
+    def _sort_reply_batch(
+        self, records: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """batch 按**真实到达顺序**排（同一事件只留一条）。
+
+        到达顺序用 ``arrival_order``（登记时递增的内部序号）；老记录没有就退回
+        ``at``（单调钟）。同一条记录被两个钩子各记一次时，这里按事件身份只留一份。
+        """
+
+        ordered: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        seen_ids: set[int] = set()
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            if id(record) in seen_ids:
+                continue
+            key = self.event_key_of(record)
+            if key:
+                if key in seen:
+                    continue
+                seen.add(key)
+            seen_ids.add(id(record))
+            ordered.append(record)
+        ordered.sort(
+            key=lambda item: (
+                int(item.get("arrival_order") or 0),
+                float(item.get("at") or 0.0),
+            )
+        )
+        return ordered
+
+    def _start_reply_batch(self, ctx: MessageContext) -> list[dict[str, Any]]:
+        """这一轮的触发记录：优先拿监听侧登记的那条（带完整身份）。
+
+        拿不到（没经过旁观钩子、或队列里已经被吸收/清掉）就按 ``ctx`` 现场合成
+        一条——合成记录同样带上身份字段，只是不进待回队列。合成的那条**排在最前**
+        （``arrival_order`` 取 0）：它是这一轮的起点，而"找不到"最常见的原因就是
+        它被待回队列的长度上限挤掉了——挤掉它的都是比它晚到的。
+        """
+
+        scope = self.merge_scope(ctx.session_id)
+        key = ctx.event_key
+        record: dict[str, Any] | None = None
+        if key:
+            for item in self._pending_replies.get(scope, []):
+                if item.get("absorbed"):
+                    continue
+                if self.event_key_of(item) == key:
+                    record = item
+                    break
+        if record is None:
+            record = {
+                "text": str(ctx.text or ""),
+                "raw_text": str(ctx.raw_text or ctx.text or ""),
+                "model_text": str(ctx.text or ""),
+                "session": str(ctx.session_id or ""),
+                "origin": str(ctx.session_id or ""),
+                "message_id": str(ctx.message_id or ""),
+                "event_id": str(ctx.event_id or ""),
+                "user_id": str(ctx.user_id or ""),
+                "user_name": str(ctx.user_name or ""),
+                # 0 = 「这一轮的第一条」：合成记录没有真实到达序号，见上面的说明
+                "arrival_order": 0,
+                "seq": 0,
+                "wall_at": self._now(),
+                "at_targets": list(ctx.at_targets or []),
+                "reply_to": dict(ctx.reply_to or {}),
+                "addressing": str(ctx.addressing or ""),
+                "images": [*(ctx.chat_images or [])],
+                "at": 0.0,
+                # 触发消息本身是这一轮的主角：不放进待回队列，只进 batch
+                "absorbed": False,
+                "picked": False,
+                "synthetic": True,
+            }
+        # 这条是触发者：渲染时它的名字/身份决定"这句是冲谁说的"那一层
+        record["trigger"] = True
+        return [record]
+
+    def reply_batch_entries(
+        self,
+        batch: list[dict[str, Any]],
+        *,
+        chat_rows: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """把 batch 转成渲染用的结构化条目（``build_reply_user_prompt`` 的入参）。
+
+        每条都带 ``name`` / ``user_id`` / ``text`` / ``at`` / ``origin`` 和
+        ``at_targets`` / ``reply_to`` / ``addressing`` ——渲染器和背景共用同一套
+        `「- [HH:MM] 名字(id): 正文」` 输出与分组规则。
+
+        ``chat_rows``：本会话的留档（``state.recent_chat``）。一条消息带的图和它的
+        图转述都存在**留档那一行**上（附件范围按留档算、转述也挂回它自己那条），
+        所以本轮 batch 里同事件的那几条**借留档的图和转述**——同一个事件只在一处
+        存这两样数据。给不出留档时（老调用方）就只用记录自带的。
+        """
+
+        stored: dict[str, dict[str, Any]] = {}
+        for row in chat_rows or []:
+            if not isinstance(row, dict):
+                continue
+            row_key = self.event_key_of(row)
+            if row_key:
+                stored.setdefault(row_key, row)
+        entries: list[dict[str, Any]] = []
+        fallback_at = self._now()
+        for record in batch:
+            if not isinstance(record, dict):
+                continue
+            at = float(record.get("wall_at") or 0.0) or fallback_at
+            images = [str(ref) for ref in (record.get("images") or []) if str(ref)]
+            captions = {
+                str(ref): str(value)
+                for ref, value in dict(record.get("captions") or {}).items()
+            }
+            row = stored.get(self.event_key_of(record)) if stored else None
+            if row is not None:
+                if not images:
+                    images = [str(ref) for ref in (row.get("images") or []) if str(ref)]
+                if not captions:
+                    captions = {
+                        str(ref): str(value)
+                        for ref, value in dict(row.get("captions") or {}).items()
+                    }
+            entries.append(
+                {
+                    "name": str(record.get("user_name") or ""),
+                    "user_id": str(record.get("user_id") or ""),
+                    "text": self._record_text(record),
+                    "raw_text": str(record.get("raw_text") or ""),
+                    "at": at,
+                    "origin": str(
+                        record.get("origin") or record.get("session") or ""
+                    ),
+                    "at_targets": list(record.get("at_targets") or []),
+                    "reply_to": dict(record.get("reply_to") or {}),
+                    "addressing": str(record.get("addressing") or ""),
+                    "images": list(images),
+                    "captions": dict(captions),
+                    "is_trigger": bool(record.get("trigger")),
+                    "event_key": self.event_key_of(record),
+                }
+            )
+        return entries
 
     async def _wait_for_quiet(self, session_id: str) -> None:
         """安静期：先等几秒看对方还有没有下文；有新消息就重新计时（有硬顶）。
@@ -6633,7 +7082,8 @@ class VirtualWorldEngine:
         """接管一次回复：自己调大模型 → 解析 reasoning/actions → 执行 → 返回要发的话。
 
         ``ok=False`` 表示本插件没能完成这次回复（没有模型、调用失败、模型没给出任何动作），
-        调用方应当回落到「注入模式」，让主人格照常回复，保证用户不会收不到回应。
+        调用方**不该**换人来答：这一条就不回了，只在日志页留一条记录——不能让她中途换成
+        主人格的腔调，宁可少回一条。
 
         注意：调用方应当先调用 ``handle_incoming()``（记录存在感/数值/互动记忆），
         本方法只负责"读状态 → 生成回复 → 执行动作"。
@@ -6677,22 +7127,39 @@ class VirtualWorldEngine:
         # 先等一个「安静期」：对方连着打字就等他打完，一起回（新消息会刷新计时）
         wait_started = time.monotonic()
         await self._wait_for_quiet(ctx.session_id)
+        # 这一轮要回的就是一个**显式 batch**：触发她的那条 + 安静期里并进来的几条。
+        # batch 是这一轮唯一的数据源（排序 / 去重 / 渲染 / 释放都看它），
+        # 后面合并重启也只是往同一个 batch 里追加。
+        batch = self._start_reply_batch(ctx)
+        ctx_key = ctx.event_key
         early = self._take_merge_texts(
             ctx.session_id,
             wait_started,
-            exclude_text=ctx.text,
+            exclude_keys={ctx_key} if ctx_key else set(),
+            exclude_text="" if ctx_key else ctx.text,
             window=max(MERGE_WINDOW_SECONDS, time.monotonic() - wait_started + 1.0),
+            limit=max(0, MERGE_MAX_TEXTS - len(batch)),
         )
-        # 按到达顺序排：她要回的是"对方连着说的这几句"，顺序反了模型会读成两轮对话
-        early.sort(key=lambda item: float(item.get("at") or 0.0))
-        for record in early:
+        # 按真实到达顺序排：她要回的是"对方连着说的这几句"，顺序反了模型会读成两轮对话
+        batch = self._sort_reply_batch([*batch, *early])
+        for record in batch:
             record["absorbed"] = True
-        texts = [*(str(item.get("text") or "") for item in early), str(ctx.text or "")]
-        texts = texts[:MERGE_MAX_TEXTS]
+            record["picked"] = True
         if self.is_event_command(ctx.text):
             # 「/vw event h」这种指令是开关，不是他说的话：原样交给她，她会一本正经地
             # 回一句"你怎么又敲这指令"。换成一句世界内的话，让她按"他刚把这一场开了起来"往下接。
-            texts = ["（他把这一场开了起来）"]
+            command_record = next(
+                (record for record in batch if record.get("trigger")), None
+            )
+            if command_record is not None:
+                command_record["text"] = "（他把这一场开了起来）"
+                command_record["model_text"] = command_record["text"]
+                batch = [command_record]
+        texts = [self._record_text(record) for record in batch]
+        # 这一轮实际回了哪几条：等真的发出去了再拿去推水位线
+        self._remember_replied_batch(batch)
+        # handle_incoming 攒下的临时提示（冷启动这类它自己算不出来的）：这一轮用完就丢
+        incoming_notes = self._incoming_notes.pop(ctx.session_id, [])
         restarts = 0
         guard_strikes = 0
         wake_note_kept = ""
@@ -6704,14 +7171,26 @@ class VirtualWorldEngine:
                 # 「刚被叫醒」之类的临时提示：接管模式也要带上，否则她会以完全清醒的状态回话
                 wake_note = wake_note_kept or self._take_wake_note(state)
                 wake_note_kept = wake_note
-                extra_notes = [wake_note] if wake_note else []
-                extra_notes.extend(self.sleep_notes(state))
+                extra_notes = [
+                    note
+                    for note in [
+                        *incoming_notes,
+                        wake_note,
+                        *self.sleep_notes(state),
+                    ]
+                    if note
+                ]
+                # 同一句只留一份：wake note 与临睡期提示两边都可能提到
+                extra_notes = list(dict.fromkeys(extra_notes))
                 density = self.speech_density_hint(state, direct=True)
                 if density:
                     extra_notes.append(density)
                 if len(texts) > 1:
+                    # 不写「对方」：这几句可能是**不同的人**在同一阵子说的（群里连发），
+                    # 单数措辞会让模型以为全部出自触发者一个人。发言人已由每行
+                    # `名字(id)` 带出，这里只说"一起答完"。
                     extra_notes.append(
-                        "对方在一条之后紧接着又说了几句，都要一起回应；"
+                        "这几句得一起回应；"
                         "不要当成两轮对话、也不要分两次回答。"
                     )
                 extra_notes = extra_notes or None
@@ -6749,7 +7228,11 @@ class VirtualWorldEngine:
                     available_tools=self.available_tools(),
                     memories=memories,
                     engagement_hint=self.engagement.hint(state),
-                    recent_chat=self.chat_context_for_reply(state, ctx),
+                    recent_chat=self.chat_context_for_reply(
+                        state,
+                        ctx,
+                        exclude_entries=self.reply_batch_entries(batch),
+                    ),
                     other_context=ctx.other_context,
                     extra_notes=extra_notes,
                     max_messages=say_limit,
@@ -6769,14 +7252,24 @@ class VirtualWorldEngine:
                     **await self.runtime_notes(state.session_id),
                 )
                 user_prompt = self.prompts.build_reply_user_prompt(
-                    user_name=ctx.user_name,
-                    text=texts[0],
+                    entries=self.reply_batch_entries(
+                        batch, chat_rows=list(state.recent_chat)
+                    ),
                     is_private=ctx.is_private,
                     addressing=self.reply_addressing(state, ctx),
-                    extra_texts=texts[1:],
                     from_session=self.reply_place(state, ctx.session_id),
+                    image_marks=dict(ctx.image_marks or {}),
                 )
                 node_id = state.node_id
+                # 留一份"实际发出去的完整请求"：调试页看的就是它（见 preview_last_reply_request）
+                self._remember_prompt_snapshot(
+                    session_id=ctx.session_id,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    contexts=history,
+                    batch=batch,
+                    chat_rows=list(state.recent_chat),
+                )
 
             # --- 第二阶段：调用大模型（不持锁） ---
             started = time.monotonic()
@@ -6804,10 +7297,16 @@ class VirtualWorldEngine:
                     error=REPLY_MUTED,
                     warnings=["模型拒答，重试后仍失败：这一轮不出声"],
                 )
-            if attempt >= MERGE_MAX_RESTARTS or len(texts) >= MERGE_MAX_TEXTS:
+            if attempt >= MERGE_MAX_RESTARTS or len(batch) >= MERGE_MAX_TEXTS:
                 break
             merged = self._take_merge_texts(
-                ctx.session_id, started, exclude_text=ctx.text
+                ctx.session_id,
+                started,
+                exclude_keys={
+                    key for key in (self.event_key_of(item) for item in batch) if key
+                },
+                exclude_text="" if ctx_key else ctx.text,
+                limit=max(0, MERGE_MAX_TEXTS - len(batch)),
             )
             if not merged:
                 break
@@ -6815,11 +7314,10 @@ class VirtualWorldEngine:
                 # 打断：这一轮生成直接作废，让新来的那条走自己的回复管线。
                 # 水位线不推进（见 mark_chat_replied 的调用点），所以新那一轮
                 # 仍然看得到刚才那几条——上一次回复等于没触发过。
-                merged.sort(key=lambda item: float(item.get("at") or 0.0))
-                self._release_records(ctx.session_id, [*early, *merged])
+                self._release_records(ctx.session_id, [*batch, *merged])
                 self._log(
                     "debug",
-                    f"又来了一条消息，这次生成作废（共 {len(texts) + len(merged)} 条待回）",
+                    f"又来了一条消息，这次生成作废（共 {len(batch) + len(merged)} 条待回）",
                 )
                 self._note_interrupt(ctx.session_id)
                 return ReplyOutcome(
@@ -6828,15 +7326,18 @@ class VirtualWorldEngine:
                     debug_messages=self.take_pending_echo(ctx.session_id),
                 )
             restarts += 1
-            merged.sort(key=lambda item: float(item.get("at") or 0.0))
+            # merge 回来的都是"刚到的"：并进**同一个 batch**（按到达顺序重排），
+            # 不再维护一条脱离身份的字符串列表
+            batch = self._sort_reply_batch([*batch, *merged])
             for record in merged:
                 record["absorbed"] = True
-            # merge 回来的都是"刚到的"，排在最后 = 时间顺序
-            texts.extend(str(record.get("text") or "") for record in merged)
-            texts = texts[:MERGE_MAX_TEXTS]
+                record["picked"] = True
+            texts = [self._record_text(record) for record in batch]
+            # 合并重启会改变这一轮的范围：重记一遍（后面提交水位线时用它）
+            self._remember_replied_batch(batch)
             self._log(
                 "debug",
-                f"又来了一条消息，合并成一次回复重新发起（共 {len(texts)} 条）",
+                f"又来了一条消息，合并成一次回复重新发起（共 {len(batch)} 条）",
             )
         if raw is None:
             return ReplyOutcome(ok=False, error="大模型调用失败")
@@ -6914,14 +7415,18 @@ class VirtualWorldEngine:
                 late = self._take_merge_texts(
                     ctx.session_id,
                     phase3_started,
-                    exclude_text=ctx.text,
+                    exclude_keys={
+                        key for key in (self.event_key_of(item) for item in batch) if key
+                    },
+                    exclude_text="" if ctx_key else ctx.text,
+                    limit=max(0, MERGE_MAX_TEXTS - len(batch)),
                 )
                 if (
                     late
                     and self._interrupt_pending()
                     and self._interrupt_allowed(ctx.session_id)
                 ):
-                    self._release_records(ctx.session_id, [*early, *late])
+                    self._release_records(ctx.session_id, [*batch, *late])
                     self._log(
                         "debug",
                         f"这一轮还没发出去，被新消息打断（共 {len(late)} 条待回）",
@@ -7138,7 +7643,7 @@ class VirtualWorldEngine:
     ) -> tuple[list[str], bool]:
         """记录一条用户消息带来的全部影响，返回要给提示词的额外说明。
 
-        注入模式和接管模式共用这一段，保证两条路径的状态演化完全一致。
+        接管回复和自主行为共用这一段，保证两条路径的状态演化完全一致。
         第二个返回值表示这次是不是把她叫醒了（调用方负责写一条事件日志）。
         """
 
@@ -7161,6 +7666,8 @@ class VirtualWorldEngine:
                 keep=self.chat_history_limit(),
                 images=ctx.chat_images,
                 origin=ctx.session_id,
+                message_id=ctx.message_id,
+                event_id=ctx.event_id,
             )
             self._tag_chat_origin(state, ctx.session_id)
         self._note_session_activity(state, ctx)
@@ -9082,6 +9589,8 @@ class VirtualWorldEngine:
                 at=ctx.at_targets,
                 reply_to=ctx.reply_to,
                 addressing=ctx.addressing,
+                message_id=ctx.message_id,
+                event_id=ctx.event_id,
             )
             self._tag_chat_origin(state, ctx.session_id)
         state.last_user_activity_at = self._now()
@@ -9797,6 +10306,16 @@ class VirtualWorldEngine:
                         continue
                     # 勾了会话组 = 让她自己挑组里的哪一处说（见 resolve_schedule_target）
                     target = await self.resolve_schedule_target(state, schedule, session_id)
+                    # 这一轮的允许落点：锁上以后动作模型的 send_to 越不过它
+                    locked_targets = self.schedule_lock_targets(schedule, session_id)
+                    # 广播目标只看"勾了哪几个具体会话"：勾组 = 她在组里挑一处说，
+                    # 不是一次发一片（锁集合比它大：勾组时组里每一处都允许她开口，
+                    # 但真正发出去的只有她挑的那一处）
+                    broadcast_targets = [
+                        item
+                        for item in self.schedule_targets(schedule, session_id)
+                        if item != target
+                    ]
                     label = schedule.id
                     if schedule.action_chain:
                         names = [
@@ -9856,6 +10375,8 @@ class VirtualWorldEngine:
                         continue
                     # 她的日程落在哪个会话里说（勾了私聊就发私聊）
                     outcome = TickOutcome(session_id=target)
+                    outcome.broadcast_targets = broadcast_targets
+                    outcome.locked_targets = locked_targets
                     # 这条日程发生在哪儿：调试回显要跟着它走（不然私聊的日程把回显发进群）
                     outcome.place = target
                     chain = schedule.action_chain
@@ -9939,9 +10460,18 @@ class VirtualWorldEngine:
 
         # 手动跑也认这条日程自己的落点（勾了私聊就发私聊；勾了组就让她自己挑一处）
         outlook = await self.load_state(session_id, cold_start=False)
+        # 必须与 run_schedules 走同一套落点规则，不然"编辑器里试跑"和"到点真跑"
+        # 会落在两个不同的会话里
+        locked_targets = self.schedule_lock_targets(schedule, session_id)
         outcome = TickOutcome(
             session_id=await self.resolve_schedule_target(outlook, schedule, session_id)
         )
+        outcome.broadcast_targets = [
+            item
+            for item in self.schedule_targets(schedule, session_id)
+            if item != outcome.session_id
+        ]
+        outcome.locked_targets = locked_targets
         outcome.place = outcome.session_id
         async with self.session_state(session_id) as state:
             if not force and not self._conditions_ok(state, schedule.conditions):
@@ -11765,6 +12295,11 @@ class VirtualWorldEngine:
         - 写了、而且对得上：发到那个会话；
         - 写了、但对不上（例如「私聊某个不在名单里的人」）：``None``，
           这句话干脆不说——总比把她想私下说的话发到群里强。
+        - **日程锁**（``outcome.locked_targets``）：这一轮是用户排的日程，落点已经
+          定死在勾选的会话（勾组 = 组里全部成员）。她写的 ``send_to`` 只要越出这个
+          集合就不发——不然"只勾了一个私聊"的日程会被模型那句 ``send_to`` 改发到
+          没勾的会话去（单目标时 ``broadcast_targets`` 是空的，光看它拦不住）。
+          非日程路径不会设这个锁，跨会话 ``send_to``（"去群里说声晚安"）照旧有效。
         """
 
         raw = str(getattr(action, "send_to", "") or "").strip()
@@ -11772,7 +12307,21 @@ class VirtualWorldEngine:
             # 没写落点：她"正在说的那个会话"优先（动作续说、亲昵动作都跟着它走）
             return outcome.home()
         target = self.resolve_send_to(state, raw, fallback="")
-        return target or None
+        if not target:
+            return None
+        allowed = {str(outcome.home()), *(str(item) for item in (outcome.broadcast_targets or []))}
+        locked = {
+            str(item)
+            for item in (getattr(outcome, "locked_targets", None) or [])
+            if str(item).strip()
+        }
+        if locked and target not in locked:
+            outcome.notes.append(f"日程落点限制：忽略未选中的 send_to {target}")
+            return None
+        if outcome.broadcast_targets and not locked and target not in allowed:
+            outcome.notes.append(f"日程落点限制：忽略未选中的 send_to {target}")
+            return None
+        return target
 
     def _plan_target(
         self,
@@ -16702,24 +17251,73 @@ class VirtualWorldEngine:
         return [*older, *current]
 
     def chat_context_for_reply(
-        self, state: WorldState, ctx: MessageContext
+        self,
+        state: WorldState,
+        ctx: MessageContext,
+        *,
+        exclude_entries: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
-        """接管回复用的群聊背景：把"刚进来的这一条"从背景里摘掉。
+        """接管回复用的群聊背景：把**本轮 batch 里的事件**整个从背景里摘掉。
 
-        这条消息紧接着会以「XX 对你说：…」的形式单独交给模型，留在背景里
-        等于同一句话在提示词里出现两遍——模型会以为对方把话重复说了好几次。
+        本轮那几条紧接着会以聊天记录的格式单独交给模型（见 ``build_reply_user_prompt``），
+        留在背景里等于同一个事件在提示词里出现两遍——模型会以为对方把话重复说了好几次。
+
+        排除的判定依据是**事件身份**：留档条目身上带着 ``event_key``（登记时按
+        ``origin + message_id`` / ``origin + 内部 id`` 算出来的），键相同就是同一个事件。
+
+        ``exclude_entries``（本轮 batch 的结构化条目）里没有身份的条目才走**有限兜底**：
+        要求「来源相同 + 用户相同 + 正文核心一致」，边界限于本轮这一批。
+        它绝不会按正文删掉用户真实的重复发言——那些条目有自己的身份键，不在排除集合里。
         """
 
         context = self.chat_window(state, ctx.session_id)
         if not context:
             return context
-        last = context[-1]
-        if last.get("is_self"):
+        entries = [item for item in (exclude_entries or []) if isinstance(item, dict)]
+        if not entries:
+            # 老路径（调用方没给 batch）：只尝试摘掉最后一条对得上的
+            last = context[-1]
+            if last.get("is_self"):
+                return context
+            same_user = str(last.get("user_id") or "") == str(ctx.user_id or "unknown")
+            if same_user and _same_text(
+                str(last.get("text") or ""), str(ctx.text or "")
+            ):
+                return context[:-1]
             return context
-        same_user = str(last.get("user_id") or "") == str(ctx.user_id or "unknown")
-        if same_user and _same_text(str(last.get("text") or ""), str(ctx.text or "")):
-            return context[:-1]
-        return context
+        keys = {
+            str(item.get("event_key") or "")
+            for item in entries
+            if str(item.get("event_key") or "")
+        }
+        # 兜底表：只有"没有身份"的条目才登记，键是 (来源, 用户, 正文核心)
+        loose: set[tuple[str, str, str]] = set()
+        for entry in entries:
+            if str(entry.get("event_key") or ""):
+                continue
+            core = " ".join(chat_core_text(str(entry.get("text") or "")).split())
+            if not core:
+                continue
+            loose.add(
+                (
+                    str(entry.get("origin") or ""),
+                    str(entry.get("user_id") or ""),
+                    core,
+                )
+            )
+        kept: list[dict[str, Any]] = []
+        for item in context:
+            item_key = self.event_key_of(item)
+            if item_key and item_key in keys:
+                continue
+            if not item_key and loose:
+                origin = str(item.get("origin") or state.session_id or "")
+                who = str(item.get("user_id") or "")
+                core = " ".join(chat_core_text(str(item.get("text") or "")).split())
+                if core and (origin, who, core) in loose:
+                    continue
+            kept.append(item)
+        return kept
 
     async def quote_in_records(self, session_id: str, text: str) -> bool:
         """被引用的那条，聊天记录里还看得到吗。
@@ -16790,11 +17388,21 @@ class VirtualWorldEngine:
             pick["label"] = f"图{index}"
         return picks
 
-    def mark_chat_replied(self, state: WorldState, session_id: str = "") -> None:
-        """她真的开口了：把这一批群聊压成概览，并把"已回应水位线"推到当前。
+    def mark_chat_replied(
+        self,
+        state: WorldState,
+        session_id: str = "",
+        *,
+        keys: set[str] | None = None,
+    ) -> None:
+        """她真的开口了：把这一批群聊压成概览，并把"已回应水位线"往前推。
 
         水位线之后的消息才是"还没回应过的"，会原样进提示词；水位线以内（也就是她刚
         回应过的这批）压成一条概览，供下一轮了解背景，不再重复回应。
+
+        ``keys``：这一轮**实际处理过的事件身份**。给了它就只推到这些事件的边界——
+        她说话这会儿新到的消息不该被一起标成"已回应"（下一轮就再也看不见了）。
+        没给（老调用方）就沿用"推到本会话此刻最新那条"的老行为。
         """
 
         now = self._now()
@@ -16819,6 +17427,25 @@ class VirtualWorldEngine:
                 **dict(state.chat_previews or {}),
                 target: {"text": preview, "at": now},
             }
+        if keys is not None:
+            # 只算"这一轮真的回过"的那几条：本轮之后才到的消息留在水位线外
+            answered = [
+                item
+                for item in state.recent_chat
+                if str(item.get("origin") or state.session_id) == target
+                and str(item.get("event_key") or "") in keys
+            ]
+            if not answered:
+                return
+            bound_seq = max([int(item.get("seq") or 0) for item in answered] or [0])
+            bound_at = max([float(item.get("at") or 0.0) for item in answered] or [0.0])
+            self._set_watermark(
+                state,
+                target,
+                until=max(previous, bound_at),
+                seq=max(previous_seq, bound_seq),
+            )
+            return
         _, seq_now = self._watermark(state, target)
         # 水位线推到"这个会话里最新那条"：跨会话的水位线不能互相顶掉
         session_seq = max(
@@ -16833,8 +17460,43 @@ class VirtualWorldEngine:
             state, target, until=now, seq=max(session_seq, seq_now)
         )
 
+    def _remember_replied_batch(self, batch: list[dict[str, Any]]) -> None:
+        """记下这一轮**实际处理过**的事件身份（按会话分组），等真发出去了再提交。
+
+        **覆盖而不是累积**：这一轮被作废（打断 / 没发出去）时，上一轮留下的旧身份
+        不该在下一轮被顺手标成"已回应"——那正好会吞掉没处理过的消息。
+        """
+
+        grouped: dict[str, set[str]] = {}
+        for record in batch:
+            key = self.event_key_of(record)
+            target = str(record.get("origin") or record.get("session") or "")
+            if key and target:
+                grouped.setdefault(target, set()).add(key)
+        for target, keys in grouped.items():
+            self._replied_batch_keys[target] = keys
+        # 只留最近若干个会话：这是个短命的"待提交"表，不是缓存
+        if len(self._replied_batch_keys) > 32:
+            for stale in list(self._replied_batch_keys)[:-32]:
+                self._replied_batch_keys.pop(stale, None)
+
+    async def mark_reply_batch_replied(self, session_id: str) -> None:
+        """回复**真的发出去**之后，把水位线推到这一轮的边界（见 `_remember_replied_batch`）。
+
+        没有这一轮的批次记录（例如只是"说给别处"的旁听投递）就**不推进**：
+        宁可不标已回应，也不要把没处理过的消息吞掉。
+        """
+
+        if not self.is_enabled(session_id):
+            return
+        keys = self._replied_batch_keys.pop(str(session_id), None)
+        if not keys:
+            return
+        async with self.session_state(session_id) as state:
+            self.mark_chat_replied(state, session_id, keys=keys)
+
     async def mark_chat_replied_by_session(self, session_id: str) -> None:
-        """按会话推进"已回应水位线"（注入模式下主人格替她回复时用）。"""
+        """按会话推进"已回应水位线"（不知道具体批次时用；推到本会话此刻最新那条）。"""
 
         if not self.is_enabled(session_id):
             return
@@ -16897,10 +17559,17 @@ class VirtualWorldEngine:
         }
 
     def group_is_chatting(self, state: WorldState) -> bool:
-        """群里最近是否真的有人在聊。"""
+        """群里最近是否真的有人在聊。
+
+        只数**别人**还没被她回过的消息：她自己刚说的话不是"有人在聊"的证据，
+        否则她会把自己的上一句当成没人接的话题，一路追着往下说。
+        """
 
         need = max(1, int(self.world.decider.min_messages_to_interject))
-        return len(self.chat_context(state)) >= need
+        others = [
+            item for item in self.chat_context(state) if not item.get("is_self")
+        ]
+        return len(others) >= need
 
     def group_is_alive(self, state: WorldState, *, minutes: int = 0) -> bool:
         """群里最近有没有人在说话（她自己的话不算）。
@@ -17519,6 +18188,11 @@ class VirtualWorldEngine:
         routed_images = {sid: refs for sid, refs in routed_images.items() if refs}
         pending = self.take_pending_echo(outcome.session_id)
         images = self._group_images(outcome)
+        broadcast_targets = []
+        for target in [outcome.session_id, *(outcome.broadcast_targets or [])]:
+            target = str(target or "").strip()
+            if target and target not in broadcast_targets:
+                broadcast_targets.append(target)
         if (
             not said
             and not routed
@@ -17612,10 +18286,23 @@ class VirtualWorldEngine:
                         self._tag_chat_origin(state, target)
             # 调试用的动作回显不算"她说过的话"：不进聊天上下文、不计无人回应保护
         sent = False
-        if ordered:
-            sent = await self.messenger.send_text(outcome.session_id, ordered)
-        if images:
-            await self._send_group_images(outcome.session_id, images)
+        # Send each default result exactly once per selected concrete destination.
+        for target in broadcast_targets:
+            try:
+                target_sent = True
+                if ordered:
+                    # 返回假值 = 平台没收下这批话：必须点名是哪个落点失败了，
+                    # 其余落点照旧继续发（一次落点失败不该拖累别的会话）
+                    target_sent = bool(await self.messenger.send_text(target, ordered))
+                    sent = sent or target_sent
+                    if not target_sent:
+                        outcome.notes.append(f"发到 {target} 失败：平台没有接收")
+                        self._log("warning", f"发到 {target} 失败：平台没有接收")
+                if images:
+                    await self._send_group_images(target, images)
+            except Exception as exc:
+                outcome.notes.append(f"发到 {target} 失败：{exc}")
+                self._log("warning", f"发到 {target} 失败：{exc}")
         for target, messages in routed.items():
             try:
                 await self.messenger.send_text(target, messages)
@@ -17974,34 +18661,80 @@ class VirtualWorldEngine:
             ],
         }
 
-    async def preview_injection(self, session_id: str, persona_id: str = "") -> str:
-        """预览注入模式会写进主人格的文本（只读，不改变任何状态）。"""
+    async def preview_last_reply_request(self, session_id: str) -> str:
+        """预览**上一轮真正发出去的那份请求**（只读，不改变任何状态）。
 
-        state = await self.load_state(session_id, cold_start=False)
-        node = self.node(state.node_id)
-        memories = self.memory.recall(
-            session_id=session_id,
-            persona_id=persona_id,
-            node_id=state.node_id,
-            limit=self.world.limits.max_think_memory,
+        排查"同一句话是不是被读成了三遍"这类问题时，看拼装逻辑永远不如看**实际交给
+        大模型的那一份**：这里连同本轮 batch 的事件身份、各部分的字符数一起给出来。
+        没有记录（还没接管回过话）时说清楚，而不是拿别的东西冒充。
+        """
+
+        snapshot = next(
+            (
+                item
+                for item in self._prompt_snapshots
+                if str(item.get("session_id") or "") == str(session_id)
+            ),
+            None,
         )
-        text = self.prompts.build_injection(
-            state,
-            node=node,
-            memories=memories,
-            engagement_hint=self.engagement.hint(state),
-            recent_chat=self.chat_window(state),
-            # 预览要和实跑一致：带上通讯录和"这条来自哪儿"、以及扩展要藏的 / 要加的
-            current_session=session_id,
-            session_labels=self.session_labels(state),
-            profile_text=self.profile_block(state),
-            samples=self.voice_sample_lines(state, session_id, preview=True),
-            hidden_actions=self._hidden_actions(state, session_id),
-            **await self.runtime_notes(state.session_id),
+        if snapshot is None:
+            return (
+                f"会话 {session_id} 还没有接管回复的记录：\n"
+                "先让她回一次话，这里就会显示**上一次实际发出去的完整请求**\n"
+                "（system prompt / 宿主历史 / 最后一条用户消息，以及本轮 batch 的事件身份）。"
+            )
+        contexts = list(snapshot.get("contexts") or [])
+        parts = [
+            "# ===== 这一轮实际发出去的请求（最近一次）=====\n"
+            f"会话：{snapshot.get('session_id') or ''}\n"
+            f"时间戳：{snapshot.get('at') or 0}\n"
+            f"字符数：system {len(str(snapshot.get('system_prompt') or ''))} / "
+            f"宿主历史 {sum(len(str(item)) for item in contexts)}（{len(contexts)} 条）/ "
+            f"用户消息 {len(str(snapshot.get('user_prompt') or ''))}\n"
+        ]
+        keys = [str(item) for item in (snapshot.get("batch_keys") or [])]
+        texts = [str(item) for item in (snapshot.get("batch_texts") or [])]
+        parts.append("本轮 batch 的事件身份（按到达顺序）：")
+        for index, key in enumerate(keys):
+            text = texts[index] if index < len(texts) else ""
+            parts.append(f"· {key or '（无身份）'}：{text}")
+        parts.append(f"\n# ===== 1. system prompt =====\n{snapshot.get('system_prompt') or ''}")
+        parts.append(
+            "# ===== 2. 宿主历史（AstrBot contexts）=====\n"
+            + ("\n".join(str(item) for item in contexts) if contexts else "（这一轮没有带宿主历史）")
         )
-        layer = self._extension_prompt(state, session_id)
-        # 单独起个小标题：不然这一段混在正文里，调试页的分段索引里看不到它
-        return f"{text}\n\n{EXTENSION_LAYER_HEADING}\n{layer}" if layer else text
+        parts.append(f"# ===== 3. 最后一条用户消息 =====\n{snapshot.get('user_prompt') or ''}")
+        return "\n".join(parts)
+
+    def _remember_prompt_snapshot(
+        self,
+        *,
+        session_id: str,
+        system_prompt: str,
+        user_prompt: str,
+        contexts: Any,
+        batch: list[dict[str, Any]],
+        chat_rows: list[dict[str, Any]],
+    ) -> None:
+        """留一份"这一轮真正发出去的完整请求"（内存里只留最近几条）。"""
+
+        try:
+            entries = self.reply_batch_entries(batch, chat_rows=chat_rows)
+            self._prompt_snapshots.insert(
+                0,
+                {
+                    "session_id": str(session_id),
+                    "at": self._now(),
+                    "system_prompt": str(system_prompt or ""),
+                    "user_prompt": str(user_prompt or ""),
+                    "contexts": list(contexts or []),
+                    "batch_keys": [str(item.get("event_key") or "") for item in entries],
+                    "batch_texts": [str(item.get("text") or "") for item in entries],
+                },
+            )
+            del self._prompt_snapshots[PROMPT_SNAPSHOT_KEEP:]
+        except Exception as exc:  # 调试快照绝不能影响回复本身
+            self._log("debug", f"请求快照没留住：{exc}")
 
     async def overview(self) -> list[dict[str, Any]]:
         """所有启用会话的简要状态：编辑器地图页一次看全"谁在哪"。"""

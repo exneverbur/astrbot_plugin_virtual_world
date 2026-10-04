@@ -1,9 +1,8 @@
 """五层提示词组装（设计文档第 5 章）。
 
-两种用途：
-- ``build_injection``：@ 触发时走「注入模式」，只把「她现在在哪、什么状态」告诉主人格，
-  不接管回复、不注入 JSON 协议。追加在 req.system_prompt 末尾，不覆盖其他插件的内容。
-- ``build_autonomous_*``：自主行为走「接管模式」，由插件自己调 LLM 并约束 JSON 输出。
+两条路都是「接管模式」（插件自己调 LLM 并约束 JSON 输出），只是用途不同：
+- ``build_autonomous_*``：她说话时用（``mode="actions"``）；
+- 同一套层也供决策 / 自主行为复用（``mode="plan"`` 等）。
 
 分层顺序按「越稳定越靠前」排：
 
@@ -80,6 +79,10 @@ MINE_LINE_CHARS = 100
 
 # 转发摘要那一行放宽：摘要本身就是压过的，再掐到 100 字就只剩半句
 FORWARD_LINE_CHARS = 420
+
+# 本轮要回的那一批（batch）里每条最多留多少字：这些是她真正要读、要回的内容，
+# 给足；字符变长从背景侧省（背景走 `context.chat_line_chars`），**不砍名字里的 id**。
+REPLY_BATCH_LINE_CHARS = 500
 
 WEEKDAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
@@ -914,14 +917,22 @@ class PromptBuilder:
                 ),
                 preview=state.chat_preview_text(session_key),
                 summaries=dict(getattr(state, "chat_summaries", None) or {}),
-                # 三个"带几行"都来自世界配置：渲染这一层不再写死
+                # 三个"带几行"都来自世界配置：渲染这一层不再写死。
+                # **0 就是"这一类一条都不带"**（用户明确要关掉），只有字段整个缺失
+                # 时才回落到默认值——所以这里不能用 `or 0` 把缺省和 0 混成一个意思。
                 answered_max=int(
-                    getattr(getattr(self.world, "context", None), "chat_answered_lines", 30)
-                    or 0
+                    getattr(
+                        getattr(self.world, "context", None),
+                        "chat_answered_lines",
+                        ANSWERED_CHAT_MAX,
+                    )
                 ),
                 elsewhere_max=int(
-                    getattr(getattr(self.world, "context", None), "chat_elsewhere_lines", 12)
-                    or 0
+                    getattr(
+                        getattr(self.world, "context", None),
+                        "chat_elsewhere_lines",
+                        ELSEWHERE_CHAT_MAX,
+                    )
                 ),
                 replied_until=replied_until,
                 replied_seq=replied_seq,
@@ -1247,6 +1258,126 @@ class PromptBuilder:
             return "\n".join(f"- {text}" for text in thoughts)
         return "（你还没细想这件事）"
 
+    def render_chat_rows(
+        self,
+        rows: list[dict[str, Any]],
+        line_chars: int,
+        *,
+        marks: dict[str, str] | None = None,
+        seen: set[str] | None = None,
+        now: datetime | None = None,
+        forward_short: bool = True,
+    ) -> tuple[list[str], bool]:
+        """把聊天记录渲染成一行行（同一个人连着说的并成一行）。
+
+        背景（:meth:`chat_blocks`）和「本轮要回的那一批」（:meth:`build_reply_user_prompt`）
+        **共用这一个渲染器**：同一个格式、同一套分组规则。以前本轮走对话体
+        （「C 对你说：」+「（紧接着又说：…）」）、背景走记录体，同一个事件在同一个
+        请求里长成两个样子，正是"对方把一句话说了三遍"错觉的一半来源。
+
+        ``line_chars``：这一批每条最多写多少字。**还没回过她的那批要给足**
+        （那是她真正要读、要回的内容），已经回过 / 别处的按背景处理，可以短。
+
+        ``marks``：这一轮真的随请求发过去的图（``地址 -> 图N``）。
+        ``seen``：跨块共用的去重集合（同一个事件不重复出现）。
+        ``now``：渲染时间戳用的"现在"。
+        ``forward_short``：转发摘要要不要改写成短前缀 ``（转发：…）``。背景（群聊
+        记录，一行挤很多条）要短；本轮 batch 里那条是**她正在读、正要回的消息**，
+        注解原样保留（正文内容一样，只是标记不换写法）。
+
+        返回 ``(行列表, 这一次有没有用上图片编号)``。
+        """
+
+        marks = {str(key): str(value) for key, value in (marks or {}).items()}
+        if seen is None:
+            seen = set()
+        marks_used = False
+        rendered: list[tuple[dict[str, Any], str]] = []
+        for item in rows:
+            name = str(item.get("name") or item.get("user_id") or "").strip()
+            raw = str(item.get("text") or "")
+            if FORWARD_SUMMARY_MARK in raw:
+                if forward_short:
+                    # 转发摘要：标记换成短前缀，这一行的字数上限也放宽
+                    raw = raw.replace(FORWARD_SUMMARY_MARK, "（转发：").rstrip() + "）"
+                    text = clip_line(raw, max(FORWARD_LINE_CHARS, line_chars))
+                else:
+                    # 本轮要回的那条：正文（含摘要）原样，只按这一批的字数上限收
+                    text = clip_line(raw, line_chars)
+            else:
+                text = clip_line(raw, line_chars)
+            if not text:
+                continue
+            labels = [
+                marks[str(ref)]
+                for ref in (item.get("images") or [])
+                if str(ref) in marks
+            ]
+            if labels:
+                # 这条带的图这一次直接发给主模型看了：标上编号，方便和图对照
+                marks_used = True
+                text = f"{text}（见{'、'.join(labels)}）"
+            # 没随这次请求发过去的图：把它的转述写出来（已经发过去的就不重复念了）
+            blind = [
+                str(value).strip()
+                for ref, value in dict(item.get("captions") or {}).items()
+                if str(ref) not in marks and str(value).strip()
+            ]
+            if blind:
+                text = f"{text}（图片：{'；'.join(blind)}）"
+            # 同一条消息被两个钩子各记一次时，这里只留一行：
+            # 提示词里同一句话出现两三遍，模型会以为对方反复说了同样的话。
+            # **有事件身份就按身份认**：正文一样的两条是用户真的说了两遍，
+            # 按正文算指纹会把合法重复一起吞掉（而且这个 `seen` 还被 answered 和
+            # fresh 共用）。只有拿不到身份的老存档才退回按正文算指纹。
+            identity = str(item.get("event_key") or "")
+            fingerprint = (
+                identity
+                if identity
+                else f"{item.get('is_self')}:{_fingerprint(chat_core_text(text))}"
+            )
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            rendered.append((item, text))
+
+        out: list[str] = []
+        texts = {id(row_item): row_text for row_item, row_text in rendered}
+        # 分组规则和"算几条"完全一致（见 core/state.py 的 group_chat_items）：
+        # 同一个人 + 同一个会话 + 间隔不超过 5 分钟 → 并成一行
+        for group in group_chat_items([item for item, _text in rendered]):
+            item = group[-1]
+            pieces: list[str] = []
+            for one in group:
+                piece = texts.get(id(one), "")
+                labels = _addressing_labels(one)
+                if labels:
+                    # 一条消息里可能有好几句（同一个人连发），箭头要跟着自己那一句
+                    piece = f"→ {labels}：{piece}"
+                piece += _addressing_hint(one)
+                pieces.append(piece)
+            # 同一个人连着说的分几行写：拼成一行（「a / b / c」）时模型会
+            # 误读成"他把同一件事重复说了好几遍"（真机上回过「A9 Plus 连发三遍」）。
+            # 后面几句缩进两格，看起来仍属于同一条。
+            body = "\n  ".join(pieces)
+            name = str(item.get("name") or item.get("user_id") or "").strip()
+            if item.get("internal"):
+                # 插件写的"她身上发生的事"：标出来，免得被当成群里谁说的话
+                who = "（她自己身上发生的事）"
+            elif item.get("is_self"):
+                who = "你"
+            else:
+                identifier = str(item.get("user_id") or "").strip()
+                who = (
+                    f"{name}({identifier})"
+                    if name and identifier
+                    else (name or identifier)
+                )
+            at = float(item.get("at", 0) or 0.0)
+            stamp = self._chat_time(at, now)
+            out.append(f"- [{stamp}] {who}: {body}")
+        return out, marks_used
+
     def chat_blocks(
         self,
         recent_chat: list[dict[str, Any]] | None,
@@ -1254,8 +1385,8 @@ class PromptBuilder:
         note: str = "",
         *,
         summaries: dict[str, Any] | None = None,
-        answered_max: int = 0,
-        elsewhere_max: int = 0,
+        answered_max: int = -1,
+        elsewhere_max: int = -1,
         preview: str = "",
         replied_until: float = 0.0,
         replied_seq: int = 0,
@@ -1330,86 +1461,16 @@ class PromptBuilder:
         def _render_rows(rows: list[dict[str, Any]], line_chars: int) -> list[str]:
             """把留档渲染成一行行（同一个人连着说的并成一行）。
 
-            ``line_chars``：这一批每条最多写多少字。**还没回过她的那批要给足**
-            （那是她真正要读、要回的内容），已经回过 / 别处的按背景处理，可以短。
+            实际渲染交给 :meth:`render_chat_rows`：**背景和本轮的 batch 共用同一个
+            渲染器**，不然同一个事件在同一个请求里会有两种样子。
             """
 
             nonlocal marks_used
-            rendered: list[tuple[dict[str, Any], str]] = []
-            for item in rows:
-                name = str(item.get("name") or item.get("user_id") or "").strip()
-                raw = str(item.get("text") or "")
-                if FORWARD_SUMMARY_MARK in raw:
-                    # 转发摘要：标记换成短前缀，这一行的字数上限也放宽
-                    raw = raw.replace(FORWARD_SUMMARY_MARK, "（转发：").rstrip() + "）"
-                    text = clip_line(raw, max(FORWARD_LINE_CHARS, line_chars))
-                else:
-                    text = clip_line(raw, line_chars)
-                if not text:
-                    continue
-                labels = [
-                    marks[str(ref)]
-                    for ref in (item.get("images") or [])
-                    if str(ref) in marks
-                ]
-                if labels:
-                    # 这条带的图这一次直接发给主模型看了：标上编号，方便和图对照
-                    marks_used = True
-                    text = f"{text}（见{'、'.join(labels)}）"
-                # 没随这次请求发过去的图：把它的转述写出来（已经发过去的就不重复念了）
-                blind = [
-                    str(value).strip()
-                    for ref, value in dict(item.get("captions") or {}).items()
-                    if str(ref) not in marks and str(value).strip()
-                ]
-                if blind:
-                    text = f"{text}（图片：{'；'.join(blind)}）"
-                # 同一条消息被两个钩子各记一次时，这里只留一行：
-                # 提示词里同一句话出现两三遍，模型会以为对方反复说了同样的话。
-                # 按**正文**算指纹：两份分别是"带注释"和"不带注释"时也要认出来
-                # （短消息尤其容易漏，例如「亲亲」和「亲亲［这条消息 @ 了：你（…）］」）。
-                fingerprint = f"{item.get('is_self')}:{_fingerprint(chat_core_text(text))}"
-                if fingerprint in seen:
-                    continue
-                seen.add(fingerprint)
-                rendered.append((item, text))
-
-            out: list[str] = []
-            texts = {id(row_item): row_text for row_item, row_text in rendered}
-            # 分组规则和"算几条"完全一致（见 core/state.py 的 group_chat_items）：
-            # 同一个人 + 同一个会话 + 间隔不超过 5 分钟 → 并成一行
-            for group in group_chat_items([item for item, _text in rendered]):
-                item = group[-1]
-                pieces: list[str] = []
-                for one in group:
-                    piece = texts.get(id(one), "")
-                    labels = _addressing_labels(one)
-                    if labels:
-                        # 一条消息里可能有好几句（同一个人连发），箭头要跟着自己那一句
-                        piece = f"→ {labels}：{piece}"
-                    piece += _addressing_hint(one)
-                    pieces.append(piece)
-                # 同一个人连着说的分几行写：拼成一行（「a / b / c」）时模型会
-                # 误读成"他把同一件事重复说了好几遍"（真机上回过「A9 Plus 连发三遍」）。
-                # 后面几句缩进两格，看起来仍属于同一条。
-                body = "\n  ".join(pieces)
-                name = str(item.get("name") or item.get("user_id") or "").strip()
-                if item.get("internal"):
-                    # 插件写的"她身上发生的事"：标出来，免得被当成群里谁说的话
-                    who = "（她自己身上发生的事）"
-                elif item.get("is_self"):
-                    who = "你"
-                else:
-                    identifier = str(item.get("user_id") or "").strip()
-                    who = (
-                        f"{name}({identifier})"
-                        if name and identifier
-                        else (name or identifier)
-                    )
-                at = float(item.get("at", 0) or 0.0)
-                stamp = self._chat_time(at, now)
-                out.append(f"- [{stamp}] {who}: {body}")
-            return out
+            lines, used = self.render_chat_rows(
+                rows, line_chars, marks=marks, seen=seen, now=now
+            )
+            marks_used = marks_used or used
+            return lines
 
         def _render_other(rows: list[dict[str, Any]]) -> list[str]:
             """别的地方同时听到的话（只当背景）：同一个会话里同一个人连着说的并成一行。"""
@@ -1448,8 +1509,10 @@ class PromptBuilder:
             return take_last_chat_groups(rows, limit)
 
         # 已经回过的那一截：原样列出来，只是标明"这批已经答过了、别重复回"
+        # 「带几行」的语义：**0 = 这一类一条都不带**（用户要关掉它），
+        # 负数才是"没配过，用兜底默认值"。以前 0 被当成"没配"、于是关不掉。
         answered_rows = _last_groups(
-            answered, answered_max if answered_max > 0 else ANSWERED_CHAT_MAX
+            answered, answered_max if answered_max >= 0 else ANSWERED_CHAT_MAX
         )
         answered_lines = _render_rows(answered_rows, back_chars)
 
@@ -1470,6 +1533,8 @@ class PromptBuilder:
             rows.sort(key=lambda item: 0 if item[0] == current else 1)
             return rows
 
+        note = " ".join(str(note or "").split())
+
         # 「更早聊过的」按会话分开列：群里聊的和私聊聊的本来就不是一回事，
         # 混成一段她就分不清哪句是哪儿的。当前会话排最前。
         for key, text in _summary_rows():
@@ -1477,42 +1542,123 @@ class PromptBuilder:
                 label_map.get(key) or key
             )
             history.append(f"- 〔{label}〕更早聊过的：{_one_line(text, 600)}")
-        note = " ".join(str(note or "").split())
-        if not answered_lines:
-            # 没有原文可列（老存档 / 这批已经被裁掉）时，退回那一行概览
-            if preview:
-                history.append(f"- 你刚回应过的那批：{_one_line(preview, 240)}")
-            elif note:
-                history.append(f"- 上一轮你们在聊：{_one_line(note, 120)}")
-        elif note:
-            # 她这一轮看到的是真原文，但"刚才在聊什么"是她自己上一轮写的总结，
-            # 两边都给她才不会把话题接丢（以前这句只在没有原文时才出现，等于白写）
-            history.append(f"- 上一轮你们在聊：{_one_line(note, 120)}（背景）")
 
+        # 「最近在聊什么」那一块：她这一轮真正要读、要回的就是这几条，
+        # **预算是先给它的**。除了记录本身，这块还有固定的表头与一句"这几条是
+        # 不是说给你的"说明——它们也要算进预算，否则 `chat_total_chars` 又会变成
+        # 一句空话（以前只按 `len(lines)` 扣，固定文字白吃一大截）。
         lines = _render_rows(fresh, fresh_chars)
         other_lines = _render_other(
             _last_groups(
-                elsewhere, elsewhere_max if elsewhere_max > 0 else ELSEWHERE_CHAT_MAX
+                elsewhere, elsewhere_max if elsewhere_max >= 0 else ELSEWHERE_CHAT_MAX
             )
             if elsewhere
             else []
         )
+        # 「最近在聊什么」那几条不参与丢弃（预算是先给它们的），这里恒为 0：
+        # 单条过长只会被 clip_line 掐短并标明还剩多少字，不会整条消失。
+        dropped_fresh = 0
+        names = [str(item).strip() for item in (mine_names or []) if str(item).strip()]
+        mentioned = any(
+            _mentions_me(str(item.get("text") or ""), names) for item in fresh
+        )
+        # 最后一条是谁说的、她说过话之后有没有人接上——这两件事决定了这几条
+        # 到底是不是"对她说的话"。以前只看"出现过 self"，于是她自己刚说完、
+        # 没人接的时候也会被说成"接着你往下说的多半是对你说的"，
+        # 模型就追着自己那一句重新解释一遍。
+        last_is_self = bool(fresh) and bool(fresh[-1].get("is_self"))
+        last_self_at = max(
+            (index for index, item in enumerate(fresh) if item.get("is_self")),
+            default=-1,
+        )
+        other_after_last_self = last_self_at >= 0 and any(
+            not item.get("is_self") for item in fresh[last_self_at + 1 :]
+        )
+        spoke = last_self_at >= 0
+        if mentioned:
+            address_line = "这几条里有人 @ 你 / 叫了你的名字：其中有话是对你说的。\n"
+        elif last_is_self:
+            address_line = (
+                "这几条的最后一句是**你自己刚说的**，之后没有人接："
+                "这不是新的对话输入，别把它当成有人在跟你说话，"
+                "也别重新解释同一件事；\n"
+                "要接就接别人的话，没人接就换点别的说，或者先安静着。\n"
+            )
+        elif spoke and other_after_last_self:
+            address_line = (
+                "这几条里你刚说过话：接着你往下说的多半是对你说的；"
+                "但他们俩之间互相说的那部分别揽到自己身上，\n"
+                "不确定是在问谁时，别用「主人」这类专属称呼。\n"
+            )
+        else:
+            address_line = (
+                "这几条里没有人 @ 你、也没有叫你的名字：他们是在互相说话。\n"
+                "别人句子里的「你」指的是群里另一个人，**不是指你**——"
+                "没点名找你时你只是在旁边看着，\n"
+                "想接话就自然接一句，但别写成「他们在跟你说话」。\n"
+            )
+        chat_header = (
+            "# 这里最近在聊什么（按时间顺序，最后一条最新；带「你:」的是你自己说的）\n"
+        )
+        chat_fixed = (
+            chat_header
+            + address_line
+            + "这一串是原样的聊天记录：谁在跟谁说话、话题怎么接的，都看这里。\n"
+            + "不要逐条复述、不要总结成列表。\n"
+        )
 
-        # 整段聊天记录的字数预算：超了先丢"背景"（已回过的最老几条 → 别处的最老几条），
-        # 还没回过的那批是这一轮真正要读的，最后才动。
-        dropped_answered = 0
-        while len("\n".join([*answered_lines, *history, *lines, *other_lines])) > budget and len(answered_lines) > 1:
-            answered_lines.pop(0)
-            dropped_answered += 1
+        def _all_len() -> int:
+            return len("\n".join([*answered_lines, *history, *lines, *other_lines]))
+
+        def _background_len() -> int:
+            return len("\n".join([*answered_lines, *history, *other_lines]))
+
+        # 剩下的额度才轮到背景：别处的 → 已回过的 → 更早的概览。
+        # 背景每一类各自按剩余额度从最早的整条丢；**一条都放不下时整类不要**，
+        # 绝不把一整行掐成半句留在提示词里（那比不给更容易让她接错话）。
+        room_for_background = max(
+            0,
+            budget
+            - (len(chat_fixed) + len("\n".join(lines)) if lines else 0),
+        )
+
         dropped_other = 0
-        while len("\n".join([*answered_lines, *history, *lines, *other_lines])) > budget and len(other_lines) > 1:
+        while other_lines and _background_len() > room_for_background:
             other_lines.pop(0)
             dropped_other += 1
-        dropped_fresh = 0
-        while len("\n".join([*answered_lines, *history, *lines, *other_lines])) > budget and len(lines) > 1:
-            # 连"还没回过"的都放不下了（一条超长刷屏 + 一堆消息）：从最早的开始丢
-            lines.pop(0)
-            dropped_fresh += 1
+
+        dropped_answered = 0
+        while answered_lines and _background_len() > room_for_background:
+            answered_lines.pop(0)
+            dropped_answered += 1
+
+        # 「更早聊过的」概览垫在最底层：丢它的信息损失最小（本来就是压缩过的）
+        while history and _background_len() > room_for_background:
+            history.pop()
+
+        # 兜底：连一条原文都塞不进极小预算时，至少保住最新那一条
+        # （她得知道刚才有人说了什么），此时超出的部分是不可避免的。
+        if not lines and not answered_lines and not other_lines and not history:
+            lines = _render_rows(fresh[-1:], fresh_chars)
+            room_for_background = 0
+
+        # 「刚聊过什么」那一行概览：没有原文可列时它就是唯一的背景
+        if not answered_lines:
+            if preview:
+                head = f"- 你刚回应过的那批：{_one_line(preview, 240)}"
+            elif note:
+                head = f"- 上一轮你们在聊：{_one_line(note, 120)}"
+            else:
+                head = ""
+        else:
+            head = (
+                f"- 上一轮你们在聊：{_one_line(note, 120)}（背景）" if note else ""
+            )
+        if head:
+            # 这一行是"刚才在聊什么"，必须有；超预算也从别的背景里让位
+            history = [head, *history]
+            while _all_len() > budget and len(history) > 1:
+                history.pop()
 
         if answered_lines:
             tail = f"\n（更早的 {dropped_answered} 条已省略）" if dropped_answered else ""
@@ -1530,33 +1676,8 @@ class PromptBuilder:
             )
 
         if lines:
-            # 她自己不在这些消息里出现时，明确告诉她"这几条不是对你说的"：
-            # 中文字面的「你」经常指群里另一个人，模型很容易当成有人在跟自己说话。
-            names = [str(item).strip() for item in (mine_names or []) if str(item).strip()]
-            mentioned = any(
-                _mentions_me(str(item.get("text") or ""), names) for item in fresh
-            )
-            spoke = any(item.get("is_self") for item in fresh)
-            if mentioned:
-                address_line = "这几条里有人 @ 你 / 叫了你的名字：其中有话是对你说的。\n"
-            elif spoke:
-                address_line = (
-                    "这几条里你刚说过话：接着你往下说的多半是对你说的；"
-                    "但他们俩之间互相说的那部分别揽到自己身上，\n"
-                    "不确定是在问谁时，别用「主人」这类专属称呼。\n"
-                )
-            else:
-                address_line = (
-                    "这几条里没有人 @ 你、也没有叫你的名字：他们是在互相说话。\n"
-                    "别人句子里的「你」指的是群里另一个人，**不是指你**——"
-                    "没点名找你时你只是在旁边看着，\n"
-                    "想接话就自然接一句，但别写成「他们在跟你说话」。\n"
-                )
             blocks.append(
-                "# 这里最近在聊什么（按时间顺序，最后一条最新；带「你:」的是你自己说的）\n"
-                + address_line
-                + "这一串是原样的聊天记录：谁在跟谁说话、话题怎么接的，都看这里。\n"
-                + "不要逐条复述、不要总结成列表。\n"
+                chat_fixed
                 + "\n".join(lines)
                 + (
                     f"\n（更早的 {dropped_fresh} 条没列出来——太长放不下；"
@@ -2206,68 +2327,8 @@ class PromptBuilder:
             lines.append(f"{kind}：" + "、".join(texts[:6]))
         return lines
 
-    def build_injection(
-        self,
-        state: WorldState,
-        *,
-        node: NodeDef | None,
-        memories: list[RecalledMemory] | None = None,
-        engagement_hint: str = "",
-        extra_notes: list[str] | None = None,
-        focus_user: str = "",
-        recent_chat: list[dict[str, Any]] | None = None,
-        style_block: str = "",
-        weather: str = "",
-        recent_search: str = "",
-        abilities_line: str = "",
-        pending_event: str = "",
-        event_journal: str = "",
-        hidden_actions: set[str] | None = None,
-        current_session: str = "",
-        session_labels: dict[str, str] | None = None,
-        profile_text: str = "",
-        samples: list[dict[str, Any]] | None = None,
-    ) -> str:
-        """注入模式：给主人格的一层「世界认知」。
-
-        ``hidden_actions``：这一轮连名字都不该出现的动作（扩展要求藏起来的 + 配额用尽的）。
-        """
-
-        scene = self.scene_compact(node, hidden=hidden_actions)
-        runtime = self.runtime_layer(
-            state,
-            node=node,
-            memories=memories,
-            engagement_hint=engagement_hint,
-            extra_notes=extra_notes,
-            focus_user=focus_user,
-            recent_chat=recent_chat,
-            style_block=style_block,
-            weather=weather,
-            recent_search=recent_search,
-            abilities_line=abilities_line,
-            pending_event=pending_event,
-            event_journal=event_journal,
-            current_session=current_session,
-            session_labels=session_labels,
-            profile_text=profile_text,
-        )
-        sample_text = self.samples_layer(
-            samples, pronoun=pronoun_for(getattr(self.world, "gender", "female"))
-        )
-        head = (
-            "\n\n# ===== 虚拟世界状态（这是你此刻真实的处境）=====\n"
-            "你有自己的空间和生活节奏，下面是你现在的处境。"
-            "自然地把它融进你的反应里（比如刚睡醒、正在忙、心情如何），"
-            "但不要向用户解释这套设定、不要复述状态数值。\n\n"
-        )
-        # 声音样例放最后（理由同 build_autonomous_system_prompt：它每轮都换，
-        # 放前面会毁掉缓存前缀；放最后还能吃近因效应）
-        tail = f"\n\n{sample_text}" if sample_text else ""
-        return f"{head}{scene}\n\n{runtime}{tail}\n# ===== 虚拟世界状态结束 ====="
-
     def scene_compact(self, node: NodeDef | None, *, hidden: set[str] | None = None) -> str:
-        """紧凑版场景说明（注入模式用）。``hidden`` 里的动作连名字都不出现。"""
+        """紧凑版场景说明（"她此刻在哪"的短版本，接管提示词与调试页都用它）。"""
 
         if node is None:
             return "你当前不在任何已知地点。"
@@ -2388,35 +2449,106 @@ class PromptBuilder:
             layers.append(sample_text)
         return "\n\n".join(layers)
 
+    @staticmethod
+    def reply_batch_rows(
+        entries: list[dict[str, Any]] | None,
+        *,
+        user_name: str = "",
+        text: str = "",
+        fallback_at: float = 0.0,
+    ) -> list[dict[str, Any]]:
+        """把本轮 batch 的结构化条目规整成可渲染的行。
+
+        老调用方（直接给 ``user_name`` + ``text``）按单条处理，格式完全一样——
+        这样"本轮要回的那一批"和聊天背景走的是同一个渲染器。
+
+        ``fallback_at``：条目没带时间时用哪个时间戳（老调用方只有 ``text``，
+        它没有"这条消息几点发的"；拿不到就写 ``--:--``，看着像条坏记录）。
+        """
+
+        source = [item for item in list(entries or []) if isinstance(item, dict)]
+        if not source and str(text or "").strip():
+            source = [
+                {"name": str(user_name or ""), "text": str(text or ""), "is_trigger": True}
+            ]
+        rows: list[dict[str, Any]] = []
+        for entry in source:
+            row = dict(entry)
+            row["text"] = str(row.get("text") or "")
+            if not row["text"].strip():
+                continue
+            row["at"] = float(row.get("at") or 0.0) or float(fallback_at or 0.0)
+            rows.append(row)
+        if rows and not any(row.get("is_trigger") for row in rows):
+            rows[-1]["is_trigger"] = True
+        return rows
+
     def build_reply_user_prompt(
         self,
         *,
-        user_name: str,
-        text: str,
+        entries: list[dict[str, Any]] | None = None,
+        user_name: str = "",
+        text: str = "",
         is_private: bool = False,
         addressing: str = "direct",
-        extra_texts: list[str] | None = None,
         from_session: str = "",
+        image_marks: dict[str, str] | None = None,
     ) -> str:
         """被 @（或其他插件放行）时的用户消息包装。
 
-        ``addressing``：
+        ``entries``：这一轮要回的**结构化条目**（触发她的那条 + 安静期里并进来的
+        几条），每条带 ``name`` / ``user_id`` / ``text`` / ``at`` / ``origin`` 以及
+        ``at_targets`` / ``reply_to`` / ``addressing``。渲染和聊天背景共用
+        :meth:`render_chat_rows`，所以这里出来的就是标准聊天记录行：::
+
+            - [21:03] A(1001): 今天开会吗
+            - [21:03] B(1002): 我去买咖啡
+            - [21:03] C(1003): → 你：几点
+
+        每条消息自己的「→ @谁 / 引用谁」由渲染器按条标出；同一个人连发按同一套
+        分组规则并成一条（后面几句缩进两格）。只有 ``text`` 的老调用方按单条处理，
+        格式一样。
+
+        ``addressing``：**由触发者那一条决定**的基调——
         - ``direct``：这句话是对她说的（@ 了她、叫了她的名字、或者接着她刚才的话）；
         - ``interject``：群里在聊，只是轮到她插一句——不能当成有人点名找她，
           更不能把别人之间的话当成对她的请求。
 
-        ``extra_texts``：她还在调模型时同一人紧接着又发的几句（合并成一次回复用）。
-
         ``from_session``：这条消息来自哪个会话（「群 123456「群名」」这种）。
         多会话时一定要给，她才知道这句是在哪儿说的。
+
+        ``image_marks``：这一轮真的随请求发过去的图（``地址 -> 图N``）。本轮这几行
+        也会像背景一样标出「（见图N）」——图和记录的对应关系不能因为这一批搬到了
+        user 消息里就丢掉。带了图就由这里负责解释编号。
         """
 
-        who = user_name or "群友"
+        moment = self._now()
+        rows = self.reply_batch_rows(
+            entries,
+            user_name=user_name,
+            text=text,
+            fallback_at=float(moment.timestamp()) if moment is not None else 0.0,
+        )
+        trigger = next(
+            (row for row in rows if row.get("is_trigger")), rows[-1] if rows else {}
+        )
+        who = str(trigger.get("name") or user_name or "群友")
         where = f"（这条来自 {from_session}）" if from_session else ""
+        lines, used = self.render_chat_rows(
+            rows,
+            REPLY_BATCH_LINE_CHARS,
+            marks=image_marks,
+            now=moment,
+            forward_short=False,
+        )
+        # 聊天记录格式：谁说的、几点说的、@ / 引用了谁，全在行里。
+        # 不再写「（紧接着又说：…）」——那是把几个人合并成一个人的说法，
+        # 真实发言人由每行的 `名字(id)` 自然带出。
+        body = "\n".join(lines)
         if addressing == "interject":
             parts = [
                 f"群里正在聊，这句话是说给大家的（{who}）{where}：",
-                text,
+                body,
                 "",
                 "没有人点名找你。你可以顺着接一句，也可以觉得没必要说就只做自己的事；"
                 "不要把这句话当成别人对你的请求或指令；"
@@ -2426,27 +2558,29 @@ class PromptBuilder:
         elif addressing == "soft":
             parts = [
                 f"{who} 在群里顺着话题跟你说（没有 @ 你）{where}：",
-                text,
+                body,
                 "",
                 "对方没有点名 @ 你，是接着眼下的话题对你说的；"
                 "照常回应就好，但别写成「你 @ 了我」；"
                 "句子里的「你」如果明显指别人，就别揽到自己身上。",
             ]
         else:
-            parts = [f"{who} 对你说{where}：", text]
-        for extra in list(extra_texts or []):
-            body = " ".join(str(extra or "").split())
-            if body:
-                parts.append(f"（紧接着又说：{body}）")
-        if extra_texts:
-            parts.append("他这几句是一口气说完的，一起回应，别分两次答。")
-        now = self._now()
-        if now is not None:
+            parts = [f"{who} 对你说{where}：", body]
+        if moment is not None:
             # 聊天记录里带的是各自发言的时间戳，跟"现在几点"很容易混：
             # 这里明确说一遍现在的时间，她就不会拿凌晨那几条当"刚刚"。
             parts.append(
-                f"（现在是 {now.strftime('%H:%M')} · {period_of(now.hour)}；"
+                f"（现在是 {moment.strftime('%H:%M')} · {period_of(moment.hour)}；"
                 "上面带时间的是那些话各自发出的时间，不代表现在。）"
+            )
+        if used:
+            # 图编号（图1/图2…）这一轮标在上面这几行里，解释就得跟到同一处：
+            # 以前这句在背景那一层；本轮那几行搬过来之后，它也要跟过来，
+            # 不然行里写着「（见图1）」却没人说图1是哪张。
+            parts.append(
+                "（上面标着「（见图N）」的图已经按编号顺序附在这次请求的最前面："
+                "图1 是其中最早的那张，后面的图接在它后面；其余的图只有文字描述。"
+                "看图说话时按编号对，别把两张图认成一张。）"
             )
         if is_private:
             parts.append("（这是私聊）")
@@ -2468,6 +2602,10 @@ class PromptBuilder:
         "- 这几句是**你自己想说**的，不是被谁问到的：别写成在向全场吆喝、招呼、招揽；\n"
         "- 不要推销、不要讨好（例如「想吃吗」「吱一声」「要的扣 1」「我给你留了一份」）；\n"
         "- 不要和最近说过的话重复，换一种说法和句式；\n"
+        "- 某个话题还留在你的记忆 / 备忘里，**不代表要再答一遍**：那只是你还记得；\n"
+        "- 只有别人又说了新话、有个问题还没答完、或者真出了新事情，才接着往下说；\n"
+        "- 你上一句没人接时，优先说你自己的状态或正在做的事，要不就安静；\n"
+        "- 真要延续旧话题就用「刚才那个……」补新的信息，别把上次的结论再讲一遍；\n"
         "- 真没什么想说的就**保持安静**——不开口比硬找一句更像真人。\n"
     )
     """自己开口（不是被搭话）时的通用分寸：自主发言和插话共用同一份。"""
@@ -2767,7 +2905,10 @@ class PromptBuilder:
         """把「她想让那条指令帮她干什么」拼成一条真正的指令文本（返回 system, user）。"""
 
         system = (
-            "你在把一句自然语言的意图拼成一条 AstrBot 指令。"
+            "你是指令参数编译器，不是正在执行动作的角色，也不是聊天回复助手。"
+            "你的唯一任务是把给定意图填成一条 AstrBot 指令；即使意图包含拍照、穿衣、亲密互动等内容，"
+            "也不要以人工智能、没有实体、无法执行或拒绝参与为理由回应。"
+            "不要评价意图，不要代入自身身份，不要拒答，不要编造额外背景。"
             "只输出这一条指令本身（以 / 开头，带好参数），不要解释、不要引号、不要 Markdown。"
         )
         prompt = (
@@ -3150,6 +3291,10 @@ class PromptBuilder:
             "- 提到具体的人时，用材料里的 QQ 号写进 participants，不要自己造人；\n"
             "- 只输出**改动**：没变的旧记忆不要抄回来；\n"
             "- 证据（evidence）写清材料里那个人原话的一小段，方便以后核对；\n"
+            "- 你自己那些普通的回复、寒暄和翻来覆去的解释**不算新事实**，默认不要记；"
+            "只有你那句话表达了持续的状态、一个计划、或真正值得记住的经历时才留下，"
+            "而且那是你自己的事，要进你自己的状态 / 计划 / 事件，"
+            "别包装成关于用户的事实；\n"
             "- digests 里的那一段是**这个人的画像速写**：只写他是谁、怎么说话、喜欢什么、"
             "你们什么关系这类**稳定的特征**，**不要写他最近遇到的事 / 新闻 / 一次性的事件**"
             "（那种事放进 facts 的「近况」，或者留在记忆里）；\n"
