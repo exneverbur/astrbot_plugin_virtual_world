@@ -360,6 +360,10 @@ class StateDynamics:
         atmosphere = node.atmosphere if node else None
         mult = self.config.atmosphere_multiplier
 
+        # 困意（sleep_pressure）：睡着的分支会提前 return，所以先算它，
+        # 这样"睡着时迅速回落"和"醒着时慢慢攒"两条路都走得到。
+        self._tick_sleep_pressure(state, minutes=minutes, world=world, now=now)
+
         if state.state in ("sleeping", "napping"):
             rate = (
                 self.config.sleep_energy_recovery_per_min
@@ -556,6 +560,57 @@ class StateDynamics:
         if affect > STORM_ENTER_AROUSAL and valence < STORM_ENTER_VALENCE:
             state.storm = True
             state.storm_since = now
+
+    def _sleep_config(self, world: WorldConfig | None, key: str, fallback: float) -> float:
+        """从 ``world.sleep`` 里读一个困意参数（测试里经常不传 world，得兜住）。"""
+
+        config = getattr(world, "sleep", None) if world is not None else None
+        try:
+            value = float(getattr(config, key, fallback))
+        except (TypeError, ValueError):
+            return float(fallback)
+        return value
+
+    def _tick_sleep_pressure(
+        self,
+        state: WorldState,
+        *,
+        minutes: float,
+        world: WorldConfig | None,
+        now: float | None,
+    ) -> None:
+        """困意随时间的自然涨落：深夜慢慢攒、白天回落、睡着迅速清掉。
+
+        「到点就困」靠的是日程与精力；困意记录的是**她熬了多久**：
+        夜里一直在攒，天亮了自动回落，睡着了一觉清掉大半，
+        被人拉着说话、被碰一碰又会压下去一点（见 ``Engine.relieve_sleep_pressure``）。
+        攒到 ``sleep.pressure_threshold`` 才会自己排睡觉。
+        """
+
+        if not state.is_sleeping and not bool(
+            getattr(getattr(world, "sleep", None), "pressure_enabled", True)
+        ):
+            return
+        current = float(getattr(state, "sleep_pressure", 0.0) or 0.0)
+        if state.is_sleeping:
+            fall = max(0.0, self._sleep_config(world, "pressure_sleep_fall_per_hour", 2.0))
+            state.sleep_pressure = clamp_value(current - fall * minutes / 60.0, 0.0, 1.0)
+            return
+        hour = self._hour(now)
+        night = True
+        if world is not None:
+            try:
+                night = bool(world.is_night_time(hour))
+            except Exception:
+                night = False
+        if night:
+            rate = max(0.0, self._sleep_config(world, "pressure_gain_per_hour", 0.5))
+            if bool(getattr(state, "sleep_delayed", False)):
+                # 他让她别睡，她也乐意再撑一会儿：这段时间困意涨得慢
+                rate *= max(0.0, self._sleep_config(world, "pressure_delay_multiplier", 0.3))
+        else:
+            rate = -max(0.0, self._sleep_config(world, "pressure_fall_per_hour", 0.6))
+        state.sleep_pressure = clamp_value(current + rate * minutes / 60.0, 0.0, 1.0)
 
     def _safety_valve(self, state: WorldState, *, now: float) -> bool:
         """效价长期偏低：把偏移减半（朝基线拉，而不是硬设一个值）。"""

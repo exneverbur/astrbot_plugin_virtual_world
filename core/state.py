@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -109,6 +110,21 @@ def chat_core_text(text: str) -> str:
     """切掉注释尾巴，只留"人说的那句话"。"""
 
     return split_annotation(text)[0]
+
+
+_MENTION_NOTE_RE = re.compile(r"［这条消息[^］]*］")
+"""「［这条消息 @ 了：…］」这种注解：**只在那一轮有用**。"""
+
+
+def strip_mention_note(text: str) -> str:
+    """去掉尾部的「［这条消息 @ 了：…］」注解，再压成单行。
+
+    `_annotate_message` 补在正文后面的那一段是"这句冲谁说的"的提示，
+    但把它带进「你刚回应过的那批」这种概览里就只剩噪音：短消息（「蓝蓝你在吗」）
+    按 40 字截断时会把整段注解带进去，再被 240 字砍成半个括号。
+    """
+
+    return " ".join(_MENTION_NOTE_RE.sub(" ", str(text or "")).split())
 
 
 def split_annotation(text: str) -> tuple[str, str]:
@@ -635,6 +651,31 @@ class WorldState:
     no_sleep_until: int = 0
     """刚被叫醒的保护期：世界时间在此之前，规则不再安排她回去睡。"""
 
+    sleep_delay_until: int = 0
+    """「等会儿再睡」的延迟窗口到哪个 tick（世界时间）。
+
+    他说了「等会儿再睡 / 先别睡」这类话，或者扩展（亲密场景）调了
+    ``ExtensionHost.delay_sleep`` 之后，世界时间在此之前：
+    规则不排睡觉、日程与 LLM 排的睡觉也会被跳掉、提示词不催她睡——
+    但她照样可以是迷迷糊糊的 ``STATE_DROWSY``。连着说就续期（取更晚的那个）。
+    和 ``no_sleep_until`` 分开记，是因为理由不同（那个是"刚被叫醒"，这个是"她答应了"），
+    面板上要分别显示给谁看、到什么时候。
+    """
+
+    sleep_delay_reason: str = ""
+    """这次延迟的说法（例如"他说「等会儿再睡」"）：只用来显示与排查。"""
+
+    sleep_delay_by: str = ""
+    """谁把睡觉推迟的（用户 id / 昵称，或者扩展名）。"""
+
+    sleep_pressure: float = 0.0
+    """困意（0~1）：深夜慢慢攒、白天回落、睡着时迅速清掉、被互动与亲密压低。
+
+    攒到 ``sleep.pressure_threshold`` 她才真的撑不住（见 Decider.rule_plan）。
+    精力低于 0.25 那条老路照旧——困意是"到点就困"之外的另一条路，
+    不是替代品：熬夜、被打断、被留住都能在困意上体现出来。
+    """
+
     last_outdoor_at: float = 0.0
     """上一次在外面（不在家那一片）是什么时候：久了她会想出去走走。"""
 
@@ -916,6 +957,13 @@ class WorldState:
         except (TypeError, ValueError):
             self.desire_push_at = 0.0
         self.no_sleep_until = max(0, int(self.no_sleep_until))
+        self.sleep_delay_until = max(0, int(self.sleep_delay_until or 0))
+        self.sleep_delay_reason = str(self.sleep_delay_reason or "")
+        self.sleep_delay_by = str(self.sleep_delay_by or "")
+        try:
+            self.sleep_pressure = max(0.0, min(1.0, float(self.sleep_pressure or 0.0)))
+        except (TypeError, ValueError):
+            self.sleep_pressure = 0.0
         try:
             self.last_outdoor_at = max(0.0, float(self.last_outdoor_at or 0.0))
         except (TypeError, ValueError):
@@ -1149,6 +1197,16 @@ class WorldState:
     @property
     def is_sleeping(self) -> bool:
         return self.state in (STATE_SLEEPING, STATE_NAPPING)
+
+    @property
+    def sleep_delayed(self) -> bool:
+        """现在是不是处在「等会儿再睡」的延迟窗口里。
+
+        窗口里：不排睡觉、不催她睡，但她可以是迷迷糊糊的临睡状态。
+        推迟到什么时候、谁推迟的，见 ``sleep_delay_until`` / ``sleep_delay_reason`` / ``sleep_delay_by``。
+        """
+
+        return bool(self.sleep_delay_until) and int(self.world_time) < int(self.sleep_delay_until)
 
     @property
     def is_busy(self) -> bool:
@@ -1490,12 +1548,14 @@ class WorldState:
 
         target = str(session_id or self.session_id or "")
         entry = dict((self.chat_previews or {}).get(target) or {})
-        text = str(entry.get("text") or "").strip()
+        # 概览是"刚聊过什么"，里头不该留着「［这条消息 @ 了：…］」那种一轮性的注解
+        # （老存档里已经存脏了，读的时候再抹一遍）
+        text = strip_mention_note(entry.get("text") or "")
         if text:
             return text
         if target != str(self.session_id or ""):
             return ""
-        return str(self.chat_preview or "").strip()
+        return strip_mention_note(self.chat_preview or "")
 
     def note_reply(self, text: str, *, keep: int = 6, session_id: str = "") -> None:
         """记一句她刚说过的话（提示词里用来提醒她别重复句式），并记下在哪儿说的。"""

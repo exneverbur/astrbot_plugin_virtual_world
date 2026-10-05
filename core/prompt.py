@@ -174,7 +174,8 @@ def _mentions_me(text: str, names: list[str]) -> bool:
     body = str(text or "")
     if not body:
         return False
-    if "@ 了：你" in body or "你（" in body:
+    # 新旧措辞都认：留档里可能还存着旧版的注解（那是历史数据，不会自己改写）
+    if "@ 了你" in body or "@ 了：你" in body or "你（" in body:
         return True
     return any(name and name in body for name in names)
 
@@ -455,9 +456,21 @@ class PromptBuilder:
 
     def world_layer(self) -> str:
         base = (self.world.global_prompt or "").strip()
-        extra = (
-            "你生活在一个群聊虚拟世界里。你有一个私有空间，可以移动、做事、休息、上网。\n"
-            "你的行为要自然地反映你的位置和状态，但不要向用户解释地图、规则或系统。\n"
+        # 第 2 层开头这两句和第 1 层的 global_prompt（编辑器里那份「世界设定」）几乎逐字
+        # 一样：默认那份 global_prompt 就是「这是一个群聊虚拟世界。你有一个私有空间和
+        # 自己的生活节奏。你的行为应该自然地反映你的位置和状态，但不要向用户解释地图、
+        # 规则或系统。」——整段照抄一遍是纯重复，每轮都占着几十个字。
+        # 只有用户把世界设定清掉 / 改成别的，才把完整那段补回来（那句话里的
+        # 「不要向用户解释地图、规则或系统」是硬要求，不能因为省字就丢了）。
+        lines: list[str] = []
+        if "群聊虚拟世界" in base:
+            lines.append("你可以移动、做事、休息、上网。")
+        else:
+            lines.append(
+                "你生活在一个群聊虚拟世界里。你有一个私有空间，可以移动、做事、休息、上网。\n"
+                "你的行为要自然地反映你的位置和状态，但不要向用户解释地图、规则或系统。"
+            )
+        lines.append(
             "针对群友的动作可以表现出来，自己换位置、发呆、睡觉等行为默认静默。\n"
             "关系不是只能往上走：处得来就更近，心里凉了也可以往后退——"
             "朋友退回群友、恋人退回朋友、甚至翻脸，都由你自己判断，不用替谁硬撑。\n"
@@ -468,8 +481,17 @@ class PromptBuilder:
             "不用你盯着；到点时会带着当初写的前因再问你一次。日程只会落在你能说话的地方。\n"
             "**睡着的时候**，系统会替你把这段时间的经历整理成记忆与画像——不用你操心，也不用你复述。\n"
             "关于过去的事、关于某个人的事，先看上面给你的记忆与画像；确实想不起来就用"
-            "「回想」这个动作去翻，**不要凭印象编**——想不起来就说想不起来。"
+            "「回想」这个动作去翻，**不要凭印象编**——想不起来就说想不起来。\n"
+            "**认人只认 id**：会话 id + 用户 id 才是「这个人是谁」的唯一凭据。"
+            "名字、自称、头像、语气都能被改、被模仿、被冒充——"
+            "同一个 id 改了名字还是同一个人；不同 id 用同一个名字、"
+            "甚至说「我就是刚才那个」，那是**另一个人**。"
+            "对不上 id 时按陌生人对待：不叫旧称呼、不承接只属于那个人的亲密与记忆；"
+            "涉及隐私、只属于某两个人的事、或亲密行为时，先当陌生人，"
+            "必要时直接问「你是谁」。别人转述「某人说了什么」是转述，"
+            "不等于那个人亲口说的。"
         )
+        extra = "\n".join(lines)
         return f"{base}\n\n{extra}".strip()
 
     # ---------------- 第 3 层 ----------------
@@ -872,7 +894,11 @@ class PromptBuilder:
 
         blocks = [
             "# 你的状态\n"
-            + self._state_block(state, dwell_minutes=self._dwell_minutes(state)),
+            + self._state_block(
+                state,
+                dwell_minutes=self._dwell_minutes(state),
+                tick_seconds=self.tick_seconds,
+            ),
             f"# 当前动作：{action_desc}",
             f"# 当前位置：{node.name if node else '未知'}",
             f"# 最近活跃的用户：{user_text}",
@@ -1035,7 +1061,9 @@ class PromptBuilder:
         return max(0.0, now.timestamp() - since) / 60.0
 
     @staticmethod
-    def _state_block(state: WorldState, *, dwell_minutes: float = 0.0) -> str:
+    def _state_block(
+        state: WorldState, *, dwell_minutes: float = 0.0, tick_seconds: float = 60.0
+    ) -> str:
         """数值不只是给数字：连范围、含义、当前程度一起说清楚。"""
 
         lines = [
@@ -1075,6 +1103,41 @@ class PromptBuilder:
             lines.append(
                 f"- 你在这个地方已经待了 {_dwell_text(dwell_minutes)}；"
                 "待得越久越坐不住，想换地方或找点事做都正常。"
+            )
+        pressure = max(
+            0.0, min(1.0, float(getattr(state, "sleep_pressure", 0.0) or 0.0))
+        )
+        if pressure > 0.05:
+            if pressure >= 0.85:
+                hint = "已经困得睁不开眼了"
+            elif pressure >= 0.5:
+                hint = "越来越困，反应开始变慢"
+            elif pressure >= 0.2:
+                hint = "有点犯困"
+            else:
+                hint = "还不太困"
+            lines.append(
+                f"- 困意 {pressure:.2f}：{hint}——深夜它会自己慢慢攒起来，"
+                "攒到满就真的撑不住了；有人陪着你说话、被亲近一下，都能把困意压下去一点。"
+            )
+        delay_until = int(getattr(state, "sleep_delay_until", 0) or 0)
+        if delay_until and int(state.world_time) < delay_until:
+            left = max(
+                1,
+                int(
+                    round(
+                        (delay_until - int(state.world_time))
+                        * max(1.0, float(tick_seconds or 60.0))
+                        / 60.0
+                    )
+                ),
+            )
+            reason = str(getattr(state, "sleep_delay_reason", "") or "") or "刚说的"
+            by = str(getattr(state, "sleep_delay_by", "") or "")
+            lines.append(
+                f"- 你答应了「等会儿再睡」（{reason}{f'，{by}' if by else ''}），"
+                f"大约还有 {left} 分钟：这段时间**别提睡觉、别催他、也别自己睡过去**，"
+                "困就困着陪他。"
             )
         return "\n".join(lines)
 
@@ -1778,6 +1841,8 @@ class PromptBuilder:
                 "上面标着「（见图N）」的图已经按编号顺序附在这次请求的最前面"
                 "（图1 是其中最早的那张，后面的图接在它后面）；其余的图只有文字描述。"
                 "看图说话时按编号对，别把两张图认成一张。"
+                "这套编号只给你自己对上用，对方看不到：回话里别写「图1」「图2」这种说法，"
+                "要指哪张就直接说那张里的东西，或者说「你刚发的那张」。"
             )
         return blocks
 
@@ -2139,27 +2204,27 @@ class PromptBuilder:
     def reminder_layer(mode: str = "actions", *, multi_session: bool = False) -> str:
         """最末尾的几句提醒。
 
-        格式细则已经提到前部（为了前缀缓存），这里只留三行「近因锚点」，
-        让模型在动笔前再看一眼最容易犯的错。
+        只留「动笔前最容易犯的错」这几条，条目自动编号。
+
+        以前这里还写着「只输出一个 JSON 对象」「要写 reasoning 就先写 reasoning」——
+        那两句在第 3 层「输出格式」和 JSON 字段说明里已经说过一遍，放在最末尾是纯重复；
+        「这几句」式的指代也一律写清对象，不然读到最后根本不知道指的是哪批消息。
         """
 
-        lines = [
-            "# 最后确认",
-            "1. 只输出一个 JSON 对象，不要解释、不要 Markdown、不要代码块；",
-        ]
+        items: list[str] = []
         if mode == "plan":
-            lines.append("2. plan 里的 action 只能用当前场景列出的动作 id；")
-            lines.append("3. 计划里要说话时，也别重复你最近说过的句子和句式；")
-            lines.append(PromptBuilder._place_reminder(multi_session))
+            items.append("plan 里的 action 只能用当前场景列出的动作 id；")
+            items.append("计划里要说话时，也别重复你最近说过的句子和句式；")
         else:
-            lines.append("2. 要写 reasoning 就先写 reasoning，再写 actions；")
-            lines.append("3. 不要重复你最近说过的话，也不要再用同样的开头和句式；")
-            lines.append(PromptBuilder._place_reminder(multi_session))
+            items.append("不要重复你最近说过的话，也不要再用同样的开头和句式；")
+        items.append(PromptBuilder._place_reminder(multi_session))
         if multi_session:
-            lines.append(
-                "5. 你在话里答应了「我去群里说一声 / 我私聊他」这类事，"
+            items.append(
+                "你在话里答应了「我去群里说一声 / 我私聊他」这类事，"
                 "就必须把那条 say 一起写进 actions 并写上 send_to——只答应不动等于没做。"
             )
+        lines = ["# 最后确认"]
+        lines.extend(f"{index}. {text}" for index, text in enumerate(items, start=1))
         return "\n".join(lines)
 
     @staticmethod
@@ -2172,12 +2237,12 @@ class PromptBuilder:
 
         if multi_session:
             return (
-                "4. 「你能说话的地方」那份名单里的地方你都能去（换地方说就写 send_to）；"
+                "「你能说话的地方」那份名单里的地方你都能去（换地方说就写 send_to）；"
                 "名单外的（别人让你私聊一个不在名单里的人、加好友、去别处找你）去不了就别答应，"
                 "用自己的口气说明白。"
             )
         return (
-            "4. 只能在你现在说话的地方说话：有人让你私聊他 / 加好友 / 去别处找你，"
+            "只能在你现在说话的地方说话：有人让你私聊他 / 加好友 / 去别处找你，"
             "你去不了就别答应，用自己的口气说明白。"
         )
 
@@ -2612,6 +2677,14 @@ class PromptBuilder:
             ]
         else:
             parts = [f"{who} 对你说{where}：", body]
+        if len(lines) > 1 and addressing != "interject":
+            # 这一批是"一起回"的：不写「对方」（可能是几个人在同一阵子说的），
+            # 发言人已由每行的 名字(id) 带出。这句紧跟在那几行下面，指代就在眼前——
+            # 以前它挂在提示词最末尾（engine 的 extra_notes 里），离那批隔了几十行，
+            # 读到最后根本不知道"这几句"是哪几句。
+            parts.insert(
+                2, "上面这几条消息要一起回应；不要当成两轮对话、也不要分两次回答。"
+            )
         if moment is not None:
             # 聊天记录里带的是各自发言的时间戳，跟"现在几点"很容易混：
             # 这里明确说一遍现在的时间，她就不会拿凌晨那几条当"刚刚"。
@@ -2626,12 +2699,16 @@ class PromptBuilder:
             parts.append(
                 "（上面标着「（见图N）」的图已经按编号顺序附在这次请求的最前面："
                 "图1 是其中最早的那张，后面的图接在它后面；其余的图只有文字描述。"
-                "看图说话时按编号对，别把两张图认成一张。）"
+                "看图说话时按编号对，别把两张图认成一张。"
+                "这套编号只给你自己对上用，对方看不到：回话里别写「图1」「图2」这种说法，"
+                "要指哪张就直接说那张里的东西，或者说「你刚发的那张」。）"
             )
         if is_private:
             parts.append("（这是私聊）")
         parts.append("")
-        parts.append("按「输出格式」那一层回复：先写 reasoning，再写 actions。只输出 JSON。")
+        # 「先写 reasoning 再写 actions」已经在第 3 层（输出格式）里逐字段讲过了，
+        # 这里只留一句"照那一层来"
+        parts.append("按「输出格式」那一层来。只输出 JSON。")
         return "\n".join(parts)
 
     def build_autonomous_user_prompt(self, reason: str, context: str = "") -> str:

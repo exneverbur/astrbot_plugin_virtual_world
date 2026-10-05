@@ -110,6 +110,7 @@ from .state import (
     chat_event_key,
     chat_item_is_fresh,
     group_chat_items,
+    strip_mention_note,
     take_last_chat_groups,
 )
 from .state_dynamics import SOOTHE_VALENCE_BELOW, StateDynamics
@@ -593,6 +594,16 @@ class ReplyOutcome:
 
     routed_images: dict[str, list[str]] = field(default_factory=dict)
     """同上，按会话分开的图片。"""
+
+    silenced: bool = False
+    """她这一轮**回过话**，但被扩展的 ``reply_replace`` 静默了（什么都不发）。
+
+    调用方要照常推进「回过话」的水位线 / 已读游标，也不能落回主人格——
+    不然世界以为这批消息没被回过，下一轮会原样再喂一遍。
+    """
+
+    replied_sessions: list[str] = field(default_factory=list)
+    """这一轮算"回过话"的会话（静默时用：水位线按它推进）。"""
 
     def routed_sessions(self) -> list[str]:
         """这一轮额外说到了哪些会话。"""
@@ -1744,13 +1755,18 @@ class VirtualWorldEngine:
         if not bool(getattr(config, "enabled", True)):
             return ""
         values = normalize_abilities(state.abilities or config.initial)
-        parts = [
-            f"{ABILITY_LABELS[name]}{ability_hint(values[name])}"
-            for name in ABILITIES
-        ]
+        hints = [ability_hint(values[name]) for name in ABILITIES]
+        # 四项同档是常态（初始值就一样）：逐条写「体力还算顺手、智力还算顺手、…」
+        # 是同一句话说四遍，收成一句；真的分档了才逐项写。
+        if len(set(hints)) == 1:
+            body = "、".join(ABILITY_LABELS[name] for name in ABILITIES) + "都" + hints[0]
+        else:
+            body = "、".join(
+                f"{ABILITY_LABELS[name]}{hint}" for name, hint in zip(ABILITIES, hints)
+            )
         return (
             "# 你自己的本事\n"
-            + "、".join(parts)
+            + body
             + "（这是你平时的手感，用来判断一件事对你难不难；不用说出来）"
         )
 
@@ -3078,6 +3094,42 @@ class VirtualWorldEngine:
                 continue
             return action.id
         return ""
+
+    async def photo_now(
+        self,
+        state: WorldState,
+        *,
+        intent: str = "",
+        reason: str = "",
+    ) -> str:
+        """现在让她拍一张：走「事件出图」那条路（按配置挑一个**已启用**的内置拍照动作）。
+
+        给扩展用的公开接口（H 那一套的「本场发送照片的概率」掷中就调它）。这里
+        **不看**出图指令在不在：指令型动作自己会把指令交给 AstrBot 去执行，没装
+        对应插件时它会记一条"没有可用的指令通道"——这条路照样算走通，等装了出图
+        插件就真能出图。返回用了哪个动作 id；``""`` = 没有可用的拍照动作。
+        """
+
+        action_id = self._photo_action_id()
+        if not action_id:
+            return ""
+        text = str(intent or "").strip() or "拍一张现在的样子，画面里带上此刻的环境。"
+        planned = PlannedAction(type=action_id, intent=text, content=text)
+        outcome = TickOutcome(state.session_id)
+        node = self.node(state.node_id) or self.node(self.default_node_id())
+        await self._execute_actions(
+            state, node, outcome, [planned], depth=0, autonomous=True
+        )
+        await self._log_event(
+            state,
+            "photo",
+            {
+                "action": action_id,
+                "why": str(reason or "有人让她拍的").strip(),
+                "notes": [str(item) for item in list(outcome.notes)[:4]],
+            },
+        )
+        return action_id
 
     async def _maybe_photo_for_event(
         self,
@@ -5182,15 +5234,32 @@ class VirtualWorldEngine:
         """睡着被吵醒 / 起床气这几句临时说明（提示词用，过期自动失效）。"""
 
         notes: list[str] = []
+        # 「等会儿再睡」的延迟窗口：他说了再待一会儿，她也答应了——
+        # 这段时间别催他、别提睡觉；已经困了的话就是"半睡档"：软、慢、迷糊，但不睡过去。
+        delayed = state.sleep_delayed
+        delay_left = self.sleep_delay_minutes(state) if delayed else 0
         # 只有真的在临睡期才说"困得不行"：只看那一步揣没揣着会出大问题——
         # 她要是从别的路躺下了（被动回合里她自己说要睡），揣着的那一步没人清，
         # 这句提示就会一直挂着，精力满着也会一天到晚说"我好困"。
         if str(getattr(state, "state", "")) == STATE_DROWSY and not state.is_sleeping:
-            # 临睡期：她已经困得不行了，只是还没躺下
+            if delayed:
+                # 半睡档：她困得不行，但答应了再待一会儿，所以只是软下来，不许真睡
+                notes.append(
+                    f"你已经困得不行了，但他刚说了「等会儿再睡」，你答应了再陪他一会儿"
+                    f"（大约还有 {delay_left} 分钟）：**说话短、慢、软，断断续续的**，"
+                    "可以含含糊糊地撒娇、赖着不走；**别提睡觉、别催他、也别自己睡过去**。"
+                )
+            else:
+                # 临睡期：她已经困得不行了，只是还没躺下
+                notes.append(
+                    "你现在困得不行了（正要睡）：**说话短、断断续续、迷迷糊糊的**——"
+                    "可以只说半句、只说一个词、或者说到一半就没下文；别安排事情、别长篇解释，"
+                    "也别主动挑话题。"
+                )
+        elif delayed:
             notes.append(
-                "你现在困得不行了（正要睡）：**说话短、断断续续、迷迷糊糊的**——"
-                "可以只说半句、只说一个词、或者说到一半就没下文；别安排事情、别长篇解释，"
-                "也别主动挑话题。"
+                f"他刚说了「等会儿再睡」，你答应了再待一会儿（大约还有 {delay_left} 分钟）："
+                "这段时间**别催他、别主动提睡觉**，也不用急着安排去睡的事。"
             )
         if self._startled_active(state) and state.startled_note:
             notes.append(state.startled_note)
@@ -5278,6 +5347,11 @@ class VirtualWorldEngine:
             state.state = STATE_IDLE
             state.drowsy_started_world_time = 0
             state.drowsy_started_at = 0.0
+            return
+        if state.sleep_delayed:
+            # 「等会儿再睡」的延迟窗口：就这么挂着——人已经软下来了（临睡期的语气还在），
+            # 但不许真睡过去，不然外面的互动（接触、开场景）一条都进不来。
+            # 窗口一过，下面那两条判断照旧：安静够了 / 拖太久了，就真的去睡。
             return
         config = self.world.sleep
         quiet_minutes = max(1, int(getattr(config, "drowsy_minutes", 5) or 5))
@@ -5459,6 +5533,99 @@ class VirtualWorldEngine:
             affect=float(getattr(config, "grumpy_affect", 0.10) or 0.0),
             note="你没睡够，这会儿有起床气",
         )
+
+    def sleep_delay_minutes(self, state: WorldState) -> int:
+        """「等会儿再睡」还剩多少分钟（不在窗口里就是 0）。"""
+
+        if not state.sleep_delayed:
+            return 0
+        left = int(state.sleep_delay_until) - int(state.world_time)
+        return max(0, int(left * self.tick_seconds // 60))
+
+    def delay_sleep(
+        self,
+        state: WorldState,
+        *,
+        minutes: int | float | None = None,
+        reason: str = "",
+        by: str = "",
+    ) -> int:
+        """把「她要睡了」往后推一个窗口：返回新的 ``sleep_delay_until``（世界时间 tick）。
+
+        - ``minutes=None`` 用配置里的 ``sleep.delay_minutes``（默认 20 分钟）；
+        - 连着说要续期：取"更晚的那个"，不会把已有的窗口缩短；
+        - 窗口里规则不排睡觉、日程与 LLM 排的睡觉会被跳过、提示词不催她睡，
+          她照样可以是迷迷糊糊的临睡状态（``STATE_DROWSY``）——但不会真的睡过去，
+          所以外面的互动（接触、开场景）照常生效；
+        - ``reason`` / ``by`` 只用来显示与排查（面板、提示词里说明是谁推迟的）。
+        """
+
+        config = self.world.sleep
+        try:
+            wait = int(minutes) if minutes is not None else int(getattr(config, "delay_minutes", 20) or 20)
+        except (TypeError, ValueError):
+            wait = int(getattr(config, "delay_minutes", 20) or 20)
+        if wait <= 0:
+            return int(state.sleep_delay_until or 0)
+        ticks = max(1, int(round(wait * 60 / max(1.0, self.tick_seconds))))
+        state.sleep_delay_until = max(
+            int(state.sleep_delay_until or 0), int(state.world_time) + ticks
+        )
+        if str(reason or ""):
+            state.sleep_delay_reason = str(reason)
+        if str(by or ""):
+            state.sleep_delay_by = str(by)
+        state.add_event(
+            "sleep_delay",
+            {"minutes": wait, "until": int(state.sleep_delay_until), "reason": str(reason or ""), "by": str(by or "")},
+        )
+        return int(state.sleep_delay_until)
+
+    def relieve_sleep_pressure(
+        self, state: WorldState, amount: int | float | None = None, *, reason: str = ""
+    ) -> float:
+        """把困意压下去一点（有人跟她说话、被碰一碰、亲密接触）。
+
+        亲密场景优先：他还在跟她待着的时候，困意不该自己涨到阈值把她送进睡眠。
+        返回压完之后的困意。
+        """
+
+        config = self.world.sleep
+        if amount is None:
+            try:
+                amount = float(getattr(config, "pressure_chat_relief", 0.05) or 0.0)
+            except (TypeError, ValueError):
+                amount = 0.0
+        try:
+            delta = max(0.0, float(amount))
+        except (TypeError, ValueError):
+            delta = 0.0
+        if not delta:
+            return float(state.sleep_pressure or 0.0)
+        state.sleep_pressure = max(0.0, min(1.0, float(state.sleep_pressure or 0.0) - delta))
+        return float(state.sleep_pressure)
+
+    def _sleep_delay_hit(self, ctx: MessageContext, state: WorldState) -> str:
+        """这句话是不是「等会儿再睡」：命中返回那个词，否则返回 ""。"""
+
+        if self._is_asleep(state):
+            # 已经睡着了就没有"再等会儿"可言了——那是叫醒的事，走 wake_words
+            return ""
+        if self.is_plugin_command(ctx.text):
+            return ""
+        config = self.world.sleep
+        if bool(getattr(config, "delay_requires_mention", True)) and not (
+            ctx.is_mentioned or ctx.is_private
+        ):
+            return ""
+        text = str(ctx.text or "")
+        if not text:
+            return ""
+        for word in tuple(getattr(config, "delay_words", ()) or ()):
+            key = str(word or "").strip()
+            if key and key in text:
+                return key
+        return ""
 
     def _wake_up_state(self, state: WorldState, ctx: MessageContext) -> None:
         """把「被叫醒」落到状态上：停下动作、可选地清掉排队计划、给一段保护期。"""
@@ -7349,14 +7516,9 @@ class VirtualWorldEngine:
                 density = self.speech_density_hint(state, direct=True)
                 if density:
                     extra_notes.append(density)
-                if len(texts) > 1:
-                    # 不写「对方」：这几句可能是**不同的人**在同一阵子说的（群里连发），
-                    # 单数措辞会让模型以为全部出自触发者一个人。发言人已由每行
-                    # `名字(id)` 带出，这里只说"一起答完"。
-                    extra_notes.append(
-                        "这几句得一起回应；"
-                        "不要当成两轮对话、也不要分两次回答。"
-                    )
+                # 「这一批要一起回应」那句话跟在消息本身后面（core/prompt.py 拼
+                # user prompt 时写），别放在这儿：这些 notes 渲染在提示词最末尾，
+                # 离那一批隔了几十行，"这几句"就没有指代对象了。
                 extra_notes = extra_notes or None
                 missing = self.extra_reminders(state, ctx=ctx)
                 if missing:
@@ -7607,7 +7769,9 @@ class VirtualWorldEngine:
                     )
             # 扩展要补的一段（例如叙述/正文）：接在她这一轮说完之后、同一个发送批次。
             # 直接塞进 outcome.messages，所以不占"一次最多说几条"的额度。
-            extra_text = await self.extensions.reply_extra(state, parsed.extra)
+            extra_text = await self.extensions.reply_extra(
+                state, parsed.extra, session_id=str(getattr(ctx, "session_id", "") or "")
+            )
             if extra_text:
                 outcome.messages.append(extra_text)
                 await self._log_event(
@@ -7684,13 +7848,26 @@ class VirtualWorldEngine:
             # 「他这一轮碰了她哪儿」：主插件不解释这些词，只转给声明要它的扩展
             # （没人声明时 parsed.touch 一定是空的，这里什么都不做）
             if parsed.touch:
-                handled = await self.extensions.touch(state, parsed.touch)
+                # 连"这一轮在哪个会话里"一起给：留档是整组共用的，扩展要凭它
+                # 认这句话是不是这会儿、在这儿说的（见 extensions.on_touch 契约）
+                handled = await self.extensions.touch(
+                    state,
+                    parsed.touch,
+                    session_id=str(getattr(ctx, "session_id", "") or ""),
+                )
                 if handled:
                     await self._log_event(
                         state,
                         "touch",
                         {"parts": list(parsed.touch), "by": ctx.user_name or ctx.user_id},
                         outcome=outcome,
+                    )
+                    # 被碰一碰（亲密接触）也把困意压下去：当场有人在跟她亲热，
+                    # 不该因为困意到了阈值就把她送进睡眠——这是"亲密优先"那条。
+                    self.relieve_sleep_pressure(
+                        state,
+                        getattr(self.world.sleep, "pressure_touch_relief", 0.2),
+                        reason="touch",
                     )
             # 扩展**自己声明**的字段：主插件同样不解释，只按声明的形状转交
             # （没人声明时 parsed.extra 一定是空的，这里什么都不做）
@@ -7765,12 +7942,43 @@ class VirtualWorldEngine:
             # 她真的开口了（哪怕只是私下补了一句）：记进本小时的被动回复额度
             async with self.session_state(ctx.session_id) as state:
                 self._count_passive_reply(state)
+        # 扩展可以决定"这一轮她**到底发什么**"（H 模式：整段正文由扩展写出来）。
+        # 返回 None = 照常发；返回空串 = 这一轮她的独立发言被静默（什么都不发）；
+        # 返回文本 = 用这段原样替换她本来要发的内容。
+        silenced = False
+        if outcome.messages:
+            raw_text = "\n".join(
+                str(item) for item in outcome.messages if str(item).strip()
+            )
+            try:
+                picked = await self.extensions.reply_replace(
+                    state, raw_text, session_id=ctx.session_id
+                )
+            except Exception:
+                picked = None  # 扩展出错 = 不干预：绝不能因为扩展有问题就发不出话
+            if picked is not None:
+                if str(picked).strip():
+                    outcome.messages = [str(picked)]
+                else:
+                    # 静默：连"只说给别的会话"的那几句也一起收掉——这一轮她什么都没发。
+                    # 但"她回过话"这件事必须照常记：水位线要推进（见 ReplyOutcome.silenced），
+                    # 不然世界以为这批消息没被回过，下一轮会把同一批原样再喂一遍。
+                    outcome.messages = []
+                    outcome.routed = {}
+                    outcome.routed_images = {}
+                    outcome.live_messages = []
+                    silenced = True
         return ReplyOutcome(
             # 只要她在**任何地方**说了话，这一轮就算成立（不然只写私聊那句时
-            # 会被判成"没产生对外发言"，交回主人格又多回一条）
+            # 会被判成"没产生对外发言"，交回主人格又多回一条）；被静默的一轮
+            # 也算成立——那句话已经处理过了，只是没发出去。
             ok=bool(
                 outcome.said_messages() or outcome.routed or outcome.routed_images
-            ),
+            )
+            or silenced,
+            silenced=silenced,
+            # 静默时水位线按它推进：只算当前会话，别处那几句已经被收掉了
+            replied_sessions=[str(ctx.session_id)] if silenced else [],
             messages=list(outcome.messages),
             # 已经即时发出去的那几句：调用方别再发一遍，但日志与额度要算上
             live_messages=list(outcome.live_messages),
@@ -7879,6 +8087,18 @@ class VirtualWorldEngine:
             if state.wake_note:
                 notes.append(state.wake_note)
             woke = True
+        # 「等会儿再睡」：说话算数——她说好了再待一会儿，就真的把这轮睡眠往后推。
+        # 放在 sleep_notes 之前：这一轮给她的说明就该是"别催他"那版。
+        delay_word = self._sleep_delay_hit(ctx, state)
+        if delay_word:
+            self.delay_sleep(
+                state,
+                reason=f"他说「{delay_word}」",
+                by=str(ctx.user_name or ctx.user_id or ""),
+            )
+        if not state.is_sleeping:
+            # 有人跟她说话本身就压一点困意：聊起来了就不会一下就困死过去
+            self.relieve_sleep_pressure(state)
         notes.extend(self.sleep_notes(state))
         if not state.cold_start_done:
             notes.append(
@@ -12862,6 +13082,24 @@ class VirtualWorldEngine:
                     outcome=outcome,
                 )
                 continue
+            if definition.id in self.DEDUPE_ACTION_IDS and state.sleep_delayed:
+                # 「等会儿再睡」：**不管这一路是谁推来的**（日程、大模型、被动回合）
+                # 都不睡——她说好了再待一会儿。日程那条路（autonomous=False）也在这里拦下，
+                # 不然 23:30 的 night_sleep 一到，答应的话就白说了。
+                left = self.sleep_delay_minutes(state)
+                outcome.notes.append(
+                    f"刚说了「等会儿再睡」（还有 {left} 分钟），这一步不睡"
+                )
+                await self._log_event(
+                    state,
+                    "skip",
+                    {
+                        "action": definition.id,
+                        "note": f"「等会儿再睡」的窗口里（还剩 {left} 分钟），这一步不睡",
+                    },
+                    outcome=outcome,
+                )
+                continue
             if (
                 definition.id in self.DEDUPE_ACTION_IDS
                 and autonomous
@@ -16277,7 +16515,8 @@ class VirtualWorldEngine:
         """「单轮」动作没现成台词时，给大模型的一句交代。"""
 
         label = definition.name or definition.id
-        who = self._target_name(state, action.target)
+        who = self._spoken_target(state, action.target)
+        private = not self.chat_is_group(str(getattr(state, "session_id", "") or ""))
         lines = [
             f"你刚刚做了「{label}」这个动作。",
             f"这个动作是什么意思：{definition.description or label}。",
@@ -16285,12 +16524,30 @@ class VirtualWorldEngine:
         if action.intent and action.intent.strip() not in ("", label):
             lines.append(f"你当时的想法：{action.intent.strip()}")
         if who:
-            lines.append(f"对象是 {who}。")
+            lines.append(
+                f"对象是{who}——就是正在跟你说话的那个人。"
+                if private
+                else f"对象是 {who}。"
+            )
         lines.append(
-            "用你自己的口吻说一句发到群里的话：短、自然、像随口说的，"
+            "用你自己的口吻说一句"
+            + ("发给他的话" if private else "发到群里的话")
+            + "：短、自然、像随口说的，"
             "不要解释设定、不要分点、不要写成在招呼全场。"
         )
         return "\n".join(lines)
+
+    def _spoken_target(self, state: WorldState, target: str) -> str:
+        """当着本人的面怎么称呼对方：私聊一律「你」，群里认得出名字才用名字。
+
+        动作文案里的 `{user}` 原来直接填平台昵称，私聊里就变成
+        「（她凑过去蹭了蹭astrbot）」——那是**账号名**，不是人；名字还能是伪装的
+        （认人只看 id）。所以私聊里换成第二人称，群里照旧用名字、认不出就还是「你」。
+        """
+
+        if not self.chat_is_group(str(getattr(state, "session_id", "") or "")):
+            return "你"
+        return self._target_display(state, target) or "你"
 
     @staticmethod
     def _target_name(state: WorldState, target: str) -> str:
@@ -16409,7 +16666,7 @@ class VirtualWorldEngine:
             or state.bot_base_nickname
             or pronounce_for(self.world.gender)
         )
-        user = self._target_display(state, action.target) or "你"
+        user = self._spoken_target(state, action.target) or "你"
         result = (
             text.replace("{bot}", bot)
             .replace("{user}", user)
@@ -18750,6 +19007,30 @@ class VirtualWorldEngine:
                 "enabled": bool(getattr(self.world.state_dynamics, "daily_mood_enabled", True)),
             },
             "values": self.dynamics.values(state),
+            # 困不困 / 答应了"等会儿再睡"到什么时候（面板与编辑器看这一段）
+            "sleep": {
+                "pressure": round(
+                    max(0.0, min(1.0, float(state.sleep_pressure or 0.0))), 4
+                ),
+                "threshold": float(
+                    getattr(getattr(self.world, "sleep", None), "pressure_threshold", 0.85)
+                    or 0.85
+                ),
+                "delayed": bool(state.sleep_delayed),
+                "delay_until": int(state.sleep_delay_until or 0),
+                "delay_minutes": self.sleep_delay_minutes(state),
+                "delay_reason": str(state.sleep_delay_reason or ""),
+                "delay_by": str(state.sleep_delay_by or ""),
+                "no_sleep_until": int(state.no_sleep_until or 0),
+            },
+            # 夜里没有 / 她正睡着的时候，编辑器把「睡眠压力」那一条藏起来：
+            # 判定跟主插件自己用的那套（``world.night`` + 本地时钟）保持一致
+            "night": {
+                "now": bool(self.world.is_night_time(self.local_now().hour)),
+                "sleeping": bool(state.is_sleeping),
+                "start_hour": int(getattr(getattr(self.world, "night", None), "start_hour", 23) or 0),
+                "end_hour": int(getattr(getattr(self.world, "night", None), "end_hour", 7) or 0),
+            },
             # 情绪两轴的派生结果：心情词、正在气头上的标记、这一轮的表达格
             "storm": bool(state.storm),
             "style": {
@@ -19578,7 +19859,9 @@ def _summarize_batch(items: list[dict[str, Any]], *, limit: int = 240) -> str:
 
     parts: list[str] = []
     for item in items or []:
-        text = " ".join(str(item.get("text") or "").split())
+        # 先切掉「［这条消息 @ 了：…］」：短消息（「蓝蓝你在吗」）按 40 字截断时
+        # 会把整段注解带进来，再被 240 字砍成半个括号
+        text = strip_mention_note(item.get("text") or "")
         if not text:
             continue
         who = "你" if item.get("is_self") else str(

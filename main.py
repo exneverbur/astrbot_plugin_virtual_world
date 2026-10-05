@@ -242,21 +242,18 @@ def _group_name(event: Any) -> str:
 
 
 def _mention_note(event: Any) -> str:
-    """这条消息 @ 了谁——包括"@ 了她自己"。
+    """这条消息 @ 了谁——只说结论，不讲平台怎么处理正文。
 
     她不知道自己的 QQ 号，所以别人 @ 她的时候，光看文本里的 ``@昵称`` 她分不清
-    那是不是在叫她。这里把 id 一起写出来，并且把她自己标成「你」。
-
-    两个坑必须在这儿说清，否则她会误会：
-
-    - **正文里可能看不到那个 @ 她自己**：AstrBot 会把"开头的 @ 机器人自己"从
-      ``message_str`` 里去掉（组件里还在）。于是正文看着像只 @ 了别人，
-      实际上是"先 @ 她、再 @ 另一个人"。
-    - **@ 了别人**时要说清那不是在叫她，别把别人的话揽到自己身上。
+    那是不是在叫她。这里直接用「你」标出"有没有 @ 她"，再点出"@ 的别人不是在
+    叫她"，别把别人的话揽到自己身上。
 
     第三个坑：**意图路由补的那个 @ 是假的**（它只是为了让消息重新走通管道）。
     照着它写"这条消息 @ 了你"，她会以为对方真的点了她——而用户看到的是一句
     平白多出来的"@ 了你"。这种消息只留一句"是顺着话题说到你的"。
+
+    以前这里还会解释「平台把开头的 @ 自己省掉了」「你说的这段正文里可能看不到
+    那一下」——那段是写给开发者看的，她只要知道结论就够了，去掉。
     """
 
     self_id = str(getattr(event, "get_self_id", lambda: "")() or "")
@@ -288,24 +285,19 @@ def _mention_note(event: Any) -> str:
         return "这段没 @ 你，是顺着上面的话题说到你的"
     if not mine and not others and not everyone:
         return ""
-    picked = [
-        *(["你（" + self_id + "）"] if mine else []),
-        *(["所有人"] if everyone else []),
-        *others,
-    ]
-    note = f"这条消息 @ 了：{'、'.join(dict.fromkeys(picked))}"
-    later = [*(["所有人"] if everyone else []), *others]
-    unique_later = "、".join(dict.fromkeys(later))
-    if later and mine:
-        note += f"；其中 {unique_later} 不是在 @ 你（那是在叫别人）"
-    elif later:
-        note += "；**这些都不是在 @ 你**（那是在叫别人）"
+    named = "、".join(dict.fromkeys(others))
+    all_note = "；还 @ 了所有人" if everyone else ""
     if mine:
-        note += (
-            "；这条消息里确实 @ 了你（你说的这段正文里可能看不到那一下，"
-            "平台把开头的 @ 自己省掉了）——别把它当成是冲别人说的"
+        if named:
+            return f"这条消息 @ 了你；同一条里 @ 的 {named} 不是你{all_note}"
+        return "这条消息 @ 了你，也 @ 了所有人" if everyone else "这条消息 @ 了你"
+    if everyone:
+        return (
+            f"这条消息 @ 了所有人，还有 {named}（都不是在 @ 你）"
+            if named
+            else "这条消息 @ 了所有人（包括你）"
         )
-    return note
+    return f"这条消息 @ 的 {named} 不是你（别揽到自己身上）"
 
 
 def _at_label(name: str, qq: str) -> str:
@@ -1197,8 +1189,15 @@ class AstrBotLLM:
                 **kwargs,
             )
         except Exception as exc:
+            # 上游按内容安全拒了这次生成：同一段内容再要一次还是会被拒，
+            # 别再把它当成"Provider 不认采样参数"反复重试——那会把真正的原因埋掉，
+            # 而且白白多打几次请求（露骨内容这条路上这条日志误导过一次排查）。
+            blocked = any(
+                marker in str(exc)
+                for marker in ("content_filter", "PROHIBITED_CONTENT", "内容安全", "content policy")
+            )
             # Provider 不认采样参数：退回只传温度，别让主回复跟着挂掉
-            if self.sampling and not self._sampling_rejected and len(kwargs) > 1:
+            if self.sampling and not self._sampling_rejected and len(kwargs) > 1 and not blocked:
                 self._sampling_rejected = True
                 self.plugin.logger.warning(
                     f"[virtual_world] Provider 不接受采样参数（{exc}），"
@@ -1239,6 +1238,12 @@ class AstrBotLLM:
                     return LLMReply(text=text, ok=True)
                 except Exception as retry_exc:
                     return LLMReply(ok=False, error=str(retry_exc))
+            if blocked:
+                self.plugin.logger.warning(
+                    f"[virtual_world] 上游按内容安全拒了这次生成（{str(exc)[:160]}）："
+                    "换一段说法、或换一个 Provider（Panel → Provider）"
+                )
+                return LLMReply(ok=False, error=str(exc))
             # 历史上下文格式不被某些 Provider 接受时，退化成不带历史再试一次
             if contexts:
                 try:
@@ -2882,7 +2887,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "exneverbur",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v2.1.7",
+    "v2.1.8",
 )
 class VirtualWorldPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -3364,11 +3369,16 @@ class VirtualWorldPlugin(Star):
                 # `_reply_images` 的 notes 交回来，这里不重复说
                 return []
             listed = "、".join(mine)
+            # 编号说给她听，就得同时说清"这是内部编号、别照着念"——不然她会
+            # 直接回"图2那张…"，而对方根本看不到编号（见 core/prompt.py 里同一句）
+            guard = "（这套编号只给你自己对上用，回话里别写「图1」这种说法）"
             if len(mine) >= len(sources):
-                return [f"这条消息带了 {len(mine)} 张图片，就是{listed}，已经一起发给你了"]
+                return [
+                    f"这条消息带了 {len(mine)} 张图片，就是{listed}，已经一起发给你了{guard}"
+                ]
             return [
                 f"这条消息带了 {len(sources)} 张图片，其中 {listed} 已经一起发给你，"
-                "其余几张只有文字描述"
+                f"其余几张只有文字描述{guard}"
             ]
         vision = getattr(self, "vision", None)
         if not sources:
@@ -3907,6 +3917,24 @@ class VirtualWorldPlugin(Star):
             pending_lines = [
                 str(item) for item in (outcome.messages or []) if str(item).strip()
             ]
+            if getattr(outcome, "silenced", False):
+                # 扩展把这一轮她的独立发言静默了（正文由扩展自己写、自己发）：
+                # 一条都不发，但这一轮**算她回过话**——水位线必须照推，
+                # 否则世界以为这批消息没被回过，下一轮会把同一批原样再喂一遍。
+                targets = list(getattr(outcome, "replied_sessions", []) or [])
+                for target in targets or [session_id]:
+                    try:
+                        await self.engine.mark_reply_batch_replied(target)
+                    except Exception as exc:
+                        self.logger.debug(
+                            f"[virtual_world] 推进水位线失败：{exc}"
+                        )
+                if self.debug:
+                    self.logger.info(
+                        f"[virtual_world] {session_id}：这一轮被扩展静默，什么都不发"
+                    )
+                event.stop_event()
+                return
             if outcome.ok and (pending_lines or live_lines or routed or routed_images):
                 # 先让别的插件的回复钩子过一遍（它们可能在回复里读写标记）
                 # 钩子看的是她这一轮说过的**全部**话（含已经发出去的那几句），

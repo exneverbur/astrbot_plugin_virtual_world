@@ -268,10 +268,14 @@ class ExtensionSpec:
     代码里也不留任何扩展的痕迹；有人声明了才加进去并转发给声明方。
     """
 
-    on_touch: Callable[[Any, list[str], float, "ExtensionHost"], None] | None = None
-    """主模型标出"这一轮他碰了她哪儿"时的回调：``(state, parts, scale, host)``。
+    on_touch: (
+        Callable[[Any, list[str], float, "ExtensionHost", str], None] | None
+    ) = None
+    """主模型标出"这一轮他碰了她哪儿"时的回调：``(state, parts, scale, host, session_id)``。
 
     ``parts`` 是主模型写的自由文本（例如 ``["腰", "耳后"]``），怎么解释由扩展自己定。
+    ``session_id`` 是**这一轮**在哪个会话里（留档是整组共用的，扩展要凭它认"这句话
+    是不是这会儿说的"）；老规格不收这个参数时主插件退回四参数调用。
     """
 
     json_fields: tuple[Any, ...] = ()
@@ -287,10 +291,17 @@ class ExtensionSpec:
     只有该扩展自己声明过的字段会出现在 ``values`` 里（同名广播给所有声明方）。
     """
 
-    on_reply_extra: Callable[[Any, dict[str, Any], "ExtensionHost"], str] | None = None
-    """这一轮要**补在她的话后面**一起发出去的一段文本：``(state, values, host) -> str``。
+    on_reply_extra: (
+        Callable[[Any, dict[str, Any], "ExtensionHost", str], str] | None
+    ) = None
+    """这一轮要**补在她的话后面**一起发出去的一段文本：
+    ``(state, values, host, session_id) -> str``。
 
-    ``values`` 和 :attr:`on_json` 收到的是同一份。返回非空字符串时，
+    ``values`` 和 :attr:`on_json` 收到的是同一份；``session_id`` 是这一轮**实际
+    回在哪个会话**（状态是整组共用的，``state.session_id`` 常是组代表会话——
+    要判"这段能不能发在这儿"得看它）。收不了第四个参数的老规格会退回三参数调用。
+
+    返回非空字符串时，
     主插件把它当作她的下一条发言发出去（同一个发送批次、排在她那几句之后），
     也照常记进她的聊天留档；不占"一次最多说几条"的额度。
     """
@@ -337,6 +348,27 @@ class ExtensionSpec:
     返回 True 时主插件**不解析、不执行、不发送**这一轮，直接重新问一次模型
     （最多 ``REPLY_GUARD_RETRIES`` 次）；问满次数还是废的，这一轮就不出声、
     也不会退回主人格。用来拦"我不能生成这类内容"这种拒答。
+    """
+
+    reply_replace: Callable[[Any, str, "ExtensionHost", str], str | None] | None = None
+    """这一轮她到底发什么：``(state, raw, host, session_id) -> str | None``。
+
+    ``raw`` 是本轮她准备发出去的正文（主模型原始输出、清洗之后、还没发）。
+    返回 ``None`` = 不干预，照常发；
+    返回 ``""``（空串）= **这一轮她的独立发言被静默，什么都不发**；
+    返回非空字符串 = **用这段文本替换她原本要发的内容**（原样发出，不做额外包装）。
+    多个扩展都表态时：**第一个返回非 None 的说了算**（和 ``reply_guard`` 一致）。
+
+    三点约定：
+
+    - 静默（返回空串）也**算她回过话了**：水位线 / 已读游标照常推进，
+      否则世界会以为这批消息没被回过，下一轮又原样喂一遍（见 ``ReplyOutcome.silenced``）；
+    - 已经**即时发出去**的那几句（慢动作前先说的）收不回来：这个钩子只管还没发的正文；
+    - ``state`` 是这一轮的状态对象，**锁已经放开**：读没问题，要改状态请走
+      ``host.update_state(session_id, ...)``——直接改这个对象不会写回存档；
+    - 钩子抛异常 = 不干预，绝不影响发送。
+
+    老签名 ``reply_replace(state, raw, host)`` 三参数版仍然可用。
     """
 
     on_command_event: Callable[[Any, str, str, "ExtensionHost"], Any] | None = None
@@ -714,8 +746,14 @@ class ExtensionHost:
                 continue
         return handled
 
-    async def reply_extra(self, state: Any, values: dict[str, Any]) -> str:
-        """这一轮要补在她的话后面发出去的那段文本（第一个返回非空的扩展说了算）。"""
+    async def reply_extra(
+        self, state: Any, values: dict[str, Any], *, session_id: str = ""
+    ) -> str:
+        """这一轮要补在她的话后面发出去的那段文本（第一个返回非空的扩展说了算）。
+
+        ``session_id`` 是这一轮**实际回在哪个会话**：状态是整组共用的，
+        扩展要靠它判断这段能不能发在这儿（老规格不收这个参数就退回三参数调用）。
+        """
 
         picked = {
             str(key): value
@@ -724,12 +762,16 @@ class ExtensionHost:
         }
         if not picked:
             return ""
+        here = str(session_id or "")
         for spec in self.specs.values():
             hook = getattr(spec, "on_reply_extra", None)
             if hook is None:
                 continue
             try:
-                result = hook(state, picked, self)
+                try:
+                    result = hook(state, picked, self, here)
+                except TypeError:
+                    result = hook(state, picked, self)
                 if hasattr(result, "__await__"):
                     result = await result
             except Exception:
@@ -773,19 +815,92 @@ class ExtensionHost:
                 continue
         return False
 
-    async def touch(self, state: Any, parts: list[str]) -> bool:
-        """把"他碰了她哪儿"转交给声明要它的扩展；没人要就什么都不做。"""
+    async def reply_replace(
+        self, state: Any, raw: str, *, session_id: str = ""
+    ) -> str | None:
+        """问她这一轮**到底发什么**：``None`` = 照常发她原本的正文，``""`` = 静默，其余 = 替换。
+
+        新写法 ``(state, raw, host, session_id)``；老写法 ``(state, raw, host)`` 也认。
+        **第一个返回非 None 的说了算**；钩子抛异常 = 不干预（不能因为扩展出错就不发话）。
+        """
+
+        here = str(session_id or "")
+        text = str(raw or "")
+        for spec in self.specs.values():
+            hook = getattr(spec, "reply_replace", None)
+            if hook is None:
+                continue
+            try:
+                try:
+                    result = hook(state, text, self, here)
+                except TypeError:
+                    result = hook(state, text, self)
+                if hasattr(result, "__await__"):
+                    result = await result
+            except Exception:
+                continue
+            if result is None:
+                continue
+            return str(result)
+        return None
+
+    async def delay_sleep(
+        self,
+        state: Any = None,
+        minutes: int | float | None = None,
+        reason: str = "",
+        *,
+        session_id: str = "",
+        by: str = "",
+    ) -> int:
+        """「现在别睡」：把她的睡眠往后推一个窗口，返回窗口结束的世界时间（tick）。
+
+        给外面（接触 / 开场景那一路）用的公开接口：窗口里主插件不排睡觉、
+        日程与大模型排的睡觉也会被跳过、提示词不再催她睡；她仍然可以是迷迷糊糊的
+        临睡状态，但不会真的睡过去——所以外部互动照常生效。连着调就续期。
+
+        - ``minutes`` 省略时用配置 ``sleep.delay_minutes``（默认 20 分钟）；
+        - ``reason`` / ``by`` 只用于显示与排查（面板、提示词里会写是谁推迟的）；
+        - ``state`` 可以直接传你手上正在改的那份状态（**推荐**：不会有锁的问题）；
+          传 ``None`` 时用 ``session_id`` 现取一份并写回去（会等会话锁，别在持锁的
+          回调里这么用——那会死等，见 ``say`` 的说明）。
+        """
+
+        engine = getattr(self.plugin, "engine", None)
+        if engine is None or not hasattr(engine, "delay_sleep"):
+            return 0
+        if state is not None:
+            return int(
+                engine.delay_sleep(state, minutes=minutes, reason=reason, by=by)
+            )
+        sid = str(session_id or "")
+        if not sid:
+            return 0
+        async with engine.session_state(sid) as live:
+            return int(engine.delay_sleep(live, minutes=minutes, reason=reason, by=by))
+
+    async def touch(self, state: Any, parts: list[str], *, session_id: str = "") -> bool:
+        """把"他碰了她哪儿"转交给声明要它的扩展；没人要就什么都不做。
+
+        新写法 ``(state, parts, scale, host, session_id)``；老写法
+        ``(state, parts, scale, host)`` 也认（那就等于来源不明，扩展按自己的规矩办）。
+        留档是整组共用的，扩展要靠 ``session_id`` 认"这句话是不是这会儿、在这儿说的"。
+        """
 
         picked = [str(item).strip() for item in (parts or []) if str(item).strip()]
         if not picked:
             return False
+        here = str(session_id or "")
         handled = False
         for spec in self.specs.values():
             hook = getattr(spec, "on_touch", None)
             if hook is None or "touch" not in tuple(getattr(spec, "wants", ()) or ()):
                 continue
             try:
-                result = hook(state, picked, 1.0, self)
+                try:
+                    result = hook(state, picked, 1.0, self, here)
+                except TypeError:
+                    result = hook(state, picked, 1.0, self)
                 if hasattr(result, "__await__"):
                     await result
                 handled = True
@@ -865,6 +980,40 @@ class ExtensionHost:
                 continue
             return str(result)
         return None
+
+    async def photo(
+        self,
+        state: Any = None,
+        *,
+        session_id: str = "",
+        intent: str = "",
+        reason: str = "",
+    ) -> str:
+        """让她现在拍一张：用主插件**内置的拍照动作**（返回动作 id，``""`` = 没拍）。
+
+        给扩展的公开接口。这里只负责"把这件事交给她"，出不出图由那条动作决定：
+        指令型动作会把指令交给 AstrBot 去执行，没装出图插件时它会记一条"没有可用的
+        指令通道"——所以**别拿返回值当成"照片发出去了"**。
+
+        ``state`` 可以直接传你手上正在改的那份状态（**推荐**：不会有锁的问题）；
+        传 ``None`` 时用 ``session_id`` 现取一份并写回去（会等会话锁，别在持锁的
+        回调里这么用——那会死等，见 ``say`` 的说明）。
+        """
+
+        engine = getattr(self.plugin, "engine", None)
+        if engine is None or not hasattr(engine, "photo_now"):
+            return ""
+        if state is not None:
+            return str(
+                await engine.photo_now(state, intent=intent, reason=reason) or ""
+            )
+        sid = str(session_id or "")
+        if not sid:
+            return ""
+        async with engine.session_state(sid) as live:
+            return str(
+                await engine.photo_now(live, intent=intent, reason=reason) or ""
+            )
 
     # ---------------- 扩展用得上的能力 ----------------
 

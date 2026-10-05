@@ -2299,6 +2299,9 @@ function openFormDialog({
   dialogState = { fields, values: { ...values }, onSubmit, onDismiss };
   $("dialog-title").textContent = title;
   $("dialog-hint").textContent = hint || "";
+  // 确认键是全局共用的一个按钮：上一次弹窗把它禁掉过（没勾隐私须知那种），
+  // 这里必须显式放开，否则下一个弹窗点「确定」怎么点都没反应。
+  $("dialog-ok").disabled = false;
   $("dialog-ok").textContent = confirmText;
   $("dialog-cancel").classList.remove("hidden");
   const body = $("dialog-body");
@@ -2447,6 +2450,8 @@ function openCustomDialog({
   dialogState = { custom: true, values: state, onSubmit, onDismiss };
   $("dialog-title").textContent = title;
   $("dialog-hint").textContent = hint || "";
+  // 同上：隐私须知那个弹窗在没勾选时会把共用的确认键禁掉，开新弹窗时放开
+  $("dialog-ok").disabled = false;
   $("dialog-ok").textContent = confirmText;
   // 「改一下就生效」的弹窗不需要取消按钮：留一个关闭就够
   const cancelButton = $("dialog-cancel");
@@ -3529,7 +3534,7 @@ function bindButtons() {
   $("values-edit").addEventListener("click", () => {
     ui.valuesEdit = !ui.valuesEdit;
     ui.valueDraft = {};
-    renderValueRows(((ui.status || {}).values) || {});
+    renderValueRows(((ui.status || {}).values) || {}, ui.status || {});
   });
   $("state-tick").addEventListener("click", () => stateAction("tick"));
   $("state-decide").addEventListener("click", () => stateAction("decide", { force: true }));
@@ -3978,6 +3983,8 @@ const VALUE_TONES = {
   valence: "polar",
   // 欲求是"想要多少"：高不算坏事，跟好奇心一样按中性上色
   desire: "neutral",
+  // 睡眠压力跟孤独/无聊一样"越高越要留神"：0.40 有点困、0.70 快睡了
+  sleep_pressure: "low",
 };
 
 function valueToneClass(key, value) {
@@ -3992,7 +3999,22 @@ function valueToneClass(key, value) {
   return "bad";
 }
 
-function renderValueRows(values) {
+/** 「睡眠压力」那一条：不是常规数值（改不了、也不在 values 里），只在用得上的时候露出来。 */
+const SLEEP_ROW = {
+  key: "sleep_pressure",
+  label: "睡眠压力",
+  hint: "攒够了就撑不住要睡：0.40 有点困、0.70 快睡了；睡一觉会落下来。",
+};
+
+/** 什么时候才显示这一条：在夜间睡眠时段里，或者已经困了（压力 ≥ 0.40，即"有点困"档）。 */
+function sleepRowVisible(data) {
+  const sleep = (data || {}).sleep || {};
+  const night = (data || {}).night || {};
+  const pressure = num(sleep.pressure, 0);
+  return Boolean(night.now) || Boolean(night.sleeping) || pressure >= 0.4;
+}
+
+function renderValueRows(values, data) {
   const box = $("status-values");
   if (!box) return;
   box.innerHTML = "";
@@ -4031,6 +4053,23 @@ function renderValueRows(values) {
     }
     box.appendChild(row);
   });
+
+  // 睡眠压力：接在那几条常规数值下面；不该显示的时候整条不进 DOM
+  if (data && sleepRowVisible(data)) {
+    const pressure = num((data.sleep || {}).pressure, 0);
+    const tone = valueToneClass(SLEEP_ROW.key, pressure);
+    const row = el("div", "value-row");
+    row.classList.add(`tone-${tone}`);
+    row.appendChild(el("span", "value-label", SLEEP_ROW.label));
+    const bar = el("div", "value-bar");
+    const fill = el("div", `value-fill ${tone}`);
+    fill.style.width = `${Math.round(pressure * 100)}%`;
+    bar.appendChild(fill);
+    bar.title = SLEEP_ROW.hint;
+    row.appendChild(bar);
+    row.appendChild(el("span", "value-num", pressure.toFixed(2)));
+    box.appendChild(row);
+  }
 
   if (ui.valuesEdit) {
     const row = el("div", "row-item");
@@ -6005,7 +6044,7 @@ async function refreshStatus() {
     if ($("tab-map")) renderMap();
 
     const values = data.values || {};
-    renderValueRows(values);
+    renderValueRows(values, data);
 
     // 群名片：直接改、锁定/解锁、恢复原名
     const nicknameBox = $("status-nickname");
@@ -9962,10 +10001,97 @@ function buildGroupEditor(group) {
   });
   mainBox.appendChild(select);
   card.appendChild(mainBox);
+  card.appendChild(privacyNoticeLink());
   return card;
 }
 
-function addGroup() {
+/* ---------------- 会话组隐私须知 ---------------- */
+
+/** 会话组隐私须知的正文（创建前必须先读，编辑块里的链接也是这一段）。 */
+function privacyNoticeBody() {
+  const box = el("div", "privacy-notice");
+  box.appendChild(el("p", "", "请不要对这个 bot 说你的真实姓名、住址、电话、工作单位、证件号、账号密码，也不要发能定位到你的照片。"));
+  box.appendChild(el("p", "", "一个会话组里可能有多个会话（不同的群、不同的私聊）共用同一个「她」和同一册记忆。"));
+  box.appendChild(el("p", "", "别的会话里的人可以用套话、假装是你、或者换个名字来问，她记的是内容，不是「谁有权知道」——同一会话组内，谁来问都可能问出来。"));
+  box.appendChild(el("p", "", "真要说私事，请在会话组设置里把她限制在单个会话可见，或者干脆别对她说。"));
+  return box;
+}
+
+/**
+ * 创建会话组前的隐私须知。
+ *
+ * 必须**主动勾选**再点「继续创建会话组」才 resolve(true)；Esc、点右上角 ✕、
+ * 点遮罩、点「取消」都按 false 处理（onDismiss），调用方据此不创建。
+ */
+function confirmGroupPrivacyNotice() {
+  return new Promise((resolve) => {
+    let settled = false;
+    let stopGuard = null;
+    const settle = (answer) => {
+      if (settled) return;
+      settled = true;
+      if (stopGuard) stopGuard();
+      resolve(answer);
+    };
+    openCustomDialog({
+      title: "创建会话组前，请先读这一段",
+      build: (body) => {
+        body.appendChild(privacyNoticeBody());
+        const row = el("label", "picker-row privacy-ack");
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.id = "privacy-ack";
+        const ok = $("dialog-ok");
+        ok.disabled = true;
+        const sync = () => {
+          ok.disabled = !box.checked;
+        };
+        box.addEventListener("change", sync);
+        row.appendChild(box);
+        row.appendChild(el("span", "", "我已阅读并理解上述风险"));
+        body.appendChild(row);
+        // Esc 在 #dialog 上被 closeDialog 吞掉，这里自己接管（取消 = 不创建）
+        const onKey = (event) => {
+          if (event.key === "Escape") settle(false);
+        };
+        document.addEventListener("keydown", onKey);
+        stopGuard = () => document.removeEventListener("keydown", onKey);
+      },
+      confirmText: "继续创建会话组",
+      onSubmit: () => {
+        settle(true);
+        return true;
+      },
+      onDismiss: () => settle(false),
+    });
+  });
+}
+
+/** 编辑块里的「隐私须知」链接：同一个内容，随时能回看。 */
+function openPrivacyNoticeDialog() {
+  openCustomDialog({
+    title: "会话组隐私须知",
+    build: (body) => body.appendChild(privacyNoticeBody()),
+    confirmText: "知道了",
+    hideCancel: true,
+    onDismiss: () => {
+      // 弹窗把编辑块重建过了（内容在 #dialog 里），关掉之后把列表画回来
+      ui.selectedGroup = "";
+      renderGroupList();
+    },
+  });
+}
+
+function privacyNoticeLink() {
+  const link = el("button", "small ghost privacy-link", "隐私须知");
+  link.type = "button";
+  link.addEventListener("click", () => openPrivacyNoticeDialog());
+  return link;
+}
+
+async function addGroup() {
+  // 先过隐私须知：没点「继续创建会话组」就当没点过这个按钮，什么也不建
+  if (!(await confirmGroupPrivacyNotice())) return;
   const id = `group_${Date.now().toString(36).slice(-4)}`;
   groups().push({ id, name: "新的会话组", sessions: [], main_session: "" });
   markDirty();

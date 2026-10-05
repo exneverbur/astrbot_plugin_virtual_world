@@ -1452,6 +1452,33 @@ class EventEngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("体力", line)
         self.assertNotIn("0.6", line)
 
+    async def test_abilities_line_merges_equal_tiers(self):
+        """四项档位一样时并成一句，不再「体力还算顺手、智力还算顺手…」列四遍。"""
+
+        state = await self.get_state()
+        state.abilities = {
+            "stamina": 0.6,
+            "wits": 0.6,
+            "dexterity": 0.6,
+            "composure": 0.6,
+        }
+        line = self.engine.abilities_line(state)
+        self.assertIn("体力、智力、灵巧、心性都还算顺手", line)
+        self.assertNotIn("体力还算顺手", line)
+
+    async def test_abilities_line_keeps_items_apart_when_tiers_differ(self):
+        state = await self.get_state()
+        state.abilities = {
+            "stamina": 0.6,
+            "wits": 0.2,
+            "dexterity": 0.6,
+            "composure": 0.6,
+        }
+        line = self.engine.abilities_line(state)
+        self.assertIn("体力还算顺手", line)
+        self.assertIn("智力不太行", line)
+        self.assertNotIn("都还算顺手", line)
+
     async def test_pending_event_line_depends_on_stage(self):
         state = await self.get_state()
         self.assertEqual(self.engine.pending_event_line(state), "")

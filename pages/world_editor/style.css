@@ -3281,6 +3281,39 @@ button.pill:hover:not(.on) {
   border-left: 2px solid var(--accent-soft);
 }
 
+/* 会话组隐私须知：创建前必须读完的那一段，也是编辑块里的回看链接 */
+.privacy-notice {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--accent-soft);
+  border-radius: 6px;
+  background: var(--bg-soft, rgba(127, 127, 127, 0.08));
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.privacy-notice p {
+  margin: 0;
+}
+
+.privacy-ack {
+  align-items: center;
+}
+
+.privacy-link {
+  align-self: flex-start;
+  margin-top: 10px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent, inherit);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
 .group-editor .picker-list {
   max-height: 240px;
 }

@@ -14,6 +14,7 @@ from .defaults import (
     DEFAULT_CAPTION_PROMPT,
     DEFAULT_CAPTION_RELATION_PROMPT,
     DEFAULT_FORWARD_PROMPT,
+    DEFAULT_SLEEP_DELAY_WORDS,
     DEFAULT_WAKE_WORDS,
 )
 
@@ -1072,6 +1073,44 @@ class SleepConfig(Permissive):
 
     wake_grace_minutes: int = 12
     """刚被叫醒的保护期（分钟）：这段时间里规则不再安排她回去睡。"""
+
+    delay_minutes: int = 20
+    """「等会儿再睡」的延迟窗口（分钟）。
+
+    他说了这类话就往后推这么久：窗口里不排睡觉、也不催她睡。
+    连着说就续期。窗口里她照样可以是迷迷糊糊的临睡状态（``drowsy``），
+    但不会真的睡过去——见 ``WorldState.sleep_delay_until``。
+    """
+
+    delay_words: list[str] = Field(default_factory=lambda: list(DEFAULT_SLEEP_DELAY_WORDS))
+    """命中这些词就算「等会儿再睡」（默认要求 @ 她，见 ``delay_requires_mention``）。"""
+
+    delay_requires_mention: bool = True
+    """是否要求 @ 她（私聊等同）才算数：群里别人说「等会儿再睡」不是对她说的。"""
+
+    pressure_enabled: bool = True
+    """是否用困意（``WorldState.sleep_pressure``）决定该不该睡，而不是只看精力。"""
+
+    pressure_threshold: float = 0.85
+    """困意攒到多少她真的撑不住（0~1）。到这条线才会自己排睡觉。"""
+
+    pressure_gain_per_hour: float = 0.5
+    """深夜每小时攒多少困意。"""
+
+    pressure_fall_per_hour: float = 0.6
+    """白天每小时回落多少困意（天亮了自然清醒）。"""
+
+    pressure_sleep_fall_per_hour: float = 2.0
+    """睡着时每小时回落多少困意（睡一觉就缓过来）。"""
+
+    pressure_delay_multiplier: float = 0.3
+    """延迟窗口里困意涨得慢多少（他让她别睡，她也乐意再撑一会儿）。"""
+
+    pressure_chat_relief: float = 0.05
+    """每收到一条有人跟她说话的消息，困意被压下去多少。"""
+
+    pressure_touch_relief: float = 0.2
+    """被碰一碰 / 亲密接触一次压下去多少困意（这是"亲密优先"那一条）。"""
 
     block_plugins: bool = True
     """睡着时是否把消息整个挡下来。

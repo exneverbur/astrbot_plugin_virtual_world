@@ -19,6 +19,20 @@ from typing import Any
 # 「明确叫醒她」的说法：命中这些词（且消息是 @ 她的）才打断睡眠，否则只回睡觉时的固定文案
 DEFAULT_WAKE_WORDS = ("醒醒", "起床", "别睡", "醒来", "起来啦", "别睡了")
 
+# 「等会儿再睡」的说法：命中这些词就给她一个延迟窗口（见 sleep.delay_minutes），
+# 窗口里不再安排她回去睡、也不催她——说话算数，答应再待一会儿就真的再待一会儿。
+DEFAULT_SLEEP_DELAY_WORDS = (
+    "等会儿再睡",
+    "等会再睡",
+    "待会儿再睡",
+    "再待会儿",
+    "再待一会",
+    "先别睡",
+    "晚点睡",
+    "再聊会",
+    "再陪我一会",
+)
+
 # 图片转述模型的默认提示词（在「全局设置 → 图片转述」里可以改）。
 # 除了画面本身，还要认出「这是不是表情包」——接梗图接错比接不上更尴尬。
 # 「看图」提示词：只描述图片本身，**不写**与话题的关系——
@@ -166,6 +180,19 @@ DEFAULT_WORLD: dict[str, Any] = {
         "clear_plan_on_wake": True,
         "applies_to_nap": True,
         "wake_grace_minutes": 12,
+        # 「等会儿再睡」：说话算数的延迟窗口（分钟）。窗口里不排睡觉、也不催她
+        "delay_minutes": 20,
+        "delay_words": list(DEFAULT_SLEEP_DELAY_WORDS),
+        "delay_requires_mention": True,
+        # 困意（sleep_pressure）：不再"到点就困"，攒够了才真的撑不住
+        "pressure_enabled": True,
+        "pressure_threshold": 0.85,
+        "pressure_gain_per_hour": 0.5,
+        "pressure_fall_per_hour": 0.6,
+        "pressure_sleep_fall_per_hour": 2.0,
+        "pressure_delay_multiplier": 0.3,
+        "pressure_chat_relief": 0.05,
+        "pressure_touch_relief": 0.2,
         "block_plugins": True,
         "block_scope": "unmentioned",
         # 迷糊惊醒：没人明确叫她、但实在吵，她会半睡半醒回两句再接着睡

@@ -153,6 +153,22 @@ class Decider:
             return False
         return self._nap_recovery_per_minute(self.world.action_map().get("nap")) > 0
 
+    def sleep_pressure_high(self, state: WorldState) -> bool:
+        """困意攒够了没有（``sleep.pressure_threshold``，默认 0.85）。"""
+
+        config = getattr(self.world, "sleep", None)
+        if not bool(getattr(config, "pressure_enabled", True)):
+            return False
+        try:
+            threshold = float(getattr(config, "pressure_threshold", 0.85) or 0.85)
+        except (TypeError, ValueError):
+            threshold = 0.85
+        try:
+            pressure = float(getattr(state, "sleep_pressure", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pressure = 0.0
+        return pressure >= threshold
+
     def nap_seconds(self, state: WorldState) -> int:
         """白天小睡睡多久：按小睡动作写的恢复速度，算到够她缓过来为止。
 
@@ -261,14 +277,27 @@ class Decider:
 
         # 1) 精力过低 -> 该休息了（刚被叫醒的保护期里不安排，免得叫醒几分钟又被抓回去睡）。
         #    夜里睡整觉，白天先小睡：白天一睡八小时，醒来正好是半夜，日子直接过乱。
-        if state.energy < 0.25 and state.world_time >= state.no_sleep_until:
+        #    除了精力，困意（sleep_pressure）攒够了也算——熬夜、被打断、被留住都会攒困意，
+        #    但它不像"到点就困"那样天一黑就翻脸。
+        #    「等会儿再睡」的延迟窗口里两条路都不走：她答应了，就真的再待一会儿。
+        exhausted = state.energy < 0.25
+        sleepy = self.sleep_pressure_high(state)
+        if (
+            (exhausted or sleepy)
+            and state.world_time >= state.no_sleep_until
+            and not state.sleep_delayed
+        ):
             steps = self._travel_then(node_id, home, graph)
             if self.is_night() or not self.can_nap():
                 steps.append({"action": "sleep", "duration": self._action_duration("sleep")})
-                reason = "夜深了，该睡了"
+                reason = "困得撑不住了，该睡了" if sleepy and not exhausted else "夜深了，该睡了"
             else:
                 steps.append({"action": "nap", "duration": self.nap_seconds(state)})
-                reason = "白天精力低，先小睡一会儿"
+                reason = (
+                    "白天困得撑不住了，先眯一会儿"
+                    if sleepy and not exhausted
+                    else "白天精力低，先小睡一会儿"
+                )
             return create_plan(
                 steps=steps,
                 world_time=state.world_time,

@@ -258,12 +258,12 @@ class TestMainImport(unittest.TestCase):
                 return "10001"
 
         note = self.module._mention_note(_Ev([At("10001", "小鲸鱼"), At("42", "小明")]))
-        self.assertIn("你（10001）", note)
+        self.assertIn("这条消息 @ 了你", note)
         self.assertIn("小明(42)", note)
-        # @ 的是别人：得写清楚"不是在 @ 你"，不然她会当成在叫她
-        self.assertIn("不是在 @ 你", note)
-        # 正文里那一下可能被平台省掉，得提醒她这条确实点到了自己
-        self.assertIn("确实 @ 了你", note)
+        # @ 的是别人：得写清楚"不是你"，不然她会当成在叫她
+        self.assertIn("不是你", note)
+        # 别再把平台怎么处理正文那套讲给她听（那段是给开发者看的）
+        self.assertNotIn("平台把开头的 @ 自己省掉了", note)
         self.assertEqual(self.module._mention_note(_Ev([])), "")
 
     def test_mention_note_does_not_repeat_a_numeric_name(self):
@@ -288,7 +288,7 @@ class TestMainImport(unittest.TestCase):
         note = self.module._mention_note(
             _Ev([At("10001", "10001"), At("42", "42")])
         )
-        self.assertIn("你（10001）", note)
+        self.assertIn("这条消息 @ 了你", note)
         self.assertIn("42", note)
         self.assertNotIn("10001(10001)", note)
         self.assertNotIn("42(42)", note)
@@ -319,14 +319,14 @@ class TestMainImport(unittest.TestCase):
         # 路由补的 @ 她自己（外加正文里真的 @ 了别人）：只留别人那一段
         event = _Ev([At("2829449702", "2829449702"), At("42", "小明")], soft=True)
         note = self.module._mention_note(event)
-        self.assertNotIn("你（", note.replace("没 @ 你", ""))
+        self.assertNotIn("@ 了你", note)
         self.assertIn("小明(42)", note)
         self.assertNotIn("2829449702(2829449702)", note)
 
         # 只有那个假 @ 的时候：明说"没 @ 你，是顺着话题说到你的"
         alone = self.module._mention_note(_Ev([At("2829449702", "2829449702")], soft=True))
         self.assertIn("没 @ 你", alone)
-        self.assertNotIn("确实 @ 了你", alone)
+        self.assertNotIn("@ 了你", alone)
 
         # 结构化那份也要剔掉它，免得渲染成「→ 你」
         targets = self.module._at_targets(_Ev([At("2829449702", "2829449702")], soft=True))
@@ -352,9 +352,9 @@ class TestMainImport(unittest.TestCase):
                 return "10001"
 
         note = self.module._mention_note(_Ev([At("42", "小明")]))
-        self.assertIn("这条消息 @ 了：小明(42)", note)
-        self.assertIn("不是在 @ 你", note)
-        self.assertNotIn("你（", note)
+        self.assertIn("小明(42)", note)
+        self.assertIn("不是你", note)
+        self.assertNotIn("@ 了你", note)
 
     # ---------------- 「指令触发」型动作：参数类型要按 AstrBot 的规矩还原 ----------------
 
@@ -1780,6 +1780,57 @@ class TestMainImport(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].get("image_urls"), ["https://img/1.jpg"])
         self.assertIn("（见图1）", self._whole_request(calls[0]))
+        # 编号只在提示词里对账用：得告诉她对面看不到「图1」这种叫法
+        self.assertIn("对方看不到", self._whole_request(calls[0]))
+        self.assertEqual(len(ask.sent), 1)
+        plugin.db.raw.close()
+
+    def test_the_trigger_message_images_are_numbered_and_never_quoted(self):
+        """她这一轮带的图：说清是图几，同时说清这套编号别照着念。"""
+
+        plugin, context, session = self._plugin_with_session(
+            session="aiocqhttp:GroupMessage:probe-trigger-images"
+        )
+        plugin.engine.world.reply_style.merge_wait_seconds = 0.05
+        calls: list[dict] = []
+
+        async def llm_generate(**kwargs):
+            calls.append(kwargs)
+
+            class _Response:
+                completion_text = '{"actions":[{"type":"say","messages":["看到了"]}]}'
+
+            return _Response()
+
+        context.llm_generate = llm_generate
+
+        class Image:
+            """假图片段（识别按类名走，名字必须叫 Image）。"""
+
+            def __init__(self, url: str) -> None:
+                self.url = url
+                self.file = ""
+                self.path = ""
+
+        async def drive():
+            ask = _GateEvent("你看这两张", session=session)
+            ask.message_obj.message = [
+                At("1"),
+                Image("https://img/1.jpg"),
+                Image("https://img/2.jpg"),
+            ]
+            await plugin.on_llm_request(ask, _GateRequest("你看这两张"))
+            return ask
+
+        ask = asyncio.run(drive())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0].get("image_urls"), ["https://img/1.jpg", "https://img/2.jpg"]
+        )
+        whole = self._whole_request(calls[0])
+        self.assertIn("就是图1、图2", whole)
+        # 编号只在提示词里对账用：得告诉她对面看不到「图1」这种叫法
+        self.assertIn("别写「图1」", whole)
         self.assertEqual(len(ask.sent), 1)
         plugin.db.raw.close()
 

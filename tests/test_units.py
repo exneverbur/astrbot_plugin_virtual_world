@@ -66,6 +66,7 @@ from core.state import (  # noqa: E402
     FORWARD_SUMMARY_MARK,
     WorldState,
     group_chat_items,
+    strip_mention_note,
 )
 from core.state_dynamics import StateDynamics  # noqa: E402
 from core.tool_policy import is_self_send_tool  # noqa: E402
@@ -1658,6 +1659,52 @@ class TestLegacyGlobalChatFields(unittest.TestCase):
         self.assertNotIn(self.OTHER, state.chat_previews)
 
 
+class TestMentionNoteIsStrippedFromSummaries(unittest.TestCase):
+    """「［这条消息 @ 了：…］」是**这一轮**的提示，进了"刚聊过什么"的概览就是噪音。
+
+    实测症状：短消息（「蓝蓝你在吗」）按 40 字截断时把整段注解带进概览，
+    再被 240 字砍成「…蓝蓝你在吗 ［这条消息 @ 了：你（10001）；这条消息里确实 @ 了你（你说」。
+    """
+
+    def test_the_note_is_cut_and_the_sentence_kept(self):
+        text = (
+            "蓝蓝你在吗 ［这条消息 @ 了你；同一条里 @ 的小明(42) 不是你"
+            "（别把它当成是冲别人说的）］"
+        )
+        self.assertEqual(strip_mention_note(text), "蓝蓝你在吗")
+
+    def test_a_note_without_a_space_before_it_is_cut_too(self):
+        self.assertEqual(strip_mention_note("亲亲［这条消息 @ 了你］"), "亲亲")
+
+    def test_other_bracketed_marks_are_kept(self):
+        # ［图片］［表情］是那句话本身的一部分，概览里也要留着
+        self.assertEqual(strip_mention_note("看这个 ［图片］"), "看这个 ［图片］")
+
+    def test_the_batch_summary_drops_the_note(self):
+        from core.engine import _summarize_batch
+
+        text = _summarize_batch(
+            [
+                {
+                    "name": "小明",
+                    "text": "蓝蓝你在吗 ［这条消息 @ 了你；同一条里 @ 的小刚(43) 不是你］",
+                },
+                {"name": "小刚", "text": "看这个 ［图片］［这条消息 @ 了所有人］"},
+            ]
+        )
+        self.assertNotIn("这条消息", text)
+        self.assertEqual(text, "小明：蓝蓝你在吗；小刚：看这个 ［图片］")
+
+    def test_the_stored_preview_is_cleaned_when_it_is_read(self):
+        # 老存档里已经存脏了：读的时候也要抹一遍，不然提示词里还是那句半截注解
+        state = WorldState(session_id="s1")
+        state.chat_previews["s1"] = {
+            "text": "小明：蓝蓝你在吗 ［这条消息 @ 了：你（10001）］",
+            "at": 0.0,
+        }
+        self.assertEqual(state.chat_preview_text("s1"), "小明：蓝蓝你在吗")
+
+
 class TestDirtyStringLists(unittest.TestCase):
     """编辑器偶尔会把 null 写进多选框（选项没有 id 时），保存不该因此整份失败。"""
 
@@ -3066,6 +3113,24 @@ class TestPromptBuilder(unittest.TestCase):
         self.world = make_world()
         self.builder = PromptBuilder(self.world)
 
+    def test_the_world_layer_does_not_repeat_the_global_prompt(self):
+        """第 2 层开头不再把第 1 层（global_prompt）那两句话抄一遍。"""
+
+        text = self.builder.world_layer()
+        self.assertEqual(text.count("群聊虚拟世界"), 1)
+        self.assertIn("不要向用户解释地图", text)
+        self.assertIn("你可以移动、做事、休息、上网", text)
+
+    def test_the_world_intro_comes_back_when_the_setting_is_empty(self):
+        """用户把「世界设定」清空时，那两句还得补回来（"别解释地图规则"是硬要求）。"""
+
+        raw = default_world()
+        raw["global_prompt"] = ""
+        world, _warnings = parse_world(raw)
+        text = PromptBuilder(world).world_layer()
+        self.assertIn("你生活在一个群聊虚拟世界里", text)
+        self.assertIn("不要向用户解释地图、规则或系统", text)
+
     def test_boredom_grows_faster_the_longer_she_stays(self):
         """待得越久无聊涨得越快；换地点（node_since 重置）就回到 1.0。"""
 
@@ -3448,6 +3513,9 @@ class TestPromptBuilder(unittest.TestCase):
         self.assertIn("还有这张", joined)
         self.assertNotIn("还有这张（见", joined)
         self.assertIn("这次一起发给你的图", joined)
+        # 编号是她自己对照用的，对面看不到「图1」这种说法：得当面交代清楚
+        self.assertIn("对方看不到", joined)
+        self.assertIn("别写「图1」「图2」", joined)
 
     def test_chat_images_are_not_marked_without_marks(self):
         """主模型不吃图时不写编号，免得她去找根本不存在的附件。"""
@@ -3999,6 +4067,53 @@ class TestPromptBuilder(unittest.TestCase):
         self.assertIn("小红 对你说", plain)
         self.assertNotIn("没有 @ 你", plain)
 
+    def test_a_multi_line_batch_is_told_to_answer_together_right_below_it(self):
+        """「这几句一起回」必须紧跟那批消息。
+
+        以前它在 engine 的 extra_notes 里，渲染在提示词最末尾，离那批隔了几十行，
+        读到最后根本不知道"这几句"是哪几句。
+        """
+
+        entries = [
+            {
+                "name": "小红",
+                "user_id": "1",
+                "text": "这事你怎么看",
+                "at": 0.0,
+                "addressing": "direct",
+                "is_trigger": True,
+            },
+            {
+                "name": "小刚",
+                "user_id": "2",
+                "text": "顺便看下这个",
+                "at": 0.0,
+                "addressing": "direct",
+            },
+        ]
+        text = self.builder.build_reply_user_prompt(entries=entries, addressing="direct")
+        self.assertIn("要一起回应", text)
+        self.assertLess(text.index("顺便看下这个"), text.index("要一起回应"))
+
+    def test_a_single_message_does_not_get_the_together_hint(self):
+        text = self.builder.build_reply_user_prompt(user_name="小红", text="在吗")
+        self.assertNotIn("要一起回应", text)
+
+    def test_the_last_line_does_not_repeat_the_format_layer(self):
+        text = self.builder.build_reply_user_prompt(user_name="小红", text="在吗")
+        self.assertIn("按「输出格式」那一层来。只输出 JSON。", text)
+        self.assertNotIn("先写 reasoning，再写 actions", text)
+
+    def test_the_final_checklist_does_not_repeat_the_format_layer(self):
+        text = self.builder.reminder_layer()
+        self.assertIn("# 最后确认", text)
+        # 第 3 层「输出格式」和 JSON 字段说明里已经逐条讲过这两句
+        self.assertNotIn("只输出一个 JSON 对象", text)
+        self.assertNotIn("要写 reasoning 就先写 reasoning", text)
+        # 条目仍然自动编号，_place_reminder 不再自带 "4. "
+        self.assertIn("\n1. ", text)
+        self.assertNotIn("4. ", text.split("# 最后确认")[-1].split("\n1. ")[0])
+
     def test_ability_map_lists_nodes(self):
         text = self.builder.ability_map()
         self.assertIn("书房", text)
@@ -4062,6 +4177,107 @@ class ExtensionHostTest(unittest.IsolatedAsyncioTestCase):
 
         broken.register(ExtensionSpec(name="bad", status_text=_boom))
         self.assertEqual("", broken.status_text(state, "s1"))
+
+    async def test_reply_replace_none_means_send_the_original(self):
+        """没人表态 / 表态说 None：都照常发她原本那句。"""
+
+        host = ExtensionHost()
+        state = WorldState(session_id="s1")
+        self.assertIsNone(await host.reply_replace(state, "原话", session_id="s1"))
+        host.register(
+            ExtensionSpec(
+                name="demo",
+                reply_replace=lambda state, raw, host, session_id: None,
+            )
+        )
+        self.assertIsNone(await host.reply_replace(state, "原话", session_id="s1"))
+
+    async def test_reply_replace_first_extension_that_speaks_wins(self):
+        """空串也是一种表态（静默）：它挡得住后面的扩展。"""
+
+        host = ExtensionHost()
+        state = WorldState(session_id="s1")
+        host.register(
+            ExtensionSpec(name="a", reply_replace=lambda state, raw, host, sid: "A 说的")
+        )
+        host.register(
+            ExtensionSpec(name="b", reply_replace=lambda state, raw, host, sid: "B 说的")
+        )
+        self.assertEqual("A 说的", await host.reply_replace(state, "原话", session_id="s1"))
+
+        host.register(
+            ExtensionSpec(name="c", reply_replace=lambda state, raw, host, sid: "")
+        )
+        self.assertEqual("A 说的", await host.reply_replace(state, "原话", session_id="s1"))
+
+        first = ExtensionHost()
+        first.register(
+            ExtensionSpec(name="c", reply_replace=lambda state, raw, host, sid: "")
+        )
+        first.register(
+            ExtensionSpec(name="a", reply_replace=lambda state, raw, host, sid: "A 说的")
+        )
+        self.assertEqual("", await first.reply_replace(state, "原话", session_id="s1"))
+
+    async def test_reply_replace_accepts_the_old_three_arg_signature(self):
+        """老写法 ``(state, raw, host)`` 也认（返回 None 时继续问下一个）。"""
+
+        host = ExtensionHost()
+        state = WorldState(session_id="s1")
+        host.register(
+            ExtensionSpec(name="old", reply_replace=lambda state, raw, host: "老写法")
+        )
+        self.assertEqual("老写法", await host.reply_replace(state, "原话", session_id="s1"))
+
+        quiet = ExtensionHost()
+        quiet.register(
+            ExtensionSpec(name="old", reply_replace=lambda state, raw, host: None)
+        )
+        self.assertIsNone(await quiet.reply_replace(state, "原话", session_id="s1"))
+
+    async def test_reply_replace_can_be_async_and_never_breaks_the_reply(self):
+        """异步钩子照样用；抛错的那个按"不干预"跳过，不影响别人。"""
+
+        host = ExtensionHost()
+        state = WorldState(session_id="s1")
+
+        async def _slow(state, raw, host, session_id):
+            return "异步也行"
+
+        def _boom(state, raw, host, session_id):
+            raise RuntimeError("坏了")
+
+        host.register(ExtensionSpec(name="bad", reply_replace=_boom))
+        host.register(ExtensionSpec(name="slow", reply_replace=_slow))
+        self.assertEqual("异步也行", await host.reply_replace(state, "原话", session_id="s1"))
+
+    async def test_host_delay_sleep_hands_it_to_the_engine(self):
+        """扩展说"现在别睡"：直接转给引擎（手上那份状态原样传下去，不碰会话锁）。"""
+
+        calls: list[tuple] = []
+
+        class _Engine:
+            def delay_sleep(self, state, *, minutes=None, reason="", by=""):
+                calls.append((state, minutes, reason, by))
+                return 4242
+
+            def session_state(self, session_id):  # pragma: no cover - 不该走到
+                raise AssertionError("手上有状态时不该去等会话锁")
+
+        class _Plugin:
+            pass
+
+        plugin = _Plugin()
+        plugin.engine = _Engine()
+        state = WorldState(session_id="s1")
+        host = ExtensionHost(plugin)
+        self.assertEqual(
+            4242, await host.delay_sleep(state, minutes=15, reason="开场景", by="2692047521")
+        )
+        self.assertEqual([(state, 15, "开场景", "2692047521")], calls)
+        # 没引擎（单测 / 宿主还没起来）时不炸
+        self.assertEqual(0, await ExtensionHost().delay_sleep(state, minutes=15))
+        self.assertEqual(0, await ExtensionHost().delay_sleep())
 
     def test_debug_events_are_registered_for_the_log_page(self):
         """扩展注册的调试类型要能被主插件列出来（日志页的筛选用它）。"""

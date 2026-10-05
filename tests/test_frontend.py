@@ -262,6 +262,24 @@ class FrontendSyntaxTest(unittest.TestCase):
         )
         self.assertEqual(bad, [], f"这些提示带着改动过程的口吻，请改写：" + str(bad[:5]))
 
+    def test_sleep_pressure_bar_only_shows_up_when_it_matters(self) -> None:
+        """数值条最后那一条「睡眠压力」：不在夜里、也还没困（<0.40）的时候整条不显示。"""
+
+        source = APP_JS.read_text("utf-8")
+        self.assertIn('label: "睡眠压力"', source)
+        self.assertIn("function sleepRowVisible(data)", source)
+        # 判据：夜里 / 她正睡着 / 已经到"有点困"那一档
+        self.assertIn(
+            "Boolean(night.now) || Boolean(night.sleeping) || pressure >= 0.4", source
+        )
+        # 渲染函数要看得到 night 块（在 state 里），两处调用点都得把 state 传进去
+        self.assertIn("function renderValueRows(values, data)", source)
+        self.assertEqual(source.count("renderValueRows("), 3, "定义 + 两处调用")
+        self.assertIn("renderValueRows(values, data);", source)
+        self.assertIn(
+            "renderValueRows(((ui.status || {}).values) || {}, ui.status || {});", source
+        )
+
     def test_state_labels_never_leak_a_bare_english_id(self) -> None:
         """状态页那一行：内置状态有中文；动作自己写的 during.state 也要能翻译。"""
 
@@ -364,6 +382,56 @@ class FrontendSyntaxTest(unittest.TestCase):
         self.assertEqual(data["many"], ["p1", "p2"])
         # 配了互斥（组 id "team"）：勾具体会话会把组挤掉，不会两组并存
         self.assertEqual(data["exclusive"], ["p1"])
+
+    def test_group_creation_is_gated_behind_the_privacy_notice(self) -> None:
+        """创建会话组要先过隐私须知：勾选 + 点「继续创建会话组」才真的建。
+
+        这一段是用户唯一一次被明确警告「组里别的会话能套出她记的事」，
+        所以顺序不能靠渲染时机兜底——``groups().push`` 必须排在确认之后。
+        """
+
+        source = APP_JS.read_text("utf-8")
+
+        # 正文四条风险 + 复选框 + 按钮，都是照写的原话
+        self.assertIn("创建会话组前，请先读这一段", source)
+        self.assertIn("请不要对这个 bot 说你的真实姓名、住址、电话、工作单位、证件号、账号密码", source)
+        self.assertIn("一个会话组里可能有多个会话（不同的群、不同的私聊）共用同一个「她」和同一册记忆。", source)
+        self.assertIn("她记的是内容，不是「谁有权知道」", source)
+        self.assertIn("真要说私事，请在会话组设置里把她限制在单个会话可见，或者干脆别对她说。", source)
+        self.assertIn("我已阅读并理解上述风险", source)
+        self.assertIn("继续创建会话组", source)
+
+        # 没勾选之前「继续」是禁用的
+        confirm = _grab_function(source, "confirmGroupPrivacyNotice")
+        self.assertIn("ok.disabled = !box.checked;", confirm)
+        self.assertIn("ok.disabled = true;", confirm)
+        # 取消的路子（✕ / 遮罩 / 取消按钮 / Esc）一律按「没确认」算
+        self.assertIn("onDismiss: () => settle(false),", confirm)
+        self.assertIn('event.key === "Escape"', confirm)
+
+        # 创建路径：先 await 确认，才轮到 push
+        # （_grab_function 不认模板串里的括号，addGroup 的 id 那行正好把 body 截断，
+        #   所以这里按源码位置核对：async → await 确认 → groups().push 的顺序）
+        head = source.index("async function addGroup(")
+        guard = source.index("!(await confirmGroupPrivacyNotice())", head)
+        push = source.index("groups().push(", head)
+        self.assertLess(guard, push, "groups().push 必须排在隐私确认之后")
+        self.assertIn("if (!(await confirmGroupPrivacyNotice())) return;", source)
+
+        # 编辑块里那个回看链接跟创建弹窗共用同一段文案
+        self.assertIn("function privacyNoticeLink(", source)
+        self.assertIn("privacyNoticeBody()", _grab_function(source, "openPrivacyNoticeDialog"))
+        self.assertIn("privacyNoticeBody()", confirm)
+        self.assertIn("card.appendChild(privacyNoticeLink());", source)
+
+    def test_the_shared_ok_button_is_re_enabled_when_a_dialog_opens(self):
+        """确认键是全页共用的一个：没勾隐私须知就取消之后，别的弹窗还得点得动。"""
+
+        source = APP_JS.read_text("utf-8")
+
+        for name in ("openFormDialog", "openCustomDialog"):
+            body = _grab_function(source, name)
+            self.assertIn("$(\"dialog-ok\").disabled = false;", body, f"{name} 没放开确认键")
 
 
 def _grab_function(source: str, name: str) -> str:
