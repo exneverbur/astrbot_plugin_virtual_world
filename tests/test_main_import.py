@@ -668,6 +668,34 @@ class TestMainImport(unittest.TestCase):
         self.assertEqual(other.sent[0].chain, [{"type": "plain", "text": "第一句"}])
         plugin.db.raw.close()
 
+    def test_quoted_voice_is_sent_outside_the_reply_chain(self):
+        """QQ 会吞掉 Reply + Record：引用文字、语音独立发送。"""
+
+        context = self.module.Context()
+        plugin = self.module.VirtualWorldPlugin(
+            context,
+            self.module.AstrBotConfig({"enabled": True, "tick_interval": 60}),
+        )
+        plugin.engine.world.reply_style.quote_mode = "always"
+        event = _QuoteEvent("在吗")
+
+        class Record:
+            def __init__(self) -> None:
+                self.file = "test-audio.wav"
+
+        voice = Record()
+        original_plain = self.module.Plain
+        self.module.Plain = _ReplyPlain
+        try:
+            event._vw_decorated_chain = [voice, _ReplyPlain("文字 fallback")]
+            asyncio.run(plugin._send_reply(event, ["文字 fallback"], quote=True))
+        finally:
+            self.module.Plain = original_plain
+            plugin.db.raw.close()
+        self.assertEqual(event.sent[0].chain[0], {"type": "reply", "id": "7788"})
+        self.assertEqual(event.sent[0].chain[1].text, "文字 fallback")
+        self.assertEqual(event.sent[1].chain, [voice])
+
     def test_quoted_message_says_who_sent_it(self):
         """引用消息要写清是谁发的；引用她自己发的图时写成「你自己」。"""
 
