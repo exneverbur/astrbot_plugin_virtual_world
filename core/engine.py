@@ -7780,27 +7780,9 @@ class VirtualWorldEngine:
                     {"chars": len(extra_text), "text": extra_text[:200]},
                     outcome=outcome,
                 )
-            # 她这次说出去的话也要进聊天上下文：下一轮提示词里才有「你最近说过的话」，
-            # 模型才知道自己刚用了什么说法，才能被要求换一种。
-            # 已经即时发出去的那几句也算她说过（不然她刚说"等我两分钟"就不记得了）。
-            for message in outcome.said_messages():
-                recorded = state.note_chat(
-                    user_id="__self__",
-                    name=state.bot_current_nickname or state.bot_base_nickname or "你",
-                    text=message,
-                    now=self._now(),
-                    keep=self.chat_history_limit(),
-                    is_self=True,
-                    origin=ctx.session_id,
-                )
-                state.note_reply(message, session_id=ctx.session_id)
-                self.note_dialogue(state, text=message, is_self=True)
-                # 这句话是在哪个会话里说的：留档只有一份，来源要标出来。
-                # 用 note_chat 的返回值定位那一条（重复没记时是 None → 什么都不改）
-                self._tag_chat_origin(state, ctx.session_id, recorded)
-            # 水位线不在这里推进：改成**确实发出去之后**由发送方通知
-            # （见 main.py 里的 mark_chat_replied_by_session）。这样被丢弃的、
-            # 或发送失败的回复不会把"这批消息已经回过"记下来，下一轮还会看到它们。
+            # 这轮的话先不要写成「你已经说过」：接管层还没有把它交给平台。
+            # 发送端在平台接受后调用 ``mark_reply_batch_replied(..., messages=...)``，
+            # 再把实际送达的文本记入最近聊天并推进水位线。
             self.note_chat_note(state, parsed.chat_note, ctx.session_id)
             # 模型自己标的心情变化（主路径）：只在这一轮是她真的跟人说话时接受，
             # 自主轮不写，免得她凭空给自己加心情。
@@ -17938,7 +17920,9 @@ class VirtualWorldEngine:
             for stale in list(self._replied_batch_keys)[:-32]:
                 self._replied_batch_keys.pop(stale, None)
 
-    async def mark_reply_batch_replied(self, session_id: str) -> None:
+    async def mark_reply_batch_replied(
+        self, session_id: str, *, messages: list[str] | None = None
+    ) -> None:
         """回复**真的发出去**之后，把水位线推到这一轮的边界（见 `_remember_replied_batch`）。
 
         没有这一轮的批次记录（例如只是"说给别处"的旁听投递）就**不推进**：
@@ -17951,7 +17935,30 @@ class VirtualWorldEngine:
         if not keys:
             return
         async with self.session_state(session_id) as state:
+            self._commit_reply_messages(state, session_id, messages or [])
             self.mark_chat_replied(state, session_id, keys=keys)
+
+    def _commit_reply_messages(
+        self, state: WorldState, session_id: str, messages: list[str]
+    ) -> None:
+        """把平台已经接受的回复写入聊天留档。"""
+
+        for message in messages:
+            text = str(message or "").strip()
+            if not text:
+                continue
+            recorded = state.note_chat(
+                user_id="__self__",
+                name=state.bot_current_nickname or state.bot_base_nickname or "你",
+                text=text,
+                now=self._now(),
+                keep=self.chat_history_limit(),
+                is_self=True,
+                origin=session_id,
+            )
+            state.note_reply(text, session_id=session_id)
+            self.note_dialogue(state, text=text, is_self=True)
+            self._tag_chat_origin(state, session_id, recorded)
 
     async def mark_chat_replied_by_session(self, session_id: str) -> None:
         """按会话推进"已回应水位线"（不知道具体批次时用；推到本会话此刻最新那条）。"""

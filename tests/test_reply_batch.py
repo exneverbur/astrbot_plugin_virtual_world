@@ -760,6 +760,27 @@ class ReplyBatchTest(unittest.IsolatedAsyncioTestCase):
         prompt = self.llm.user_prompt()
         self.assertEqual(prompt.count("在吗"), 1, "这一轮的那条只出现一次")
 
+    async def test_bot_reply_is_recorded_only_after_delivery_commit(self):
+        """生成成功不是送达成功：发送前不能留下虚假的 bot 发言。"""
+
+        self.merge_mode()
+        self.register("晚饭吃什么", message_id="deliver-1")
+        reply = await self.engine.handle_reply(
+            self.ctx("晚饭吃什么", message_id="deliver-1")
+        )
+        self.assertTrue(reply.ok, reply.error)
+
+        async with self.engine.session_state(SESSION) as state:
+            self.assertFalse(
+                any(item.get("is_self") for item in state.recent_chat),
+                "平台尚未确认前，不能把模型草稿写成已经发出的消息",
+            )
+
+        await self.engine.mark_reply_batch_replied(SESSION, messages=reply.messages)
+        async with self.engine.session_state(SESSION) as state:
+            sent = [item for item in state.recent_chat if item.get("is_self")]
+            self.assertEqual([item.get("text") for item in sent], ["哦。"])
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

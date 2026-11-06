@@ -3954,8 +3954,9 @@ class VirtualWorldPlugin(Star):
                 # 调试回显按它实际发生的位置插进去（先调工具、再说话，群里也是这个顺序）
                 payload = self._merge_with_echo(bridged, outcome, echo)
                 sent_ok = True
+                delivered_here = bool(live_lines)
                 if payload or made_images:
-                    await self._send_reply(
+                    delivered_here = await self._send_reply(
                         event,
                         payload,
                         # 前面已经即时说过话时，这一条是接着往下讲，不再引用触发她的那条
@@ -3963,12 +3964,21 @@ class VirtualWorldPlugin(Star):
                         quote_mode_hint=str(getattr(outcome, "quote_hint", "") or ""),
                         images=made_images,
                     )
+                    if not delivered_here:
+                        sent_ok = False
                 # 说给别处的那些：逐条投到那个会话（不带引用——那条消息不在这里）
                 # 投失败的目标**不算回过话**：水位线不推进，它下一轮还会被当成新的
                 failed_targets: set[str] = set()
                 for target, texts in routed.items():
                     try:
-                        await self.messenger.send_text(target, list(texts))
+                        delivered = await self.messenger.send_text(target, list(texts))
+                        if not delivered:
+                            failed_targets.add(target)
+                            sent_ok = False
+                            continue
+                        await self.engine.mark_reply_batch_replied(
+                            target, messages=list(texts)
+                        )
                     except Exception as exc:
                         failed_targets.add(target)
                         sent_ok = False
@@ -3977,7 +3987,12 @@ class VirtualWorldPlugin(Star):
                         )
                 for target, refs in routed_images.items():
                     try:
-                        await self.messenger.send_images(target, list(refs))
+                        delivered = await self.messenger.send_images(target, list(refs))
+                        if not delivered:
+                            failed_targets.add(target)
+                            sent_ok = False
+                            continue
+                        await self.engine.mark_reply_batch_replied(target)
                     except Exception as exc:
                         failed_targets.add(target)
                         sent_ok = False
@@ -3989,8 +4004,14 @@ class VirtualWorldPlugin(Star):
                 for target in [session_id, *(list(routed) + list(routed_images))]:
                     if target in failed_targets:
                         continue  # 没发出去的那边不算回应过
+                    if target != session_id:
+                        continue  # 别处已在它的实际发送成功处提交
+                    if not delivered_here:
+                        continue
                     try:
-                        await self.engine.mark_reply_batch_replied(target)
+                        await self.engine.mark_reply_batch_replied(
+                            target, messages=live_lines + list(bridged)
+                        )
                     except Exception as exc:
                         self.logger.debug(f"[virtual_world] 推进水位线失败：{exc}")
                 if not sent_ok:
@@ -4091,7 +4112,7 @@ class VirtualWorldPlugin(Star):
         quote: bool = False,
         quote_mode_hint: str = "",
         images: list[str] | None = None,
-    ) -> None:
+    ) -> bool:
         """把接管产生的消息发回当前会话（逐条发送 = 天然分段回复）。
 
         分段之间按上一条的字数停一下：群里看起来就像她在一条条打字，
@@ -4104,7 +4125,8 @@ class VirtualWorldPlugin(Star):
         pending = [str(item).strip() for item in messages if str(item).strip()]
         refs = _sendable_images(images)
         if not pending and not refs:
-            return
+            return False
+        delivered = False
         quote_id = self._quote_target(event, quote_mode_hint) if quote else ""
         for index, content in enumerate(pending):
             if self.messenger.blocked(session_id):
@@ -4117,6 +4139,7 @@ class VirtualWorldPlugin(Star):
             try:
                 await event.send(MessageChain(chain))
                 self.messenger.mark_sent(session_id)
+                delivered = True
             except Exception as exc:
                 # 失败就失败：以前这里会立刻换一条通道再发一次，遇到"超时但其实发出去了"
                 # 的情况就会重复刷屏，所以只保留一次尝试。
@@ -4130,12 +4153,13 @@ class VirtualWorldPlugin(Star):
 
         if refs and not self.messenger.blocked(session_id):
             # 只在"她什么都没说、只发了图"时，让图片这条去引用（第一条才引用）
-            await self._send_images(
+            delivered = await self._send_images(
                 event,
                 refs,
                 quote=quote and not pending,
                 quote_mode_hint=quote_mode_hint,
-            )
+            ) or delivered
+        return delivered
 
     async def _send_images(
         self,
