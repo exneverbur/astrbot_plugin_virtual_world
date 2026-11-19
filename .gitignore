@@ -1,10 +1,51 @@
+# ---------------- Python ----------------
 __pycache__/
-*.pyc
-*.pyo
-.idea/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------------- 本地数据与运行产物 ----------------
 data/
-docs/SEAMS.md
-docs/TICKETS.md
-docs/API_NOTES.md
 graphflow-out/
+.graphflow/
 .graphflow-cache/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+
+# ---------------- 临时文件与备份 ----------------
+_tmp*
+.tmp*
+*.bak
+*.orig
+*.rej
+.vwprobe/
+.vwtest/
+.vwtest_test_follow_up.bak
+
+# ---------------- 编辑器 / 系统 ----------------
+.idea/
+.vscode/
+.claude/
+.trae/
+.DS_Store
+Thumbs.db
+
+# ---------------- 注意 ----------------
+.astrbot-plugin/*
+!.astrbot-plugin/i18n/
+!.astrbot-plugin/i18n/*.json
+
+# ---------------- 不上传的目录（只留本地）----------------
+# 2026-11-19 用户决定：GitHub 上不放文档、测试与开发工具。
+# tools/ 里的脚本依赖 tests/ 的替身，单独留着对使用者也是坏的。
+docs/
+tests/
+tools/
