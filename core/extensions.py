@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -32,6 +33,16 @@ MODEL_SLOTS = ("helper", "creator", "llm", "event", "judge", "consolidate")
 
 ``helper`` 打杂 / ``creator`` 内容生成（编事件包那个） / ``llm`` 主模型 /
 ``event`` 事件 / ``judge`` 判断 / ``consolidate`` 整理。
+"""
+
+EXTENSION_API_VERSION = 1
+"""扩展挂载点的能力版本：**加接口就加一**（老扩展不用改，``hasattr`` 照旧能判）。"""
+
+EXTENSION_CAPABILITIES = ("say", "log", "image", "card", "generate", "model_slots")
+"""这一版宿主明确给扩展用的接口（:meth:`ExtensionHost.capabilities` 的原样内容）。
+
+``image`` / ``card`` 是 v1 新加的：扩展要把自己找来的图或"标题+链接"发到会话里，
+不用自己拼平台消息段，也不用猜宿主怎么发。
 """
 
 
@@ -252,6 +263,12 @@ class ExtensionSpec:
 
     和 ``gate`` 的区别：gate 是"让不让做"，这个是"做的时候顺手记一笔"。
     返回非空字符串时，那句话会作为她这一轮要说的话排进去。
+
+    ``session_id`` 是**这一轮实际回在哪个会话**（和 :attr:`on_touch` /
+    :attr:`on_reply_extra` 同一个口径）：状态是整组共用的一份，``state.session_id``
+    常是主页那个会话——**要发卡/发消息就用这个 ``session_id``**，拿 ``state.session_id``
+    会发错地方（2026-10 真机问题：群里要的卡发进了 WebUI 私聊）。取不到本轮回话
+    会话时（纯自主 tick）它才退回 ``state.session_id``。
     """
 
     hidden_actions: Callable[[Any, str, "ExtensionHost"], set] | None = None
@@ -456,8 +473,17 @@ class ExtensionHost:
                 saved[key] = item.get("default")
         return saved
 
-    def save_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """保存设置页提交的内容（只认它自己声明过的字段）。"""
+    def save_settings(
+        self,
+        payload: dict[str, Any],
+        *,
+        errors: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """保存设置页提交的内容（只认它自己声明过的字段）。
+
+        写盘失败**不抛给调用方**（设置页只需要一句人话）：原因 append 进 ``errors``
+        （调用方传了才记），内存里的值照常生效，返回值仍是完整配置。
+        """
 
         data = self._load_settings()
         for name, values in dict(payload or {}).items():
@@ -469,13 +495,17 @@ class ExtensionHost:
             data[str(name)] = {**(data.get(str(name)) or {}), **picked}
         self._settings = data
         path = self.settings_path()
-        if path is not None:
-            try:
-                path.write_text(
-                    json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-                )
-            except Exception:
-                pass
+        if path is None:
+            if errors is not None:
+                errors.append("找不到数据目录，设置只在内存里生效")
+            return data
+        try:
+            path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception as exc:
+            if errors is not None:
+                errors.append(f"设置没写进磁盘：{type(exc).__name__}: {exc}")
         return data
 
     # ---------------- 钩子 ----------------
@@ -1023,6 +1053,191 @@ class ExtensionHost:
         engine = getattr(self.plugin, "engine", None)
         return getattr(engine, "helper_llm", None) or getattr(engine, "llm", None)
 
+    def capabilities(self) -> dict[str, Any]:
+        """这一版宿主给扩展的接口清单（扩展按 ``api_version`` 判能不能用某个能力）。"""
+
+        return {
+            "api_version": EXTENSION_API_VERSION,
+            "capabilities": list(EXTENSION_CAPABILITIES),
+        }
+
+    @staticmethod
+    def _warn(message: str) -> None:
+        """扩展链路上的告警：有主插件日志就写，没有就吞掉（绝不影响主流程）。"""
+
+        try:
+            from astrbot.api import logger  # noqa: PLC0415
+
+            logger.warning(f"[vw-ext] {message}")
+        except Exception:
+            pass
+
+    def _send_channel(self) -> Any:
+        """宿主真正发消息的那条链路（``engine.messenger``）；没有就返回 None。"""
+
+        engine = getattr(self.plugin, "engine", None)
+        return getattr(engine, "messenger", None)
+
+    def _image_target(self, source: str) -> str:
+        """把扩展给的 ``source`` 认成发送链路吃得下的图片地址（认不出 = 空串）。
+
+        认的写法：``http(s)://`` / ``base64://`` / ``data:`` / ``file://`` 原样交给
+        宿主；本机存在的路径转成绝对路径；剩下的当 ``media_id`` 去问宿主的媒体表。
+        """
+
+        ref = str(source or "").strip()
+        if not ref:
+            return ""
+        if ref.lower().startswith(("http://", "https://", "base64://", "data:", "file://")):
+            return ref
+        try:
+            path = Path(ref).expanduser()
+            if path.is_file():
+                return str(path.resolve())
+        except OSError:
+            pass
+        engine = getattr(self.plugin, "engine", None)
+        lookup = getattr(engine, "media_file_source", None)
+        if lookup is None:
+            return ""
+        try:
+            found = str(lookup(ref) or "").strip()
+        except Exception:
+            return ""
+        if not found:
+            return ""
+        try:
+            return found if Path(found).is_file() else ""
+        except OSError:
+            return ""
+
+    def _receipt_ok(self, receipt: Any, session_id: str) -> bool:
+        """统一判"这一条到底发出去没有"（accepted / delivered 才算）。"""
+
+        try:
+            from .ports import as_receipt  # noqa: PLC0415
+
+            ok = bool(as_receipt(receipt, target=session_id))
+        except Exception as exc:
+            self._warn(f"扩展发东西的回执看不懂：{type(exc).__name__}: {exc}")
+            return False
+        if not ok:
+            self._warn(f"扩展这一条没发到 {session_id}")
+        return ok
+
+    @staticmethod
+    def _mark_ok(messenger: Any, session_id: str) -> None:
+        """顺手告诉宿主的发送链路"这一条发出去了"（没这个方法就算了）。"""
+
+        hook = getattr(messenger, "mark_sent", None)
+        if hook is None:
+            return
+        try:
+            hook(session_id)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _card_chain(image: str, text: str) -> Any:
+        """拼一条「封面图 + 文字」的消息链；裸环境（没装 AstrBot）返回 None。"""
+
+        try:
+            from astrbot.api.event import MessageChain  # noqa: PLC0415
+            from astrbot.api.message_components import Image, Plain  # noqa: PLC0415
+
+            return MessageChain(chain=[Image(file=image), Plain(text)])
+        except Exception:
+            return None
+
+    async def _send_text_card(self, messenger: Any, session_id: str, text: str) -> bool:
+        """没有封面（或封面发不出去）时的那条路：走宿主自己的文字链路。"""
+
+        if messenger is None or not hasattr(messenger, "send_text"):
+            self._warn("扩展要发卡，但宿主没有文字发送链路")
+            return False
+        try:
+            receipt = await messenger.send_text(session_id, [text])
+        except Exception as exc:
+            self._warn(f"扩展发卡失败：{type(exc).__name__}: {exc}")
+            return False
+        return self._receipt_ok(receipt, session_id)
+
+    async def image(self, session_id: str, source: str) -> bool:
+        """把一张图发到这个会话（扩展自己的图走这条路，不用自己拼消息段）。
+
+        ``source`` 可以是本机绝对路径、``media_id``（媒体库里那张图），
+        也可以直接是 ``http(s)://`` / ``base64://`` / ``file://`` 地址。
+        返回 True = 平台收下了；发不出去一律 False（**不抛给扩展**）。
+        图片本体由主插件现成的出站链路发（失败冷却、临时会话那些照旧）。
+        """
+
+        sid = str(session_id or "").strip()
+        target = self._image_target(source)
+        if not sid or not target:
+            self._warn(
+                f"扩展要发图，但认不出这张图：会话={sid!r} 图={str(source or '')[:120]!r}"
+            )
+            return False
+        messenger = self._send_channel()
+        if messenger is None or not hasattr(messenger, "send_images"):
+            self._warn("扩展要发图，但宿主没有图片发送链路")
+            return False
+        try:
+            receipt = await messenger.send_images(sid, [target])
+        except Exception as exc:
+            self._warn(f"扩展发图失败：{type(exc).__name__}: {exc}")
+            return False
+        return self._receipt_ok(receipt, sid)
+
+    async def card(
+        self,
+        session_id: str,
+        title: str,
+        desc: str,
+        url: str,
+        cover: str = "",
+    ) -> bool:
+        """发一条「标题 + 描述 + 链接 +（可选）封面图」的组合消息。
+
+        链接就是纯文本 URL（平台认不出卡片样式时它照样能点、能复制）。
+        ``cover`` 认不出或发不出去时**降级成纯文字卡**，不会整条失败。
+        返回 True = 平台收下了；发不出去一律 False（**不抛给扩展**）。
+        """
+
+        sid = str(session_id or "").strip()
+        head = _keep_paragraphs(title)
+        body = _keep_paragraphs(desc)
+        link = str(url or "").strip()
+        if link and not link.lower().startswith(("http://", "https://")):
+            link = ""
+        text = "\n".join(part for part in (head, body, link) if part)
+        if not sid or not text:
+            self._warn(
+                f"扩展要发卡，但没写清楚：会话={sid!r} 标题={str(title or '')[:60]!r}"
+            )
+            return False
+        context = getattr(self.plugin, "context", None)
+        messenger = self._send_channel()
+        if context is None and messenger is None:
+            self._warn("扩展要发卡，但宿主没有可用的发送通道")
+            return False
+        image = self._image_target(cover) if cover else ""
+        if image and context is not None:
+            chain = self._card_chain(image, text)
+            if chain is not None:
+                try:
+                    result = await context.send_message(sid, chain)
+                except Exception as exc:
+                    self._warn(
+                        f"扩展发卡（带封面）失败，改发文字：{type(exc).__name__}: {exc}"
+                    )
+                else:
+                    if result:
+                        self._mark_ok(messenger, sid)
+                        return True
+                    self._warn("扩展发卡（带封面）平台没有接收，改发文字")
+        return await self._send_text_card(messenger, sid, text)
+
     def _model_channel(self, slot: str = "") -> Any:
         """按**档位**取模型通道：``helper`` / ``creator`` / ``llm`` / ``event`` / …
 
@@ -1409,6 +1624,10 @@ class ExtensionHost:
         **换行照原样保留**：扩展写的长段叙述是靠空行分段的，
         把它压成一行就等于没有排版（一段几百字糊成一坨）。
 
+        **先发后记**（计划 §5 A2）：只有平台真收下了才写进她的留档。发失败就
+        什么都不记并返回 ``False``，让扩展自己决定要不要重试——"没发出去"
+        不能变成她记忆里"我说过这句"。
+
         只该在**后台任务**里调：动作回调 / tick 里正拿着这个会话的锁，
         再进来会等锁（等不到就是死等）。
         """
@@ -1420,7 +1639,39 @@ class ExtensionHost:
         sid = str(session_id or getattr(state, "session_id", "") or "")
         if engine is None or not sid:
             return False
-        # 1) 先记进留档：她自己说的那句，跟走正常回复路径一个写法
+        # 1) 先真的发出去（发送通道没注入 / 发失败都返回 False，让扩展自己决定怎么办）
+        delivered = False
+        for name in ("say_sink", "debug_sink"):
+            sink = getattr(engine, name, None)
+            if sink is None:
+                continue
+            try:
+                if await sink(sid, body):
+                    delivered = True
+                    break
+            except Exception:
+                continue
+        if not delivered:
+            return False
+        # 1.5) 阶段A3：这一类是「扩展接口」入口，记进捕获账（按身份去重，
+        #      同一句被宿主钩子再看见也不会记第二遍）。
+        try:
+            from .capture import CAPTURE_EXTENSION, capture_identity  # noqa: PLC0415
+
+            engine = self.plugin.engine
+            engine.captures.note(
+                CAPTURE_EXTENSION,
+                session_id=sid,
+                operation_id=engine.capture_code(f"ext:{sid}"),
+                text=body,
+                origin="extension",
+                # 别名只用来回答"这句是不是我们自己发的"（宿主钩子再看见时认人），
+                # 不参与计数：同样一句话说两次就是两条真发言。
+                aliases=(capture_identity(session_id=sid, texts=[body]),),
+            )
+        except Exception:
+            pass
+        # 2) 平台收下了才记进留档：她自己说的那句，跟走正常回复路径一个写法
         try:
             async with engine.session_state(sid) as fresh:
                 fresh.note_chat(
@@ -1439,18 +1690,9 @@ class ExtensionHost:
                 except Exception:
                     pass
         except Exception:
-            return False
-        # 2) 真的发出去（发送通道没注入 / 发失败都返回 False，让扩展自己决定怎么办）
-        for name in ("say_sink", "debug_sink"):
-            sink = getattr(engine, name, None)
-            if sink is None:
-                continue
-            try:
-                if await sink(sid, body):
-                    return True
-            except Exception:
-                continue
-        return False
+            # 话已经发出去了：留档失败不能再改口说"没发出去"
+            return True
+        return True
 
     def snapshot(self, state: Any = None) -> dict[str, Any]:
         """设置页要的全部内容：字段定义 + 已保存的值（+ 面板数据）。"""

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import time
@@ -58,6 +59,116 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return result
 
 
+def backfill_world_dict(
+    raw: dict[str, Any], defaults: dict[str, Any]
+) -> tuple[dict[str, Any], list[str]]:
+    """把 ``raw`` 里缺的默认键补上，返回 ``(新 dict, 补上的路径列表)``。
+
+    T1（用户 2026-10-24）：``world.json`` 里很多新配置从来没落盘过，运行时靠
+    ``_deep_merge(default_world(), raw)`` 兜着——用户在编辑器里看到的是默认值，
+    盘上却没有，``/vw debug``、导出、手工编辑都看不到真实生效值。这里把缺的键
+    真正写进文件，边界如下：
+
+    * **只补缺失键**：用户已有的值一律不动——显式写成 ``null`` / ``0`` / ``""`` /
+      ``[]`` 也算"他表达过意思"，同样保留；
+    * 两边都是 dict 才递归；类型对不上（默认是 dict、盘上是标量，或反过来）保持
+      用户那份，不往里补，更不抛异常；
+    * 缺的是整段 dict 时**只记这一段的路径**（``agent``），不再把里面每个叶子列
+      一遍——不然多一个新段就能刷满几十条路径；
+    * 顺序稳定：先按默认值的书写顺序，再补用户自己多出来的键（保持原顺序）。
+    """
+
+    added: list[str] = []
+    source = raw if isinstance(raw, dict) else {}
+    merged = _backfill_merge(source, defaults or {}, "", added)
+    return merged, added
+
+
+def _backfill_merge(
+    current: dict[str, Any], defaults: dict[str, Any], prefix: str, added: list[str]
+) -> dict[str, Any]:
+    """``backfill_world_dict`` 的递归体：返回补过键的新 dict，路径记进 ``added``。"""
+
+    result: dict[str, Any] = {}
+    for key, default in defaults.items():
+        path = f"{prefix}{key}"
+        if key not in current:
+            result[key] = copy.deepcopy(default)
+            added.append(path)
+            continue
+        value = current[key]
+        if isinstance(default, dict) and isinstance(value, dict):
+            result[key] = _backfill_merge(value, default, f"{path}.", added)
+        else:
+            result[key] = value
+    for key, value in current.items():
+        if key not in defaults:
+            result[key] = value
+    return result
+
+
+def backfill_action_idle_activity(
+    raw: dict[str, Any], defaults: dict[str, Any]
+) -> tuple[dict[str, Any], list[str]]:
+    """T20：给老存档里的**内置动作**补 ``idle_activity``（只补这一个缺失键）。
+
+    为什么需要单独一层：``backfill_world_dict`` 只补"整段缺失"的键，``actions``
+    在盘上是一整段列表（老存档里是默认动作的序列化副本），列表里的每个动作不会
+    因为它缺字段就被补——``world.json`` 里 77 条内置动作都没有 ``idle_activity``，
+    而 ``search_web`` 的声明只写在 ``core/defaults.py`` 里，运行时永远长不出来。
+
+    边界（和 T1 的回填保持一致）：
+
+    * 只补 ``idle_activity`` 一个键，其它字段一律不动；
+    * 只补 ``builtin`` 为真、或 id 出现在默认动作表里的动作，扩展动作不碰；
+    * 用户已经写过的值一律保留——显式 ``null`` / ``{"weight": 0}`` 都算"他表达过
+      意思"，不会再被默认声明覆盖；
+    * 不写盘，盘上落点仍由 :meth:`ConfigStore.load_world` 现有的回填保存流程决定。
+    """
+
+    if not isinstance(raw, dict):
+        return raw, []
+    actions = raw.get("actions")
+    default_actions = (defaults or {}).get("actions")
+    if not isinstance(actions, list) or not isinstance(default_actions, list):
+        return raw, []
+    declared: dict[str, Any] = {}
+    for item in default_actions:
+        if not isinstance(item, dict):
+            continue
+        action_id = str(item.get("id") or "")
+        declaration = item.get("idle_activity")
+        if action_id and declaration is not None:
+            declared[action_id] = declaration
+    if not declared:
+        return raw, []
+    result = dict(raw)
+    filled: list[Any] = []
+    added: list[str] = []
+    changed = False
+    for item in actions:
+        if not isinstance(item, dict):
+            filled.append(item)
+            continue
+        action_id = str(item.get("id") or "")
+        declaration = declared.get(action_id)
+        is_builtin = bool(item.get("builtin")) or action_id in declared
+        if (
+            action_id
+            and declaration is not None
+            and is_builtin
+            and "idle_activity" not in item
+        ):
+            item = {**item, "idle_activity": copy.deepcopy(declaration)}
+            added.append(f"actions.{action_id}.idle_activity")
+            changed = True
+        filled.append(item)
+    if not changed:
+        return raw, []
+    result["actions"] = filled
+    return result, added
+
+
 class ConfigStore:
     """配置与数据的统一入口。"""
 
@@ -69,6 +180,8 @@ class ConfigStore:
         self._schedules: SchedulesConfig | None = None
         self._sessions: SessionsConfig | None = None
         self.created_files: list[str] = []
+        self.last_backfill: list[str] = []
+        """上一次 ``load_world()`` 补进 ``world.json`` 的路径（没补就是空表，给事件日志用）。"""
 
     # ---------------- 路径 ----------------
 
@@ -140,6 +253,21 @@ class ConfigStore:
 
     def load_world(self) -> WorldConfig:
         raw = self._read_json(self.world_path, default_world())
+        raw = self._upgrade_agent_budgets(raw)
+        raw = self._upgrade_event_genres(raw)
+        # T1：盘上缺的默认键补回去（只补缺失键，不动用户值），补过才写盘。
+        # 顺序：先迁移检测（``core.migrations.detect_all`` 读的是盘上原文，语义不动），
+        # 再回填——补进来的都是"当前默认值"，而 ``detect_all`` 对"已经是新默认"的路径
+        # 本来就不列，所以「有待确认的迁移」这个判定不会因为回填而变化。
+        raw, backfilled = backfill_world_dict(raw, default_world())
+        # T20：老存档里的内置动作是默认动作的**序列化副本**，不会自动长出
+        # ``idle_activity``；这里按字段再补一层（只补缺失键，用户写过的 null /
+        # weight 0 一律保留，扩展动作不碰）。写盘仍走下面同一条回填流程。
+        raw, idle_backfilled = backfill_action_idle_activity(raw, default_world())
+        backfilled = list(backfilled) + idle_backfilled
+        self.last_backfill = list(backfilled)
+        if backfilled:
+            self._persist_backfill(raw, backfilled)
         # 升级补字段：默认值 + 用户值（用户值优先）
         merged = _deep_merge(default_world(), raw)
         merged["nodes"] = raw.get("nodes", merged.get("nodes", []))
@@ -149,6 +277,86 @@ class ConfigStore:
         self.warnings.extend(warnings)
         self._world = world
         return world
+
+    def _upgrade_agent_budgets(self, raw: dict[str, Any]) -> dict[str, Any]:
+        """结构补全：盘上**根本没有 agent 段**时按当前默认写一份。
+
+        这一节原本住在插件配置里（老版本），文件里没有它是「结构缺失」而不是「用户调过
+        的值」—— 读盘这一层直接把默认写进去，不等用户确认。
+
+        **内容迁移不在这里做**（T17）：``agent.query_total_seconds`` 还是最初那版的
+        6 秒、``max_steps`` 还是 5，都属于「我们发过的默认值变了」，会被
+        :func:`core.migrations.detect_all` 列进清单，用户在编辑器里勾过之后才落盘。
+        以前这里识别出来就静默写回，用户既没看见改了什么，也没法拒绝。
+        """
+
+        if not isinstance(raw, dict):
+            return raw
+        if isinstance(raw.get("agent"), dict):
+            return raw  # 有这一节：内容迁移交给 core.migrations
+        fresh = default_world().get("agent")
+        if not isinstance(fresh, dict) or not fresh:
+            return raw
+        result = dict(raw)
+        result["agent"] = fresh
+        try:
+            self._write_json(self.world_path, result)
+        except OSError as exc:
+            self.warnings.append(f"Agent 段没能补进 world.json（{exc}），这次先按默认值跑")
+        return result
+
+    def _upgrade_event_genres(self, raw: dict[str, Any]) -> dict[str, Any]:
+        """结构补全：``events`` 段在、但**题材表不完整**时按这一版的默认写一份。
+
+        ``events.genres`` 缺失 / 是空表 / 根本不是列表，属于「文件不完整」——没有可逆的
+        用户值可丢，读盘这一层直接补上默认。整段 ``events`` 都没有的情况不写盘：
+        ``parse_world`` 会用模型默认补齐，那种世界照样跑得起来。
+
+        **内容迁移不在这里做**（T17）：最初那 7 类（一个 weight 管三档、examples 是名词
+        串）要换成按档位分权的一版，这件事改的是用户看得见的内容，所以交给
+        :func:`core.migrations.detect_all` 列进清单，用户在编辑器里勾过才落盘。以前这里
+        认出旧表就静默写回（还带一条 warning）：用户既没得选，warning 又因为
+        ``save_world`` 写的是入参原始 dict 而永远清不掉。
+        """
+
+        if not isinstance(raw, dict):
+            return raw
+        events = raw.get("events")
+        if not isinstance(events, dict):
+            return raw
+        genres = events.get("genres")
+        if isinstance(genres, list) and genres:
+            return raw  # 有表：内容迁移交给 core.migrations
+        upgraded = dict(events)
+        upgraded["genres"] = copy.deepcopy(WorldConfig().events.genres)
+        if not str(events.get("genre_scale") or "").strip():
+            upgraded["genre_scale"] = WorldConfig().events.genre_scale
+        result = dict(raw)
+        result["events"] = upgraded
+        try:
+            self._write_json(self.world_path, result)
+        except OSError as exc:
+            self.warnings.append(f"事件题材表没能补进 world.json（{exc}），这次先按默认值跑")
+        return result
+
+    def _persist_backfill(self, data: dict[str, Any], added: list[str]) -> None:
+        """把补过键的 ``world.json`` 写回盘，写之前先留一份 ``.bak-backfill-<ts>``。
+
+        只在真补到键时调用（幂等：第二次启动 ``added`` 为空，不写盘也不备份）。
+        写失败只记一条 warning，**绝不挡住启动**——内存里那份已经补好了，这次照样按
+        默认值跑。
+        """
+
+        path = self.world_path
+        try:
+            if path.exists():
+                backup = path.with_name(f"{path.name}.bak-backfill-{int(time.time())}")
+                backup.write_bytes(path.read_bytes())
+            self._write_json(path, data)
+        except OSError as exc:
+            self.warnings.append(
+                f"world.json 补的 {len(added)} 个默认键没写回（{exc}），这次先按默认值跑"
+            )
 
     def load_schedules(self) -> SchedulesConfig:
         raw = self._read_json(self.schedules_path, default_schedules())
@@ -774,13 +982,38 @@ class ConfigStore:
         note: str = "",
         cold_start_mode: str = "awakening",
         cold_start_node: str = "",
+        temporary: bool = False,
+        temp_origin: str = "",
+        temp_source: str = "",
+        snapshot: bool = True,
     ) -> bool:
+        """往白名单里加一条会话（已有同 id 的正常行就重新启用）。
+
+        ``temporary=True`` 是临时会话自动接管用的：多写几个来源字段，并且调用方
+        会传 ``snapshot=False``——每私聊出去一个人就存一份全量快照太吵，而这条
+        路径不涉及用户手改配置，回滚价值不大。
+
+        **不覆盖用户意图**：命中一条"用户自己停用的普通会话"（``enabled`` 为假、
+        也不是临时行）时什么都不做、返回 ``False``——自动接管不能把用户关掉的
+        会话偷偷打开（审查 P2）。真要让用户重新启用，走 ``set_session_enabled``。
+        期限只在 ``temp_sessions`` 表里存一份（``expires_at`` 曾在这里也写一份，
+        两处必然分叉，已删）。
+        """
+
         raw = self.raw_sessions()
         sessions = raw.setdefault("sessions", [])
         for item in sessions:
             if item.get("session_id") == session_id:
+                if not item.get("enabled") and not item.get("temporary"):
+                    return False
                 item["enabled"] = True
-                self.save_sessions(raw)
+                if temporary:
+                    item["temporary"] = True
+                    # 空串 = 不知道这条临时会话是从哪儿发起的（用户 m00001 追加需求）。
+                    # 以前这里折回 session_id 自己，那是"自己指自己"，永远映射不出东西。
+                    item["temp_origin"] = temp_origin or ""
+                    item["temp_source"] = temp_source or "private"
+                self.save_sessions(raw, snapshot=snapshot)
                 return False
         sessions.append(
             {
@@ -793,9 +1026,13 @@ class ConfigStore:
                 or (self._world.default_node_id() if self._world else "bedroom"),
                 "added_at": int(time.time()),
                 "note": note,
+                "temporary": bool(temporary),
+                # 同上：空串原样留着，别再折回 session_id 自己
+                "temp_origin": (temp_origin or "") if temporary else "",
+                "temp_source": temp_source if temporary else "",
             }
         )
-        self.save_sessions(raw)
+        self.save_sessions(raw, snapshot=snapshot)
         return True
 
     def remove_session(self, session_id: str) -> bool:
@@ -835,6 +1072,23 @@ class ConfigStore:
         for item in raw.get("sessions", []):
             if item.get("session_id") == session_id:
                 item["enabled"] = bool(enabled)
+                self.save_sessions(raw)
+                return True
+        return False
+
+    def release_temp_session(self, session_id: str) -> bool:
+        """解除临时会话接管：关掉白名单那一行、摘掉临时标记，行本身留着。
+
+        这是 ``ended`` 黑洞的出口（审查 H2）：状态只在 DB 里改（``released``），
+        这里负责让消息回到宿主默认路由。返回"是否真的有这一行"。
+        """
+
+        raw = self.raw_sessions()
+        for item in raw.get("sessions", []):
+            if item.get("session_id") == session_id:
+                item["enabled"] = False
+                if item.get("temporary"):
+                    item["temporary"] = False
                 self.save_sessions(raw)
                 return True
         return False

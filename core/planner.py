@@ -39,6 +39,9 @@ def create_plan(
             continue
         normalized.append(
             {
+                "generation_phase_id": str(step.get("generation_phase_id") or ""),
+                "generation_execution_id": str(step.get("generation_execution_id") or ""),
+                "session": str(step.get("session") or ""),
                 "action": action,
                 # 这一步的来路（``reply`` = 排它的时候正有人在跟她说话）：
                 # 轮到她做的时候要靠它判断"这算回话还是她主动开口"
@@ -148,7 +151,9 @@ def describe(state) -> str:
     steps = plan.get("steps") or []
     index = int(plan.get("current_step", 0))
     done = [s.get("action") for s in steps[:index]]
-    todo = [s.get("action") for s in steps[index:]]
+    todo = [f"{s.get('action')}（生成权限受阻，需重新生成或取消）"
+            if s.get('status') == 'blocked_generation_authority' else s.get('action')
+            for s in steps[index:]]
     return (
         f"来源={plan.get('source')} 原因={plan.get('reason')} "
         f"已完成={'/'.join(str(d) for d in done) or '无'} "

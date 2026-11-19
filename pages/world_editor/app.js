@@ -1,5 +1,5 @@
 /**
- * 虚拟世界编辑器前端。
+ * SOLIS世界编辑器前端。
  *
  * 设计原则：能点就不要手输、每一个输入框都有悬停说明、按动作类型显示/隐藏无关字段。
  * 运行在 AstrBot 插件 Page 的沙箱 iframe 里，只能通过 window.AstrBotPluginPage bridge
@@ -12,6 +12,8 @@ const ui = {
   status: {},
   config: { world: {}, schedules: {}, sessions: {} },
   sessions: [],
+  // 临时会话（用户 m00001）：她私聊出去的陌生人，来自 GET /temp_sessions
+  tempSessions: [],
   tools: [],
   overview: [],
   selectedNode: "",
@@ -19,9 +21,20 @@ const ui = {
   selectedZone: "",
   mapLevel: "world",
   // 全局设置：当前选中的分类标签，以及哪些标签里有未保存的改动
-  settingsTab: "basic",
+  settingsTab: "profile",
+  // 设置首页默认只显示 5 张常用卡；切到 advanced 才铺开全部分类
+  settingsMode: "common",
+  passwordRequired: false,
   dirtyTabs: new Set(),
+  // 每改一次 +1：保存只清"提交那一刻"的脏标记，保存期间的新编辑不许被 loadAll 冲掉
+  editRevision: 0,
+  // 保存正在进行（防重复提交；不是"退出编辑"的意思）
+  saving: false,
+  // 有未保存改动的**域**：world / schedules / sessions（保存只提交真正改过的）
+  dirtyDomains: new Set(),
   events: {},
+  // 素材页当前页签：谈资 / 表情包（离开再回来保持上次选择）
+  materialPane: "topics",
   // 「数值」默认只读展示（彩色条），点「编辑数值」才切成滑杆
   valuesEdit: false,
   valueDraft: {},
@@ -36,10 +49,75 @@ const ui = {
   historyHours: 24,
   historyBusy: false,
   defaults: { actions: {}, captions: {} },
+  // 内容迁移（T17）：GET /migrations 的清单 + 这一次启动里已经问过的条目指纹
+  // （保存会改 world_rev，但同一批迁移不该再问一遍，所以按条目 id 去重）
+  migrations: { items: [], skipped: [], world_rev: "" },
+  migrationPromptShown: "",
   // 通讯录：认识的人 + 当前选中的人
   contacts: [],
   contactUser: "",
   contactDetail: null,
+  // 谈资：列表、翻页游标、功能开关，以及当前选中的那一条（详情 + 曝光记录）
+  topics: {
+    session: "",
+    status: "",
+    source: "",
+    items: [],
+    total: 0,
+    nextCursor: "",
+    enabled: null,
+    selected: "",
+    detail: null,
+    shares: [],
+    loading: false,
+    // 「最近召回」：只读的观测面板，跟会话走（records 就是后端存的那几条轨迹）
+    recall: { session: "", records: [], note: "", loading: false },
+  },
+  // 表情包：收藏列表、筛选条件、当前选中的那一条（详情在右边）
+  meme: {
+    scope: "",
+    state: "",
+    search: "",
+    items: [],
+    selected: "",
+    detail: null,
+    loading: false,
+    summary: null,
+    previews: {},
+    missing: {},
+    enabled: null,
+    reason: "",
+    // 用户 m14731：多选（删除 / 导出都认这份集合，换筛选条件不清空）
+    checked: new Set(),
+    // 批量补描述的后台任务（页面只轮询；见 memeDescribeMissing）
+    describeJob: null,
+    describeTimer: 0,
+    // 「从文件夹导入」的后台任务（用户 m18755：要进度条）
+    importJob: null,
+    importTimer: 0,
+    // 列表现在铺了多少张（用户 m18846：先 30 张，点「加载更多」再往上加）
+    shown: 30,
+    // 排序（用户 m21273）：collected=收藏时间 / used=使用次数；desc=true 为倒序
+    order: "collected",
+    desc: true,
+    // 后端一共多少条、还能不能翻（用户 m18961：后端也分页）
+    total: 0,
+    hasMore: false,
+  },
+  // Agent 页的工具调用记录：她调用过哪些工具（倒序分页，游标按事件 id）
+  agent: {
+    items: [],
+    cursor: 0,
+    hasMore: false,
+    onlyFailed: false,
+    note: "",
+    loading: false,
+    // 分页（用户 m45903）：cursors[i] 是第 i+1 页的 before 游标，第 1 页是 0
+    page: 1,
+    cursors: [0],
+    // 当前停在哪一页签：work / learning / drafts / runs
+    pane: "work",
+  },
 };
 
 /* ================================================================== */
@@ -49,7 +127,7 @@ const ui = {
 const ATTRS = [
   { key: "energy", label: "精力", hint: "越低越想睡觉，睡觉会恢复" },
   { key: "loneliness", label: "孤独感", hint: "越高越想找人说话" },
-  { key: "curiosity", label: "好奇心", hint: "越高越想去书房上网查东西" },
+  { key: "curiosity", label: "好奇心", hint: "越高越想掏手机查点什么；门槛会随无聊/精力浮动" },
   {
     key: "affect",
     label: "心潮",
@@ -165,7 +243,7 @@ const ECHO_TYPE_CHOICES = [
     key: "memory",
     icon: "📝",
     label: "写了一条记忆",
-    hint: "一段对话被总结成记忆时发出来，方便对着看记得准不准。",
+    hint: "一段对话被总结成记忆时会发出来，便于核对是否准确。",
     group: "mind",
   },
   {
@@ -391,6 +469,13 @@ const ECHO_TYPE_CHOICES = [
     hint: "线索挂起 / 过期 / 收尾：这件事暂时告一段落。",
     group: "event",
   },
+  {
+    key: "timeline",
+    icon: "⏱️",
+    label: "消息时间线",
+    hint: "从收到到发完各段用了多久——排查「@ 了她很久才回」用。",
+    group: "core",
+  },
 ];
 
 /** 调试输出的分组：类型多了以后按用途分块，找起来快。 */
@@ -417,11 +502,18 @@ const LOG_TYPES = {
   move: { icon: "🚶", label: "移动" },
   schedule: { icon: "⏰", label: "日程到点" },
   skip: { icon: "⏭️", label: "被跳过" },
+  image_reaction: { icon: "🖼️", label: "看图接话（说了）" },
+  image_reaction_skip: { icon: "🤐", label: "看图接话（没插话）" },
   nickname: { icon: "🪪", label: "群名片" },
   engagement: { icon: "🔇", label: "进入安静期" },
   extreme: { icon: "⚠️", label: "极端保护" },
   wake_up: { icon: "👋", label: "被叫醒" },
   interrupt: { icon: "✋", label: "打断" },
+  pause: { icon: "⏸️", label: "先暂停" },
+  resume: { icon: "▶️", label: "接着做" },
+  trouble: { icon: "⚠️", label: "出错了" },
+  dm_send: { icon: "📨", label: "主动私聊" },
+  delivery_skip: { icon: "🚫", label: "没发出去" },
   cancel: { icon: "🛑", label: "按你说的停下" },
   vision: { icon: "🖼️", label: "图片内容" },
   recall_start: { icon: "💭", label: "回想开始" },
@@ -454,7 +546,28 @@ const LOG_TYPES = {
   chain: { icon: "🔗", label: "动作链" },
   cold_start: { icon: "🌅", label: "冷启动" },
   bot_spoke: { icon: "🗣️", label: "发言等待回应" },
+  timeline: { icon: "⏱️", label: "消息时间线" },
+  follow_up: { icon: "⏳", label: "追问（等回话）" },
 };
+
+/**
+ * 一条事件在日志页里显示成什么。
+ *
+ * `follow_up` 不能一律叫「追问（等回话）」：老版本把她每说一句都记一条，
+ * 没起算的也记（`detail.armed === false`），时间线上就成了"她每句都在追人"。
+ * 现在只记真起算的，盘上的老记录按 `armed` 分开显示。
+ */
+function eventMeta(event) {
+  const type = String((event && event.event_type) || "");
+  const meta = LOG_TYPES[type] || { icon: "•", label: type };
+  const detail = event && event.detail && typeof event.detail === "object" ? event.detail : {};
+  if (type === "follow_up" && detail.armed === false) {
+    // 到点该追、模型却说不用等了：那是"没追"，不是"她还在等人接话"
+    if (detail.closed) return { icon: "💤", label: "到点没追（不用等了）" };
+    return { icon: "💤", label: "不追问（这句不用等）" };
+  }
+  return meta;
+}
 
 /** 扩展注册的事件类型（`/config` 里的 `debug_events`）：并进上面那张表。 */
 let EXT_DEBUG_TYPES = [];
@@ -522,7 +635,7 @@ const REASONING_LABELS = [
   ["mood", "心情"],
   ["who", "在和谁说话"],
   ["inner", "心里想的"],
-  ["intent", "打算怎么办"],
+  ["intent", "下一步计划"],
 ];
 
 const STATES = [
@@ -603,16 +716,6 @@ const TRIGGERS = [
     hint: "动作完成后立刻执行指定日程里的动作链",
   },
 ];
-
-/** 图片转述提示词的占位文字：真正的默认值从后端 `/defaults` 取（core/defaults.py 一份）。 */
-const DEFAULT_CAPTION_PROMPT =
-  "你是群聊图片转述器……（留空即用内置默认，点标题右侧的 ↺ 可以看默认内容）";
-
-const DEFAULT_CAPTION_RELATION_PROMPT =
-  "你会拿到图片的文字转述和当前对话……（留空即用内置默认）";
-
-const DEFAULT_FORWARD_PROMPT =
-  "你在读一段被转发的聊天记录……（留空即用内置默认，点标题右侧的 ↺ 可以看默认内容）";
 
 const TARGET_TYPES = [
   { key: "none", label: "自己 / 空间", hint: "动作只作用于她自己或环境，默认不发到群里" },
@@ -704,12 +807,33 @@ function num(value, fallback = 0) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+/**
+ * 读一个「必须为正」的配置数字：留空 / 0 / 认不出的值一律退回默认值。
+ *
+ * 记忆那几项（上限、保护期、衰减）在后端就是 ``or 默认值`` 的写法——0 不是什么
+ * 「关掉」，而是「没填」。设置页必须按同一套口径显示，否则用户看到 0 会以为
+ * 容量闸/衰减被关掉了（记忆上限填 0 还可能让人以为一条都不留）。
+ */
+function positiveNum(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/** 字节数给人看（图片资产库的占用）。 */
+function formatBytes(value) {
+  const size = num(value, 0);
+  if (size < 1024) return `${Math.round(size)} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
 function toast(message) {
   const node = $("toast");
   node.textContent = message;
   node.classList.remove("hidden");
   window.clearTimeout(toast._timer);
-  toast._timer = window.setTimeout(() => node.classList.add("hidden"), 2600);
+  // 4 秒：多行提示（配置提醒、保存失败的几行摘要）按 2.6 秒根本读不完
+  toast._timer = window.setTimeout(() => node.classList.add("hidden"), 4000);
 }
 
 /**
@@ -764,13 +888,66 @@ function setSaveState(text) {
 }
 
 /** 标记"有未保存的改动"（保存成功后会自动热加载）。 */
-function markDirty() {
+/**
+ * 这个改动落在哪个域：`world`（世界配置）/ `schedules`（日程）/ `sessions`（会话）。
+ *
+ * 以前这里一律当成"当前设置标签"，于是改日程也会在「全局设置」的某个标签上点圆点、
+ * 保存时还把世界配置一起提交（复核报告 P1-2 后半 + 脏点问题）。
+ * 现在按**改动发生在哪一页**判断：用户正在操作的控件所在的 section 就是答案。
+ */
+function dirtyDomainNow() {
+  const active = typeof document !== "undefined" ? document.activeElement : null;
+  const host = active && active.closest ? active.closest("section.tab") : null;
+  const tab = host ? String(host.id || "").replace(/^tab-/, "") : "";
+  if (tab === "schedules") return "schedules";
+  if (tab === "sessions") return "sessions";
+  return "world";
+}
+
+const DIRTY_DOMAIN_LABELS = { world: "世界配置", schedules: "日程", sessions: "会话" };
+
+/** 未保存改动的域（给状态行用的小结）。 */
+function dirtyDomainText() {
+  const names = Array.from(ui.dirtyDomains || [])
+    .filter((key) => DIRTY_DOMAIN_LABELS[key])
+    .map((key) => DIRTY_DOMAIN_LABELS[key]);
+  return names.join("、");
+}
+
+function markDirty(domain = "") {
   ui.dirty = true;
-  setSaveState("有未保存的改动");
-  // 哪个标签页里改的，就在那个标签上点一个小圆点：
-  // 分类以后最容易出的疏漏就是"在别的页改完，忘了保存"
-  if (ui.settingsTab) ui.dirtyTabs.add(ui.settingsTab);
-  renderSettingsTabs();
+  // 版本号只增不减：保存成功时用它判断"这次提交之后有没有人又改过"
+  ui.editRevision = (ui.editRevision || 0) + 1;
+  const key = String(domain || dirtyDomainNow() || "world");
+  if (ui.dirtyDomains) ui.dirtyDomains.add(key);
+  setSaveState(`有未保存的改动（${dirtyDomainText() || DIRTY_DOMAIN_LABELS[key] || "世界配置"}）`);
+  // 只有**世界配置**的改动才在设置标签上点圆点（日程 / 会话不在设置里，点了反而误导）；
+  // 而且点的是"改动发生的那一档"，不是"当前焦点停在哪一档"。
+  if (key === "world" && ui.settingsTab) {
+    ui.dirtyTabs.add(ui.settingsTab);
+    renderSettingsTabs();
+  }
+}
+
+/**
+ * 给一个表单容器挂一次「change 委托」：里面任何控件改过就算这个域有改动。
+ *
+ * 为什么要这么兜一层（用户 m29086 的日程描述改了存不下来）：`inputField` /
+ * `checkboxField` 这些通用控件**本身不调 markDirty**——只有少数专用控件会在自己的
+ * change 里调。于是像「日程描述」这种直接复用通用控件的字段，改完编辑器不认，
+ * 保存按钮说「没有要保存的改动」，刷新就丢了。与其逐个控件打补丁（漏一个就再犯一次），
+ * 不如在**容器**上统一听 change。`[data-no-dirty]` 是给纯展示的小开关留的口子。
+ */
+function bindDirtyChange(container, domain) {
+  if (!container) return container;
+  if (container.dataset && container.dataset.dirtyBound === "1") return container;
+  if (container.dataset) container.dataset.dirtyBound = "1";
+  container.addEventListener("change", (event) => {
+    const target = event.target;
+    if (!target || (target.closest && target.closest("[data-no-dirty]"))) return;
+    markDirty(domain || "");
+  });
+  return container;
 }
 
 /** 当前性别对应的称呼：她 / 他 / ta。 */
@@ -1106,7 +1283,7 @@ const KNOBS = [
   {
     id: "chat_freq",
     label: "主动说话频率",
-    hint: "她多久主动冒一次头（被叫到时的回话不算）。这是上限与倾向：具体说多少还看她心情和孤独感。",
+    hint: "她主动找你的频率；被叫到时回话不算。",
     levels: [
       { "limits.max_autonomous_per_hour": 2, "limits.max_llm_text_per_hour": 8,
         "limits.max_llm_plan_per_hour": 4 },
@@ -1123,7 +1300,7 @@ const KNOBS = [
   {
     id: "group_lively",
     label: "群聊活跃度",
-    hint: "群里在聊的时候她插话的意愿。调高会更爱接话，也更容易被热闹带动。",
+    hint: "群里热闹时，她插话的意愿。",
     levels: [
       { "decider.interject_threshold": 0.75, "decider.interject_cooldown_minutes": 40,
         "decider.min_messages_to_interject": 4, "limits.max_share_per_hour": 1 },
@@ -1140,7 +1317,7 @@ const KNOBS = [
   {
     id: "clingy",
     label: "私聊粘人程度",
-    hint: "她想你的速度、主动来找你的次数，以及她多想要人陪着贴着。",
+    hint: "她多久会想你、主动来找你。",
     levels: [
       { "profile.miss_growth_per_min": 0.0005, "profile.miss_threshold": 0.8,
         "profile.miss_push_daily_max": 1, "profile.miss_cooldown_min_minutes": 40,
@@ -1177,7 +1354,7 @@ const KNOBS = [
   {
     id: "verbosity",
     label: "一次说几句",
-    hint: "单次回复的长度上限，以及说话太密的判定。调低她会更像群里随手打两行。",
+    hint: "一条回复最多拆成几句。",
     levels: [
       { "limits.max_messages_per_say": 1, "reply_style.dense_max_lines": 2,
         "reply_style.dense_window_minutes": 15 },
@@ -1194,7 +1371,7 @@ const KNOBS = [
   {
     id: "mood_swing",
     label: "情绪起伏",
-    hint: "她多容易被逗乐、多容易被惹到，以及情绪回得多快。调高会更容易兴奋起来。",
+    hint: "被逗乐或被惹到的难易，以及情绪回得快不快。",
     levels: [
       { "state_dynamics.chat_valence_cap": 0.02, "state_dynamics.chat_valence_daily_cap": 0.06,
         "state_dynamics.valence_decay_per_min": 0.022 },
@@ -1211,14 +1388,14 @@ const KNOBS = [
   {
     id: "life_rich",
     label: "生活丰富度",
-    hint: "她一个人待着时遇上事的多少。调高更热闹（也更费模型），调低更像安静过日子。",
+    hint: "她独处时身边发生小事的频率；越高越热闹，也越费模型。",
     levels: [
       { "events.micro_per_hour": 0.3, "events.small_per_hour": 0.1,
         "events.big_per_hour": 0.01, "events.min_gap_minutes": 120 },
       { "events.micro_per_hour": 0.6, "events.small_per_hour": 0.2,
         "events.big_per_hour": 0.015, "events.min_gap_minutes": 60 },
       { "events.micro_per_hour": 1, "events.small_per_hour": 0.3,
-        "events.big_per_hour": 0.02, "events.min_gap_minutes": 30 },
+        "events.big_per_hour": 0.028, "events.min_gap_minutes": 30 },
       { "events.micro_per_hour": 2, "events.small_per_hour": 0.6,
         "events.big_per_hour": 0.04, "events.min_gap_minutes": 15 },
       { "events.micro_per_hour": 4, "events.small_per_hour": 1.2,
@@ -1228,29 +1405,29 @@ const KNOBS = [
   {
     id: "whimsy",
     label: "任性度",
-    hint: "她有多凭性子来：调高会让这一轮更多交给大模型自由发挥，情绪上头更久，也爱随手拍张照。",
+    hint: "行为交给模型自由发挥的比例；越高越常临时起意。",
     levels: [
       { "decider.llm_rate_min": 0.01, "decider.llm_rate_max": 0.15,
-        "state_dynamics.mood_override_duration": 180, "events.photo_chance": 0.1,
+        "state_dynamics.mood_override_duration": 180, "events.photo_tendency": 0.1,
         "events.genre_cooldown_minutes": 480 },
       { "decider.llm_rate_min": 0.03, "decider.llm_rate_max": 0.28,
-        "state_dynamics.mood_override_duration": 360, "events.photo_chance": 0.2,
+        "state_dynamics.mood_override_duration": 360, "events.photo_tendency": 0.2,
         "events.genre_cooldown_minutes": 300 },
       { "decider.llm_rate_min": 0.05, "decider.llm_rate_max": 0.4,
-        "state_dynamics.mood_override_duration": 600, "events.photo_chance": 0.3,
+        "state_dynamics.mood_override_duration": 600, "events.photo_tendency": 0.3,
         "events.genre_cooldown_minutes": 180 },
       { "decider.llm_rate_min": 0.09, "decider.llm_rate_max": 0.55,
-        "state_dynamics.mood_override_duration": 900, "events.photo_chance": 0.45,
+        "state_dynamics.mood_override_duration": 900, "events.photo_tendency": 0.45,
         "events.genre_cooldown_minutes": 90 },
       { "decider.llm_rate_min": 0.15, "decider.llm_rate_max": 0.75,
-        "state_dynamics.mood_override_duration": 1500, "events.photo_chance": 0.6,
+        "state_dynamics.mood_override_duration": 1500, "events.photo_tendency": 0.6,
         "events.genre_cooldown_minutes": 30 },
     ],
   },
   {
     id: "memory_diligence",
     label: "记忆勤奋度",
-    hint: "她记你记得多细、整理得多勤。调高留下的画像与记忆更完整（也更容易花 token）。",
+    hint: "记忆和画像记多细；越高越完整，也越费模型。",
     levels: [
       { "profile.digest_chars": 40, "profile.digest_limit": 3,
         "context.chat_compress_threshold": 400, "context.summary_refresh_minutes": 30,
@@ -1269,7 +1446,106 @@ const KNOBS = [
         "context.chat_answered_lines": 60 },
     ],
   },
+  {
+    id: "self_disclosure",
+    label: "分享自己的事",
+    hint: "谈资开着时，她多愿意讲自己的经历。",
+    levels: [
+      { "topics.recall_limit": 0, "topics.proactive_limit": 0,
+        "topics.proactive_min_importance": 0.8 },
+      { "topics.recall_limit": 1, "topics.proactive_limit": 1,
+        "topics.proactive_min_importance": 0.65 },
+      { "topics.recall_limit": 3, "topics.proactive_limit": 1,
+        "topics.proactive_min_importance": 0.5 },
+      { "topics.recall_limit": 5, "topics.proactive_limit": 2,
+        "topics.proactive_min_importance": 0.35 },
+      { "topics.recall_limit": 8, "topics.proactive_limit": 3,
+        "topics.proactive_min_importance": 0.2 },
+    ],
+  },
 ];
+
+/** 每个滑块 5 档的人话名字：滑块上只显示这个，不再显示“标准（3/5）”。 */
+const KNOB_LEVEL_LABELS = {
+  chat_freq: ["很少", "偶尔", "正常", "常主动", "很主动"],
+  group_lively: ["安静", "少插话", "正常", "爱接话", "很活跃"],
+  clingy: ["独立", "偶尔想", "正常", "黏人", "很黏"],
+  verbosity: ["一句", "两句", "三句", "一小段", "长一点"],
+  mood_swing: ["平稳", "稳", "正常", "敏感", "起伏大"],
+  life_rich: ["安静", "偶尔", "正常", "热闹", "很热闹"],
+  whimsy: ["规律", "偶尔", "正常", "随性", "很任性"],
+  memory_diligence: ["少记", "简单", "正常", "细致", "很细"],
+  self_disclosure: ["不说", "偶尔", "正常", "常分享", "很爱讲"],
+};
+
+/** 第一屏只放这 4 个；其余收进“更多”。 */
+const KNOB_CORE_IDS = ["chat_freq", "group_lively", "clingy", "verbosity"];
+
+/** 一键预设只改核心滑块，不碰任何功能开关。 */
+const KNOB_PRESETS = [
+  {
+    id: "quiet",
+    label: "安静",
+    desc: "少主动、少插话、短句",
+    levels: { chat_freq: 2, group_lively: 2, verbosity: 2, clingy: 2 },
+  },
+  {
+    id: "standard",
+    label: "标准",
+    desc: "默认节奏",
+    levels: { chat_freq: 3, group_lively: 3, verbosity: 3, clingy: 3 },
+  },
+  {
+    id: "lively",
+    label: "热闹",
+    desc: "常开口、爱接话、长一点",
+    levels: { chat_freq: 4, group_lively: 4, verbosity: 4, clingy: 3 },
+  },
+  {
+    id: "clingy",
+    label: "黏人",
+    desc: "更常想你、更常找你",
+    levels: { chat_freq: 4, group_lively: 3, verbosity: 3, clingy: 5 },
+  },
+];
+
+/** 一个滑块当前档位的人话名字。 */
+function knobLevelName(knob, level) {
+  const labels = KNOB_LEVEL_LABELS[knob.id];
+  const safe = Math.min(5, Math.max(1, Number(level) || 3));
+  return labels ? labels[safe - 1] : KNOB_LEVEL_NAMES[safe - 1];
+}
+
+/** 这个预设是否正好等于当前核心档位。 */
+function knobPresetMatches(world, preset) {
+  return Object.keys(preset.levels).every((id) => {
+    const knob = KNOBS.find((item) => item.id === id);
+    return knob && knobLevel(world, knob) === preset.levels[id];
+  });
+}
+
+/** 应用预设：只写它管的滑块，不改任何功能开关。 */
+function applyKnobPreset(world, preset) {
+  Object.keys(preset.levels).forEach((id) => {
+    const knob = KNOBS.find((item) => item.id === id);
+    if (!knob) return;
+    world.ui_knobs = world.ui_knobs || {};
+    world.ui_knobs[id] = preset.levels[id];
+    applyKnobLevel(world, knob, preset.levels[id]);
+  });
+  markDirty();
+}
+
+/** 设置页摘要卡用的一句话。 */
+function handfeelSummary(world) {
+  const core = KNOB_CORE_IDS.map((id) => KNOBS.find((knob) => knob.id === id)).filter(Boolean);
+  const standard = core.every((knob) => knobLevel(world, knob) === 3 && !knobTouched(world, knob));
+  if (standard) return "当前：标准（推荐）";
+  const short = { chat_freq: "主动", group_lively: "群聊", clingy: "粘人", verbosity: "句数" };
+  return `当前：${core
+    .map((knob) => `${short[knob.id] || knob.label} ${knobLevelName(knob, knobLevel(world, knob))}`)
+    .join(" · ")}`;
+}
 
 function getPath(obj, path) {
   return String(path)
@@ -1294,12 +1570,86 @@ function knobLevel(world, knob) {
 }
 
 /** 用户是不是在这一档上手动改过字段（改过就把滑块旁标一句，别让人以为是滑块没生效）。 */
+function topicSettings(world) {
+  const topics = world.topics || {};
+  const defaults = { recall_limit: 3, proactive_limit: 1, proactive_min_importance: 0.5, share_purpose_weight: 1, experience_willingness: 0.5, expression_length: 120 };
+  const soft = {share_purpose_weight: ["chat_freq", [0.25,0.6,1,1.4,1.8]], experience_willingness: ["self_disclosure", [0,0.25,0.5,0.75,1]], expression_length: ["verbosity", [40,80,120,180,240]]};
+  const overrides = topics.overrides || {};
+  const knob = KNOBS.find((item) => item.id === "self_disclosure");
+  const hasLevel = Number.isInteger((world.ui_knobs || {}).self_disclosure);
+  const mapped = knob.levels[knobLevel(world, knob) - 1];
+  const values = {}, sources = {};
+  Object.keys(defaults).forEach((name) => {
+    const item = overrides[name] || (topics.settings_version !== 1 && name in topics
+      ? { mode: "custom", value: topics[name] } : { mode: "auto" });
+    let value = num(topics[name], defaults[name]);
+    let source = "base";
+    if (soft[name]) {
+      const [id, levels] = soft[name];
+      const level = (world.ui_knobs || {})[id];
+      if (Number.isInteger(level) && level >= 1 && level <= 5) { value = levels[level - 1]; source = "handfeel"; }
+    } else if (hasLevel) { value = mapped[`topics.${name}`]; source = "handfeel"; }
+    if (item.mode === "custom") { value = num(item.value, defaults[name]); source = "custom"; }
+    value = ["proactive_min_importance", "experience_willingness"].includes(name) ? Math.min(1, Math.max(0, value)) : name === "share_purpose_weight" ? Math.max(0, value) : Math.max(0, Math.trunc(value));
+    if (topics.enabled === false && name !== "proactive_min_importance") { value = 0; source = "hard_gate"; }
+    values[name] = value; sources[name] = source;
+  });
+  return { values, sources };
+}
+
+function topicOverride(world, name, mode, value) {
+  world.topics = world.topics || {};
+  const topics = world.topics;
+  // Preserve every legacy explicit field before marking the configuration migrated.
+  topics.overrides = topics.overrides || {};
+  ["recall_limit", "proactive_limit", "proactive_min_importance", "share_purpose_weight", "experience_willingness", "expression_length"].forEach((key) => {
+    if (!topics.overrides[key]) topics.overrides[key] = topics.settings_version !== 1 && key in topics
+      ? { mode: "custom", value: topics[key] } : { mode: "auto" };
+  });
+  // 新格式的版本号是 2（老格式才是 1）：1 表示字段是裸值、没有 overrides；
+  // 写 2 之后后端与前端都按 overrides 说话，裸字段只剩"迁移前先保住"的作用。
+  topics.settings_version = 2;
+  topics.overrides[name] = mode === "custom" ? { mode, value: Number(value) } : { mode: "auto" };
+}
+
+function topicSettingControl(world, name, label) {
+  const box = el("div", "field");
+  const effective = topicSettings(world);
+  const item = (world.topics.overrides || {})[name] || { mode: "auto" };
+  const sourceText = { base: "基础配置", handfeel: "预设自动", custom: "高级自定义", hard_gate: "功能关闭硬限制" };
+  const note = el("p", "muted", "");
+  function draw() {
+    const current = topicSettings(world);
+    note.textContent = `实际有效：${current.values[name]} · 来源：${sourceText[current.sources[name]] || current.sources[name]}`;
+  }
+  box.appendChild(inputField(label, item.mode === "custom" ? item.value : effective.values[name], (value) => {
+    topicOverride(world, name, "custom", value); markDirty(); draw();
+  }, { type: "number", min: 0, max: ["proactive_min_importance", "experience_willingness"].includes(name) ? 1 : undefined,
+       step: ["proactive_min_importance", "experience_willingness", "share_purpose_weight"].includes(name) ? "0.05" : "1", hint: "手动输入即保存为 custom，即使数值与默认相同也保留来源。" }));
+  const reset = el("button", "ghost small", "恢复自动");
+  reset.type = "button";
+  reset.addEventListener("click", () => {
+    topicOverride(world, name, "auto"); markDirty();
+    const input = box.querySelector("input");
+    if (input) input.value = String(topicSettings(world).values[name]);
+    draw();
+  });
+  box.appendChild(reset); box.appendChild(note); draw();
+  return box;
+}
+
 function knobTouched(world, knob) {
+  if (knob.id === "self_disclosure") return Object.values(topicSettings(world).sources).includes("custom");
   const values = knob.levels[knobLevel(world, knob) - 1];
   return Object.keys(values).some((path) => Number(getPath(world, path)) !== Number(values[path]));
 }
 
 function applyKnobLevel(world, knob, level) {
+  if (knob.id === "self_disclosure") {
+    world.ui_knobs = world.ui_knobs || {};
+    world.ui_knobs.self_disclosure = Math.min(5, Math.max(1, level));
+    return;
+  }
   const values = knob.levels[Math.min(5, Math.max(1, level)) - 1];
   Object.keys(values).forEach((path) => setPath(world, path, values[path]));
 }
@@ -1315,17 +1665,19 @@ function fieldLabel(path) {
   return map[path] || path;
 }
 
-/** 「手感」滑块：向导和全局设置共用同一块。 */
-function knobEditor(world, onChange) {
+/** 「性格与习惯」滑块。向导的「她的性格」那一步也直接嵌这个（compact 模式）。 */
+function knobEditor(world, onChange, options = {}) {
   world.ui_knobs = world.ui_knobs || {};
+  const compact = options.compact === true;
+  const showDetails = options.showDetails !== false;
+  const showTouched = options.showTouched !== false;
   const box = el("div", "full knob-box");
-  KNOBS.forEach((knob) => {
+
+  function renderRow(knob) {
     const row = el("div", "knob-row");
     const head = el("div", "knob-head");
     head.appendChild(el("span", "knob-label", knob.label));
     const levelText = el("span", "knob-level", "");
-    const touched = el("span", "knob-touched", "");
-    head.appendChild(touched);
     head.appendChild(levelText);
     row.appendChild(head);
 
@@ -1338,38 +1690,67 @@ function knobEditor(world, onChange) {
     slider.className = "knob-slider";
     row.appendChild(slider);
 
-    const detail = document.createElement("details");
-    detail.className = "knob-detail";
-    const summary = document.createElement("summary");
-    summary.appendChild(el("span", "", "会改哪些参数"));
-    detail.appendChild(summary);
-    const body = el("div", "knob-detail-body");
-    detail.appendChild(body);
-    row.appendChild(detail);
+    const scale = el("div", "knob-scale");
+    scale.appendChild(el("span", "", knobLevelName(knob, 1)));
+    scale.appendChild(el("span", "", knobLevelName(knob, 3)));
+    scale.appendChild(el("span", "", knobLevelName(knob, 5)));
+    row.appendChild(scale);
+
     if (knob.hint) row.appendChild(el("p", "muted knob-hint", knob.hint));
+
+    let body = null;
+    let custom = null;
+    let reset = null;
+    if (showDetails) {
+      const detail = document.createElement("details");
+      detail.className = "knob-detail";
+      const summary = document.createElement("summary");
+      summary.appendChild(el("span", "", "高级：影响哪些设置"));
+      detail.appendChild(summary);
+      custom = el("div", "knob-custom");
+      custom.appendChild(el("span", "muted", "这项有几个参数被单独改过。"));
+      reset = el("button", "knob-reset", "恢复标准");
+      reset.type = "button";
+      reset.title = "把这一项恢复成标准档";
+      reset.addEventListener("click", () => {
+        world.ui_knobs[knob.id] = 3;
+        applyKnobLevel(world, knob, 3);
+        markDirty();
+        draw();
+        if (typeof onChange === "function") onChange();
+      });
+      custom.appendChild(reset);
+      detail.appendChild(custom);
+      body = el("div", "knob-detail-body");
+      detail.appendChild(body);
+      row.appendChild(detail);
+    }
 
     function draw() {
       const level = knobLevel(world, knob);
+      const touchedNow = knobTouched(world, knob);
       slider.value = String(level);
-      levelText.textContent = `${KNOB_LEVEL_NAMES[level - 1]}（${level}/5）`;
+      levelText.textContent = knobLevelName(knob, level);
+      if (custom) custom.style.display = showTouched && touchedNow ? "" : "none";
+      if (!body) return;
       const values = knob.levels[level - 1];
       body.innerHTML = "";
       Object.keys(values).forEach((path) => {
-        const now = Number(getPath(world, path));
+        const now = Number(
+          knob.id === "self_disclosure"
+            ? topicSettings(world).values[path.split(".")[1]]
+            : getPath(world, path),
+        );
         const want = Number(values[path]);
         const changed = now !== want;
         const item = el("div", "knob-detail-row");
         const nameCell = el("div", "knob-detail-name");
         nameCell.appendChild(el("span", "", fieldLabel(path)));
-        nameCell.appendChild(el("code", "knob-detail-path", path));
         item.appendChild(nameCell);
         item.appendChild(el("span", "", `${want}`));
-        if (changed) {
-          item.appendChild(el("span", "muted", `（现在是 ${now}）`));
-        }
+        if (changed) item.appendChild(el("span", "muted", `现在是 ${now}`));
         body.appendChild(item);
       });
-      touched.textContent = knobTouched(world, knob) ? "已手动调整" : "";
     }
 
     slider.addEventListener("input", () => {
@@ -1380,8 +1761,265 @@ function knobEditor(world, onChange) {
       if (typeof onChange === "function") onChange();
     });
     draw();
-    box.appendChild(row);
+    return row;
+  }
+
+  KNOBS.filter((knob) => !compact || KNOB_CORE_IDS.includes(knob.id)).forEach((knob) => {
+    box.appendChild(renderRow(knob));
   });
+
+  if (compact) {
+    const rest = KNOBS.filter((knob) => !KNOB_CORE_IDS.includes(knob.id));
+    if (rest.length) {
+      const more = document.createElement("details");
+      more.className = "knob-more";
+      const summary = document.createElement("summary");
+      summary.appendChild(el("span", "", `更多（${rest.length} 项）`));
+      more.appendChild(summary);
+      const body = el("div", "knob-more-body");
+      rest.forEach((knob) => body.appendChild(renderRow(knob)));
+      more.appendChild(body);
+      box.appendChild(more);
+    }
+  }
+  return box;
+}
+
+/** 设置页里的摘要文字：面板里调完立刻能看见。 */
+function updateHandfeelSummary() {
+  const node = ui.handfeelSummaryNode;
+  if (node && node.isConnected) node.textContent = handfeelSummary(ui.config.world);
+}
+
+/** 「性格与习惯」面板：预设 + 4 个核心滑块 + 更多 5 项。 */
+//: 「恢复默认」能勾的那几块（用户 m08826）：只重置勾中的，人设/记忆/谈资默认不勾。
+const RESET_SECTIONS = [
+  {
+    key: "basic",
+    label: "全局基础值",
+    desc: "名额、上下文、媒体这些数字（跟这一版的默认值走）",
+    on: true,
+  },
+  {
+    key: "actions",
+    label: "动作库",
+    desc: "动作的说明与参数回到内置版本（她自己整理过的会被覆盖）",
+    on: true,
+  },
+  {
+    key: "agent",
+    label: "Agent 预算",
+    desc: "步数、超时、审批档位、模型槽位",
+    on: true,
+  },
+  { key: "topics", label: "谈资设置", desc: "谈资系统的开关与名额（素材不删）", on: false },
+  { key: "meme", label: "表情包设置", desc: "额度与判定（收藏的图不删）", on: false },
+  { key: "persona", label: "人设", desc: "名字、性别、角色卡", on: false },
+  {
+    key: "memory",
+    label: "记忆与关系",
+    desc: "人设记忆、人物档案、好感度（清了就找不回来）",
+    on: false,
+  },
+];
+
+async function openManualEditor() {
+  let text = "";
+  try {
+    const out = await apiGet("manual");
+    text = String((out && out.text) || "");
+  } catch (error) {
+    toast(`读不出说明书：${error && error.message ? error.message : error}`);
+    return;
+  }
+  openFormDialog({
+    title: "插件说明书（给她看的）",
+    hint: "介绍这个插件：她跑在什么里、有哪些动作和本事、边界在哪。原样进提示词，保存后下一轮生效。",
+    wide: true,
+    fields: [{ key: "text", label: "说明书（Markdown）", type: "textarea", rows: 20 }],
+    values: { text },
+    confirmText: "保存",
+    onSubmit: async (values) => {
+      const result = await apiPost("manual/save", { text: String(values.text || "") });
+      if (result && result.ok) {
+        toast(`保存了（${result.chars || 0} 字）`);
+        return true;
+      }
+      toast(`没保存：${(result && result.reason) || "不知道原因"}`);
+      return false;
+    },
+  });
+}
+
+function openResetDefaults() {
+  const backdrop = el("div", "wizard-backdrop handfeel-backdrop");
+  const card = el("div", "wizard-card handfeel-card");
+  const head = el("div", "wizard-head");
+  head.appendChild(el("div", "wizard-title", "恢复默认"));
+  const close = el("button", "icon-btn", "✕");
+  close.type = "button";
+  close.title = "关闭";
+  close.addEventListener("click", () => backdrop.remove());
+  head.appendChild(close);
+  card.appendChild(head);
+  card.appendChild(
+    el(
+      "p",
+      "muted wizard-hint",
+      "只把勾中的那几块变回这一版的默认值，没勾的一律不动。新版改过的动作说明、基础值也在里面——老配置享受不到的，在这里补回来。",
+    ),
+  );
+  const body = el("div", "wizard-body");
+  const picked = new Set();
+  RESET_SECTIONS.forEach((item) => {
+    const row = el("label", "reset-row");
+    const box = el("input");
+    box.type = "checkbox";
+    box.checked = item.on === true;
+    if (box.checked) picked.add(item.key);
+    box.addEventListener("change", () => {
+      if (box.checked) picked.add(item.key);
+      else picked.delete(item.key);
+      refresh();
+    });
+    const text = el("span", "reset-text");
+    text.appendChild(el("strong", "", item.label));
+    text.appendChild(el("span", "muted", item.desc));
+    row.appendChild(box);
+    row.appendChild(text);
+    body.appendChild(row);
+  });
+  card.appendChild(body);
+  const footer = el("div", "wizard-foot");
+  const cancel = el("button", "ghost", "取消");
+  cancel.type = "button";
+  cancel.addEventListener("click", () => backdrop.remove());
+  const go = el("button", "primary", "恢复这几块");
+  go.type = "button";
+  function refresh() {
+    go.disabled = picked.size === 0;
+    go.textContent = picked.size ? `恢复选中的 ${picked.size} 块` : "至少勾一块";
+  }
+  go.addEventListener("click", async () => {
+    const sections = [...picked];
+    go.disabled = true;
+    go.textContent = "正在恢复…";
+    try {
+      await apiPost("config/reset", { sections });
+      toast("已经恢复；页面重新读一遍配置");
+      backdrop.remove();
+      window.location.reload();
+    } catch (err) {
+      toast(`恢复失败：${err.message || err}`);
+      refresh();
+    }
+  });
+  footer.appendChild(cancel);
+  footer.appendChild(go);
+  card.appendChild(footer);
+  refresh();
+  backdrop.appendChild(card);
+  document.body.appendChild(backdrop);
+}
+
+function openHandfeel() {
+  const world = ui.config.world;
+  const backdrop = el("div", "wizard-backdrop handfeel-backdrop");
+  const card = el("div", "wizard-card handfeel-card");
+  const head = el("div", "wizard-head");
+  head.appendChild(el("div", "wizard-title", "性格与习惯"));
+  const close = el("button", "icon-btn", "✕");
+  close.type = "button";
+  close.title = "关闭";
+  close.addEventListener("click", () => backdrop.remove());
+  head.appendChild(close);
+  card.appendChild(head);
+  card.appendChild(
+    el(
+      "p",
+      "muted wizard-hint",
+      "先选整体感觉；想细调再拖下面的滑块。改完点「完成」，再点页面右上角「保存」才会生效。",
+    ),
+  );
+
+  const presetRow = el("div", "wizard-preset-grid");
+  const body = el("div", "wizard-body handfeel-body");
+
+  function drawPresets() {
+    presetRow.innerHTML = "";
+    KNOB_PRESETS.forEach((preset) => {
+      const button = el(
+        "button",
+        `wizard-preset${knobPresetMatches(world, preset) ? " on" : ""}`,
+      );
+      button.type = "button";
+      button.appendChild(el("span", "wizard-preset-title", preset.label));
+      button.appendChild(el("span", "wizard-preset-desc", preset.desc));
+      button.addEventListener("click", () => {
+        applyKnobPreset(world, preset);
+        drawPresets();
+        drawBody();
+        updateHandfeelSummary();
+      });
+      presetRow.appendChild(button);
+    });
+  }
+
+  function drawBody() {
+    body.innerHTML = "";
+    body.appendChild(
+      knobEditor(
+        world,
+        () => {
+          drawPresets();
+          updateHandfeelSummary();
+        },
+        { compact: true, showDetails: true },
+      ),
+    );
+  }
+
+  card.appendChild(presetRow);
+  card.appendChild(body);
+
+  const foot = el("div", "wizard-foot");
+  const done = el("button", "primary", "完成");
+  done.type = "button";
+  done.addEventListener("click", () => backdrop.remove());
+  foot.appendChild(done);
+  card.appendChild(foot);
+  backdrop.appendChild(card);
+  document.body.appendChild(backdrop);
+
+  backdrop.addEventListener("click", (event) => {
+    if (event.target === backdrop) backdrop.remove();
+  });
+  const onKey = (event) => {
+    if (event.key === "Escape") {
+      backdrop.remove();
+      document.removeEventListener("keydown", onKey);
+    }
+  };
+  document.addEventListener("keydown", onKey);
+
+  drawPresets();
+  drawBody();
+  updateHandfeelSummary();
+}
+
+/** 设置页摘要卡里的当前值 + 「调整」按钮。 */
+function handfeelCard(world) {
+  const box = el("div", "full handfeel-card-summary");
+  const summary = el("p", "knob-summary", handfeelSummary(world));
+  ui.handfeelSummaryNode = summary;
+  box.appendChild(summary);
+  const row = el("div", "row");
+  const button = el("button", "ghost small", "调整…");
+  button.type = "button";
+  button.title = "打开完整面板，细调说话频率、群聊活跃度、粘人程度等";
+  button.addEventListener("click", () => openHandfeel());
+  row.appendChild(button);
+  box.appendChild(row);
   return box;
 }
 
@@ -1434,6 +2072,8 @@ function bondsEditor(world) {
   defaultSelect.title = "第一次见到一个人时先给他这条关系；只能有一条";
   defaultSelect.addEventListener("change", () => {
     world.profile.default_bond = defaultSelect.value;
+    // 亲手选过就记一笔：默认值以后升级也不再改这一项（用户 m11008）
+    world.profile.bond_chosen = true;
     markDirty();
   });
   defaultRow.appendChild(defaultSelect);
@@ -1693,7 +2333,7 @@ function levelsEditor(world) {
       "hint-line",
       "分级表字段：name / min_affinity / max_affinity（好感区间）/ address（称呼）/ " +
         "deny（这一档**还不能做**的动作 id，会写成「这一档还不能做」给她看；留空 = 不限制）/ " +
-        "proactive_per_day（每天最多主动找他几次）/ prompt（这一级写给模型的提示词文本，可随便改）。",
+        "proactive_per_day（每天最多主动找他几次）/ prompt（这一级写给模型的提示词文本，可自行修改）。",
     ),
   );
   box.appendChild(
@@ -1726,8 +2366,20 @@ function selectField(label, value, choices, onChange, opts = {}) {
   wrapper.appendChild(fieldHead(label, opts.hint));
   const node = document.createElement("select");
   choices.forEach((choice) => {
-    const [choiceValue, choiceLabel] =
-      typeof choice === "object" ? [choice.key, choice.label] : choice;
+    // 三种写法都认：字符串、[值, 文案] 数组、{ key, label } 对象。
+    // 以前只判 typeof === "object"，数组会走进对象分支取到 undefined，
+    // 结果下拉框看着是空的（「从这一档算熟人」就这么空过）。
+    let choiceValue;
+    let choiceLabel;
+    if (Array.isArray(choice)) {
+      [choiceValue, choiceLabel] = choice;
+    } else if (choice && typeof choice === "object") {
+      choiceValue = choice.key;
+      choiceLabel = choice.label;
+    } else {
+      choiceValue = choice;
+      choiceLabel = choice;
+    }
     node.appendChild(option(choiceValue, choiceLabel));
   });
   node.value = value ?? "";
@@ -1736,17 +2388,73 @@ function selectField(label, value, choices, onChange, opts = {}) {
   return wrapper;
 }
 
+/**
+ * 会真的动这台机器上文件的开关：开启前必须先看声明、再点一次确认。
+ *
+ * 依据（用户 2026-10-19）：`astrbot_file_write_tool` / `astrbot_file_edit_tool`
+ * 能写任意路径，VW 没给它们加沙箱；「执行代码」更是直接在这台机器上跑。
+ * 光在提示里写一句"有安全风险"没人当回事，所以做成**开启前的拦截**：
+ * 弹窗里说清楚"别在个人电脑或重要服务器上开"，点了才真的打开。
+ */
+const AGENT_FILE_POWER_WARNING =
+  "开启后她能真的改动这台机器上的文件（写、改、删，甚至执行代码），出的问题就直接落在你自己的东西上。" +
+  "建议只在隔离环境里用（虚拟机、容器、专用测试机）；不要在个人电脑或重要的服务器上打开。";
+
 function checkboxField(label, checked, onChange, opts = {}) {
   const wrapper = el("label", "inline");
   if (opts.adv) wrapper.dataset.adv = "1";
   const input = document.createElement("input");
   input.type = "checkbox";
   input.checked = !!checked;
-  input.addEventListener("change", () => onChange(input.checked));
+  input.addEventListener("change", async () => {
+    const next = input.checked;
+    if (next && opts.confirm) {
+      const ok = await confirmDialog({
+        title: opts.confirmTitle || `确定要开启「${label}」吗？`,
+        message: opts.confirm,
+        confirmText: "我明白风险，开启",
+        danger: true,
+      });
+      if (!ok) {
+        // 没点确认就回到关闭：不能让她莫名其妙拿到这份权限
+        input.checked = false;
+        return;
+      }
+    }
+    onChange(next);
+  });
   wrapper.appendChild(input);
   wrapper.appendChild(el("span", "", label));
   const tip = tipBox(opts.hint);
   if (tip) wrapper.appendChild(tip);
+  return wrapper;
+}
+
+/** 分钟滑块：一个数字的连续档位（比如"同一个群两次之间至少隔几分钟"）。
+ *  注意：和下面的 `sliderField`（0~1 的亲密度滑块）不是一回事，别同名。 */
+function minuteSliderField(label, value, onChange, opts = {}) {
+  const wrapper = el("div", "field");
+  if (opts.adv) wrapper.dataset.adv = "1";
+  const min = opts.min ?? 0;
+  const unit = opts.unit || "分钟";
+  const head = el("div", "knob-head");
+  head.appendChild(el("span", "knob-label", label));
+  const readout = el("span", "knob-level", `${num(value, min)} ${unit}`);
+  head.appendChild(readout);
+  wrapper.appendChild(head);
+  if (opts.hint) wrapper.appendChild(el("p", "muted knob-hint", opts.hint));
+  const slider = document.createElement("input");
+  slider.type = "range";
+  slider.className = "knob-slider";
+  slider.min = String(min);
+  slider.max = String(opts.max ?? 240);
+  slider.step = String(opts.step ?? 5);
+  slider.value = String(num(value, min));
+  slider.addEventListener("input", () => {
+    readout.textContent = `${slider.value} ${unit}`;
+  });
+  slider.addEventListener("change", () => onChange(num(slider.value, min)));
+  wrapper.appendChild(slider);
   return wrapper;
 }
 
@@ -1864,7 +2572,7 @@ function echoTypesField(world) {
     box.appendChild(el("span", "echo-icon", choice.icon));
     box.appendChild(el("span", "", choice.label));
     if (mode) box.appendChild(el("span", "echo-mode", MODE_LABELS[mode] || mode));
-    const tip = `${choice.hint || ""}\n点一下切换：关 → 完整 → 精简。`;
+    const tip = `${choice.hint || ""}\n点击切换：关 → 完整 → 精简。`;
     box.setAttribute("data-tip", tip.trim());
     box.setAttribute("title", tip.trim());
     box.addEventListener("click", () => {
@@ -2922,7 +3630,7 @@ function chainEditor(chain, onChange, opts = {}) {
         const jump = el("button", "small ghost", `↩ 先移动到${nodeLabel(need)}`);
         jump.type = "button";
         jump.title =
-          `这一步要求她在「${nodeLabel(need)}」。点一下会在它前面插入一步「移动到${nodeLabel(need)}」，` +
+          `这一步要求她在「${nodeLabel(need)}」。点击会在它前面插入一步「移动到${nodeLabel(need)}」，` +
           "否则执行到这里会因为地点不对被跳过。";
         jump.addEventListener("click", () => {
           state.splice(index, 0, { type: "walk_to", target_node: need });
@@ -3091,7 +3799,7 @@ async function boot() {
     // 直接访问页面时拿不到插件页的凭证，接口永远不会响应，这里先给个说法，别留一片空白。
     $("login").classList.remove("hidden");
     $("login-message").textContent =
-      "请在 AstrBot WebUI 的插件详情页里打开本页面（插件管理 → 虚拟世界 → 虚拟世界编辑器）。";
+      "请在 AstrBot WebUI 的插件详情页里打开本页面（插件管理 → 虚拟世界 → SOLIS世界编辑器）。";
     return;
   }
   try {
@@ -3112,9 +3820,11 @@ async function boot() {
   }
   if (!status || !status.password_required) {
     ui.token = "";
+    ui.passwordRequired = false;
     await startApp();
     return;
   }
+  ui.passwordRequired = true;
   $("login").classList.remove("hidden");
   $("login-button").addEventListener("click", doLogin);
   $("login-password").addEventListener("keydown", (event) => {
@@ -3143,8 +3853,11 @@ async function doLogin() {
 async function startApp() {
   $("app").classList.remove("hidden");
   applyTheme(currentTheme(), false);
+  ui.settingsMode = readSettingsMode();
   bindTabs();
   bindButtons();
+  bindTopics();
+  bindMemes();
   renderHistoryWindows();
   watchPronoun();
   await loadAll();
@@ -3175,8 +3888,8 @@ function applyTheme(theme, persist = true) {
     button.textContent = next === "light" ? "☀️ 浅色" : "🌙 深色";
     button.title =
       next === "light"
-        ? "现在是浅色，点一下切到深色（会记住）"
-        : "现在是深色，点一下切到浅色（会记住）";
+        ? "当前为浅色主题，点击切换到深色（会记住选择）"
+        : "当前为深色主题，点击切换到浅色（会记住选择）";
   }
   if (persist) {
     try {
@@ -3196,7 +3909,7 @@ function toggleTheme() {
   applyTheme(currentTheme() === "light" ? "dark" : "light");
 }
 
-async function loadAll() {
+async function loadAll(options = {}) {
   setSaveState("加载中…");
   try {
     const [config, tools, defaults] = await Promise.all([
@@ -3210,15 +3923,167 @@ async function loadAll() {
     // 扩展注册的调试类型跟内置默认文案一起给（同一份 /defaults 载荷）
     applyDebugEvents((ui.defaults || {}).debug_events);
     ui.sessions = (config.sessions && config.sessions.sessions) || [];
-    if (config.warnings && config.warnings.length) {
-      toast(`配置提醒：${config.warnings.join("；")}`);
-    }
+    // 配置提醒（config.warnings）不再 toast：读盘时发现的问题每次进站、每次保存都来
+    // 一遍，弹窗关不掉还挡视线。改成常驻横幅，见 renderToolWarnings。
     renderEverything();
     setSaveState("已加载");
+    await refreshMigrations({ prompt: options.promptMigrations !== false });
   } catch (error) {
     setSaveState("加载失败");
     toast(error.message || "加载配置失败");
   }
+}
+
+/** 数字/文字给人看：迁移弹窗里的「老值 → 新值」。 */
+function formatMigrationValue(value) {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "number") return String(Math.round(value * 1e6) / 1e6);
+  if (typeof value === "boolean") return value ? "开" : "关";
+  return String(value);
+}
+
+/**
+ * 拉一次待确认的内容迁移（T17），需要时开弹窗。
+ *
+ * ``prompt=false`` 时只记账不弹窗（保存后、应用后刷新用）：保存会改 ``world_rev``，
+ * 但同一批条目不该被问第二次，所以去重按条目 id 的指纹（``ui.migrationPromptShown``）。
+ */
+async function refreshMigrations({ prompt = true } = {}) {
+  let payload = null;
+  try {
+    payload = await apiGet("migrations");
+  } catch (error) {
+    return; // 还没有这条路由（旧后端）/ 读盘失败：不该让整个页面加载不起来
+  }
+  if (!payload || !Array.isArray(payload.items)) return;
+  ui.migrations = payload;
+  const signature = payload.items
+    .map((item) => item.id)
+    .sort()
+    .join(",");
+  const asked = ui.migrationPromptShown === signature;
+  ui.migrationPromptShown = signature;
+  if (!prompt || !signature || asked) return;
+  await promptMigrationDialog(payload.items);
+}
+
+/**
+ * 「有 N 项旧配置可以升级」：勾中的才落盘，其余原样不动。
+ *
+ * 三条硬要求：``conflict``（用户自己改过的）与 ``reversible=false``（改的是动作描述这类
+ * 文字内容）默认不勾；同一批条目一次启动只问一次；「暂不」= 本次启动不再问。
+ * iframe 里没有 allow-modals，所以只能用 ``openCustomDialog``（原生 confirm 会被吞掉）。
+ */
+function promptMigrationDialog(items) {
+  return new Promise((resolve) => {
+    const pending = items.slice();
+    const checked = {};
+    pending.forEach((item) => {
+      checked[item.id] = item.default_on === true;
+    });
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const refreshTitle = () => {
+      const title = $("dialog-title");
+      if (title) title.textContent = `有 ${pending.length} 项旧配置可以升级`;
+    };
+    openCustomDialog({
+      title: `有 ${items.length} 项旧配置可以升级`,
+      confirmText: "全部应用",
+      // 共用的取消键写的就是"取消"；这里要的是「暂不（本次启动不再问）」，自己画在底部
+      hideCancel: true,
+      build(body) {
+        body.appendChild(
+          el(
+            "p",
+            "migration-lead",
+            "这些是我们改过的默认，不影响你现在的设置，除非你勾选。",
+          ),
+        );
+        const list = el("div", "migration-list");
+        body.appendChild(list);
+        let lastTitle = "";
+        pending.forEach((item) => {
+          if (item.title && item.title !== lastTitle) {
+            lastTitle = item.title;
+            list.appendChild(el("div", "migration-group", item.title));
+          }
+          const row = el("label", "migration-row");
+          const box = document.createElement("input");
+          box.type = "checkbox";
+          box.className = "migration-box";
+          box.checked = checked[item.id] === true;
+          box.addEventListener("change", () => {
+            checked[item.id] = box.checked;
+          });
+          row.appendChild(box);
+          const text = el("div", "migration-text");
+          text.appendChild(el("div", "migration-label", item.label || item.field_path));
+          text.appendChild(
+            el(
+              "div",
+              "migration-values",
+              `${formatMigrationValue(item.before)} → ${formatMigrationValue(item.after)}`,
+            ),
+          );
+          if (item.note) text.appendChild(el("div", "migration-note", item.note));
+          row.appendChild(text);
+          const later = el("button", "migration-later", "别再问");
+          later.type = "button";
+          later.addEventListener("click", async (event) => {
+            event.preventDefault();
+            try {
+              await apiPost("migrations/skip", { ids: [item.id] });
+            } catch (error) {
+              toast(error.message || "这一项没能记住，下次再问");
+              return;
+            }
+            checked[item.id] = false;
+            const index = pending.findIndex((one) => one.id === item.id);
+            if (index >= 0) pending.splice(index, 1);
+            row.remove();
+            refreshTitle();
+          });
+          row.appendChild(later);
+          list.appendChild(row);
+        });
+        const foot = el("div", "migration-foot");
+        foot.appendChild(
+          el("span", "migration-foot-note", "只勾你想改的，其余保持你现在的设置。"),
+        );
+        const skip = el("button", "migration-skip", "暂不（本次启动不再问）");
+        skip.type = "button";
+        skip.addEventListener("click", () => {
+          closeDialog(); // 触发 onDismiss → finish(false)
+        });
+        foot.appendChild(skip);
+        body.appendChild(foot);
+      },
+      onDismiss: () => finish(false),
+      onSubmit: async () => {
+        const ids = pending
+          .filter((item) => checked[item.id] === true)
+          .map((item) => item.id);
+        if (!ids.length) {
+          toast("一项都没勾，那就先不动");
+          return false;
+        }
+        const result = await apiPost("migrations/apply", { ids });
+        const applied = (result && result.applied) || [];
+        const failed = (result && result.failed) || [];
+        if (failed.length) toast(`有 ${failed.length} 项没能应用：${failed.join("、")}`);
+        else toast(`已应用 ${applied.length} 项`);
+        // 应用后刷新，但不许立刻又弹一次（剩下的冲突项留着下次启动再问）
+        await loadAll({ promptMigrations: false });
+        finish(true);
+        return true;
+      },
+    });
+  });
 }
 
 function renderEverything() {
@@ -3231,6 +4096,7 @@ function renderEverything() {
   renderScheduleList();
   renderScheduleForm();
   renderSessionList();
+  renderTempConfig();
   renderMemoryFilters();
   renderSettings();
   renderToolWarnings();
@@ -3331,10 +4197,15 @@ function showTab(name, button) {
   const title = $("page-title");
   if (title && target) title.textContent = target.textContent.trim();
   if (name === "status") refreshStatus();
+  if (name === "agent") refreshAgentPage();
   if (name === "events") loadEvents();
+  if (name === "materials") showMaterialPane(ui.materialPane || "topics");
+  else if (typeof closeMemeDrawer === "function") closeMemeDrawer();
   if (name === "contacts") loadContacts();
   if (name === "memories") loadMemories();
   if (name === "logs") loadLogs();
+  // 临时会话（用户 m00001）：进会话页先取一次，切到那一栏再取一次
+  if (name === "sessions") loadTempSessions();
   if (name === "map") loadOverview();
   if (name === "debug") loadTools();
   if (name === "presets") loadPresets();
@@ -3343,8 +4214,84 @@ function showTab(name, button) {
 function bindButtons() {
   $("save").addEventListener("click", saveAll);
   bindFilterToggle("memory-filter-toggle", "#tab-memories");
+
+  // 用户 m11096 第 12 条：会话摘要可查、可改（传空就是删掉这一份）。
+  $("memory-summaries").addEventListener("click", async () => {
+    const session = $("memory-session").value || ui.session || "";
+    if (!session) {
+      toast("先选一个会话", "warn");
+      return;
+    }
+    try {
+      const data = await apiGet("state", { session });
+      const rows = Array.isArray(data.chat_summaries) ? data.chat_summaries : [];
+      if (!rows.length) {
+        toast("还没有会话摘要（聊得多、攒得够长才会压成摘要）", "warn");
+        return;
+      }
+      const fields = rows.map((row, index) => ({
+        key: String(row.session || index),
+        label: `${row.label || row.session || "这一份"}摘要`,
+        hint: row.session || "",
+        type: "textarea",
+        rows: 5,
+        value: row.text || "",
+      }));
+      const values = {};
+      const ok = await new Promise((resolve) => {
+        openFormDialog({
+          title: "会话摘要",
+          hint: "这些都是她自己压出来的「更早聊过的」。改完保存，下一轮就按新内容说；清空等于删掉这一段。",
+          fields,
+          values,
+          confirmText: "保存全部",
+          wide: true,
+          onSubmit: async (next) => {
+            for (const field of fields) {
+              const text = String(next[field.key] ?? "").trim();
+              if (text === String(field.value || "").trim()) continue;
+              await apiPost("summaries/save", { session, target: field.key, text });
+            }
+            toast("改好了", "ok");
+            resolve(true);
+            return true;
+          },
+          onDismiss: () => resolve(false),
+        });
+      });
+      if (ok) loadMemories();
+    } catch (error) {
+      toast(`读取摘要失败：${error.message || error}`, "danger");
+    }
+  });
+
+  // 用户 m11096 第 16 条：记忆库里同一句话常被记好几遍，给一个手动整理按钮。
+  $("memory-tidy").addEventListener("click", async () => {
+    const button = $("memory-tidy");
+    const session = $("memory-session").value || ui.session || "";
+    if (!session) {
+      toast("先选一个会话", "warn");
+      return;
+    }
+    button.disabled = true;
+    try {
+      const data = await apiPost("memories/tidy", { session });
+      toast(data.message || "整理好了", "ok");
+      ui.saveState = "clean";
+      loadMemories();
+    } catch (error) {
+      toast(`整理失败：${error.message || error}`, "danger");
+    } finally {
+      button.disabled = false;
+    }
+  });
   bindFilterToggle("log-filter-toggle", "#tab-logs");
-  bindSegmented("session-seg", { sessions: "session-pane", groups: "group-pane" });
+  bindSegmented("session-seg", {
+    sessions: "session-pane",
+    groups: "group-pane",
+    // 临时会话（用户 m00001 需求 12）：她私聊出去的陌生人，单独的第三栏
+    temp: "temp-pane",
+  });
   if ($("theme-toggle")) {
     $("theme-toggle").addEventListener("click", toggleTheme);
   }
@@ -3354,6 +4301,13 @@ function bindButtons() {
   ["map-fit", "map-fit-zone"].forEach((id) => {
     if ($(id)) $(id).addEventListener("click", fitMapToCanvas);
   });
+  if ($("session-seg")) {
+    // 切到「临时会话」那一栏才去取数据（这一页其余两栏是本地数据，不用请求）
+    $("session-seg").addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-seg]");
+      if (button && button.dataset.seg === "temp") loadTempSessions();
+    });
+  }
   if ($("debug-expand")) {
     $("debug-expand").addEventListener("click", () => {
       const sections = Array.from(document.querySelectorAll("#debug-output .debug-section"));
@@ -3386,8 +4340,20 @@ function bindButtons() {
       applyActionView();
     });
   }
-  if ($("settings-save-top")) {
-    $("settings-save-top").addEventListener("click", saveAll);
+  if ($("settings-show-common")) {
+    $("settings-show-common").addEventListener("click", () => setSettingsMode("common"));
+  }
+  if ($("wizard-open")) {
+    $("wizard-open").addEventListener("click", () => openWizard());
+  }
+  if ($("handfeel-open")) {
+    $("handfeel-open").addEventListener("click", () => openHandfeel());
+  }
+  if ($("reset-defaults-open")) {
+    $("reset-defaults-open").addEventListener("click", () => openResetDefaults());
+  }
+  if ($("manual-open")) {
+    $("manual-open").addEventListener("click", () => openManualEditor());
   }
   if ($("settings-search")) {
     $("settings-search").addEventListener("input", (event) =>
@@ -3524,11 +4490,77 @@ function bindButtons() {
   }
 
   $("status-refresh").addEventListener("click", refreshStatus);
+  if ($("agent-refresh")) $("agent-refresh").addEventListener("click", refreshAgentPage);
+  if ($("agent-export")) $("agent-export").addEventListener("click", exportAgentBundle);
+
+async function exportAgentBundle() {
+  // 用户 m11096：一键导出「现状 / 最近对话 / 计划 / 记忆」，整份拿走看
+  const button = $("agent-export");
+  const old = button.textContent;
+  button.disabled = true;
+  button.textContent = "导出中…";
+  try {
+    const data = await apiGet("export", { session: ui.session || "", limit: 120 });
+    const text = String((data && data.text) || "");
+    if (!text) throw new Error("没有内容");
+    const blob = new Blob([text], { type: "text/markdown;charset=utf-8" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `virtual-world-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.md`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 2000);
+  } catch (error) {
+    toast(`导出失败：${error.message || error}`, "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = old;
+  }
+}
+  if ($("agent-seg")) {
+    $("agent-seg").addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-seg]");
+      if (button) showAgentPane(button.dataset.seg, true);
+    });
+  }
+  if ($("agent-runs-failed")) {
+    $("agent-runs-failed").addEventListener("change", () => {
+      ui.agent.onlyFailed = $("agent-runs-failed").checked;
+      loadAgentRuns();
+    });
+  }
+  if ($("agent-runs-prev")) {
+    $("agent-runs-prev").addEventListener("click", () => {
+      loadAgentRunsPage(Math.max(1, (ui.agent.page || 1) - 1));
+    });
+  }
+  if ($("agent-runs-more")) {
+    $("agent-runs-more").addEventListener("click", () => {
+      loadAgentRunsPage((ui.agent.page || 1) + 1);
+    });
+  }
   $("status-session").addEventListener("change", () => {
+    setScopeSession(scopeSession(), "status-session");
+    refreshScopePage();
     refreshStatus();
+    // 换了会话，Agent 页那一份快照与工具调用记录也跟着作废
+    if ($("tab-agent") && $("tab-agent").classList.contains("active")) refreshAgentPage();
     // 换会话 = 可能换了人格：简易人设跟着刷新一遍
     if (typeof ui.loadPersonaBrief === "function") {
       ui.loadPersonaBrief({ overwrite: true });
+    }
+    // 谈资是按会话（scope）存的：换会话先丢掉上一个会话的数据，
+    // 否则点开谈资会看到别的会话的内容。
+    topicForget();
+    topicSyncFlag();
+    const materialsActive =
+      $("tab-materials") && $("tab-materials").classList.contains("active");
+    if (materialsActive && ui.materialPane === "topics") {
+      loadTopics();
+      loadTopicRecall();
+    } else {
+      renderTopicsList();
+      renderTopicDetail();
+      renderTopicRecall();
     }
   });
   $("values-edit").addEventListener("click", () => {
@@ -3653,57 +4685,164 @@ function bindButtons() {
 }
 
 async function saveAll() {
-  setSaveState("保存中…");
-  try {
-    const worldResult = await apiPost("config/world", { world: ui.config.world });
-    const scheduleResult = await apiPost("config/schedules", {
-      schedules: ui.config.schedules,
-    });
-    const sessionResult = await apiPost("config/sessions", {
-      sessions: ui.config.sessions,
-    });
-    const warnings = [
-      ...(worldResult.warnings || []),
-      ...(scheduleResult.warnings || []),
-      ...(sessionResult.warnings || []),
-      ...toolActionWarnings(),
-    ];
-    // 保存时顺手给缺意图的工具 / 指令步骤补的意图（写进配置了，编辑器里能看到）
-    const autoIntents = scheduleResult.filled || [];
-    // 保存即生效：不用再单独点「热加载」
-    const reloadResult = await apiPost("reload", {});
-    ui.dirty = false;
-    ui.dirtyTabs.clear();
-    renderSettingsTabs();
-    setSaveState("已保存并生效");
-    toast(
-      warnings.length
-        ? `已保存并生效，提醒：${warnings.join("；")}`
-        : autoIntents.length
-          ? `已保存并生效，顺手补了这些步骤的意图：${autoIntents.join("；")}`
-        : (reloadResult.warnings || []).length
-          ? `已保存并生效，提醒：${reloadResult.warnings.join("；")}`
-          : "已保存并生效",
-    );
-    await loadAll();
-  } catch (error) {
-    setSaveState("保存失败");
-    toast(error.message || "保存失败");
+  // 防重复提交：保存中再点一次不排队、不并行（双击 / 回车）
+  if (ui.saving) return null;
+  // 提交快照 + 编辑版本号：**只清"提交那一刻"的脏标记**，保存期间的新编辑必须留下
+  const revision = ui.editRevision || 0;
+  // **只提交真正改过的域**（复核报告 P1-2 后半）：改日程不该顺带把世界配置再提交一遍
+  // （那会触发动作说明重排、还会把"缺少内置动作"之类的补回提示塞给用户）。
+  const dirtyDomains = Array.from(ui.dirtyDomains || []);
+  if (!dirtyDomains.length) {
+    setSaveState("没有要保存的改动");
+    toast("没有要保存的改动");
+    return { ok: true, parts: [], warnings: [], editLost: false, skipped: true };
   }
+  const payloads = {
+    world: JSON.parse(JSON.stringify(ui.config.world || {})),
+    schedules: JSON.parse(JSON.stringify(ui.config.schedules || {})),
+    sessions: JSON.parse(JSON.stringify(ui.config.sessions || [])),
+  };
+  ui.saving = true;
+  setSaveState("保存中…");
+  // 逐段回执：世界 / 日程 / 会话各自成败，**不再用一句"保存失败"盖住已经生效的那段**
+  const parts = [];
+  const warnings = [];
+  try {
+    const allAttempts = [
+      ["world", "世界配置", () => apiPost("config/world", { world: payloads.world })],
+      ["schedules", "日程", () => apiPost("config/schedules", { schedules: payloads.schedules })],
+      ["sessions", "会话", () => apiPost("config/sessions", { sessions: payloads.sessions })],
+    ];
+    const attempts = allAttempts.filter(([domain]) => dirtyDomains.includes(domain));
+    let scheduleFilled = [];
+    for (const [domain, label, call] of attempts) {
+      try {
+        const result = await call();
+        if (result && result.ok === false) {
+          parts.push({ domain, label, ok: false, error: String(result.reason || "被拒绝") });
+          continue;
+        }
+        parts.push({ domain, label, ok: true, warnings: (result && result.warnings) || [] });
+        if (result && Array.isArray(result.warnings)) warnings.push(...result.warnings);
+        if (domain === "schedules" && result && Array.isArray(result.filled)) {
+          scheduleFilled = result.filled;
+        }
+      } catch (error) {
+        parts.push({ domain, label, ok: false, error: String((error && error.message) || error) });
+      }
+    }
+    const failed = parts.filter((item) => !item.ok);
+    // 三段都失败就不必热加载（没东西生效）
+    let reloadWarnings = [];
+    if (parts.some((item) => item.ok)) {
+      try {
+        const reloadResult = await apiPost("reload", {});
+        reloadWarnings = (reloadResult && reloadResult.warnings) || [];
+      } catch (error) {
+        parts.push({
+          domain: "reload",
+          label: "热加载",
+          ok: false,
+          error: String((error && error.message) || error),
+        });
+      }
+    }
+    warnings.push(...toolActionWarnings());
+    // 成功的域从"脏"里移掉；失败 / 没提交的留着重试
+    const savedOk = new Set(
+      parts.filter((item) => item.ok && item.domain !== "reload").map((item) => item.domain),
+    );
+    Array.from(ui.dirtyDomains || []).forEach((key) => {
+      if (savedOk.has(key)) ui.dirtyDomains.delete(key);
+    });
+    // 脏标记只在"提交之后没人再改"时才清；期间改过的保留，绝不 loadAll 覆盖
+    if (!failed.length && (ui.editRevision || 0) === revision) {
+      ui.dirty = false;
+      ui.dirtyTabs.clear();
+      ui.dirtyDomains.clear();
+    } else if (failed.length) {
+      ui.dirty = true;
+      dirtyDomains.forEach((key) => ui.dirtyDomains.add(key));
+    }
+    renderSettingsTabs();
+    const submitted = parts.filter((item) => item.domain !== "reload").map((item) => item.label);
+    const summary = failed.length
+      ? `保存失败：${failed.map((item) => `${item.label}（${item.error}）`).join("；")}` +
+        (parts.some((item) => item.ok)
+          ? `；已生效：${parts.filter((item) => item.ok).map((item) => item.label).join("、")}`
+          : "")
+      : `已保存并生效（${submitted.join("、")}）`;
+    setSaveState(summary);
+    // 缩图与动图是"下一张才生效"的：保存成功后单独说一句，别让人以为页面上写着就已经变了
+    // 保存失败时保留标记，等真的写进配置再提示一次
+    const memeScalePending = !!ui.memeScalePending && !failed.length;
+    if (!failed.length) ui.memeScalePending = false;
+    toast(
+      failed.length
+        ? summary
+        : warnings.length
+          ? `已保存并生效，提醒：${warnings.join("；")}`
+          : scheduleFilled.length
+            ? `已保存并生效，同时补全了这些步骤的意图：${scheduleFilled.join("；")}`
+            : reloadWarnings.length
+              ? `已保存并生效，提醒：${reloadWarnings.join("；")}`
+              : memeScalePending
+                ? "已保存，下一张表情包生效"
+                : "已保存并生效",
+    );
+    // 只在"提交之后没人再改"时才整体重载：否则会把刚打的新内容冲掉
+    if ((ui.editRevision || 0) === revision) {
+      // 保存后不许因为「还有旧配置可升级」再弹一次窗：这一批条目进站时已经问过了
+      await loadAll({ promptMigrations: false });
+      // 临时会话的规则存在 world 里：保存完顺手把列表一起回显（到期状态/轮数）
+      await loadTempSessions();
+    }
+    return { ok: !failed.length, parts, warnings, editLost: (ui.editRevision || 0) !== revision };
+  } finally {
+    ui.saving = false;
+  }
+}
+
+/**
+ * 由系统维护的工具型动作（``HIDDEN_ACTION_IDS``）不进「还没选工具」这类提醒。
+ *
+ * 这两个动作在动作库里是**藏起来**的（见 ``visibleActions``），工具统一在
+ * 「设置 → 高级功能 → 联网搜索」里配，引擎优先读全局的 ``world.search``、只有全局为空
+ * 才回退到动作上残留的字段（``core/engine.py`` 的 ``search_option``）。
+ * 所以对用户说「这些工具型动作还没选工具：用手机看网页」既没法照做、又已经过时了。
+ */
+function isManagedToolAction(action) {
+  return !!action && HIDDEN_ACTION_IDS.has(String(action.id || ""));
 }
 
 /** 工具型动作必须选工具；没选的在这里统一提醒（仍然允许保存，运行时会跳过并写日志）。 */
 function toolActionWarnings() {
   // 停用的动作运行时会被直接跳过，别再拿它来烦用户
-  const live = actions().filter((action) => action.enabled !== false);
+  const live = actions().filter(
+    (action) => action.enabled !== false && !isManagedToolAction(action),
+  );
   const missing = live
-    .filter((action) => action.llm_level === "tool" && !actionToolNames(action).length)
+    .filter(
+      (action) =>
+        action.llm_level === "tool" &&
+        !actionToolNames(action).length &&
+        !usesGlobalSearch(action),
+    )
     .map((action) => action.name || action.id);
+  const follows = live.filter(
+    (action) => action.llm_level === "tool" && usesGlobalSearch(action),
+  );
   const noCommand = live
     .filter((action) => action.llm_level === "command" && !String(action.trigger_command || "").trim())
     .map((action) => action.name || action.id);
   const warnings = [];
   if (missing.length) warnings.push(`这些工具型动作还没选工具，会被跳过：${missing.join("、")}`);
+  if (follows.length && !effectiveSearchTools().length) {
+    warnings.push(
+      `这些动作写着「${GLOBAL_SEARCH_LABEL}」，但联网搜索里还没配工具，会被跳过：` +
+        follows.map((action) => action.name || action.id).join("、"),
+    );
+  }
   if (noCommand.length) {
     warnings.push(`这些指令型动作还没填要触发的指令，会被跳过：${noCommand.join("、")}`);
   }
@@ -3730,6 +4869,11 @@ function missingToolActions() {
   return actions()
     .filter((action) => action.enabled !== false)
     .filter((action) => action.llm_level === "tool")
+    // 系统维护的那两个动作在动作库里根本不存在，让人「去动作里换工具」是无解的；
+    // 它们的工具在「联网搜索」里配，那边自己会标出没装上的工具
+    .filter((action) => !isManagedToolAction(action))
+    // 写着「跟随全局联网搜索」的动作不在这一条里报：全局为空时上面那条提醒更准确
+    .filter((action) => !usesGlobalSearch(action))
     .map((action) => {
       const names = actionToolNames(action);
       const fallbacks = Array.isArray(action.tool_fallbacks)
@@ -3754,50 +4898,52 @@ function missingToolActionWarnings() {
   ];
 }
 
-/** 把「工具不存在」提醒画到状态页和动作页的横幅上。 */
+/**
+ * 状态页 / 动作页 / 调试页的横幅：工具缺失 + 读配置时的提醒。
+ *
+ * 两样都是常驻的：读盘时的提醒（``config.warnings``）以前是一进站就 toast 一次、
+ * 保存完再来一次，关不掉也看不完；现在跟「工具不存在」并排摆在横幅里，改好就消失。
+ */
 function renderToolWarnings() {
+  const blocks = [];
   const missing = missingToolActions();
+  if (missing.length) {
+    blocks.push({
+      title: `有 ${missing.length} 个工具型动作对应的工具不存在，执行时会被跳过`,
+      detail: missing
+        .map((item) => `${item.name} → ${item.tools.join(" / ")}`)
+        .join("　·　"),
+      foot: "在动作里把工具换成 AstrBot 里已经装好的那个（搜索、天气这类内置动作也带备选，装任意一个搜索工具就能用）。",
+    });
+  }
+  const warnings = (ui.config && ui.config.warnings) || [];
+  if (warnings.length) {
+    blocks.push({
+      title: `配置提醒（${warnings.length}）`,
+      detail: warnings.join("　·　"),
+      foot: "这些是读配置时发现的问题，改好对应那项就会消失。",
+    });
+  }
   const targets = [
     $("status-banner"),
     $("action-banner"),
     $("debug-banner"),
   ].filter(Boolean);
   targets.forEach((box) => {
-    if (!missing.length) {
+    box.innerHTML = "";
+    if (!blocks.length) {
       box.classList.add("hidden");
-      box.innerHTML = "";
       return;
     }
     box.classList.remove("hidden");
-    box.innerHTML = "";
-    box.appendChild(
-      el("span", "banner-icon", "⚠"),
-    );
-    const body = el("div", "banner-body");
-    body.appendChild(
-      el(
-        "div",
-        "banner-title",
-        `有 ${missing.length} 个工具型动作对应的工具不存在，执行时会被跳过`,
-      ),
-    );
-    body.appendChild(
-      el(
-        "div",
-        "banner-detail",
-        missing
-          .map((item) => `${item.name} → ${item.tools.join(" / ")}`)
-          .join("　·　"),
-      ),
-    );
-    body.appendChild(
-      el(
-        "div",
-        "banner-hint",
-        "在动作里把工具换成 AstrBot 里已经装好的那个（搜索、天气这类内置动作也带备选，装任意一个搜索工具就能用）。",
-      ),
-    );
-    box.appendChild(body);
+    blocks.forEach((block) => {
+      box.appendChild(el("span", "banner-icon", "⚠"));
+      const body = el("div", "banner-body");
+      body.appendChild(el("div", "banner-title", block.title));
+      body.appendChild(el("div", "banner-detail", block.detail));
+      body.appendChild(el("div", "banner-hint", block.foot));
+      box.appendChild(body);
+    });
   });
 }
 
@@ -3806,6 +4952,33 @@ function actionToolNames(action) {
   const list = Array.isArray(action.tool_names) ? action.tool_names.filter(Boolean) : [];
   if (list.length) return list;
   return action.tool_name ? [action.tool_name] : [];
+}
+
+/**
+ * 「用全局联网搜索」的假工具名（跟 `core/models.py` 的 ``GLOBAL_SEARCH_TOOL`` 一致）。
+ *
+ * 自己新建一个"联网搜索"动作时，工具名其实该跟着「设置 → 高级功能 → 联网搜索」走；
+ * 以前那种"必须在这儿选一个具体工具"的要求既重复又会在全局换工具时失效。
+ */
+const GLOBAL_SEARCH_TOOL = "@global_search";
+const GLOBAL_SEARCH_LABEL = "联网搜索（跟随全局设置）";
+
+function usesGlobalSearch(action) {
+  return actionToolNames(action).includes(GLOBAL_SEARCH_TOOL);
+}
+
+/**
+ * 联网搜索**实际**会用到的工具：全局 ``world.search.tool_names`` 优先，
+ * 全局为空才回退到 ``search_web`` 动作上残留的老字段（跟引擎的 ``search_option`` 一致）。
+ *
+ * 空数组 = 这项能力真的不可用（她查不了网上的东西）。
+ */
+function effectiveSearchTools(world = (ui.config && ui.config.world) || {}) {
+  const search = world.search || {};
+  const names = Array.isArray(search.tool_names) ? search.tool_names.filter(Boolean) : [];
+  if (names.length) return names;
+  const action = actions().find((item) => String(item.id || "") === "search_web");
+  return action ? actionToolNames(action) : [];
 }
 
 /* ================================================================== */
@@ -3852,17 +5025,85 @@ async function nicknameAction(action) {
   }
 }
 
+/** 所有"选会话"的控件（顶栏那个是**唯一真相**，其余都跟它走）。 */
+const SCOPE_SESSION_IDS = [
+  "status-session",
+  "memory-session",
+  "debug-session",
+  "log-session",
+  "map-session",
+  "schedule-session",
+  "contacts-session",
+];
+
+function scopeSession() {
+  const top = $("status-session");
+  return top ? String(top.value || "") : "";
+}
+
+/**
+ * 把"当前会话"同步到所有页面自己的选择器上。
+ *
+ * 为什么要有这一层（复核报告 P2-3）：以前顶栏选了 B，记忆页可能还停在 A——
+ * 页面看着同一个会话，查的却是另一条。现在**只有一个 scope**：
+ * 任何一个选择器改了，其余全部跟上，正在看的那一页立刻重读。
+ */
+function setScopeSession(value, sourceId = "") {
+  const wanted = String(value || "");
+  SCOPE_SESSION_IDS.forEach((id) => {
+    if (id === sourceId) return;
+    const select = $(id);
+    if (!select) return;
+    if (String(select.value || "") !== wanted) select.value = wanted;
+  });
+  updateScopeNote();
+  return wanted;
+}
+
+/** 顶栏那一行小字：这个会话属于哪一档（角色组 / 具体会话）。 */
+function updateScopeNote() {
+  const note = $("scope-note");
+  if (!note) return;
+  const value = scopeSession();
+  if (!value) {
+    note.textContent = "";
+    return;
+  }
+  // 组代表会话 → 说她"这一处"共享；组里的成员会话 → 说明它就是这条会话本身
+  const group = typeof groupOwning === "function" ? groupOwning(value) : null;
+  const label = (typeof sessionLabel === "function" && sessionLabel(value)) || value;
+  if (group && String(group.representative || group.representative_session || "") === value) {
+    note.textContent = `角色组共享（${group.name || "这一组"}）`;
+  } else if (group) {
+    note.textContent = `具体会话：${label}`;
+  } else {
+    note.textContent = `具体会话：${label}`;
+  }
+}
+
+/** 换了会话之后，把**当前这一页**的数据重读一遍（别的页切过去时会自己按新会话读）。 */
+function refreshScopePage() {
+  // 导航是 `#tabs` 里一排 button[data-tab]（不是 .nav-item）
+  const active = document.querySelector("#tabs button.active");
+  const tab = active ? String(active.dataset.tab || "") : "";
+  // 与 showTab() 里那张表保持同一套函数名（那些才是真正会按会话重读的入口）
+  const loaders = {
+    status: "refreshStatus",
+    memories: "loadMemories",
+    logs: "loadLogs",
+    debug: "loadTools",
+    contacts: "loadContacts",
+    map: "loadOverview",
+  };
+  const name = loaders[tab];
+  if (!name) return;
+  const fn = window[name];
+  if (typeof fn === "function") fn();
+}
+
 function renderSessionSelects() {
   const options = scopeOptions();
-  [
-    "status-session",
-    "memory-session",
-    "debug-session",
-    "log-session",
-    "map-session",
-    "schedule-session",
-    "contacts-session",
-  ].forEach((id) => {
+  SCOPE_SESSION_IDS.forEach((id) => {
     const select = $(id);
     if (!select) return;
     const previous = select.value;
@@ -3876,6 +5117,8 @@ function renderSessionSelects() {
       ? previous
       : options[0].value;
   });
+  // 全部先对齐到顶栏那一份，再刷新那句说明
+  setScopeSession(scopeSession());
 }
 
 /**
@@ -4193,6 +5436,42 @@ function setStatusEmpty(text) {
  * 人物面板顶部：头像取名字首字，下面是「名字 + 一行摘要」。
  * 数据全部来自已有的状态快照，不额外请求。
  */
+/** 状态页顶部头像：有 QQ 号就拉真头像，取不到退回名字首字（用户 m14014）。
+ *  结果按 URL 记在内存里，来回切会话不重复请求。
+ */
+const HERO_AVATAR_CACHE = new Map();
+
+function fillHeroAvatar(box, qq, label) {
+  if (!box) return;
+  const initial = label ? Array.from(label)[0] : "？";
+  box.textContent = initial;
+  box.classList.remove("photo");
+  box.style.backgroundImage = "";
+  if (!/^\d{5,12}$/.test(qq)) return;
+  const url = `https://q1.qlogo.cn/g?b=qq&nk=${qq}&s=100`;
+  const state = HERO_AVATAR_CACHE.get(url);
+  const apply = () => {
+    box.textContent = "";
+    box.classList.add("photo");
+    box.style.backgroundImage = `url("${url}")`;
+  };
+  if (state === true) {
+    apply();
+    return;
+  }
+  if (state === false) return;
+  HERO_AVATAR_CACHE.set(url, "loading");
+  const img = new Image();
+  img.onload = () => {
+    HERO_AVATAR_CACHE.set(url, true);
+    apply();
+  };
+  img.onerror = () => {
+    HERO_AVATAR_CACHE.set(url, false);
+  };
+  img.src = url;
+}
+
 function renderHero(data, stateLabel) {
   const avatar = $("hero-avatar");
   const nameBox = $("hero-name");
@@ -4209,7 +5488,8 @@ function renderHero(data, stateLabel) {
   const base = String(data.nickname_base || "").trim();
   const nickname = String(data.nickname || "").trim();
   const label = base || sessionShortName(data.session_id || "") || nickname;
-  avatar.textContent = label ? Array.from(label)[0] : "？";
+  // 她自己有 QQ 号就用真头像（用户 m14014），没有 QQ 号（合成身份）才退回名字首字。
+  fillHeroAvatar(avatar, String(data.self_id || "").trim(), label);
   nameBox.textContent = label || "（还没设置群名片）";
   const action = data.current_action || {};
   const where = [data.zone_name, data.node_name].filter(Boolean).join(" · ");
@@ -4341,6 +5621,27 @@ function renderStatusSections(data, stateLabel) {
       statusLine(timeBox, label, `${text}${when}`.trim() || "（空）", "muted");
     });
   }
+
+  // ---------------- 今天做过的事（今日记） ----------------
+  const journalBox = $("status-journal");
+  journalBox.innerHTML = "";
+  const journal = data.today_journal || {};
+  const journalLines = journal.lines || [];
+  if (journalLines.length) {
+    statusLine(journalBox, "做了", `${journalLines.length} 件事`);
+    journalLines.forEach((row) => {
+      statusLine(journalBox, String(row.part || ""), String(row.text || ""));
+    });
+  } else {
+    statusLine(journalBox, "", "今天还没做什么", "muted");
+  }
+  if (Number(journal.failed || 0) > 0) {
+    statusLine(journalBox, "没做成", `${Number(journal.failed)} 次`, "muted");
+  }
+  const journalOpen = journal.open || [];
+  const journalChanges = journal.changes || [];
+  journalOpen.forEach((text) => statusLine(journalBox, "还没做完", String(text), "muted"));
+  journalChanges.forEach((text) => statusLine(journalBox, "中途变了", String(text), "muted"));
 
   // ---------------- 正在进行 ----------------
   const progressBox = $("status-progress");
@@ -4588,9 +5889,111 @@ function renderStatusSections(data, stateLabel) {
     `${channel.llm_provider ? channel.llm_provider : "跟随当前会话供应商"} · ${llmText}`,
     llmTone,
   );
+  renderAgency(data);
 }
 
-/* ---------------- 数值曲线：她最近过得怎么样 ---------------- */
+/* ---------------- T12 Step 2：她自己的打算 ---------------- */
+
+const AGENCY_MODE_TONES = {
+  comply: "",
+  negotiate: "warn",
+  ask_first: "warn",
+  partial: "warn",
+};
+
+/**
+ * 「她自己的打算」卡：当前那条打算（来源 / 强度 / 还剩多久）+ 最近十次选择。
+ *
+ * 读的是 `/state` 快照里现成的 `agency` 字段（后端 `engine.agency_section` 算好的），
+ * 没有新增接口。整块在「正在进行」那一栏下面，跟着 `renderStatusSections` 每次重画；
+ * 后端没给（老版本 / 读失败）就画一句"暂时没有"，不报错、不占位。
+ */
+function renderAgency(data) {
+  const progress = $("status-progress");
+  const card = progress ? progress.closest(".status-card") : null;
+  if (!card) return;
+  let block = card.querySelector(".agency-block");
+  if (!block) {
+    block = el("section", "status-block agency-block");
+    block.appendChild(el("h3", "", "她自己的打算"));
+    const host = progress.closest(".status-block");
+    if (host && host.parentNode === card) card.insertBefore(block, host.nextSibling);
+    else card.appendChild(block);
+  }
+  // 只留标题：正文每次重画（不能每次新建一块，不然卡片会越堆越多）
+  while (block.children.length > 1) block.removeChild(block.lastChild);
+  const body = el("div", "status-lines");
+  block.appendChild(body);
+  const agency = data && data.agency ? data.agency : {};
+  const intention = agency.intention || null;
+  if (intention && intention.text) {
+    statusLine(body, "当前打算", String(intention.text), "");
+    statusLine(
+      body,
+      "来路",
+      `${intention.origin_label || "来路不明"} · ${intention.state_label || "刚立下"}`,
+      "",
+    );
+    statusMeter(
+      body,
+      "还剩多少劲",
+      num(intention.strength, 0),
+      `${intention.strength_label || "说不清"}${
+        Number(intention.expires_at || 0)
+          ? `｜还有 ${formatCountdown(intention.expires_at)}`
+          : ""
+      }`,
+    );
+    if (intention.alternative) {
+      statusLine(body, "另一条路", String(intention.alternative), "muted");
+    }
+  } else {
+    statusLine(body, "当前打算", "（暂时没有，手头没什么非做不可的事）", "muted");
+  }
+  statusLine(
+    body,
+    "本周让位",
+    `${num(agency.yield_week, 0)} 次（一共 ${num(agency.yield_total, 0)} 次没照做）`,
+    "",
+  );
+  const recent = Array.isArray(agency.recent) ? agency.recent.slice(0, 10) : [];
+  if (!recent.length) {
+    statusLine(body, "最近的选择", "（还没记下什么）", "muted");
+    return;
+  }
+  const list = el("div", "agency-recent");
+  recent.forEach((item) => list.appendChild(agencyRow(item)));
+  body.appendChild(list);
+}
+
+/** 一条选择 / 一次意图收尾画成一行：左边是个小牌，右边是他当时让她做的事。 */
+function agencyRow(item) {
+  const row = el("div", "agency-row");
+  const at = num(item.at, 0);
+  const when = at ? agoText(Math.max(0, Date.now() / 1000 - at)) : "";
+  if (item.kind === "intention") {
+    const tag = el("span", "agency-tag", item.state_label || "收尾");
+    row.appendChild(tag);
+    row.appendChild(el("span", "agency-text", item.text || "（那件事）"));
+    row.appendChild(el("span", "agency-when", `${when}放下`));
+    return row;
+  }
+  const mode = String(item.mode || "comply");
+  const tag = el(
+    "span",
+    `agency-tag${AGENCY_MODE_TONES[mode] ? ` ${AGENCY_MODE_TONES[mode]}` : ""}`,
+    item.mode_label || mode,
+  );
+  row.appendChild(tag);
+  const text = item.request || "（他没说清楚要做什么）";
+  row.appendChild(el("span", "agency-text", text));
+  row.appendChild(
+    el("span", "agency-when", item.changed ? `${when}真的改了动作` : when),
+  );
+  return row;
+}
+
+/* ---------------- 数值曲线：她的近期状态 ---------------- */
 
 const HISTORY_WINDOWS = [
   { hours: 6, label: "6 小时" },
@@ -5103,7 +6506,7 @@ function openEvalModal(rounds) {
     $("eval-modal-hint").textContent =
       `下面 ${ui.evalRounds.length} 轮就是要问的问题。确认没问题再点「开始跑」——`
       + "它带着完整提示词（人设 + 声音样例 + 状态 + 画像）走真实调用，但**不写任何状态**，"
-      + "跑多少遍都不会弄脏她的世界。";
+      + "跑多少遍都不会改动她的世界数据。";
   }
   if ($("eval-status")) $("eval-status").textContent = "";
   renderEvalQuestions();
@@ -5961,7 +7364,9 @@ function genreEditor(world) {
     fieldHead(
       "事件题材与权重",
       "代码按权重抽一个题材，再让模型「就在这个题材里」编——不这样写，模型永远只生成温馨小事，" +
-        "「被人跟着」这种偏暗的题材一次都不会出现。权重 0 = 不生成这一类。",
+        "「被人跟着」这种偏暗的题材一次都不会出现。权重 0 = 不生成这一类。" +
+        "带三个框的题材按档位分权（小事件 / 微事件 / 大事件各算各的）：大事件的权重放在" +
+        "「日常小事」上就会被吃饭喝水占掉，所以大事默认只从人际、意外、危险、机会、旧账里抽。",
     ),
   );
   const list = el("div", "genre-list");
@@ -5977,20 +7382,28 @@ function genreEditor(world) {
         item.name = name.value.trim();
         markDirty();
       });
+      const tierWeights =
+        item.weights && typeof item.weights === "object" ? item.weights : null;
       const weight = document.createElement("input");
       weight.type = "number";
       weight.min = "0";
       weight.step = "1";
-      weight.title = "权重：相对比例，0 就是不生成这一类";
-      weight.value = item.weight ?? 0;
+      weight.title = tierWeights
+        ? "小事件权重（微事件 / 大事件在右边两个框里单独调）"
+        : "权重：相对比例，0 就是不生成这一类";
+      weight.value = tierWeights ? tierWeights.small ?? 0 : item.weight ?? 0;
       weight.addEventListener("change", () => {
-        item.weight = num(weight.value, 0);
+        if (tierWeights) {
+          tierWeights.small = num(weight.value, 0);
+        } else {
+          item.weight = num(weight.value, 0);
+        }
         markDirty();
       });
       const examples = document.createElement("input");
       examples.type = "text";
       examples.value = item.examples || "";
-      examples.placeholder = "例子：被误解、被人跟着";
+      examples.placeholder = "例子：用 | 分开写形态，例如 她的{某样东西}被{别人}拿走";
       examples.addEventListener("change", () => {
         item.examples = examples.value.trim();
         markDirty();
@@ -6005,6 +7418,21 @@ function genreEditor(world) {
       });
       row.appendChild(name);
       row.appendChild(weight);
+      if (tierWeights) {
+        [["micro", "微事件权重"], ["big", "大事件权重"]].forEach(([key, label]) => {
+          const input = document.createElement("input");
+          input.type = "number";
+          input.min = "0";
+          input.step = "1";
+          input.title = label;
+          input.value = tierWeights[key] ?? 0;
+          input.addEventListener("change", () => {
+            tierWeights[key] = num(input.value, 0);
+            markDirty();
+          });
+          row.appendChild(input);
+        });
+      }
       row.appendChild(examples);
       row.appendChild(remove);
       list.appendChild(row);
@@ -6012,7 +7440,12 @@ function genreEditor(world) {
     const add = el("button", "small ghost", "＋ 加一类题材");
     add.type = "button";
     add.addEventListener("click", () => {
-      world.events.genres.push({ name: "新题材", weight: 5, examples: "" });
+      world.events.genres.push({
+        name: "新题材",
+        weight: 5,
+        weights: { micro: 5, small: 5, big: 0 },
+        examples: "",
+      });
       markDirty();
       paint();
     });
@@ -6057,8 +7490,8 @@ async function refreshStatus() {
       const locked = Boolean(data.nickname_locked);
       nickToggle.textContent = locked ? "解锁" : "锁定";
       nickToggle.title = locked
-        ? `已锁定，插件不会自动改名（原名：${data.nickname_base || "还没记下来"}）。点一下解锁。`
-        : "解锁状态下她会随状态自动改名。点一下锁住。";
+        ? `已锁定，插件不会自动改名（原名：${data.nickname_base || "还没记下来"}）。点击解锁。`
+        : "解锁状态下她会随状态自动改名。点击锁定。";
       nickToggle.classList.toggle("primary", locked);
     }
     const currentAction = data.current_action || {};
@@ -6083,7 +7516,7 @@ async function refreshStatus() {
     if (thoughts.length) innerLines.push(`她主动留下的心里话：${thoughts.join("；")}`);
     $("status-thoughts").textContent = innerLines.join("\n");
 
-    // 更早的群聊摘要（只有在「上下文 → 留档超了怎么办 = 压成摘要」时才有）
+    // 更早的群聊摘要（只有在「上下文 → 留档超出上限时的处理 = 压成摘要」时才有）
     const summaryBlock = $("status-context");
     // 摘要按会话分开存：这里把每个会话那一份都列出来（当前会话标成「这里」）
     const summaryRows = Array.isArray(data.chat_summaries)
@@ -6173,7 +7606,16 @@ async function stateAction(action, extra = {}) {
     } else if (result.notes && result.notes.length) {
       toast(result.notes.join("；"));
     } else if (action === "interrupt") {
-      toast(result.interrupted ? "已打断她正在做的事" : "她现在没有在做动作");
+      // 取消是两步：先发取消信号（立刻回），再等状态真的清干净。所以这里说清
+      // 现在到底是"已请求取消/正在停"还是"已经停下"，而不是只丢一句"已打断"。
+      toast(
+        result.note ||
+          (result.interrupted ? "已停止：手头的动作停下了" : "她现在没有在做动作")
+      );
+      if (result.cancelling) {
+        // 还在停：过一会儿再拉一次状态，好让按钮/状态显示跟上（还在停 → 变成没在忙）
+        setTimeout(refreshStatus, 1500);
+      }
     } else if (action === "wake") {
       toast(result.was_sleeping ? "已把她叫醒" : "她本来就没在睡");
     } else {
@@ -6287,10 +7729,19 @@ function actionItems() {
 }
 
 function toolItems() {
+  // 第一条是"引用全局配置"的选项：动作只说"我要联网搜索"，用哪个工具由全局决定
+  const pinned = {
+    id: GLOBAL_SEARCH_TOOL,
+    name: GLOBAL_SEARCH_LABEL,
+    desc:
+      "用「设置 → 高级功能 → 联网搜索」里配的工具。以后换搜索工具只改那一处，" +
+      "这个动作不用跟着改。\n",
+    group: "本插件",
+  };
   if (!ui.tools.length) {
-    return [{ id: "", name: "（AstrBot 还没有注册任何工具）", desc: "", group: "其它" }];
+    return [pinned, { id: "", name: "（AstrBot 还没有注册任何工具）", desc: "", group: "其它" }];
   }
-  return ui.tools.map((tool) => ({
+  return [pinned, ...ui.tools.map((tool) => ({
     id: tool.name,
     name:
       (tool.source === "official" ? "官方 · " : tool.plugin ? `插件 · ` : "") + tool.name,
@@ -6304,7 +7755,7 @@ function toolItems() {
         ? "⚠ 这是「直接把消息发到当前会话」的内置工具：插件里选它不会生效（会绕过回复管线，导致表情包识别、分段回复、发送前插件都不生效）。\n"
         : "") + (tool.description || ""),
     group: toolGroup(tool),
-  }));
+  }))];
 }
 
 /** 工具按来源分组：官方搜索 / 官方其它 / 插件（按提供它的插件名分）。 */
@@ -6677,7 +8128,7 @@ function renderZoneMap() {
     );
     chip.style.left = `${num(anchor.x) + 8}px`;
     chip.style.top = `${num(anchor.y) + 62 + index * 22}px`;
-    chip.title = "点一下进对面区域看看";
+    chip.title = "点击查看对面区域";
     chip.addEventListener("click", (event) => {
       event.stopPropagation();
       enterZone(thereZone);
@@ -7120,9 +8571,15 @@ async function commitGeneratedActions(drafts) {
   });
   markDirty();
   renderActionGrid();
-  // 生成结果确认即保存：不然用户以为没添加成功，还要再找一次右上角的「保存」
-  await saveAll();
-  toast(`已加入 ${added} 个动作并保存`);
+  // 生成结果确认即保存：不然用户以为没添加成功，还要再找一次右上角的「保存」。
+  // 但**保存成没成要看回执**：失败时草稿留着、把原因说清，不许报"并保存"。
+  const saved = await saveAll();
+  toast(
+    saved && saved.ok
+      ? `已加入 ${added} 个动作并保存`
+      : `已加入 ${added} 个动作，但没保存成功：改动还在编辑器里，点右上角「保存」重试`,
+  );
+  // 草稿已经进了配置列表，关窗是必须的（留着再点一次"确认"会重复加入）
   return true;
 }
 
@@ -7142,7 +8599,8 @@ async function generateZoneNodes(zoneId, count, button) {
       const problems = result.problems || [];
       openCustomDialog({
         title: `生成的地点（${drafts.length} 个）`,
-        hint: "自动摆好位置并按区域连成链（首个连最近的地点，默认 1 tick）。「确认加入」写入配置后立即生效。"
+        hint:
+          "自动摆好位置并按区域连成链（首个连最近的地点，默认 1 tick）。「确认加入」写入配置后立即生效。" +
           (problems.length ? `模型那边有这些情况：${problems.join("；")}` : ""),
         confirmText: "确认加入选中的",
         build: (body) => buildNodeDraftList(body, drafts),
@@ -7223,9 +8681,13 @@ async function commitGeneratedNodes(drafts, newEdges) {
   markDirty();
   renderMap();
   renderNodeForm();
-  // 生成结果确认即保存
-  await saveAll();
-  toast(`已加入 ${picked.length} 个地点（含自动连线）并保存`);
+  // 生成结果确认即保存（同样以回执为准：失败要留草稿、说实话）
+  const saved = await saveAll();
+  toast(
+    saved && saved.ok
+      ? `已加入 ${picked.length} 个地点（含自动连线）并保存`
+      : `已加入 ${picked.length} 个地点，但没保存成功：改动还在编辑器里，点右上角「保存」重试`,
+  );
   return true;
 }
 
@@ -7491,7 +8953,7 @@ function addPortal() {
       markDirty();
       renderNodeForm();
       renderMap();
-      toast("跨区连线已加入，记得点右上角保存");
+      toast("跨区连线已加入，点右上角「保存」后生效。");
       return true;
     },
   });
@@ -7933,7 +9395,7 @@ async function editMapJson() {
       renderMap();
       renderNodeForm();
       renderActionGrid();
-      toast("地图已替换（记得点右上角保存）");
+      toast("已替换地图，点右上角「保存」后生效。");
       return true;
     },
   });
@@ -8277,7 +9739,7 @@ function renderActionForm() {
   form.appendChild(
     comboField("分组", action.group || "", knownGroups, (value) => (action.group = value.trim()), {
       hint:
-        "动作库里的归类，随便起名字（下拉里是已有的分组，也可以直接写新的）。" +
+        "动作库里的归类，名称自定（下拉里是已有分组，也可以直接写新名称）。" +
         "留空就按用途自动归类。",
       placeholder: "例如 互动",
     }),
@@ -8328,14 +9790,14 @@ function renderActionForm() {
         {
           key: "brief",
           label: "只写名字",
-          hint: "只写「id（名字）」：看一眼就知道干嘛的动作（点头、抱抱、亲亲）用这个，省提示词。",
+          hint: "只写「id（名称）」：含义一看就懂的动作（点头、抱抱、亲亲）用这个，可节省提示词。",
         },
       ],
       (value) => {
         action.desc_mode = value;
         renderActionForm();
       },
-      { hint: "工具型 / 时长由你定 / 只有这个地点才能做这些标记不受影响。" },
+      { hint: "工具型 / 时长自定 / 只有这个地点才能做：这些标记不受影响。" },
     ),
   );
   form.appendChild(
@@ -8610,10 +10072,21 @@ function renderActionForm() {
       paramBox.appendChild(el("p", "hint", "（选择工具后显示它的参数）"));
     }
     currentTools.forEach((name) => {
+      const globalSearch = name === GLOBAL_SEARCH_TOOL;
       const tool = ui.tools.find((item) => item.name === name);
-      paramBox.appendChild(el("div", "sub-title", name));
       paramBox.appendChild(
-        el("p", "hint", tool ? tool.param_text || "（这个工具不需要参数）" : "（没找到这个工具）"),
+        el("div", "sub-title", globalSearch ? GLOBAL_SEARCH_LABEL : name),
+      );
+      paramBox.appendChild(
+        el(
+          "p",
+          "hint",
+          globalSearch
+            ? "参数由「联网搜索」里的全局配置决定。"
+            : tool
+              ? tool.param_text || "（这个工具不需要参数）"
+              : "（没找到这个工具）",
+        ),
       );
     });
     const toolName = currentTools[0] || "";
@@ -8623,7 +10096,7 @@ function renderActionForm() {
 
     // 工具型动作最容易踩的坑，直接在表单里点出来
     const missingTools = currentTools.filter(
-      (name) => !ui.tools.some((item) => item.name === name),
+      (name) => name !== GLOBAL_SEARCH_TOOL && !ui.tools.some((item) => item.name === name),
     );
     if (action.enabled === false) {
       // 动作已停用，运行时不会跑，不用提示它缺工具
@@ -8633,6 +10106,14 @@ function renderActionForm() {
           "p",
           "warn-line",
           "⚠ 这是工具型动作，但还没选工具。没有工具的这一步会被直接跳过（日志里会写明原因）。",
+        ),
+      );
+    } else if (usesGlobalSearch(action) && !effectiveSearchTools().length) {
+      toolBox.appendChild(
+        el(
+          "p",
+          "warn-line",
+          `⚠ 这个动作写着「${GLOBAL_SEARCH_LABEL}」，但联网搜索里还没配工具，这一步会被跳过。`,
         ),
       );
     } else if (missingTools.length) {
@@ -8646,134 +10127,15 @@ function renderActionForm() {
     }
 
     if ((action.tool_flow || "simple") === "search") {
-      const searchBox = el("div", "subsection");
-      const searchTitle = el("div", "sub-title");
-      searchTitle.appendChild(el("span", "", "联网检索设置"));
-      searchTitle.appendChild(
-        tipBox(
-          "她在 intent 里写想查什么，也可给几条 queries 分角度查；" +
-            "结果整理成证据交给她，证据里没有的会直说没查到。",
+      // 用户 m10393：联网搜索不再让用户在每个动作上配一遍——工具、档位、条数都搬到
+      // 全局设置 → 高级功能 → 联网搜索（一份配置管所有地点）。这里只留一句指路。
+      toolBox.appendChild(
+        el(
+          "p",
+          "hint",
+          "联网检索的参数统一在 全局设置 → 高级功能 → 联网搜索 里改；动作上不再单独配。",
         ),
       );
-      searchBox.appendChild(searchTitle);
-      searchBox.appendChild(
-        pickerField(
-          "阅读网页工具（可选）",
-          action.reader_tool_names || [],
-          toolItems(),
-          (chosen) => {
-            action.reader_tool_names = chosen;
-            // 选完要立刻重画：不然按钮上还是"点击选择工具…"，
-            // 再点开时上次选的也没勾上（看起来就像这个字段配不了）
-            renderActionForm();
-          },
-          {
-            hint: "能传网址、返回正文的工具（如把网页转成 markdown）。配上后按检索深度抓最靠前的几篇正文；留空只用摘要。",
-            empty: "点击选择工具…",
-            renderChips: true,
-          },
-        ),
-      );
-      searchBox.appendChild(
-        pillsField(
-          "检索深度",
-          action.search_depth || "standard",
-          SEARCH_DEPTHS,
-          (value) => {
-            action.search_depth = value;
-            renderActionForm();
-          },
-        {
-          hint: "查询上限：快查只查一轮；标准读前两篇、不够补查一轮；深挖至少三篇、最多补两轮。她只能选更浅的档。",
-        },
-        ),
-      );
-      searchBox.appendChild(
-        inputField(
-          "最多查询条数",
-          action.search_max_queries ?? 3,
-          (value) => (action.search_max_queries = Math.min(5, Math.max(1, num(value, 3)))),
-          {
-            hint:
-              "她自己一次最多能给几条查询词；没写查询词时，插件会让辅助模型按她的意图翻出一条。",
-            type: "number",
-            min: 1,
-            max: 5,
-          },
-        ),
-      );
-      searchBox.appendChild(
-        inputField(
-          "最多读几篇正文",
-          action.search_max_reads ?? 2,
-          (value) => (action.search_max_reads = Math.max(0, num(value, 2))),
-          { hint: "配了阅读工具才生效；读得越多越慢，也越费工具额度。", type: "number", min: 0, max: 5 },
-        ),
-      );
-      searchBox.appendChild(
-        inputField(
-          "最多补查几轮",
-          action.search_rounds ?? 1,
-          (value) => (action.search_rounds = Math.max(0, num(value, 1))),
-          {
-            hint: "查到的东西太少时，让辅助模型换个角度再查一轮；0 = 不补查。",
-            type: "number",
-            min: 0,
-            max: 3,
-          },
-        ),
-      );
-      searchBox.appendChild(
-        inputField(
-          "搜索主题",
-          action.search_topic || "",
-          (value) => (action.search_topic = value.trim()),
-          {
-            hint: "这个动作固定查什么：日程调用且没写意图时用它当查询词。留空则由她按当时处境自己想一句。",
-            placeholder: "例如 今日新闻热点",
-          },
-        ),
-      );
-      searchBox.appendChild(
-        inputField(
-          "查询模板（可选）",
-          action.search_query_template || "",
-          (value) => (action.search_query_template = value.trim()),
-          {
-            hint: "把主题套成固定格式，占位符 {topic} 与 {date}，例如「{date} 新闻热点」。",
-            placeholder: "例如 {date} 新闻热点",
-          },
-        ),
-      );
-      searchBox.appendChild(
-        pillsField(
-          "讲结果时带来源",
-          action.search_cite ? "yes" : "no",
-          [
-            { key: "no", label: "不带", hint: "来源只写进日志与调试输出，群里不出现网址（默认）" },
-            { key: "yes", label: "带一条", hint: "允许她在末尾用括号补一条参考链接" },
-          ],
-          (value) => {
-            action.search_cite = value === "yes";
-            renderActionForm();
-          },
-          { hint: "群里通常不想看到一串网址；要核对来源时再打开。" },
-        ),
-      );
-      searchBox.appendChild(
-        inputField(
-          "查完回落多少好奇",
-          num(action.search_satisfy_curiosity ?? 0.3),
-          (value) =>
-            (action.search_satisfy_curiosity = Math.min(1, Math.max(0, num(value, 0.3)))),
-          {
-            hint: "查完一次、真拿到东西之后好奇心降多少（默认 0.3）；0 = 不回落",
-            type: "number",
-            step: "0.05",
-          },
-        ),
-      );
-      toolBox.appendChild(searchBox);
     }
     form.appendChild(toolBox);
   }
@@ -8992,10 +10354,14 @@ function actionOwnerTitle(name) {
   return hit ? String(hit.title || hit.name || "") : String(name || "");
 }
 
+/** 由系统自己维护、不给用户在动作库里配的动作（用户 m10393）。 */
+const HIDDEN_ACTION_IDS = new Set(["search_web", "read_web_page"]);
+
 function visibleActions() {
   const keyword = String(($("action-search") || {}).value || "").trim().toLowerCase();
   const picked = String(ui.actionGroup || "");
   return actions().filter((action) => {
+    if (HIDDEN_ACTION_IDS.has(String(action.id || ""))) return false;
     const owner = actionOwnerOf(action);
     if (picked.startsWith("ext:")) {
       if (owner !== picked.slice(4)) return false;
@@ -9023,7 +10389,7 @@ function renderActionMenu() {
   const box = $("action-menu");
   if (!box) return;
   box.innerHTML = "";
-  const list = actions();
+  const list = actions().filter((action) => !HIDDEN_ACTION_IDS.has(String(action.id || "")));
   const originals = list.filter((action) => !actionOwnerOf(action));
   const counts = new Map();
   originals.forEach((action) => {
@@ -9068,6 +10434,7 @@ function actionMenuItem(key, label, count) {
 
 function renderActionGrid() {
   renderActionMenu();
+  ensureActionDiscovery();
   const grid = $("action-grid");
   grid.innerHTML = "";
   // 内置动作排最前（引擎专用，先让用户看到）；其余按加入时间倒序，没时间的保持原顺序。
@@ -9111,6 +10478,312 @@ function applyActionView() {
     window.localStorage.setItem(ACTION_VIEW_KEY, table ? "table" : "cards");
   } catch (error) {
     /* 记不住就记不住，不影响用 */
+  }
+}
+
+/* ---------------- 动作说明整理：只读摘要 + 预览 + 排队 ---------------- */
+
+/**
+ * 动作说明整理的入口（挂在动作库顶上）。
+ *
+ * 三件事都**不改世界配置**：「开始整理」只是把动作排进后台队列，真正的说明由后台慢慢写。
+ * 所以这里既不走「保存」，也不弹确认框——把它接进保存流程会让"看一眼摘要"变成一次写盘。
+ */
+function actionDiscoveryCard() {
+  const card = el("div", "card action-discovery");
+  card.appendChild(el("h2", "", "动作说明整理"));
+  card.appendChild(
+    el(
+      "p",
+      "hint",
+      "她每一轮看到的动作清单里，每条只有一句话。这一句话由后台整理生成：" +
+        "不占回复时间，也不影响动作本身能不能用。",
+    ),
+  );
+  // 用户 m29086：讲清这个功能是干啥的、为什么要有、什么时候需要点。
+  const explain = document.createElement("details");
+  explain.dataset.role = "explain";
+  const explainHead = document.createElement("summary");
+  explainHead.textContent = "这是做什么的？为什么要有？要点吗？";
+  explain.appendChild(explainHead);
+  explain.appendChild(
+    el(
+      "p",
+      "muted",
+      "她做决定时，提示词里会列出「此刻能做的事」。每条动作原本只有一个名字（例如「蹭一蹭」），" +
+        "名字看不出「什么时候值得做、做了会怎样」。整理就是让辅助模型对着动作的设定，补出一句像人话的说明" +
+        "（比如「靠过去蹭一蹭，撒娇或者求安慰的时候用」），她挑动作时更准。",
+    ),
+  );
+  explain.appendChild(
+    el(
+      "p",
+      "muted",
+      "为什么要有：不整理她也照样能做那些动作，只是清单里全是人名一样的短词，容易挑错、容易冷场。" +
+        "整理是一次性的后台活，写完就存下来，不会每轮重写。",
+    ),
+  );
+  explain.appendChild(
+    el(
+      "p",
+      "muted",
+      "无需手动点击——她自己会整理（睡着时每 5 分钟扫一次、醒着每小时一次，" +
+        "只排还缺说明的动作，全都有说明就跳过）。只有两种情况值得手动点：" +
+        "① 刚加了一批动作、想马上看到整理好的说明；② 改了动作设定之后想让说明跟着更新" +
+        "（这时用「全部重算」）。「现在整理一次」只是替你按下扫描，没缺的就不会白花模型调用。",
+    ),
+  );
+  // 默认折叠（details 自己就是折叠的），别用 hidden 把它藏死——用户 m29086 的第三问
+  // 就是"要在页面讲明白这是干啥的"，藏在点不开的地方等于没写。
+  card.appendChild(explain);
+  const summary = el("p", "muted", "正在读取…");
+  summary.dataset.role = "summary";
+  card.appendChild(summary);
+  // 自动整理的状态一行（用户 m29086：让它自己整理这件事要看得见）
+  const autoLine = el("p", "muted auto-tidy");
+  autoLine.dataset.role = "auto-tidy";
+  card.appendChild(autoLine);
+  const toolbar = el("div", "toolbar");
+  const previewButton = document.createElement("button");
+  previewButton.type = "button";
+  previewButton.textContent = "看要整理哪些";
+  previewButton.title = "列出还缺说明的动作，以及代码现在能算出来的那句话";
+  const tidyButton = document.createElement("button");
+  tidyButton.type = "button";
+  tidyButton.textContent = "现在整理一次";
+  tidyButton.title = "立刻扫一遍：只把还缺说明的动作排进后台队列";
+  const rebuildButton = document.createElement("button");
+  rebuildButton.type = "button";
+  rebuildButton.textContent = "开始整理";
+  rebuildButton.title = "把这些动作排进后台队列，由辅助模型慢慢写";
+  const refreshButton = document.createElement("button");
+  refreshButton.type = "button";
+  refreshButton.textContent = "刷新";
+  refreshButton.title = "重新读取当前的整理进度";
+  // 补缺只排"还没有简述"的；全部重算连已经整理好的也再跑一遍（P0-2：按钮叫什么就做什么）
+  const forceButton = document.createElement("button");
+  forceButton.type = "button";
+  forceButton.textContent = "全部重算";
+  forceButton.title = "已经整理好的也重新写一遍（会多花模型调用）";
+  toolbar.appendChild(previewButton);
+  toolbar.appendChild(tidyButton);
+  toolbar.appendChild(rebuildButton);
+  toolbar.appendChild(forceButton);
+  toolbar.appendChild(refreshButton);
+  card.appendChild(toolbar);
+  const detail = document.createElement("details");
+  detail.dataset.role = "detail";
+  const detailHead = document.createElement("summary");
+  detailHead.textContent = "明细";
+  detail.appendChild(detailHead);
+  const rows = el("div", "rows");
+  rows.dataset.role = "rows";
+  detail.appendChild(rows);
+  detail.classList.add("hidden");
+  card.appendChild(detail);
+  previewButton.addEventListener("click", () => previewActionDiscovery(card));
+  tidyButton.addEventListener("click", () => tidyActionDiscovery(card));
+  rebuildButton.addEventListener("click", () => rebuildActionDiscovery(card, "fill"));
+  forceButton.addEventListener("click", () => rebuildActionDiscovery(card, "force"));
+  refreshButton.addEventListener("click", () => loadActionDiscovery(card));
+  return card;
+}
+
+/** 动作库渲染时确保这张卡片在场；只在第一次真的去读一次进度。 */
+function ensureActionDiscovery() {
+  const anchor = $("action-banner");
+  if (!anchor || !anchor.parentNode) return null;
+  let card = anchor.parentNode.querySelector(".action-discovery");
+  if (!card) {
+    card = actionDiscoveryCard();
+    anchor.insertAdjacentElement("afterend", card);
+    loadActionDiscovery(card);
+  }
+  return card;
+}
+
+function actionDiscoveryParts(card) {
+  return {
+    summary: card.querySelector('[data-role="summary"]'),
+    detail: card.querySelector('[data-role="detail"]'),
+    rows: card.querySelector('[data-role="rows"]'),
+  };
+}
+
+function actionDiscoverySetSummary(card, text) {
+  const parts = actionDiscoveryParts(card);
+  if (parts.summary) parts.summary.textContent = text;
+}
+
+function actionDiscoveryAutoText(report) {
+  const auto = (report && report.auto_tidy) || {};
+  if (auto.enabled === false) {
+    return "自动整理没开着：整理要用「打杂 / 睡眠整理」那个模型，" +
+      "在「运行与模型」里配好之后她会自己整理（不用点）。";
+  }
+  const asleep = auto.sleeping === true;
+  const every = asleep ? "她睡着，每 5 分钟扫一次" : "她醒着，每小时扫一次";
+  const bits = [every];
+  const age = num(auto.last_age, -1);
+  const note = String(auto.note || "").trim();
+  if (age >= 0) bits.push(`上次扫描 ${agoText(age)}`);
+  if (note) {
+    // 引擎自己会把这一扫的结果说清楚（排了几个 / 剩下的都是扩展动作 / 全都整理过了）。
+    // 页面别再按数字猜一遍——猜出来的话和引擎的判断迟早对不上。
+    bits.push(note);
+  } else if (num(auto.missing, 0) > 0) {
+    bits.push(`还缺 ${num(auto.missing, 0)} 个`);
+  } else if (age >= 0) {
+    bits.push("没有缺说明的动作，扫完就跳过");
+  } else {
+    bits.push("还没扫过，下一拍就会看一次");
+  }
+  return bits.join("；");
+}
+
+async function loadActionDiscovery(card) {
+  if (!card) return;
+  actionDiscoverySetSummary(card, "正在读取…");
+  try {
+    const report = await apiGet("actions/discovery");
+    const missing = num(report.missing_count, (report.missing || []).length);
+    const total = num(report.total, 0);
+    const pending = num((report.queue || {}).pending, 0);
+    const parts = [];
+    if (!total) {
+      parts.push("还没有任何动作");
+    } else if (missing > 0) {
+      parts.push(`${missing} 个动作还没有简述（共 ${total} 个）`);
+    } else {
+      parts.push(`全部 ${total} 个动作都有简述了`);
+    }
+    // P0-2：来源与停用分开说——"配置里 76 个、这里 73 个"的差额就在这一句里
+    const sources = report.sources || {};
+    const named = [
+      ["world", "自己配的"],
+      ["builtin", "内置"],
+      ["extension", "扩展"],
+      ["runtime", "运行时"],
+    ]
+      .map(([key, label]) => (num(sources[key], 0) ? `${label} ${num(sources[key], 0)}` : ""))
+      .filter(Boolean);
+    if (named.length) parts.push(`按来源：${named.join(" · ")}`);
+    const disabled = num(report.disabled, 0);
+    if (disabled > 0) parts.push(`停用 ${disabled} 个不算在内`);
+    if (num(report.unsupported_or_readonly, 0) > 0) {
+      parts.push(`${num(report.unsupported_or_readonly, 0)} 个是扩展提供的（只读，用派生存储）`);
+    }
+    if (pending > 0) parts.push(`后台还有 ${pending} 个在排队`);
+    // 后端那句 note 与上面这行说的是同一件事（"N 个动作还没有简述"），**不重复说第二遍**
+    // —— 只在数字算不出来、或者还有一句别的话（例如全都整理好了）时才用它兜底。
+    const note = String(report.note || "").trim();
+    const counted = total > 0 && /还没有简述|都有简述/.test(parts[0] || "");
+    if (note && !counted) parts.push(note);
+    actionDiscoverySetSummary(card, parts.join("；"));
+    if ((report.queue || {}).last_error) {
+      const parts2 = actionDiscoveryParts(card);
+      if (parts2.summary) {
+        parts2.summary.textContent += `（上一次整理没成功：${report.queue.last_error}）`;
+      }
+    }
+    const autoLine = card.querySelector('[data-role="auto-tidy"]');
+    if (autoLine) autoLine.textContent = `自动整理：${actionDiscoveryAutoText(report)}`;
+  } catch (error) {
+    actionDiscoverySetSummary(
+      card,
+      `读不到整理进度：${(error && error.message) || "接口没有响应"}`,
+    );
+  }
+}
+
+function actionDiscoveryPreviewRow(row) {
+  const line = el("div", "row-item");
+  const head = el("div", "grow");
+  head.appendChild(el("strong", "", `${row.name || row.id || "（没有名字）"}（${row.id || ""}）`));
+  line.appendChild(head);
+  const body = el("div", "grow");
+  const before = String(row.before_summary || "").trim();
+  body.appendChild(el("div", "", `现在的那句：${before || "（还没有）"}`));
+  const after = String(row.after_summary || "").trim();
+  body.appendChild(
+    el("div", "", `整理后大概会变成：${after || "（要等模型写出来才知道）"}`),
+  );
+  if (row.reason) body.appendChild(el("div", "muted", `原因：${row.reason}`));
+  if (row.needs_expand) {
+    body.appendChild(el("div", "muted", "这条的完整说明要展开才能看清，整理后会短一些。"));
+  }
+  line.appendChild(body);
+  return line;
+}
+
+async function previewActionDiscovery(card) {
+  if (!card) return;
+  const parts = actionDiscoveryParts(card);
+  if (parts.rows) parts.rows.innerHTML = "";
+  try {
+    const result = await apiPost("actions/discovery/preview", {});
+    const rows = result.rows || [];
+    if (parts.detail) parts.detail.classList.remove("hidden");
+    if (!rows.length) {
+      if (parts.rows) parts.rows.appendChild(el("p", "muted", "没有需要整理的动作。"));
+      if (parts.detail) parts.detail.open = true;
+      return;
+    }
+    rows.forEach((row) => {
+      if (parts.rows) parts.rows.appendChild(actionDiscoveryPreviewRow(row));
+    });
+    if (parts.detail) {
+      const head = parts.detail.querySelector("summary");
+      if (head) head.textContent = `明细（${rows.length} 条）`;
+      parts.detail.open = true;
+    }
+  } catch (error) {
+    if (parts.detail) parts.detail.classList.remove("hidden");
+    if (parts.rows) {
+      parts.rows.appendChild(
+        el("p", "muted", `看不了要整理哪些：${(error && error.message) || "接口没有响应"}`),
+      );
+    }
+  }
+}
+
+async function tidyActionDiscovery(card) {
+  if (!card) return;
+  try {
+    const result = await apiPost("actions/discovery/tidy", {});
+    if (result && result.ok === false) {
+      toast(`扫不动：${result.error || "接口没有响应"}`);
+      return;
+    }
+    const queued = num(result.queued, 0);
+    if (queued > 0) {
+      toast(`${result.note || `排上 ${queued} 个`}，后台慢慢做`);
+    } else if (num(result.missing, 0) > 0) {
+      toast(result.note || "缺说明的动作都已经在队列里了");
+    } else {
+      toast("扫完了：所有动作都有说明，这次一个都没排（也没花模型调用）");
+    }
+    await loadActionDiscovery(card);
+  } catch (error) {
+    toast(`扫不动：${(error && error.message) || "接口没有响应"}`);
+  }
+}
+
+async function rebuildActionDiscovery(card, mode = "fill") {
+  if (!card) return;
+  try {
+    // fill = 补缺（默认）；force = 连已整理好的也重算
+    const result = await apiPost("actions/discovery/rebuild", { mode });
+    const queued = num(result.queued, 0);
+    const label = mode === "force" ? "全部重算：" : "";
+    toast(
+      queued > 0
+        ? `${label}${result.note || `排上 ${queued} 个`}，后台慢慢做`
+        : result.note || "没有需要重排的动作",
+    );
+    await loadActionDiscovery(card);
+  } catch (error) {
+    toast(`排不进队列：${(error && error.message) || "接口没有响应"}`);
   }
 }
 
@@ -9219,6 +10892,16 @@ function renderActionTable(list) {
   });
 }
 
+/** 这条动作属于哪个用途（后端算好的那份；离线时退回它自己写的 use_purpose）。 */
+function actionPurposeOf(action) {
+  const id = String((action && action.id) || "");
+  const map = (ui.status && ui.status.action_purposes) || {};
+  const hit = map[id];
+  if (hit && hit.label) return hit;
+  const own = String((action && action.use_purpose) || "").trim();
+  return own ? { purpose: own, label: own, recognized: false } : null;
+}
+
 function actionCard(action) {
   const card = el("div", "action-card");
   if (action.enabled === false) card.classList.add("off");
@@ -9249,6 +10932,9 @@ function actionCard(action) {
   if (action.llm_level === "tool") head.appendChild(el("span", "badge", "工具"));
   if (action.builtin) head.appendChild(el("span", "badge", "内置"));
   if (owner) head.appendChild(el("span", "badge", "扩展"));
+  // 用途小牌（P0-5）：和提示词里的分组是同一个分类器算出来的，两边看到的一致
+  const purpose = actionPurposeOf(action);
+  if (purpose) head.appendChild(el("span", "badge purpose", purpose.label));
   card.appendChild(head);
 
   const meta = el("div", "card-meta");
@@ -9386,7 +11072,7 @@ async function deleteAction(actionId) {
     title: "删除这个动作？",
     message:
       `「${action.name || action.id}」会被从动作库里删掉。` +
-      "如果只是暂时不想让她做，用卡片左上角的开关停用就好。",
+      "如果只是暂时不想让她做，用卡片左上角的开关停用即可。",
     confirmText: "删除",
   });
   if (!ok) return;
@@ -9434,7 +11120,7 @@ async function editActionsJson() {
       markDirty();
       renderActionGrid();
       renderMap();
-      toast(`已替换为 ${parsed.length} 个动作（记得点右上角保存）`);
+      toast(`已替换为 ${parsed.length} 个动作，点右上角「保存」后生效。`);
       return true;
     },
   });
@@ -9532,6 +11218,7 @@ function renderScheduleList() {
     del.addEventListener("click", () => {
       ui.config.schedules.schedules = schedules().filter((row) => row.id !== schedule.id);
       ui.selectedSchedule = "";
+      markDirty("schedules");
       renderScheduleList();
       renderScheduleForm();
     });
@@ -9566,22 +11253,347 @@ async function runScheduleNow(schedule) {
     confirmText: "立即执行",
   });
   if (!ok) return;
-  try {
-    const result = await apiPost("state/action", {
-      session: sessionId,
-      action: "run_schedule",
-      schedule_id: schedule.id,
-      force: true,
-    });
-    toast(result.ok ? result.note || "已执行" : result.reason || "没有执行");
-    if (result.ok) refreshStatus();
-  } catch (error) {
-    toast(error.message || "执行失败");
+  const operationId = crypto.randomUUID();
+  let retry;
+  do {
+    retry = false;
+    try {
+      const result = await apiPost("state/action", {
+        session: sessionId,
+        action: "run_schedule",
+        schedule_id: schedule.id,
+        force: true,
+        operation_id: operationId,
+      });
+      const replayStatus = {sent: "这次执行已完成", decided_silent: "这次执行已完成，未发言",
+        ready_to_send: "这次执行正在等待发送确认", pending: "这次执行仍在处理中",
+        generation_unknown: "这次执行尚未确认，请勿重复发起", failed: "这次执行失败，未重新执行"};
+      toast(result.replayed ? replayStatus[result.status] || "已有执行记录，等待确认" :
+        result.ok ? result.note || "已执行" : result.reason || "没有执行");
+      if (result.ok || result.replayed) refreshStatus();
+    } catch (error) {
+      retry = await confirmDialog({
+        title: "没有收到执行结果",
+        message: `${error.message || "连接失败"}。重试会查询同一次执行，不会重复执行。`,
+        confirmText: "重试",
+      });
+    }
+  } while (retry);
+}
+
+const REPEAT_KINDS = [
+  { key: "daily", label: "每天" },
+  { key: "weekly", label: "每周的某几天" },
+  { key: "monthly", label: "每月的某几号" },
+  { key: "every", label: "每 N 分钟" },
+  { key: "workdays", label: "工作日（周一到周五）" },
+  { key: "once", label: "只做这一次" },
+  { key: "cron", label: "cron 表达式（高级）" },
+];
+
+const REPEAT_DEFAULT_WINDOW = { start: "00:00", end: "23:59" };
+
+/**
+ * 这条日程的频率（`repeat`）：老的 `time` + `days` 会被推断成一次，
+ * 之后一律以 `repeat` 为准 —— 否则「每天 08:00、22:00 各一次」这种写法
+ * 在 `time` 只有一个值的旧结构里根本存不下。
+ */
+function repeatOf(schedule) {
+  if (!schedule.repeat || typeof schedule.repeat !== "object") {
+    const days = Array.isArray(schedule.days) ? schedule.days.slice() : [];
+    let kind = "daily";
+    if (schedule.once) kind = "once";
+    else if (days.length && days.length < 7) {
+      const sorted = days.slice().sort().join(",");
+      kind = sorted === "mon,tue,wed,thu,fri" ? "workdays" : "weekly";
+    }
+    schedule.repeat = {
+      kind,
+      at: [schedule.time || "08:00"],
+      weekdays: kind === "weekly" ? days : [],
+      month_days: [],
+      every_minutes: 60,
+      window: { ...REPEAT_DEFAULT_WINDOW },
+      expr: "",
+    };
   }
+  const repeat = schedule.repeat;
+  if (!Array.isArray(repeat.at) || !repeat.at.length) repeat.at = [schedule.time || "08:00"];
+  if (!Array.isArray(repeat.weekdays)) repeat.weekdays = [];
+  if (!Array.isArray(repeat.month_days)) repeat.month_days = [];
+  if (!repeat.window || typeof repeat.window !== "object") repeat.window = { ...REPEAT_DEFAULT_WINDOW };
+  if (!REPEAT_KINDS.some((item) => item.key === repeat.kind)) repeat.kind = "daily";
+  return repeat;
+}
+
+/** 把结构化频率投影回 `time` / `days` / `once`：提示词、日志、列表摘要都还在读它们。 */
+function syncScheduleLegacy(schedule) {
+  const repeat = repeatOf(schedule);
+  schedule.once = repeat.kind === "once";
+  schedule.time = String(repeat.at[0] || "08:00");
+  if (schedule.once) return;
+  if (repeat.kind === "workdays") {
+    schedule.days = ["mon", "tue", "wed", "thu", "fri"];
+  } else if (repeat.kind === "weekly") {
+    const picked = new Set(repeat.weekdays || []);
+    schedule.days = WEEKDAYS.filter((day) => picked.has(day.key)).map((day) => day.key);
+  } else {
+    schedule.days = WEEKDAYS.map((day) => day.key);
+  }
+}
+
+const CLOCK_SPLIT = /[,，、\s]+/;
+const CLOCK_TEXT = /^(\d{1,2}):(\d{2})$/;
+
+/** 「08:00, 22:30」→ ["08:00", "22:30"]（乱写的部分直接丢掉，不让它进配置）。 */
+function parseClockList(text) {
+  const out = [];
+  String(text || "")
+    .split(CLOCK_SPLIT)
+    .forEach((item) => {
+      const match = CLOCK_TEXT.exec(item.trim());
+      if (!match) return;
+      const hour = Number(match[1]);
+      const minute = Number(match[2]);
+      if (hour > 23 || minute > 59) return;
+      const clock = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+      if (!out.includes(clock)) out.push(clock);
+    });
+  return out.length ? out : ["08:00"];
+}
+
+/** 一句话预览：这条日程实际会在什么时候触发（与后端的 cron 推导同一套口径）。 */
+function repeatPreview(schedule) {
+  const repeat = repeatOf(schedule);
+  const times = (repeat.at || []).filter((item) => /^\d{2}:\d{2}$/.test(item));
+  const clocks = times.length ? times.join("、") : "08:00";
+  if (repeat.kind === "cron") return `按 cron「${repeat.expr || "（空）"}」触发`;
+  if (repeat.kind === "once") return `只在 ${schedule.date || "下一次到点"} ${clocks} 跑一次，跑完删掉`;
+  if (repeat.kind === "every") {
+    const window = repeat.window || REPEAT_DEFAULT_WINDOW;
+    return `在 ${window.start}-${window.end} 之间，每 ${repeat.every_minutes || 60} 分钟一次`;
+  }
+  if (repeat.kind === "workdays") return `周一到周五 ${clocks}`;
+  if (repeat.kind === "monthly") {
+    const days = (repeat.month_days || []).join("、") || "1";
+    return `每月 ${days} 号 ${clocks}`;
+  }
+  if (repeat.kind === "weekly") {
+    const picked = new Set(repeat.weekdays || []);
+    const label = WEEKDAYS.filter((day) => picked.has(day.key))
+      .map((day) => day.label)
+      .join(" ") || "（没勾）";
+    return `${label} ${clocks}`;
+  }
+  return `每天 ${clocks}`;
+}
+
+function scheduleRepeatBox(schedule) {
+  const repeat = repeatOf(schedule);
+  const box = el("div", "subsection");
+  const title = el("div", "sub-title");
+  title.appendChild(el("span", "", "触发频率"));
+  title.appendChild(tipBox("一天里可以有多个时间点；tick 间隔决定精度（默认 1 分钟一拍）。"));
+  box.appendChild(title);
+  box.appendChild(
+    selectField(
+      "频率",
+      repeat.kind,
+      REPEAT_KINDS.map((item) => ({ key: item.key, label: item.label })),
+      (value) => {
+        repeat.kind = value;
+        if (value === "weekly" && !(repeat.weekdays || []).length) {
+          repeat.weekdays = WEEKDAYS.map((day) => day.key);
+        }
+        if (value === "workdays") repeat.weekdays = ["mon", "tue", "wed", "thu", "fri"];
+        if (value === "monthly" && !(repeat.month_days || []).length) repeat.month_days = [1];
+        syncScheduleLegacy(schedule);
+        markDirty();
+        renderScheduleForm();
+      },
+      { hint: "「每 N 分钟」适合巡逻类的日常；太频繁会被限流（一天最多 24 次）。" },
+    ),
+  );
+  if (repeat.kind === "cron") {
+    box.appendChild(
+      inputField(
+        "cron 表达式",
+        repeat.expr || "",
+        (value) => {
+          repeat.expr = value.trim();
+          markDirty();
+        },
+        {
+          hint: "五段：分 时 日 月 周，例 0 8 * * 1,3,5 即周一三五 08:00。",
+          placeholder: "0 8 * * 1,3,5",
+        },
+      ),
+    );
+  } else {
+    box.appendChild(
+      inputField(
+        "时间点",
+        (repeat.at || []).join(", "),
+        (value) => {
+          repeat.at = parseClockList(value);
+          syncScheduleLegacy(schedule);
+          markDirty();
+          renderScheduleForm();
+        },
+        {
+          hint: "24 小时制 HH:MM，多个时间用逗号隔开，例如 08:00, 12:30, 22:30。",
+          placeholder: "08:00, 22:30",
+        },
+      ),
+    );
+  }
+  if (repeat.kind === "weekly") {
+    const wrapper = el("div", "field");
+    wrapper.appendChild(fieldHead("星期", "只在勾选的星期触发。"));
+    const row = el("div", "weekdays");
+    WEEKDAYS.forEach((day) => {
+      const picked = (repeat.weekdays || []).includes(day.key);
+      const label = el("label", picked ? "on" : "");
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = picked;
+      input.addEventListener("change", () => {
+        const set = new Set(repeat.weekdays || []);
+        if (input.checked) set.add(day.key);
+        else set.delete(day.key);
+        repeat.weekdays = WEEKDAYS.filter((item) => set.has(item.key)).map((item) => item.key);
+        label.classList.toggle("on", input.checked);
+        syncScheduleLegacy(schedule);
+        markDirty();
+        renderScheduleForm();
+      });
+      label.appendChild(input);
+      label.appendChild(el("span", "", day.label));
+      row.appendChild(label);
+    });
+    wrapper.appendChild(row);
+    box.appendChild(wrapper);
+  }
+  if (repeat.kind === "monthly") {
+    box.appendChild(
+      inputField(
+        "每月几号",
+        (repeat.month_days || []).join(", "),
+        (value) => {
+          const days = String(value || "")
+            .split(CLOCK_SPLIT)
+            .map((item) => Number(item))
+            .filter((item) => Number.isInteger(item) && item >= 1 && item <= 31);
+          repeat.month_days = Array.from(new Set(days)).sort((a, b) => a - b);
+          markDirty();
+          renderScheduleForm();
+        },
+        {
+          hint: "写 1~31，多个用逗号隔开；小月没有的日子会自动跳过。",
+          placeholder: "1, 15",
+        },
+      ),
+    );
+  }
+  if (repeat.kind === "every") {
+    box.appendChild(
+      inputField(
+        "间隔分钟",
+        repeat.every_minutes ?? 60,
+        (value) => {
+          repeat.every_minutes = Math.max(5, Math.min(1440, num(value, 60)));
+          markDirty();
+          renderScheduleForm();
+        },
+        {
+          hint: "最小 5 分钟。间隔小于 tick 的话实际会被 tick 拍数限制。",
+          type: "number",
+          min: 5,
+          step: 5,
+        },
+      ),
+    );
+    box.appendChild(
+      inputField(
+        "时间段 起",
+        (repeat.window || REPEAT_DEFAULT_WINDOW).start,
+        (value) => {
+          repeat.window.start = parseClockList(value)[0];
+          markDirty();
+          renderScheduleForm();
+        },
+        { hint: "只在这段时间内触发，例：08:00。", placeholder: "08:00" },
+      ),
+    );
+    box.appendChild(
+      inputField(
+        "时间段 止",
+        (repeat.window || REPEAT_DEFAULT_WINDOW).end,
+        (value) => {
+          repeat.window.end = parseClockList(value)[0];
+          markDirty();
+          renderScheduleForm();
+        },
+        { hint: "例：22:30。跨午夜请写成两条日程。", placeholder: "22:30" },
+      ),
+    );
+  }
+  const preview = el("p", "muted", `实际触发：${repeatPreview(schedule)}`);
+  box.appendChild(preview);
+  refreshRepeatPreview(schedule, preview);
+  return box;
+}
+
+// 编辑器只算得出「每天 08:30」这一层；工作日 / 每 N 分钟 / cron / 跨午夜都交给后端
+// （`schedule/repeat/preview`）。先本地显示一个即时结果，后端回来再覆盖；请求晚到的
+// 旧结果不能盖掉新结果，所以带一个自增序号。
+let repeatPreviewSeq = 0;
+
+function refreshRepeatPreview(schedule, node) {
+  const token = ++repeatPreviewSeq;
+  const local = repeatPreview(schedule);
+  node.textContent = `实际触发：${local}`;
+  const repeat = repeatOf(schedule);
+  apiPost("schedule/repeat/preview", {
+    repeat,
+    time: schedule.time,
+    days: schedule.days,
+    once: Boolean(schedule.once),
+    date: schedule.date || "",
+  })
+    .then((result) => {
+      if (token !== repeatPreviewSeq || !node.isConnected) return;
+      if (!result || result.ok === false) {
+        node.textContent = `实际触发：${(result && result.error) || "这句算不出来"}（先按 ${local}）`;
+        return;
+      }
+      const exprs = (result.exprs || []).join(" / ");
+      const cron = exprs ? `（cron：${exprs}）` : "";
+      const next = result.next_text ? ` · ${result.next_text}` : "";
+      node.textContent = `实际触发：${result.when_text || local}${cron}${next}`;
+    })
+    .catch(() => {
+      // 端点不可用（旧后端）就保留本地预览，不打扰用户
+    });
+}
+
+/**
+ * 触发频率收进「高级」：大多数日程就是「每天几点」，第一眼不该被 7 档频率、星期勾选、
+ * 间隔分钟铺满。折叠标题上仍写着现在的实际触发时间，想知道随时一眼能看到。
+ */
+function scheduleRepeatDetails(schedule) {
+  const box = el("details", "advanced");
+  const summary = el("summary", "", `高级：触发频率（现在：${repeatPreview(schedule) || "每天"}）`);
+  box.appendChild(summary);
+  box.appendChild(scheduleRepeatBox(schedule));
+  return box;
 }
 
 function renderScheduleForm() {
   const form = $("schedule-form");
+  // 日程属性里绝大多数控件（描述、时间、按钮组、星期勾选）改完都不自己报改动，
+  // 统一在这里听 change，免得"改了描述按保存却说没有要保存的改动"（用户 m29086）。
+  bindDirtyChange(form, "schedules");
   form.innerHTML = "";
   const schedule = schedules().find((item) => item.id === ui.selectedSchedule);
   $("schedule-title").textContent = schedule ? `日程属性：${schedule.id}` : "日程属性";
@@ -9597,61 +11609,26 @@ function renderScheduleForm() {
       hint: "内部标识，用于「接着执行另一个日程」。",
     }),
   );
-  form.appendChild(
-    inputField("触发时间", schedule.time || "08:00", (value) => (schedule.time = value), {
-      hint: "24 小时制，格式 HH:MM，例如 23:30。精度取决于世界时钟的 tick 间隔。",
-      placeholder: "23:30",
-    }),
-  );
-  form.appendChild(
-    checkboxField(
-      "只做这一次（跑完自动删掉）",
-      schedule.once === true,
-      (value) => {
-        schedule.once = value;
-        if (!value) schedule.date = "";
-        renderScheduleForm();
-      },
-      {
-        hint: "开启后这条日程只在指定那天跑一遍，跑完自动删除；「星期」对它不生效。",
-      },
-    ),
-  );
-  if (schedule.once) {
+  form.appendChild(scheduleRepeatDetails(schedule));
+  if (repeatOf(schedule).kind === "once") {
     form.appendChild(
       inputField("日期", schedule.date || "", (value) => (schedule.date = value.trim()), {
         hint: "格式 YYYY-MM-DD；留空表示下一次到点就跑。日期过了的会自己清掉。",
         placeholder: "2026-09-22",
       }),
     );
-    form.appendChild(
-      inputField(
-        "描述（这条日程是干什么的）",
-        schedule.note || "",
-        (value) => (schedule.note = value.trim()),
-        {
-          hint: "到点时会连着动作链一起带给她：她知道自己现在在做什么、为什么做。留空就只有动作链。",
-          placeholder: "睡前收尾：洗漱完回卧室躺下，别再摸手机（主人说下午可能下雨，记得收衣服）",
-        },
-      ),
-    );
-  } else {
-    form.appendChild(weekdayField(schedule));
   }
-  // 描述对两种日程都适用：固定日程（每天/每周）也要能写清楚"这件事是干什么的"
-  if (!schedule.once) {
-    form.appendChild(
-      inputField(
-        "描述（这条日程是干什么的）",
-        schedule.note || "",
-        (value) => (schedule.note = value.trim()),
-        {
-          hint: "到点时会连着动作链一起带给她：她知道自己现在在做什么、为什么做。留空就只有动作链。",
-          placeholder: "睡前收尾：洗漱完回卧室躺下，别再摸手机",
-        },
-      ),
-    );
-  }
+  form.appendChild(
+    inputField(
+      "描述（这条日程是干什么的）",
+      schedule.note || "",
+      (value) => (schedule.note = value.trim()),
+      {
+        hint: "到点时会连着动作链一起带给她：她知道自己现在在做什么、为什么做。留空就只有动作链。",
+        placeholder: "睡前收尾：洗漱完回卧室躺下，别再摸手机（主人说下午可能下雨，记得收衣服）",
+      },
+    ),
+  );
   form.appendChild(checkboxField("启用", schedule.enabled !== false, (value) => (schedule.enabled = value)));
 
   const conditionBox = el("div", "subsection");
@@ -9812,6 +11789,7 @@ function addSchedule() {
     auto_travel: true,
   });
   ui.selectedSchedule = id;
+  markDirty("schedules");
   renderScheduleList();
   renderScheduleForm();
 }
@@ -9822,6 +11800,9 @@ function addSchedule() {
 
 function renderSessionList() {
   const list = $("session-list");
+  // 会话页同样只靠少数几个控件自己报改动；备注输入框之类的通用控件改了不算改动，
+  // 统一在面板上听 change（用户 m29086）。
+  bindDirtyChange($("session-pane"), "sessions");
   list.innerHTML = "";
   ui.sessions.forEach((session) => {
     const item = el("div", "list-item");
@@ -9867,6 +11848,7 @@ function renderSessionList() {
     const toggle = el("button", "small", session.enabled ? "禁用" : "启用");
     toggle.addEventListener("click", () => {
       session.enabled = !session.enabled;
+      markDirty("sessions");
       renderSessionList();
       renderSessionSelects();
     });
@@ -9874,6 +11856,7 @@ function renderSessionList() {
     del.addEventListener("click", () => {
       ui.sessions = ui.sessions.filter((row) => row.session_id !== session.session_id);
       ui.config.sessions.sessions = ui.sessions;
+      markDirty("sessions");
       renderSessionList();
       renderSessionSelects();
     });
@@ -9891,8 +11874,311 @@ function renderSessionList() {
   renderGroupList();
 }
 
-/** 会话组：组里的群 / 私聊共享聊天上下文与记忆。 */
+/**
+ * 临时会话（用户 m00001 需求 12）：她成功私聊出去的陌生人。
+ *
+ * 三栏：活跃（还没到期）/ 已结束（收尾了）/ 已归档（默认收起来）。
+ * 「归档」只是把这张卡片收进第三栏，不动数据；「恢复」再放回去。
+ */
 
+function tempSourceText(source) {
+  // 来源按 main.py `_send_temp_session` 有没有走临时会话发送算（需求 11）
+  return source === "group_temp" ? "群临时会话" : "好友私聊";
+}
+
+function tempStateText(state) {
+  if (state === "active") return "活跃";
+  if (state === "expired") return "到期了（他再开口就收尾）";
+  // 解除接管（审查 H2）：这是「已结束之后」唯一的人工出口，她的钩子不再吞这个 umo
+  if (state === "released") return "已解除接管（消息回到宿主默认路由）";
+  return "已结束";
+}
+
+function tempTimeText(stamp) {
+  const value = Number(stamp) || 0;
+  if (!value) return "—";
+  try {
+    return new Date(value * 1000).toLocaleString();
+  } catch (error) {
+    return "—";
+  }
+}
+
+async function loadTempSessions() {
+  const list = $("temp-session-list");
+  if (!list) return;
+  try {
+    const data = await apiGet("temp_sessions");
+    ui.tempSessions = Array.isArray(data.items) ? data.items : [];
+  } catch (error) {
+    list.innerHTML = "";
+    list.appendChild(
+      el("p", "muted", `临时会话读不出来：${error && error.message ? error.message : error}`),
+    );
+    return;
+  }
+  renderTempSessionList();
+}
+
+function renderTempSessionList() {
+  const list = $("temp-session-list");
+  if (!list) return;
+  const items = Array.isArray(ui.tempSessions) ? ui.tempSessions : [];
+  list.innerHTML = "";
+  if (!items.length) {
+    list.appendChild(
+      el("p", "muted", "还没有临时会话。她成功私聊一个还没启用的人之后，这里才会出现记录。"),
+    );
+    return;
+  }
+  const buckets = [
+    ["active", "活跃", items.filter((item) => !item.archived && item.state === "active")],
+    [
+      "ended",
+      "已结束",
+      items.filter((item) => !item.archived && item.state !== "active"),
+    ],
+    ["archived", "已归档", items.filter((item) => item.archived)],
+  ];
+  buckets.forEach(([_key, title, rows]) => {
+    if (!rows.length) return;
+    list.appendChild(el("div", "temp-group-title", `${title}（${rows.length}）`));
+    rows.forEach((row) => {
+      const item = el("div", "list-item");
+      const info = el("div", "list-main");
+      info.appendChild(el("div", "", `👤 ${row.umo}`));
+      info.appendChild(
+        el(
+          "div",
+          "meta",
+          `${tempSourceText(row.source)} · 创建于 ${tempTimeText(row.created_at)} · ${Number(
+            row.rounds,
+          ) || 0} 轮 · ${tempStateText(row.state)}`,
+        ),
+      );
+      const summary = String(row.summary || "").trim();
+      if (summary) {
+        info.appendChild(el("div", "meta", `摘要：${summary}`));
+      }
+      item.appendChild(info);
+      const toggle = el("button", "small", row.archived ? "恢复" : "归档");
+      toggle.addEventListener("click", async () => {
+        toggle.disabled = true;
+        try {
+          await apiPost("temp_sessions/archive", {
+            umo: row.umo,
+            archived: !row.archived,
+          });
+          // 「恢复」会把 ended/expired 一并复位成 active（审查 H2-3），所以状态
+          // 以服务端为准，整表重取一遍，别在前端自己猜。
+          await loadTempSessions();
+        } catch (error) {
+          toast(`没改成：${error && error.message ? error.message : error}`, "danger");
+        } finally {
+          toggle.disabled = false;
+        }
+      });
+      const box = el("div", "list-actions");
+      box.appendChild(toggle);
+      if (row.state !== "released") {
+        // 解除接管（审查 H2）：ended 之后她本来会吞掉这个人的所有消息；点这里把
+        // 临时会话置 released、白名单关掉，消息回到宿主默认路由。
+        const release = el("button", "small", "解除接管");
+        release.title = "不再由她接管这个人的私聊；消息回到宿主默认路由";
+        release.addEventListener("click", async () => {
+          // 编辑器跑在没有 allow-modals 的 sandbox iframe 里，裸 confirm 会被拦掉；
+          // 统一走页面自己的弹窗（跟别处一样）。
+          const sure = await confirmDialog({
+            title: "解除接管",
+            message: `解除对 ${row.umo} 的接管？之后这个人的消息不再由她回，回到宿主默认路由。`,
+            confirmText: "解除接管",
+          });
+          if (!sure) {
+            return;
+          }
+          release.disabled = true;
+          try {
+            await apiPost("temp_sessions/release", { umo: row.umo });
+            toast("已解除接管：这个人的消息回到宿主默认路由了");
+            await loadTempSessions();
+          } catch (error) {
+            toast(`没解开：${error && error.message ? error.message : error}`, "danger");
+          } finally {
+            release.disabled = false;
+          }
+        });
+        box.appendChild(release);
+      }
+      item.appendChild(box);
+      list.appendChild(item);
+    });
+  });
+}
+
+/**
+ * 临时会话的 6 项规则（用户 m00001）：读写的是 ``world.temp_session``，
+ * 跟手改 world.json、引擎里的那个 ``TempSessionConfig`` 是同一份。
+ */
+function tempSessionConfig() {
+  if (!ui.config.world) ui.config.world = {};
+  if (!ui.config.world.temp_session) ui.config.world.temp_session = {};
+  return ui.config.world.temp_session;
+}
+
+/** 关系等级只认 ``world.profile.levels`` 里的真实档位，不在前端另抄一份。 */
+function tempLevelChoices() {
+  const profile = (ui.config.world && ui.config.world.profile) || {};
+  const levels = Array.isArray(profile.levels) ? profile.levels : [];
+  return levels.map((level, index) => [
+    String(index),
+    String((level && level.name) || `第 ${index + 1} 档`),
+  ]);
+}
+
+/** 控件挂上稳定 id / name，既方便测试定位，也让人一眼看出存的是哪个字段。 */
+function tempConfigInput(node, field) {
+  const input = node.querySelector("input, select");
+  if (input) {
+    input.id = `temp-config-${field.replace(/_/g, "-")}`;
+    input.name = `temp_session.${field}`;
+  }
+  return node;
+}
+
+/** 一行 = 控件 + 控件下面那句人话说明（label 里塞 p 不合法，所以包一层 .field）。 */
+function tempConfigRow(control, hint) {
+  const row = el("div", "field");
+  row.appendChild(control);
+  row.appendChild(el("p", "hint", hint));
+  return row;
+}
+
+function renderTempConfig() {
+  const host = $("temp-config");
+  if (!host) return;
+  const cfg = tempSessionConfig();
+  host.innerHTML = "";
+  const section = settingsSection(
+    "临时会话规则",
+    "这里决定她怎么接管临时会话；保存后立即生效，也可以直接手改 world.json。",
+    "",
+    "temp_session",
+  );
+  section.id = "temp-config-card";
+  const fields = section._fields;
+  const rows = [];
+
+  const enabled = checkboxField(
+    "自动接管临时会话",
+    cfg.enabled !== false,
+    (value) => {
+      cfg.enabled = !!value;
+      markDirty("world");
+    },
+  );
+  rows.push(
+    tempConfigRow(
+      tempConfigInput(enabled, "enabled"),
+      "关掉后，她给还没启用的人发消息也不会再登记；已经有的记录留在下面。",
+    ),
+  );
+
+  const numberRow = (field, label, min, max, hint) => {
+    let input = null;
+    const node = inputField(
+      label,
+      cfg[field] ?? "",
+      (raw) => {
+        const next = Number(raw);
+        if (!Number.isInteger(next) || next < min || next > max) {
+          toast(`${label}要填 ${min}~${max} 的整数，已保留原来的值`, "danger");
+          if (input) input.value = String(cfg[field] ?? "");
+          return;
+        }
+        cfg[field] = next;
+        markDirty("world");
+      },
+      { type: "number", min, max, step: 1 },
+    );
+    input = node.querySelector("input");
+    return tempConfigRow(tempConfigInput(node, field), hint);
+  };
+
+  rows.push(
+    numberRow(
+      "ttl_minutes",
+      "到期时间（分钟）",
+      1,
+      1440,
+      "到期只把会话标成「到期」，她不会主动发消息；对方再来找她时，回完最后一句就收尾。",
+    ),
+  );
+  rows.push(
+    numberRow(
+      "max_rounds",
+      "最多聊几轮",
+      1,
+      200,
+      "一条消息加一句回复算 1 轮；到最后一轮，她说完这句就收尾。",
+    ),
+  );
+
+  const keep = checkboxField(
+    "熟人永久保留",
+    cfg.familiar_keep !== false,
+    (value) => {
+      cfg.familiar_keep = !!value;
+      markDirty("world");
+    },
+  );
+  rows.push(
+    tempConfigRow(
+      tempConfigInput(keep, "familiar_keep"),
+      "打开后，达到下面那一档的人不参与到期，会一直保留；关掉就一样按分钟数到期。",
+    ),
+  );
+
+  const choices = tempLevelChoices();
+  const current = Number(cfg.familiar_level);
+  const levelValue = String(Number.isInteger(current) ? current : 0);
+  const level = selectField(
+    "从这一档算熟人",
+    levelValue,
+    choices.length ? choices : [[levelValue, "关系等级没读到"]],
+    (value) => {
+      const next = Number(value);
+      if (!Number.isInteger(next)) return;
+      cfg.familiar_level = next;
+      markDirty("world");
+    },
+  );
+  rows.push(
+    tempConfigRow(
+      tempConfigInput(level, "familiar_level"),
+      "这一档及以上算熟人：不参与到期，记忆也正常留下；低于它的按临时会话处理。",
+    ),
+  );
+
+  const group = checkboxField(
+    "群临时会话也接管",
+    cfg.group_temp !== false,
+    (value) => {
+      cfg.group_temp = !!value;
+      markDirty("world");
+    },
+  );
+  rows.push(
+    tempConfigRow(
+      tempConfigInput(group, "group_temp"),
+      "从群里发起的私聊同样登记成临时会话；关掉就只接管好友私聊。",
+    ),
+  );
+
+  rows.forEach((row) => fields.appendChild(row));
+  host.appendChild(section);
+}
+
+/** 会话组：组里的群 / 私聊共享聊天上下文与记忆。 */
 function groups() {
   if (!ui.config.sessions) ui.config.sessions = { sessions: [], groups: [] };
   if (!Array.isArray(ui.config.sessions.groups)) ui.config.sessions.groups = [];
@@ -9902,6 +12188,8 @@ function groups() {
 function renderGroupList() {
   const list = $("group-list");
   if (!list) return;
+  // 组名用的是通用输入框（自己不报改动），跟会话面板一样在容器上听 change。
+  bindDirtyChange($("group-pane"), "sessions");
   list.innerHTML = "";
   groups().forEach((group) => {
     const item = el("div", "list-item");
@@ -10285,7 +12573,7 @@ async function loadLogs() {
     fillLogTypes(data.types || []);
     list.innerHTML = "";
     (data.events || []).forEach((event) => {
-      const meta = LOG_TYPES[event.event_type] || { icon: "•", label: event.event_type };
+      const meta = eventMeta(event);
       const item = el("div", "log-item");
       item.dataset.type = event.event_type;
       const time = el("div", "log-time");
@@ -10315,7 +12603,7 @@ function showLogDetail(item, event) {
   item.classList.add("selected");
   const box = $("log-detail");
   if (!box) return;
-  const meta = LOG_TYPES[event.event_type] || { icon: "•", label: event.event_type };
+  const meta = eventMeta(event);
   const raw = {
     id: event.id,
     world_time: event.world_time,
@@ -10413,6 +12701,62 @@ async function loadContacts() {
   }
 }
 
+/** 通讯录里那张小头像：先出头字，取到 QQ 头像再盖上去（用户 m13421）。 */
+function contactAvatar(item) {
+  const box = el("span", "contact-avatar-box");
+  const label = String(item.name || item.user_id || "?").trim();
+  box.appendChild(el("span", "contact-avatar-initial", label ? Array.from(label)[0] : "?"));
+  const img = el("img", "contact-avatar");
+  img.alt = "";
+  img.dataset.qq = String(item.user_id || "");
+  img.addEventListener("load", () => img.classList.add("loaded"));
+  box.appendChild(img);
+  return box;
+}
+
+/** 名单画完之后再补头像：网络慢不拖住列表，取不到就留着头字。 */
+async function fillAvatars(root = document) {
+  const images = Array.from(root.querySelectorAll("img[data-qq]")).filter(
+    (img) => !img.dataset.asked && img.dataset.qq,
+  );
+  if (!images.length) return;
+  const qqs = Array.from(new Set(images.map((img) => img.dataset.qq)));
+  images.forEach((img) => {
+    img.dataset.asked = "1";
+  });
+  try {
+    const data = await apiPost("avatars", { qqs });
+    const map = data.avatars || {};
+    images.forEach((img) => {
+      const url = map[img.dataset.qq];
+      if (url) img.src = url;
+    });
+  } catch (error) {
+    /* 头像只是装饰：取不到就留着头字，不打扰用户 */
+  }
+}
+
+/** 一个会话在人话里叫什么：有备注用备注，没有就按「群/私聊 + 号码」。 */
+function sessionPlaceLabel(sessionId) {
+  const raw = String(sessionId || "");
+  const found = (ui.sessions || []).find(
+    (item) => String((item && item.session_id) || "") === raw,
+  );
+  const note = found ? String(found.note || "").trim() : "";
+  if (note) return note;
+  const parts = raw.split(":");
+  const kind = (parts[1] || "").toLowerCase();
+  const isPrivate = kind.includes("friend") || kind.includes("private");
+  return `${isPrivate ? "私聊" : "群"} ${parts.slice(2).join(":")}`;
+}
+
+/** 同一个人在几个地方各叫什么（用户 m14014）。 */
+function contactPlaces(cards) {
+  return Object.entries(cards || {})
+    .map(([sessionId, card]) => ({ where: sessionPlaceLabel(sessionId), card: String(card || "") }))
+    .filter((item) => item.card);
+}
+
 function renderContactsList() {
   const box = $("contacts-list");
   const keyword = ($("contacts-search") ? $("contacts-search").value : "").trim();
@@ -10435,6 +12779,7 @@ function renderContactsList() {
     row.classList.toggle("active", item.user_id === ui.contactUser);
     row.dataset.user = item.user_id;
     const head = el("div", "contact-row-head");
+    head.appendChild(contactAvatar(item));
     head.appendChild(el("strong", "", item.name || item.user_id));
     (item.bonds || []).forEach((bond) => {
       head.appendChild(contactBadge(bond, "pill pill-bond"));
@@ -10449,11 +12794,25 @@ function renderContactsList() {
       `${item.level || "陌生人"} · 好感 ${Math.round(Number(item.affinity) || 0)} · 聊过 ${item.message_count || 0} 句 · ${formatStamp(item.last_seen_at)}`,
     );
     row.appendChild(meta);
+    const places = contactPlaces(item.cards);
+    if (places.length > 1) {
+      row.appendChild(
+        el(
+          "div",
+          "contact-row-cards",
+          "在 " +
+            places
+              .map((place) => `${place.where}叫「${place.card}」`)
+              .join(" · "),
+        ),
+      );
+    }
     if (item.digest) {
       row.appendChild(el("div", "contact-row-digest", item.digest));
     }
     box.appendChild(row);
   });
+  fillAvatars(box);
 }
 
 function renderContactPlaces() {
@@ -10509,7 +12868,7 @@ function renderContactDetail(data) {
   if (person.qq_name) metaBits.push(`昵称「${person.qq_name}」`);
   const cards = Object.entries(person.cards || {});
   cards.forEach(([sessionId, card]) => {
-    if (card) metaBits.push(`在 ${sessionId.split(":").slice(-1)[0]} 叫「${card}」`);
+    if (card) metaBits.push(`在「${sessionPlaceLabel(sessionId)}」叫「${card}」`);
   });
   const caps = (data.bonds_config || [])
     .filter((item) => (person.affinities || []).includes(item.name))
@@ -10604,6 +12963,67 @@ function renderContactDetail(data) {
     ),
   );
   box.appendChild(affinityCard);
+
+  // 二点二、信赖值（T15-S3）：-1 ~ +1，0 是"还没判断"。**只读**——
+  // 它只靠事件与夜间整理里的小额评估变化，没有手动加减的入口（用户拍板）。
+  const trustValue = Math.max(-1, Math.min(1, Number(person.trust) || 0));
+  const trustLabel = (value) => {
+    if (value >= 0.6) return "基本不用怀疑";
+    if (value >= 0.3) return "信得过";
+    if (value >= 0.1) return "多半会信";
+    if (value > -0.1) return "还没判断";
+    if (value > -0.3) return "多留个心眼";
+    if (value > -0.6) return "不太信";
+    return "基本不信";
+  };
+  const trustCard = el("div", "contact-section");
+  const trustHead = el("div", "section-head");
+  trustHead.appendChild(el("h3", "", "信赖值"));
+  trustHead.appendChild(el("span", "pill", trustLabel(trustValue)));
+  trustCard.appendChild(trustHead);
+  const trustBar = el("div", "affinity-bar");
+  const trustFill = el("i");
+  // -1~+1 映射到 0~100%：中点 50% 就是"还没判断"
+  trustFill.style.width = `${Math.max(0, Math.min(100, (trustValue + 1) * 50))}%`;
+  if (trustValue < 0) trustFill.classList.add("negative");
+  trustBar.appendChild(trustFill);
+  const trustSummary = el("div", "affinity-summary");
+  trustSummary.appendChild(trustBar);
+  trustSummary.appendChild(
+    el(
+      "span",
+      "affinity-value",
+      `${trustValue > 0 ? "+" : ""}${trustValue.toFixed(1)} / ±1.0`,
+    ),
+  );
+  trustCard.appendChild(trustSummary);
+  const trustNotes = Array.isArray(person.trust_notes) ? person.trust_notes.slice(0, 3) : [];
+  if (trustNotes.length) {
+    const trustList = el("div", "list");
+    trustList.appendChild(el("p", "hint-line", "最近几次变化："));
+    trustNotes.forEach((item) => {
+      const delta = Number(item.delta) || 0;
+      trustList.appendChild(
+        el(
+          "div",
+          "contact-line muted",
+          `${formatStamp(item.at)} ${delta >= 0 ? "+" : ""}${delta.toFixed(2)}`
+            + `（${item.reason || "没写原因"}）`,
+        ),
+      );
+    });
+    trustCard.appendChild(trustList);
+  }
+  trustCard.appendChild(
+    el(
+      "p",
+      "hint-line",
+      "这一项只靠日常相处和事件慢慢变：兑现过的承诺、给过的建议、帮过的忙才算，"
+        + "而且要有原话对得上。30 天没互动，负信赖会慢慢淡回中间。"
+        + "它只是她心里的印象，不是「听谁的」的概率。",
+    ),
+  );
+  box.appendChild(trustCard);
 
   // 二点五、她记着的账：记了就会对他冷一档，所以这里要写清现在算不算数
   const grudge = data.grudge;
@@ -11278,10 +13698,10 @@ function openMemoryDialog(memory, preset = {}) {
 /** 全局设置的分组：小节标题 → 标签页。标题改了这里要跟着改。 */
 const SETTINGS_TABS = [
   {
-    key: "basic",
-    label: "基础",
-    hint: "她是谁、生活在什么样的世界、谁是管理员",
-    sections: ["基础", "persona", "persona_brief", "她的初始状态"],
+    key: "profile",
+    label: "她是谁",
+    hint: "名字、性别、角色卡、声音样例",
+    sections: ["persona", "persona_brief"],
   },
   {
     key: "state",
@@ -11294,26 +13714,43 @@ const SETTINGS_TABS = [
     label: "说话与决策",
     hint: "多久开口、说什么、怎么分句",
     sections: [
-      "手感（滑块）",
+      "性格与习惯",
       "自主决策",
       "孤独感与插话",
-      "没人理她时怎么办",
+      "无人回应时的处理",
       "说话频率与预算",
       "说话节奏",
+      "追问",
+      "私聊",
+      "表达变奏",
+      "回复格式（精简/完整）",
+      "谈资",
+      // 语义检索（向量索引）属于"怎么翻旧事"，归这一档；以前它不在任何分类里，
+      // 于是被兜底到「基础」页（复核报告 P2-5）。
+      "语义检索（向量索引）",
+      "action_selection",
+      "boredom_online",
     ],
   },
   {
     key: "world",
-    label: "世界与事件",
-    hint: "她遇上什么事、怎么求助、动作与地点、工具、天气",
+    label: "世界与生活",
+    hint: "世界规则、初始状态、事件、动作与地点、工具、天气",
     sections: [
+      "世界与生活",
+      "她的初始状态",
       "事件",
+      "contributions",
       "作息与夜晚",
       "她自己的账",
       "干涉与线索",
       "动作与地点",
       "工具",
       "天气",
+      // 表情包总开关与自动收图（用户 m00001）：以前素材页那几块面板保存后会跳到
+      // world 档，而 world 档里根本没有表情包一节 —— 跳过去等于把设置页藏空。
+      // 现在这里真的有一节，跳转目标存在，也顺手把两个总开关放进来看得见。
+      "表情包",
     ],
   },
   {
@@ -11322,16 +13759,33 @@ const SETTINGS_TABS = [
     hint: "记得什么、怎么把信息喂给模型",
     sections: [
       "记忆",
+      // 记忆的容量/衰减参数（用户要求挂到设置页）：单独一段，挂在「记忆」下面
+      "memory_budget",
+      // 知识卡也归这一档（用户 m00001）：它是"记住的东西"，不该另开一级 tab
+      "知识卡",
+      "dream",
       "用户画像",
       "上下文",
       "图片转述",
     ],
   },
   {
+    key: "advanced",
+    label: "高级功能",
+    hint: "不常改的：Agent 自主能力、联网搜索、存储",
+    sections: ["Agent（自主能力）", "联网搜索", "存储"],
+  },
+  {
+    key: "extensions",
+    label: "扩展",
+    hint: "装了哪些扩展包，以及它们各自的配置",
+    sections: ["扩展"],
+  },
+  {
     key: "debug",
     label: "调试与安全",
-    hint: "排查用，以及不许做的事",
-    sections: ["调试输出", "内容安全与隐私"],
+    hint: "管理员、排查用，以及不许做的事",
+    sections: ["管理员", "调试输出", "内容安全与隐私"],
   },
 ];
 
@@ -11346,7 +13800,165 @@ function settingsTabOf(section) {
   const found = SETTINGS_TABS.find(
     (item) => item.sections.includes(key) || item.sections.includes(title),
   );
-  return found ? found.key : "basic";
+  return found ? found.key : SETTINGS_TABS[0].key;
+}
+
+const SETTINGS_MODE_KEY = "vw-settings-mode";
+
+/** 常用 / 全部设置：默认常用，选择记在本机。 */
+function readSettingsMode() {
+  try {
+    return window.localStorage.getItem(SETTINGS_MODE_KEY) === "advanced"
+      ? "advanced"
+      : "common";
+  } catch (error) {
+    return "common";
+  }
+}
+
+function setSettingsMode(mode) {
+  ui.settingsMode = mode === "advanced" ? "advanced" : "common";
+  try {
+    window.localStorage.setItem(SETTINGS_MODE_KEY, ui.settingsMode);
+  } catch (error) {
+    /* 隐私模式记不住就记不住 */
+  }
+  renderSettingsMode();
+}
+
+function renderSettingsMode() {
+  const advanced = ui.settingsMode === "advanced";
+  const hub = $("settings-hub");
+  const form = $("settings-form");
+  const passwordCard = $("settings-password-card");
+  const bar = document.querySelector("#tab-settings .settings-bar");
+  const hits = $("settings-search-hits");
+  if (hub) hub.classList.toggle("hidden", advanced);
+  if (bar) bar.classList.toggle("hidden", !advanced);
+  if (form) form.classList.toggle("hidden", !advanced);
+  if (passwordCard) passwordCard.classList.toggle("hidden", !advanced);
+  if (hits && !advanced) hits.classList.add("hidden");
+  if (advanced) {
+    applySettingsTabs();
+  } else {
+    renderSettingsHub();
+  }
+}
+
+/** 点常用卡片的「编辑」：切到全部设置并落到对应分类。 */
+function openSettingsTab(tab) {
+  ui.settingsTab = tab || SETTINGS_TABS[0].key;
+  setSettingsMode("advanced");
+  const form = $("settings-form");
+  if (form && form.scrollIntoView) {
+    form.scrollIntoView({ block: "start", behavior: "smooth" });
+  }
+}
+
+function renderSettingsHub() {
+  const box = $("settings-hub");
+  if (!box) return;
+  const world = ui.config.world || {};
+  const gender = (GENDERS.find((item) => item.key === world.gender) || {}).label || "未设置";
+  const personaMode =
+    { astrbot: "跟随 AstrBot", plugin: "用插件这份", append: "AstrBot + 插件" }[
+      (world.persona || {}).mode || "astrbot"
+    ] || "跟随 AstrBot";
+  const model = (ui.config.providers || {}).llm || "跟随插件";
+  const safety = [
+    ...((world.content_safety || {}).blocked_words || []),
+    ...((world.content_safety || {}).message_blocklist || []),
+    ...((world.content_safety || {}).session_blocklist || []),
+  ].length;
+  const cards = [
+    {
+      title: "她是谁",
+      desc: "名字、性别、角色卡",
+      tab: "profile",
+      values: [
+        ["名字", world.bot_name || "未设置"],
+        ["性别", gender],
+        ["人设", personaMode],
+      ],
+    },
+    {
+      title: "世界与生活",
+      desc: "世界名称、时区、初始状态",
+      tab: "world",
+      values: [
+        ["世界", world.name || "小世界"],
+        ["时区", world.timezone || "Asia/Shanghai"],
+        ["初始状态", "默认"],
+      ],
+    },
+    {
+      title: "说话与决策",
+      desc: "主动程度、群聊活跃度、自主能力",
+      tab: "talk",
+      values: [
+        ["性格", handfeelSummary(world).replace(/^当前：/, "")],
+        ["自主能力", world.agent && world.agent.enabled ? "开启" : "关闭"],
+        ["表达变奏", world.variation && world.variation.enabled === false ? "关闭" : "开启"],
+      ],
+    },
+    {
+      title: "运行与模型",
+      desc: "主模型、辅助模型、工具",
+      tab: "talk",
+      values: [
+        ["主模型", String(model)],
+        ["辅助模型", String((ui.config.providers || {}).helper || "跟随插件")],
+        ["可用工具", `${(ui.tools || []).length} 个`],
+      ],
+    },
+    {
+      title: "安全与调试",
+      desc: "访问密码、内容安全、调试",
+      tab: "debug",
+      values: [
+        ["访问密码", ui.passwordRequired ? "独立密码" : "跟随 AstrBot"],
+        ["内容安全", safety ? `${safety} 条规则` : "未配置"],
+        ["调试输出", "在全部设置里"],
+      ],
+    },
+  ];
+
+  box.innerHTML = "";
+  const head = el("div", "settings-hub-head");
+  const copy = el("div");
+  copy.appendChild(el("h2", "", "常用设置"));
+  copy.appendChild(
+    el("p", "muted", "只显示最常改的 5 组；完整参数在「全部设置」里，随时可以切回去。"),
+  );
+  head.appendChild(copy);
+  const all = el("button", "ghost", "全部设置");
+  all.type = "button";
+  all.addEventListener("click", () => setSettingsMode("advanced"));
+  head.appendChild(all);
+  box.appendChild(head);
+
+  const grid = el("div", "settings-hub-grid");
+  cards.forEach((item) => {
+    const card = el("div", "card settings-hub-card");
+    const cardHead = el("div", "settings-hub-card-head");
+    cardHead.appendChild(el("h3", "", item.title));
+    cardHead.appendChild(el("span", "muted", item.desc));
+    card.appendChild(cardHead);
+    const values = el("div", "settings-hub-values");
+    item.values.forEach(([key, value]) => {
+      values.appendChild(el("span", "", key));
+      values.appendChild(el("span", "", value));
+    });
+    card.appendChild(values);
+    const foot = el("div", "settings-hub-card-foot");
+    const edit = el("button", "ghost small", "编辑");
+    edit.type = "button";
+    edit.addEventListener("click", () => openSettingsTab(item.tab));
+    foot.appendChild(edit);
+    card.appendChild(foot);
+    grid.appendChild(card);
+  });
+  box.appendChild(grid);
 }
 
 function renderSettingsTabs() {
@@ -11358,7 +13970,8 @@ function renderSettingsTabs() {
     const button = el("button", `settings-tab${tab.key === current ? " active" : ""}`);
     button.type = "button";
     button.title = tab.hint;
-    button.appendChild(el("span", "", tab.label));
+    const label = tab.key === "profile" ? `${pronoun()}是谁` : tab.label;
+    button.appendChild(el("span", "", label));
     if (ui.dirtyTabs.has(tab.key)) {
       button.appendChild(el("i", "dirty-dot", ""));
     }
@@ -11379,6 +13992,23 @@ function applySettingsTabs() {
     if (!section.classList.contains("card-section")) return;
     section.classList.toggle("hidden", settingsTabOf(section) !== current);
   });
+  const passwordCard = $("settings-password-card");
+  if (passwordCard) {
+    passwordCard.classList.toggle(
+      "hidden",
+      ui.settingsMode !== "advanced" || current !== "debug",
+    );
+  }
+  const rawEditor = $("world-json-editor");
+  if (rawEditor) rawEditor.classList.toggle("hidden", current !== "debug");
+  // 「扩展」第一次被点开时才去拉数据（进页面不拉、也不轮询）：装了什么扩展
+  // 跟 world.json 无关，没必要在别的分栏上付这次请求。
+  if (current === "extensions") {
+    const extensions = form.querySelector('[data-section-key="扩展"]');
+    if (extensions && typeof extensions._loadExtensions === "function") {
+      extensions._loadExtensions();
+    }
+  }
   renderSettingsTabs();
 }
 
@@ -11408,11 +14038,19 @@ function searchSettings(keyword) {
     const fieldHit = fields.find((item) => item.toLowerCase().includes(word));
     const tipHit = tips.find((item) => item.toLowerCase().includes(word));
     if (!headMatch && !fieldHit && !tipHit) return;
+    // 命中的**具体字段**（没命中字段就是整节）：点结果要能落到它身上（P2-4）
+    const fieldNode = fieldHit
+      ? Array.from(section.querySelectorAll(".field-head")).find(
+          (head) => String(head.textContent || "").trim() === fieldHit,
+        )
+      : null;
     hits.push({
       tab,
       title,
       label: headMatch ? title : fieldHit || title,
       tip: tipHit ? tipHit.slice(0, 80) + "…" : "",
+      field: fieldHit || "",
+      node: fieldNode ? fieldNode.closest(".field") || fieldNode : null,
     });
   });
   box.innerHTML = "";
@@ -11434,8 +14072,22 @@ function searchSettings(keyword) {
       const target = Array.from(form.children).find(
         (section) => String(section.dataset.sectionTitle || "") === hit.title,
       );
-      if (target && target.scrollIntoView) {
-        target.scrollIntoView({ block: "center", behavior: "smooth" });
+      const focusNode = (hit.node && hit.node.isConnected ? hit.node : target) || target;
+      // 高级字段默认收在 <details> 里：**先把它和所有祖先展开**，否则"定位到了看不见"
+      if (focusNode) {
+        let node = focusNode;
+        while (node && node !== form) {
+          if (node.tagName === "DETAILS") node.open = true;
+          node = node.parentElement;
+        }
+        if (focusNode.scrollIntoView) {
+          focusNode.scrollIntoView({ block: "center", behavior: "smooth" });
+        }
+        // 高亮两秒：列表里点完立刻能看出落点
+        focusNode.classList.add("settings-hit-target");
+        window.setTimeout(() => focusNode.classList.remove("settings-hit-target"), 2000);
+        const focusable = focusNode.querySelector("input, select, textarea, button");
+        if (focusable && focusable.focus) focusable.focus({ preventScroll: true });
       }
       box.classList.add("hidden");
     });
@@ -11494,19 +14146,19 @@ const ADVANCED_LABELS = {
     "压缩后保留多少条原文",
     "两次压缩至少间隔（分钟）",
     "一次最多带几张图（没配转述模型时）",
-    "聊天记录最多带几张图",
   ],
   "图片转述": [
     "最多记住多少张图",
     "缓存保留多少天",
     "摘要最多多少字",
-    "转发摘要提示词",
   ],
   "说话节奏": [
     "每个字停顿（秒）",
     "单条最多停顿（秒）",
     "回答前先等几秒（安静期）",
     "安静期最长等多久（秒）",
+    "群里 @ 她时先等几秒",
+    "@ 时最多等几秒",
     "说话密度统计窗口（分钟）",
     "窗口内说几句算太密",
   ],
@@ -11543,6 +14195,582 @@ function collapseAdvancedFields(form) {
   });
 }
 
+/* --- 存储（高级功能） --- */
+
+/**
+ * 存储卡（用户 m00001）：只读状态 + 阈值/保留天数 + 「立即清理一次 / 刷新」。
+ *
+ * 状态只在建卡时取一次、点按钮再取一次 —— 不做 30 秒轮询：设置页可以挂很久，
+ * 而「磁盘还剩多少、上次维护是什么时候」本来就是"要看的时候看一眼"的信息，
+ * 定时拉只会在后台一直发请求。
+ */
+function storageCard(world) {
+  const section = settingsSection(
+    "存储",
+    "数据目录占多大、磁盘还剩多少，旧快照和旧记录留多久。",
+    "磁盘写满会让所有写入失败，她那一轮直接不说话。这里是只读快照，点「刷新」再看一次。",
+  );
+  if (!world.storage) world.storage = {};
+  const storage = world.storage;
+  const box = el("div", "status-box");
+  const lines = {};
+  [
+    ["free", "磁盘可用"],
+    ["data", "数据目录占用"],
+    ["db", "state.db"],
+    ["wal", "state.db-wal"],
+    ["shm", "state.db-shm"],
+    ["top", "最大的文件"],
+    ["write", "最近一次写失败"],
+    ["snapshot", "旧快照清理"],
+    ["vacuum", "自动缩库"],
+    ["error", "读取"],
+  ].forEach(([key, label]) => {
+    lines[key] = statusLine(box, label, "正在读…");
+  });
+  section._fields.appendChild(box);
+
+  const say = (key, text, tone = "") => {
+    const row = lines[key];
+    if (!row) return;
+    const node = row.querySelector(".status-val");
+    if (node) node.textContent = text;
+    row.classList.remove("bad", "warn", "muted");
+    if (tone) row.classList.add(tone);
+  };
+  const clock = (value) => {
+    const ts = Number(value) || 0;
+    return ts > 0 ? new Date(ts * 1000).toLocaleString() : "";
+  };
+  const VACUUM_MODES = { "": "还没跑过", none: "不用回收", full: "全量回收", incremental: "增量回收" };
+
+  const load = async () => {
+    try {
+      const data = await apiGet("storage");
+      if (!data || data.ok === false) {
+        throw new Error((data && data.error) || "接口没返回 ok");
+      }
+      say(
+        "free",
+        `${formatBytes(data.free_bytes)}${data.low_space ? "（低于告警线）" : ""}`,
+        data.low_space ? "bad" : "",
+      );
+      say(
+        "data",
+        `${formatBytes(data.data_bytes)}${data.over_limit ? "（超过上限）" : ""}`,
+        data.over_limit ? "bad" : "",
+      );
+      say("db", formatBytes(data.db_bytes));
+      say("wal", formatBytes(data.wal_bytes));
+      say("shm", formatBytes(data.shm_bytes));
+      const top = Array.isArray(data.top_files) ? data.top_files : [];
+      say(
+        "top",
+        top.length
+          ? top.map((item) => `${item.name} ${formatBytes(item.bytes)}`).join("、")
+          : "这一项没读到文件清单",
+        top.length ? "" : "muted",
+      );
+      const writeError = String(data.last_write_error || "").trim();
+      if (writeError) {
+        const at = clock(data.last_write_error_at);
+        say("write", `${writeError}${at ? `（${at}）` : ""}`, "bad");
+      } else {
+        say("write", "目前没有写失败", "muted");
+      }
+      const snapshot = data.snapshot || {};
+      const cleanedAt = clock(snapshot.last_at);
+      // 没跑过清理时 `deleted` / `freed_bytes` 都是 0；写成「上次删 0 个、腾出 0 B」
+      // 读起来像"刚跑过、什么都没删"，所以先看有没有跑过
+      say(
+        "snapshot",
+        cleanedAt
+          ? `上次删 ${num(snapshot.deleted)} 个、腾出 ${formatBytes(snapshot.freed_bytes)}`
+            + `（${cleanedAt}）；每类留 ${num(snapshot.keep)} 份`
+          : `还没清理过；每类留 ${num(snapshot.keep)} 份`,
+      );
+      const vacuum = data.vacuum || {};
+      const ranAt = clock(vacuum.last_run_at);
+      say(
+        "vacuum",
+        `${vacuum.enabled ? "开着" : "关着"}；`
+          + `${VACUUM_MODES[String(vacuum.mode || "")] || String(vacuum.mode || "还没跑过")}；`
+          + `空闲页 ${num(vacuum.freelist_pages)}${ranAt ? `（${ranAt}）` : ""}`,
+      );
+      say("error", "正常", "muted");
+      return true;
+    } catch (error) {
+      say("error", `暂时读不到存储状态：${error && error.message ? error.message : error}`, "bad");
+      return false;
+    }
+  };
+
+  section._fields.appendChild(el("div", "sub-title", "阈值与保留"));
+  section._fields.appendChild(
+    inputField(
+      "磁盘至少留多少 MB",
+      num(storage.min_free_mb, 500),
+      (value) => (storage.min_free_mb = num(value)),
+      { hint: "可用空间低于这个数就告警。默认 500。", type: "number", min: "0", max: "102400", step: "50" },
+    ),
+  );
+  section._fields.appendChild(
+    inputField(
+      "数据目录最多多少 MB",
+      num(storage.max_data_mb, 300),
+      (value) => (storage.max_data_mb = num(value)),
+      { hint: "数据目录超过这个大小就告警。默认 300。", type: "number", min: "0", max: "102400", step: "50" },
+    ),
+  );
+  section._fields.appendChild(
+    inputField(
+      "每类旧快照留几份",
+      num(storage.keep_snapshots, 1),
+      (value) => (storage.keep_snapshots = num(value)),
+      { hint: "五类快照各留几份；填 0 就不自动清。默认 1 份。", type: "number", min: "0", max: "50", step: "1" },
+    ),
+  );
+  section._fields.appendChild(
+    checkboxField(
+      "自动清旧快照",
+      storage.auto_clean_snapshots !== false,
+      (value) => (storage.auto_clean_snapshots = value),
+      { hint: "启动和每日维护时按上面的份数删；关掉只算不删。" },
+    ),
+  );
+  section._fields.appendChild(
+    checkboxField(
+      "每天自动缩库",
+      storage.vacuum_enabled !== false,
+      (value) => (storage.vacuum_enabled = value),
+      { hint: "把删掉的空闲页还给文件系统；关掉库只涨不缩。" },
+    ),
+  );
+  section._fields.appendChild(
+    inputField(
+      "决策批次留几天",
+      num(storage.decision_batch_keep_days, 14),
+      (value) => (storage.decision_batch_keep_days = num(value)),
+      { hint: "一天清一次，只删更老的；0 = 不清。默认 14 天。", type: "number", min: "0", max: "3650", step: "1" },
+    ),
+  );
+  section._fields.appendChild(
+    inputField(
+      "状态历史留几天",
+      num(storage.state_history_keep_days, 30),
+      (value) => (storage.state_history_keep_days = num(value)),
+      { hint: "另有按条数裁剪兜底；0 = 不清。默认 30 天。", type: "number", min: "0", max: "3650", step: "1" },
+    ),
+  );
+  section._fields.appendChild(
+    inputField(
+      "事件记录留几天",
+      num(storage.event_keep_days, 30),
+      (value) => (storage.event_keep_days = num(value)),
+      { hint: "另有按条数裁剪兜底；0 = 不清。默认 30 天。", type: "number", min: "0", max: "3650", step: "1" },
+    ),
+  );
+
+  const actions = el("div", "row-item");
+  const maintain = el("button", "small", "立即清理一次");
+  maintain.type = "button";
+  maintain.title = "清旧快照、按保留天数删旧记录，再回收空闲页";
+  maintain.addEventListener("click", async () => {
+    const sure = await confirmDialog({
+      title: "立即清理一次",
+      message:
+        "会删掉超过保留份数的旧快照、超过保留天数的旧记录，并回收数据库空闲页。"
+        + "主库 state.db、world.json、会话与图片都不动。",
+      confirmText: "清理",
+    });
+    if (!sure) return;
+    maintain.disabled = true;
+    try {
+      const result = await apiPost("storage/maintenance");
+      if (!result || result.ok === false) {
+        throw new Error((result && result.error) || "维护没返回 ok");
+      }
+      const removed = result.removed || {};
+      const total = Object.keys(removed).reduce((sum, key) => sum + num(removed[key]), 0);
+      const snapshot = result.snapshot || {};
+      toast(`清理好了：删掉 ${total} 项，腾出 ${formatBytes(snapshot.freed_bytes)}`);
+      await load();
+    } catch (error) {
+      toast(`清理失败：${error && error.message ? error.message : error}`);
+    } finally {
+      maintain.disabled = false;
+    }
+  });
+  const refresh = el("button", "small", "刷新");
+  refresh.type = "button";
+  refresh.addEventListener("click", async () => {
+    refresh.disabled = true;
+    try {
+      await load();
+    } finally {
+      refresh.disabled = false;
+    }
+  });
+  actions.appendChild(maintain);
+  actions.appendChild(refresh);
+  section._fields.appendChild(actions);
+
+  load();
+  return section;
+}
+
+/* --- 扩展（「扩展」分栏：扩展包自己声明的配置） --- */
+
+/**
+ * 扩展设置：后端一直有 `GET/POST /extensions`，前端以前只画动作列表，
+ * 所以搬史那三项（enabled / keywords / daily_limit）等于没有界面。
+ *
+ * 这里完全照扩展自己声明的 `settings` 画：`bool` → 复选框，`number` → 数字框
+ * （带 min/max/step），`string` 和未知 kind → 单行文本。没装扩展就是一句空态，
+ * 不报错、不轮询、不自动保存（点各自卡片上的「保存」才发）。
+ */
+function extensionsCard() {
+  const section = settingsSection(
+    "扩展",
+    "装了哪些扩展包，以及它们各自的配置。字段由扩展包自己声明，这里只照着画。",
+    "没装扩展时这里是空的；装了之后改完点卡片上的「保存」才生效。",
+  );
+  // 扩展的值不写在 world.json 里：别让它们点亮「有未保存的改动」
+  section.dataset.noDirty = "1";
+  const state = { loaded: false, loading: false };
+  const list = el("div", "status-card");
+  section._fields.appendChild(list);
+
+  const showNote = (text) => {
+    list.innerHTML = "";
+    list.appendChild(el("p", "muted", text));
+  };
+
+  const extensionCard = (item) => {
+    const card = el("div", "card");
+    const head = el("h2", "", String(item.title || item.name || "扩展"));
+    const version = String(item.version || "").trim();
+    if (version) head.appendChild(el("span", "muted", `v${version}`));
+    card.appendChild(head);
+
+    // 只改这一张卡自己的副本：点「保存」时才拼成 {values: {扩展名: {...}}}
+    const values = Object.assign({}, item.values || {});
+    const fields = el("div", "fields");
+    const specs = Array.isArray(item.settings) ? item.settings : [];
+    specs.forEach((spec) => {
+      const key = String((spec && spec.key) || "");
+      if (!key) return;
+      const label = String(spec.label || key);
+      const hint = String(spec.hint || "");
+      const kind = String((spec && spec.kind) || "string");
+      const raw = values[key] !== undefined ? values[key] : spec.default;
+      if (kind === "bool") {
+        fields.appendChild(
+          checkboxField(label, Boolean(raw), (next) => { values[key] = Boolean(next); }, { hint }),
+        );
+        return;
+      }
+      if (kind === "number") {
+        const opts = { hint, type: "number" };
+        if (spec.min !== undefined && spec.min !== null) opts.min = String(spec.min);
+        if (spec.max !== undefined && spec.max !== null) opts.max = String(spec.max);
+        if (spec.step !== undefined && spec.step !== null) opts.step = String(spec.step);
+        fields.appendChild(
+          inputField(
+            label,
+            raw === undefined || raw === null ? "" : num(raw),
+            (next) => { values[key] = num(next); },
+            opts,
+          ),
+        );
+        return;
+      }
+      // string 与将来才有的未知 kind：一律单行文本，不替扩展猜控件
+      fields.appendChild(
+        inputField(
+          label,
+          raw === undefined || raw === null ? "" : String(raw),
+          (next) => { values[key] = next; },
+          { hint },
+        ),
+      );
+    });
+    card.appendChild(fields);
+
+    const row = el("div", "row-item");
+    const save = el("button", "small", "保存");
+    save.type = "button";
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      try {
+        const result = await apiPost("extensions", {
+          values: { [String(item.name || "")]: values },
+        });
+        if (!result || result.ok === false) {
+          throw new Error((result && result.error) || "保存没返回 ok");
+        }
+        toast("已保存");
+      } catch (error) {
+        toast(`保存失败：${error && error.message ? error.message : error}`);
+      } finally {
+        save.disabled = false;
+      }
+    });
+    row.appendChild(save);
+    card.appendChild(row);
+    return card;
+  };
+
+  const load = async (force = false) => {
+    if (state.loading || (state.loaded && !force)) return;
+    state.loading = true;
+    showNote("正在读扩展…");
+    try {
+      const data = await apiGet("extensions");
+      const items = Array.isArray(data && data.extensions) ? data.extensions : [];
+      state.loaded = true;
+      if (!items.length) {
+        showNote("还没有装扩展包。");
+        return;
+      }
+      list.innerHTML = "";
+      items.forEach((item) => list.appendChild(extensionCard(item)));
+    } catch (error) {
+      showNote(`暂时读不到扩展：${error && error.message ? error.message : error}`);
+    } finally {
+      state.loading = false;
+    }
+  };
+
+  section._loadExtensions = load;
+  return section;
+}
+
+/* --- 知识卡（记忆与上下文） --- */
+
+const KNOWLEDGE_PAGE_SIZE = 50;
+
+/** 知识卡列表（用户 m00001）：搜索、翻页、多选删除。删卡走 confirmDialog。 */
+function knowledgeCard() {
+  const section = settingsSection(
+    "知识卡",
+    "她查过、记下来的东西：一条一个主题，带摘要和关键词。用之前会先看置信度与新鲜度。",
+    "过期（expired）的卡不会再被翻出来用，但也不会自己消失；确认没用了就删掉。",
+  );
+  const state = { q: "", offset: 0, total: 0, items: [], selected: new Set(), loading: false };
+
+  const bar = el("div", "row-item knowledge-bar");
+  const search = document.createElement("input");
+  search.type = "search";
+  search.id = "knowledge-card-search";
+  search.className = "knowledge-search";
+  search.placeholder = "搜主题 / 摘要 / 关键词，回车";
+  search.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    state.q = String(search.value || "").trim();
+    state.offset = 0;
+    load();
+  });
+  // `type="search"` 的 ✕ 清空不会触发 keydown：清空了就按空条件重拉一次，
+  // 否则列表还停在旧关键词的结果上，看起来像"清空没生效"。
+  search.addEventListener("input", () => {
+    if (String(search.value || "").trim()) return;
+    if (!state.q) return;
+    state.q = "";
+    state.offset = 0;
+    load();
+  });
+  bar.appendChild(search);
+  const countText = el("span", "section-note", "");
+  bar.appendChild(countText);
+  section._fields.appendChild(bar);
+
+  const list = el("div", "knowledge-list");
+  list.id = "knowledge-card-list";
+  section._fields.appendChild(list);
+
+  const actions = el("div", "row-item");
+  const prev = el("button", "small", "上一页");
+  prev.type = "button";
+  prev.disabled = true;
+  prev.addEventListener("click", () => {
+    if (state.offset <= 0) return;
+    state.offset = Math.max(0, state.offset - KNOWLEDGE_PAGE_SIZE);
+    load();
+  });
+  const next = el("button", "small", "下一页");
+  next.type = "button";
+  next.disabled = true;
+  next.addEventListener("click", () => {
+    if (state.offset + KNOWLEDGE_PAGE_SIZE >= state.total) return;
+    state.offset += KNOWLEDGE_PAGE_SIZE;
+    load();
+  });
+  const remove = el("button", "danger small", "删除选中");
+  remove.type = "button";
+  remove.id = "knowledge-card-delete";
+  remove.disabled = true;
+  remove.addEventListener("click", async () => {
+    const ids = Array.from(state.selected);
+    if (!ids.length) {
+      toast("先勾选要删的知识卡");
+      return;
+    }
+    const sure = await confirmDialog({
+      title: "删除知识卡",
+      message: `删掉这 ${ids.length} 张知识卡？删完她就想不起来了，也不能撤回。`,
+      confirmText: "删除",
+    });
+    if (!sure) return;
+    remove.disabled = true;
+    try {
+      const result = await apiPost("knowledge/cards/delete", { ids });
+      if (!result || result.ok === false) {
+        throw new Error((result && result.error) || "删除没返回 ok");
+      }
+      toast(`删掉了 ${num(result.deleted)} 张知识卡`);
+      state.selected.clear();
+      await load();
+    } catch (error) {
+      toast(`删除失败：${error && error.message ? error.message : error}`);
+    } finally {
+      remove.disabled = state.selected.size === 0;
+    }
+  });
+  actions.appendChild(remove);
+  actions.appendChild(prev);
+  actions.appendChild(next);
+  section._fields.appendChild(actions);
+
+  const renderRows = () => {
+    list.innerHTML = "";
+    prev.disabled = state.offset <= 0;
+    next.disabled = state.offset + KNOWLEDGE_PAGE_SIZE >= state.total;
+    remove.disabled = state.selected.size === 0;
+    countText.textContent = state.total
+      ? `共 ${state.total} 张，这一页 ${state.offset + 1}–`
+        + `${Math.min(state.total, state.offset + state.items.length)} 张`
+      : "";
+    if (!state.items.length) {
+      list.appendChild(el("p", "section-note knowledge-empty", "还没有知识卡。她查到的东西会先落在这里。"));
+      return;
+    }
+    state.items.forEach((item) => {
+      const row = el("div", "knowledge-row");
+      const pick = document.createElement("input");
+      pick.type = "checkbox";
+      pick.className = "knowledge-pick";
+      pick.checked = state.selected.has(item.id);
+      pick.addEventListener("change", () => {
+        if (pick.checked) state.selected.add(item.id);
+        else state.selected.delete(item.id);
+        remove.disabled = state.selected.size === 0;
+      });
+      row.appendChild(pick);
+      const main = el("div", "knowledge-main");
+      const head = el("div", "knowledge-head");
+      head.appendChild(el("span", "knowledge-subject", String(item.subject || "（没有主题）")));
+      head.appendChild(
+        el("span", "knowledge-conf", `置信度 ${Math.round(num(item.confidence) * 100)}%`),
+      );
+      const status = String(item.status || "active");
+      if (status !== "active") head.appendChild(el("span", "knowledge-tag", status));
+      main.appendChild(head);
+      const summary = String(item.summary || "").trim();
+      if (summary) main.appendChild(el("p", "knowledge-summary", summary));
+      const meta = [];
+      const keywords = Array.isArray(item.keywords) ? item.keywords.filter(Boolean) : [];
+      if (keywords.length) meta.push(`关键词：${keywords.join(" / ")}`);
+      const created = num(item.created_at);
+      if (created > 0) meta.push(`记于 ${new Date(created * 1000).toLocaleString()}`);
+      meta.push(`用过 ${num(item.use_count)} 次`);
+      main.appendChild(el("div", "knowledge-meta", meta.join(" · ")));
+      row.appendChild(main);
+      list.appendChild(row);
+    });
+  };
+
+  const load = async () => {
+    if (state.loading) return;
+    state.loading = true;
+    countText.textContent = "正在读…";
+    try {
+      const params = { limit: KNOWLEDGE_PAGE_SIZE, offset: state.offset };
+      if (state.q) params.q = state.q;
+      const data = await apiGet("knowledge/cards", params);
+      if (!data || data.ok === false) {
+        throw new Error((data && data.error) || "接口没返回 ok");
+      }
+      state.items = Array.isArray(data.items) ? data.items : [];
+      state.total = num(data.total);
+      if (!state.items.length && state.offset > 0) {
+        state.offset = 0;
+        state.loading = false;
+        return load();
+      }
+      state.selected.clear();
+      renderRows();
+    } catch (error) {
+      list.innerHTML = "";
+      list.appendChild(
+        el(
+          "p",
+          "section-note",
+          `暂时读不到知识卡：${error && error.message ? error.message : error}`,
+        ),
+      );
+      countText.textContent = "";
+    } finally {
+      state.loading = false;
+    }
+  };
+
+  load();
+  return section;
+}
+
+/* --- 表情包（世界与生活） --- */
+
+/**
+ * 表情包总开关（用户 m00001 第 4 条）：素材页那几块面板保存后会 `ui.settingsTab = "world"`，
+ * 以前 world 档里根本没有这一节，跳过去等于把设置页的可见小节藏空。
+ * 现在 world 档真的有一节，这里放两个总开关 + 一个去素材页挑图的入口。
+ */
+function memeSettingsCard(world) {
+  const section = settingsSection(
+    "表情包",
+    "她能不能发表情包、要不要自己收图。挑图、清洗和额度在「素材 → 表情包」里。",
+    "总开关关掉后聊天里不会出现表情包动作；已经收的图和记录都不会被删。",
+  );
+  if (!world.meme) world.meme = {};
+  const meme = world.meme;
+  section._fields.appendChild(
+    checkboxField(
+      "打开表情包",
+      meme.enabled !== false,
+      (value) => {
+        meme.enabled = value;
+        memeMasterField();
+        memeMasterBox();
+      },
+      { hint: "关掉之后聊天里不会出现表情包动作；已收的图与记录都不会被删除。" },
+    ),
+  );
+  // 收图没有"看到就全收"这一档（用户 2026-10-29 拍板）：开关与字段一起删了，
+  // 收图只有一条路——「收图与评审」里攒池、拼图、通过才收藏。
+  const actions = el("div", "row-item");
+  const jump = el("button", "small", "去素材页挑图");
+  jump.type = "button";
+  jump.addEventListener("click", () => {
+    showTab("materials");
+    showMaterialPane("meme");
+  });
+  actions.appendChild(jump);
+  section._fields.appendChild(actions);
+  return section;
+}
+
 function renderSettings() {
   const world = ui.config.world;
   world.default_state = world.default_state || {};
@@ -11552,71 +14780,53 @@ function renderSettings() {
   world.nickname_sync = world.nickname_sync || {};
   world.content_safety = world.content_safety || {};
   world.reply_style = world.reply_style || {};
+  world.variation = world.variation || {};
   world.vision = world.vision || {};
   const form = $("settings-form");
+  // **设置页任何一处改动都要算"有未保存的改动"**：过去只在少数控件（滑块、文本域、按钮组）
+  // 里自己调 markDirty，普通复选框和数字框（"要不要开这个功能""等几分钟"）改完是哑的——
+  // 按保存只回一句「没有要保存的改动」，看着像没生效。这里统一挂一次（innerHTML 清空不会
+  // 影响 form 自身的监听），标 `[data-no-dirty]` 的控件除外（那种是纯展示用的小开关）。
+  bindDirtyChange(form, "world");
   form.innerHTML = "";
   form.className = "form settings";
 
-  /* --- 基础 --- */
-  const basic = settingsSection(
-    "基础",
-    "这些是全局规则，决定她生活在什么样的世界里。",
-    "新手只需要改「全局提示词」，其它保持默认即可。",
+  /* --- 世界与生活 --- */
+  const worldBase = settingsSection(
+    "世界与生活",
+    "世界名称、时区、世界规则；她的初始状态也在这里。",
+    "世界规则每次对话都会带上，用一两句话说明「她在过自己的生活、不要解释设定」就够了。",
   );
-  const basicFull = el("div", "full");
-  const wizardRow = el("div", "row");
-  const wizardButton = el("button", "small primary", "重新运行设置向导…");
-  wizardButton.type = "button";
-  wizardButton.title = "把「她在哪儿生活 / 她是谁 / 模型 / 手感 / 记忆」再走一遍（每一步都会预填当前值）";
-  wizardButton.addEventListener("click", () => openWizard());
-  wizardRow.appendChild(wizardButton);
-  wizardRow.appendChild(
-    el("span", "muted", "第一次用不知道从哪下手就点它；只会覆盖你在这几步里改过的东西"),
-  );
-  basicFull.appendChild(wizardRow);
-  basicFull.appendChild(
+  const worldFull = el("div", "full");
+  worldFull.appendChild(
     textareaField("世界规则（全局提示词）", world.global_prompt || "", (value) => (world.global_prompt = value), {
       hint:
         "每次和她对话都会带上这段规则。用一两句话说明「她在过自己的生活、不要解释设定」就够了，不要写太长。",
       rows: 4,
     }),
   );
-  basic._fields.appendChild(basicFull);
-  basic._fields.appendChild(
+  worldBase._fields.appendChild(worldFull);
+  worldBase._fields.appendChild(
     inputField("世界名称", world.name || "小世界", (value) => (world.name = value), {
       hint: "只用于展示。",
     }),
   );
-  basic._fields.appendChild(
+  worldBase._fields.appendChild(
     checkboxField(
       "要求先写推理草稿（reasoning）",
       world.reasoning_enabled !== false,
       (value) => (world.reasoning_enabled = value),
       {
-        hint: "输出动作前先写「在哪 / 状态 / 心情 / 和谁说话 / 打算怎么办」。草稿不进群、不占动作数，能减少答错对象。",
+        hint: "输出动作前先写「在哪 / 状态 / 心情 / 和谁说话 / 下一步计划」。草稿不进群、不占动作数，能减少答错对象。",
       },
     ),
   );
-  basic._fields.appendChild(
+  worldBase._fields.appendChild(
     inputField("时区", world.timezone || "Asia/Shanghai", (value) => (world.timezone = value), {
       hint: "日程按这个时区判断几点。系统缺少时区数据时自动退回本机时间。",
     }),
   );
-  basic._fields.appendChild(
-    tagField(
-      "管理员 QQ",
-      world.admin_ids || [],
-      (value) => {
-        world.admin_ids = value;
-      },
-      {
-        hint: "这些 QQ 号也能用管理类指令（重载、重置状态、改名片、跑日程、调试）。AstrBot 管理员始终可用。",
-        placeholder: "输入 QQ 号后按回车",
-        emptyText: "（没有额外管理员：只有 AstrBot 的管理员能用管理指令）",
-      },
-    ),
-  );
-  form.appendChild(basic);
+  form.appendChild(worldBase);
 
   /* --- 她 / 他 / ta（人设）：构成"这个人"的设置都收在这一节 --- */
   world.persona = world.persona || { mode: "astrbot", text: "" };
@@ -11673,7 +14883,7 @@ function renderSettings() {
     (value) => (world.persona.text = value),
     {
       rows: 12,
-      hint: "她是谁、怎么说话、在意什么。留空时自动回落到 AstrBot 那份，免得把人格弄没。",
+      hint: "她是谁、怎么说话、在意什么。留空时自动回落到 AstrBot 那份，避免人格设定丢失。",
       placeholder: "例如：你是……（身份、说话习惯、喜欢和讨厌的事）",
     },
   );
@@ -11697,7 +14907,7 @@ function renderSettings() {
       world.persona.mode = "plugin";
       markDirty();
       renderSettings();
-      toast(`已导入 ${data.chars || text.length} 字，记得保存`);
+      toast(`已导入 ${data.chars || text.length} 字，点右上角「保存」后生效。`);
     } catch (error) {
       toast(error.message || "读取失败");
     }
@@ -11923,7 +15133,7 @@ function renderSettings() {
         }
         adoptCandidates(picked);
         persistVoiceSamples();
-        toast(`采用了 ${picked.length} 条，记得点右上角保存`);
+        toast(`已采用 ${picked.length} 条，点右上角「保存」后生效。`);
         return true;
       },
     });
@@ -11949,7 +15159,7 @@ function renderSettings() {
   function editVoiceSample(item) {
     openFormDialog({
       title: "编辑样例",
-      hint: "这一句会被喂给她当口吻样本——宁缺毋滥，别写成你想让她说的台词。",
+      hint: "这一句会作为她的口吻样本，宁缺毋滥；不宜写成指定她照说的台词。",
       fields: [
         { key: "text", label: "内容", type: "textarea", rows: 3, value: item.text || "" },
         {
@@ -11982,7 +15192,7 @@ function renderSettings() {
         item.move = String(values.move || "").trim().slice(0, 20);
         item.source = item.source || "model";
         persistVoiceSamples();
-        toast("改好了，记得点右上角保存");
+        toast("已修改，点右上角「保存」后生效。");
         return true;
       },
     });
@@ -12068,7 +15278,7 @@ function renderSettings() {
     // 出错也留在弹窗里显示（渲染在 #dialog-error），不然看着就是"点了没反应"。
     await openFormDialog({
       title: "生成声音样例",
-      hint: "选几个场景，每个场景让她说三条不同走法的话。生成的结果会先放进候选池，你可以慢慢挑。",
+      hint: "选择若干场景，每个场景生成三条不同说法。结果先放入候选池，可再逐条挑选。",
       fields: [
         {
           key: "scenes",
@@ -12120,7 +15330,7 @@ function renderSettings() {
       },
     });
     if (added) {
-      toast(`候选池加了 ${added} 条，点「候选池」去挑，记得保存`);
+      toast(`候选池新增 ${added} 条，可在「候选池」中挑选，点右上角「保存」后生效。`);
     }
   }
 
@@ -12147,7 +15357,7 @@ function renderSettings() {
     }
     pushCandidates(found, "chat");
     persistVoiceSamples();
-    toast(`从聊天里挑了 ${found.length} 条候选，记得点右上角保存`);
+    toast(`已从聊天中挑出 ${found.length} 条候选，点右上角「保存」后生效。`);
   }
 
   candidateGenerate.addEventListener("click", generateVoiceSamples);
@@ -12202,7 +15412,12 @@ function renderSettings() {
       hint: "会随数值变化自动推导出心情，这里只是起点。",
     }),
   );
-  form.appendChild(stateSection);
+  // 初始状态归「世界与生活」，不再留在人设页
+  if (worldBase && worldBase.parentElement === form) {
+    worldBase.insertAdjacentElement("afterend", stateSection);
+  } else {
+    form.appendChild(stateSection);
+  }
 
   /* --- 她的本事（能力值） --- */
   const abilitySection = settingsSection(
@@ -12269,31 +15484,36 @@ function renderSettings() {
       + "好奇心过了 0.7 之后涨得越来越慢，不会一路顶死在满值。",
     "觉得她太爱睡觉就调小精力衰减；觉得她太黏人就调小孤独增长；觉得她老跑去上网查东西就调小好奇增长。",
   );
+  // 边界按字段语义给，不搞一刀切：变化速度（每分钟/每小时涨落多少）封到 0.5，
+  // 比率与阈值（0~1 之间才有意义的那几个）封到 1；越界值写不进去，省得一个手滑
+  // 把「每分钟涨 3 点」存下来——那会让她一分钟内从平静冲到满值。
   [
-    ["energy_decay_per_min", "精力衰减/分钟", "越大越容易累"],
-    ["loneliness_growth_per_min", "孤独增长/分钟", "越大越容易想找人"],
-    ["curiosity_growth_per_min", "好奇增长/分钟", "越大越想上网查东西"],
-    ["affect_decay_per_min", "心潮回落/分钟", "越大情绪平复得越快（默认 0.02 ≈ 50 分钟从满值回到平静）"],
-    ["valence_decay_per_min", "效价回落/分钟", "越大心情平复得越快（默认 0.014 ≈ 50 分钟回落一半）"],
-    ["chat_valence_cap", "聊天单轮最多推动效价", "一轮聊天最多让心情变化多少。调大她会因为几句夸奖就明显开心；默认 0.05 偏向「心情靠经历，不靠嘴甜」"],
-    ["chat_valence_daily_cap", "聊天每天最多推动效价", "日常聊天一天最多把心情推多少（正负各算一份）。填 0 = 不限制；日常陪伴改的是好感度，不是心情的量程"],
-    ["boredom_growth_per_min", "无聊增长/分钟", "越大越想换地方"],
-    ["sleep_energy_recovery_per_min", "睡觉恢复精力/分钟", "越大睡一觉回得越多"],
-    ["nap_energy_recovery_per_min", "小睡恢复精力/分钟", "小睡时的恢复速度"],
-    ["sleep_curiosity_decay_per_min", "睡觉时好奇回落/分钟", "睡一觉把昨天攒的好奇放下（默认 0.0012 ≈ 整觉降 0.58）"],
-    ["sleep_curiosity_floor", "睡醒时最低的好奇", "睡一觉最多把好奇心压到这儿：醒来还是会对新鲜事感兴趣"],
-    ["atmosphere_multiplier", "地点氛围影响强度", "0 表示地点氛围完全不影响数值"],
-    ["desire_growth_per_min", "欲求增长/分钟", "越大越想要人碰：默认约三天攒满；累着或心情差时涨得更慢"],
-    ["desire_relief", "被亲近一次降多少", "再乘动作自己的「亲密程度」：抱一下比拍拍肩解渴"],
-    ["desire_tease", "被撩一下涨多少", "只是嘴上撩、没真碰到：再乘关系亲疏，越亲近越管用"],
-    ["desire_sleep_fall_per_hour", "睡觉时欲求回落/小时", "睡一觉起来没那么憋"],
-    ["desire_wake_keep", "睡醒时保留多少", "0~1，睡醒后欲求乘这个系数"],
-    ["desire_soft_top", "欲求涨到多少后减半", "过了这条线涨速减半，免得一直吊在顶上"],
-  ].forEach(([key, label, hint]) => {
+    ["energy_decay_per_min", "精力衰减/分钟", "越大越容易累", 0, 0.5],
+    ["loneliness_growth_per_min", "孤独增长/分钟", "越大越容易想找人", 0, 0.5],
+    ["curiosity_growth_per_min", "好奇增长/分钟", "越大越想上网查东西", 0, 0.5],
+    ["affect_decay_per_min", "心潮回落/分钟", "越大情绪平复得越快（默认 0.02 ≈ 50 分钟从满值回到平静）", 0, 0.5],
+    ["valence_decay_per_min", "效价回落/分钟", "越大心情平复得越快（默认 0.014 ≈ 50 分钟回落一半）", 0, 0.5],
+    ["chat_valence_cap", "聊天单轮最多推动效价", "一轮聊天最多让心情变化多少。调大她会因为几句夸奖就明显开心；默认 0.05 偏向「心情靠经历，不靠嘴甜」", 0, 1],
+    ["chat_valence_daily_cap", "聊天每天最多推动效价", "日常聊天一天最多把心情推多少（正负各算一份）。填 0 = 不限制；日常陪伴改的是好感度，不是心情的量程", 0, 1],
+    ["boredom_growth_per_min", "无聊增长/分钟", "越大越想换地方", 0, 0.5],
+    ["sleep_energy_recovery_per_min", "睡觉恢复精力/分钟", "越大睡一觉回得越多", 0, 0.5],
+    ["nap_energy_recovery_per_min", "小睡恢复精力/分钟", "小睡时的恢复速度", 0, 0.5],
+    ["sleep_curiosity_decay_per_min", "睡觉时好奇回落/分钟", "睡一觉把昨天攒的好奇放下（默认 0.0012 ≈ 整觉降 0.58）", 0, 0.5],
+    ["sleep_curiosity_floor", "睡醒时最低的好奇", "睡一觉最多把好奇心压到这儿：醒来还是会对新鲜事感兴趣", 0, 1],
+    ["atmosphere_multiplier", "地点氛围影响强度", "0 表示地点氛围完全不影响数值", 0, 1],
+    ["desire_growth_per_min", "欲求增长/分钟", "越大越想要人碰：默认约三天攒满；累着或心情差时涨得更慢", 0, 0.5],
+    ["desire_relief", "被亲近一次降多少", "再乘动作自己的「亲密程度」：抱一下比拍拍肩解渴", 0, 0.5],
+    ["desire_tease", "被撩一下涨多少", "只是嘴上撩、没真碰到：再乘关系亲疏，越亲近越管用", 0, 0.5],
+    ["desire_sleep_fall_per_hour", "睡觉时欲求回落/小时", "睡一觉起来没那么憋", 0, 0.5],
+    ["desire_wake_keep", "睡醒时保留多少", "0~1，睡醒后欲求乘这个系数", 0, 1],
+    ["desire_soft_top", "欲求涨到多少后减半", "过了这条线涨速减半，免得一直吊在顶上", 0, 1],
+  ].forEach(([key, label, hint, low, high]) => {
     dynamics._fields.appendChild(
       inputField(label, num(world.state_dynamics[key]), (value) => (world.state_dynamics[key] = num(value)), {
         hint,
         type: "number",
+        min: low,
+        max: high,
         step: "0.0001",
       }),
     );
@@ -12329,12 +15549,11 @@ function renderSettings() {
 
   /* --- 说话频率 --- */
   const knobs = settingsSection(
-    "手感（滑块）",
-    "不想逐个调参数就用这几个滑块：一格一格拖，它会同时改掉一组相关的设置。",
-    "中间那档就是内置默认值。滑块给的是上限与倾向，具体说多少还看她当时的心情和孤独感。" +
-      "想精调就展开「会改哪些参数」，改过之后这里会标「已手动调整」。",
+    "性格与习惯",
+    "她主动找你的频率、群里接话的意愿、一次说几句、私聊里粘不粘人。",
+    "先选一个整体感觉，想细调再打开完整面板。这里改的是全局配置，所有会话共用。",
   );
-  knobs._fields.appendChild(knobEditor(world));
+  knobs._fields.appendChild(handfeelCard(world));
   form.appendChild(knobs);
 
   const limits = settingsSection(
@@ -12342,37 +15561,52 @@ function renderSettings() {
     "控制她多久主动说一次话、每次最多说几句，以及大模型的调用预算。",
     "空群里最容易出问题的就是「自言自语刷屏」，这里的上限就是干这个用的。",
   );
+  // 每一项都要有下限和上限（用户 m00001：以前只有 type=number，能填 -5 或 99999）。
+  // 口径：次数类一律 0~200（后端把每小时上限当"别刷屏"的闸门，再大就等于没设）；
+  // 秒数类的最大档是「一天」= 86400，够表示"基本不限"，又不至于写成天文数字。
   [
-    ["max_autonomous_per_hour", "每小时最多自主行动次数", "包括主动搭话、去搜索、换地方"],
-    ["max_share_per_hour", "每小时最多分享次数", "「分享见闻」这类动作的上限"],
+    ["max_autonomous_per_hour", "每小时最多自主行动次数", "包括主动搭话、去搜索、换地方", 200],
+    ["max_share_per_hour", "每小时最多分享次数", "「分享见闻」这类动作的上限", 200],
     [
       "max_replies_per_hour",
       "每小时最多被动回复次数",
       "被 @ 到 / 私聊 / 明确对她说时给的回复；超过之后这一条不回（仍然由本插件接管，不落回主人格）。默认 200，填 0 = 完全不限制",
+      200,
     ],
-    ["max_messages_per_say", "每次最多说几句", "一次回复拆成几条消息发送"],
-    ["max_actions_per_message", "一次最多执行几个动作", "一条消息里允许的动作数量"],
-    ["plan_valid_duration", "计划有效期（秒）", "一次 LLM 计划覆盖多长时间，默认 1800（30 分钟）"],
-    ["max_action_chain_depth", "动作链最大深度", "防止动作套动作无限循环"],
-    ["llm_plan_min_interval_seconds", "问计划的间隔（秒）", "两次「问大模型要计划」之间至少隔多久，默认 900"],
-    ["max_llm_plan_per_hour", "每小时最多计划决策次数", "降低 token 消耗"],
-    ["max_llm_text_per_hour", "每小时最多生成发言次数", "超出后她这一轮保持安静（不会再退到一句写死的通用台词）"],
+    ["max_messages_per_say", "每次最多说几句", "一次回复拆成几条消息发送", 200],
+    ["max_actions_per_message", "一次最多执行几个动作", "一条消息里允许的动作数量", 200],
+    [
+      "reply_round_budget_seconds",
+      "一次回复的总时限（秒）",
+      "从等安静期开始算：到点就不再为刚到的消息重来一版，手上这版照发。默认 120，0 = 不限",
+      86400,
+    ],
+    ["plan_valid_duration", "计划有效期（秒）", "一次 LLM 计划覆盖多长时间，默认 1800（30 分钟）", 86400],
+    ["max_action_chain_depth", "动作链最大深度", "防止动作套动作无限循环", 200],
+    ["llm_plan_min_interval_seconds", "问计划的间隔（秒）", "两次「问大模型要计划」之间至少隔多久，默认 900", 86400],
+    ["max_llm_plan_per_hour", "每小时最多计划决策次数", "降低 token 消耗", 200],
+    ["max_llm_text_per_hour", "每小时最多生成发言次数", "超出后她这一轮保持安静（不会再退到一句写死的通用台词）", 200],
     [
       "max_arrival_decisions_per_hour",
       "每小时最多抵达决策次数",
       "她走到一个新地方后立刻做一次决策的上限；这类决策不占自主行动额度，单独限流",
+      200,
     ],
     [
       "max_tool_param_per_hour",
       "每小时最多补全工具参数次数",
       "「把意图翻译成工具参数」的辅助模型调用上限，超出后这类动作会跳过",
+      200,
     ],
-    ["forced_plan_min_interval_seconds", "极端保护最短间隔（秒）", "强制睡觉/强制找人这类兜底行为的最小间隔"],
-  ].forEach(([key, label, hint]) => {
+    ["forced_plan_min_interval_seconds", "极端保护最短间隔（秒）", "强制睡觉/强制找人这类兜底行为的最小间隔", 86400],
+  ].forEach(([key, label, hint, high]) => {
     limits._fields.appendChild(
       inputField(label, num(world.limits[key]), (value) => (world.limits[key] = num(value)), {
         hint,
         type: "number",
+        min: 0,
+        max: high,
+        step: "1",
       }),
     );
   });
@@ -12382,7 +15616,7 @@ function renderSettings() {
   const style = settingsSection(
     "说话节奏",
     "她一句一句发消息时的停顿，以及「最近话太密」的判定。",
-    "群里分段回复如果同一瞬间全冒出来，一眼就能看出是机器；按字数停一下读起来才像人在打字。",
+    "群聊分段回复若同时出现，容易被看出是程序生成；按字数延迟更接近真人打字的节奏。",
   );
   style._fields.appendChild(
     checkboxField(
@@ -12408,8 +15642,8 @@ function renderSettings() {
   style._fields.appendChild(
     inputField(
       "每个字停顿（秒）",
-      num(world.reply_style.typing_delay_per_char, 0.03),
-      (value) => (world.reply_style.typing_delay_per_char = num(value, 0.03)),
+      num(world.reply_style.typing_delay_per_char, 0.16),
+      (value) => (world.reply_style.typing_delay_per_char = num(value, 0.16)),
       {
         hint: "默认 0.03 秒/字：一句话 20 个字大概等 0.6 秒。",
         type: "number",
@@ -12421,8 +15655,8 @@ function renderSettings() {
   style._fields.appendChild(
     inputField(
       "单条最多停顿（秒）",
-      num(world.reply_style.typing_delay_max, 2.5),
-      (value) => (world.reply_style.typing_delay_max = num(value, 2.5)),
+      num(world.reply_style.typing_delay_max, 5),
+      (value) => (world.reply_style.typing_delay_max = num(value, 5)),
       {
         hint: "上限。长句子不会一直等下去，默认 2.5 秒。",
         type: "number",
@@ -12431,29 +15665,8 @@ function renderSettings() {
       },
     ),
   );
-  style._fields.appendChild(
-    pillsField(
-      "回复时引用触发她的消息",
-      world.reply_style.quote_mode || "smart",
-      [
-        { key: "off", label: "不引用", hint: "任何情况下都不带引用段" },
-        { key: "always", label: "总是引用", hint: "每次回复的第一条都引用触发她的那条消息" },
-        {
-          key: "smart",
-          label: "智能",
-          hint: "这一轮要回一串消息（她还在回上一条时又来了新的）才引用，单独一句对答不引用",
-        },
-      ],
-      (value) => {
-        world.reply_style.quote_mode = value;
-        markDirty();
-        renderSettings();
-      },
-      {
-        hint: "她的话或图片的第一条带引用段。仅在 QQ / OneBot 这类平台生效，其他平台自动跳过。",
-      },
-    ),
-  );
+  // 引用档位已经去掉（用户 m09933）：不默认引用，只有她自己在说那句话时
+  // 写了方括号编号才引用，所以这里没有开关可调了。
   style._fields.appendChild(
     checkboxField(
       "新消息打断还没回完的回复",
@@ -12471,7 +15684,7 @@ function renderSettings() {
       (value) => (world.reply_style.merge_wait_seconds = num(value, 5)),
       {
         hint:
-          "收到消息先等这么久再开口：期间每来一条新消息就重新计时，连着打字就等他说完一起回。" +
+          "收到消息先等这么久再开口：有新消息就重新计时，连着打字就等他说完一起回。" +
           "0 = 立即回答。",
         type: "number",
         step: "0.5",
@@ -12486,6 +15699,34 @@ function renderSettings() {
       (value) => (world.reply_style.merge_wait_max_seconds = num(value, 30)),
       {
         hint: "一直有新消息时也不会等超过这么久，免得永远不开口。",
+        type: "number",
+        step: "1",
+        min: 0,
+      },
+    ),
+  );
+  style._fields.appendChild(
+    inputField(
+      "群里 @ 她时先等几秒",
+      num(world.reply_style.mention_wait_seconds, 3),
+      (value) => (world.reply_style.mention_wait_seconds = num(value, 3)),
+      {
+        hint:
+          "群里真的 @ 了她时用的安静期，比上面那项短：" +
+          "要留出对方把一句打完的时间。0 = 收到就答。",
+        type: "number",
+        step: "0.5",
+        min: 0,
+      },
+    ),
+  );
+  style._fields.appendChild(
+    inputField(
+      "@ 时最多等几秒",
+      num(world.reply_style.mention_wait_max_seconds, 10),
+      (value) => (world.reply_style.mention_wait_max_seconds = num(value, 10)),
+      {
+        hint: "对方一直补话时，@ 这一轮的硬顶。0 = 只按上面那一项等，不再延长。",
         type: "number",
         step: "1",
         min: 0,
@@ -12518,6 +15759,969 @@ function renderSettings() {
     ),
   );
   form.appendChild(style);
+
+  /* --- 追问 --- */
+  world.follow_up = world.follow_up || {};
+  const followUp = settingsSection(
+    "追问",
+    "她问完在等你回话，隔几分钟没人接就再问一句。",
+    "要不要等由模型自己写在回话里（不再按问号猜）；到点时它还会再看一眼——" +
+      "把已经过了多久、追过几次都告诉它，由它判断还值不值得等。你回话、或它觉得不用等了，等待就取消。" +
+      "默认等 10 分钟、最多问 1 次。",
+    "follow_up",
+  );
+  followUp._fields.appendChild(
+    checkboxField(
+      "她问完没回音时追一句",
+      world.follow_up.enabled !== false,
+      (value) => (world.follow_up.enabled = value),
+      {
+        hint: "关掉就是问完不管：没人接她也不催。",
+      },
+    ),
+  );
+  followUp._fields.appendChild(
+    inputField(
+      "等多久没回就追（分钟）",
+      num(world.follow_up.wait_minutes, 10),
+      (value) => (world.follow_up.wait_minutes = num(value, 10)),
+      {
+        hint: "从她说出那句话算起。太短像是在催，太长她自己也忘了。",
+        type: "number",
+        min: 0.5,
+        step: "0.5",
+      },
+    ),
+  );
+  followUp._fields.appendChild(
+    inputField(
+      "最多追几次",
+      num(world.follow_up.max_times, 1),
+      (value) => (world.follow_up.max_times = num(value, 1)),
+      {
+        hint: "追满这么多次还没人接，这件事她就放下了。",
+        type: "number",
+        min: 1,
+        max: 5,
+        step: "1",
+      },
+    ),
+  );
+  form.appendChild(followUp);
+
+  /* --- 私聊 --- */
+  world.profile = world.profile || {};
+  const dm = settingsSection(
+    "私聊",
+    "她想跟某个人单独说两句时，可以直接去私聊，不用你先把它加进会话列表。",
+    "以前她只能对「会话页里配好的地方」说话，所以「去私聊一个新朋友」永远发不出去——" +
+      "模型写了目标也被解析回当前会话。现在通讯录里有过往来的人都能作为落点：" +
+      "已配好的私聊直接用，没配过的按平台拼一个（例如 mika:FriendMessage:12345）。" +
+      "拼错、或者平台不让陌生人私聊时会发送失败——那种情况她会在**原会话**说一句" +
+      "「刚才想跟 X 单独说两句，消息没发出去」，不会静默。",
+    "dm",
+  );
+  dm._fields.appendChild(
+    checkboxField(
+      "允许她主动私聊没配过的人",
+      world.profile.dm_send_enabled !== false,
+      (value) => (world.profile.dm_send_enabled = !!value),
+      {
+        hint: "关掉就只对会话页里配好的地方说话（老行为）。",
+      },
+    ),
+  );
+  dm._fields.appendChild(
+    inputField(
+      "每天最多主动私聊几次",
+      num(world.profile.dm_daily_max, 3),
+      (value) => (world.profile.dm_daily_max = num(value, 3)),
+      {
+        hint: "防止她一高兴挨个敲人；只算新开的私聊，回话不算。",
+        type: "number",
+        min: 0,
+        max: 20,
+        step: "1",
+      },
+    ),
+  );
+  dm._fields.appendChild(
+    inputField(
+      "私聊会话 id 怎么写",
+      String(world.profile.dm_session_template || ""),
+      (value) => (world.profile.dm_session_template = String(value || "").trim()),
+      {
+        hint: "留空按当前平台自动拼；平台特殊就写模板，用 {user} 代表对方号码。",
+        placeholder: "例如 aiocqhttp:FriendMessage:{user}",
+      },
+    ),
+  );
+  form.appendChild(dm);
+
+  /* --- 表达变奏 --- */
+  world.variation = world.variation || {};
+  const variation = settingsSection(
+    "表达变奏",
+    "同一件事换个说法：偶尔俏皮一点、干巴巴一点，或者故意把话说小。",
+    "默认开着。开着时她聊天不会每句都一个腔调：关系够近、这一轮气氛又轻松，她偶尔换个说法；" +
+      "正经事、气氛紧张、或者你们还不熟，她会照直说，不会为了一句俏皮话硬凹。" +
+      "效果就体现在聊天记录里——嫌她太贫或者太木，调下面的「变奏频率」就行。",
+  );
+  variation._fields.appendChild(
+    checkboxField(
+      "允许她换一种说法",
+      world.variation.enabled === true,
+      (value) => (world.variation.enabled = value),
+      {
+        hint:
+          "关系够近、这一轮气氛又轻松时，她偶尔把同一个意思换个说法；正经事一律直答。",
+      },
+    ),
+  );
+  variation._fields.appendChild(
+    inputField(
+      "变奏频率",
+      num(world.variation.rate, 0.15),
+      (value) => (world.variation.rate = num(value, 0.15)),
+      {
+        hint: "每一轮换说法的概率（默认 0.15）。连着几轮都在俏皮会很假，所以别调太高。",
+        type: "number",
+        step: "0.05",
+        min: 0,
+        max: 1,
+      },
+    ),
+  );
+  variation._fields.appendChild(
+    inputField(
+      "两次变奏至少隔几轮",
+      num(world.variation.min_gap_turns, 3),
+      (value) => (world.variation.min_gap_turns = num(value, 3)),
+      {
+        hint: "刚换过说法的这几轮先不换（默认 3 轮），避免连着俏皮。",
+        type: "number",
+        min: 0,
+      },
+    ),
+  );
+  variation._fields.appendChild(
+    pillsField(
+      "变奏力度上限",
+      world.variation.magnitude || "strong",
+      [
+        { key: "none", label: "不发力", hint: "完全不换说法，一律直说" },
+        { key: "light", label: "轻", hint: "稍微换个说法，不抢戏" },
+        { key: "medium", label: "中", hint: "可以明显打趣，但仍然不改事实" },
+        { key: "strong", label: "大", hint: "默认档：允许更放开，风险高的场合仍然会被拦下" },
+      ],
+      (value) => (world.variation.magnitude = value),
+      {
+        hint:
+          "只是上限：关系一般或者这一轮风险偏高时，实际力度会被自动压到更小的一档。",
+      },
+    ),
+  );
+  form.appendChild(variation);
+
+  /* --- 拐话头 --- */
+  world.topic_steer = world.topic_steer || {};
+  const topicSteer = settingsSection(
+    "拐话头",
+    "闲聊时她可能不顺着你说，而是把话拐到自己正在做的事、自己的打算、还没回的人身上。",
+    "默认开着。开着时，只有闲聊/分享这类回合她才可能拐走（求助、急事、你在难受时一律照旧接话），" +
+      "而且拐走之后那件事实在要接下去：到点还没接着说，下一轮会提醒她一次；再过一个窗口仍没提，就记成明确放弃，" +
+      "不会只丢一句就没下文。",
+  );
+  topicSteer._fields.appendChild(
+    checkboxField(
+      "允许她拐自己的话头",
+      world.topic_steer.enabled === true,
+      (value) => (world.topic_steer.enabled = value),
+      { hint: "关掉之后她一律接你的话，不会再拐到自己身上。" },
+    ),
+  );
+  topicSteer._fields.appendChild(
+    inputField(
+      "两次拐话头至少隔几轮",
+      num(world.topic_steer.cooldown_turns, 5),
+      (value) => (world.topic_steer.cooldown_turns = num(value, 5)),
+      {
+        hint: "刚拐过这几轮先不拐（默认 5 轮），避免她每句话都在说自己的事。",
+        type: "number",
+        min: 0,
+      },
+    ),
+  );
+  topicSteer._fields.appendChild(
+    inputField(
+      "每天最多拐几次",
+      num(world.topic_steer.daily_cap, 2),
+      (value) => (world.topic_steer.daily_cap = num(value, 2)),
+      {
+        hint: "按人算，同一个人一天最多被拐走几次（默认 2 次）。",
+        type: "number",
+        min: 0,
+      },
+    ),
+  );
+  form.appendChild(topicSteer);
+
+  /* --- 回复格式（精简/完整） --- */
+  // 用户 2026-10-26：回话轮的 JSON 被新字段撑复杂了，性格被压平——精简只要求 request。
+  // 这里只是那一个开关，读写的仍然是 world.reply_schema.legacy（老存档没有这一段就是 true）。
+  world.reply_schema = world.reply_schema || {};
+  const replySchema = settingsSection(
+    "回复格式（精简/完整）",
+    "精简：只要求她填 request，回复更短更自然；完整：额外要求 share/tease/topic/intent/check，信息更多但更长",
+    "默认精简。字段越多她越像在填表：回复变长，人也跟着变平。精简只要求 request{kind, expect}，" +
+      "同一份世界配置渲染出来的格式约束能少一千来字，回话更短、更像她自己。" +
+      "旧输出里带着那些字段也照样解析、不会报警；想换回 2026-10-26 那版完整格式，把这个开关关掉就行。",
+  );
+  replySchema._fields.appendChild(
+    checkboxField(
+      "只要求她填 request（精简）",
+      world.reply_schema.legacy !== false,
+      (value) => (world.reply_schema.legacy = value),
+      {
+        hint: "精简：只要求 request，回话更短更自然；完整：多要五项，信息更多但更长",
+      },
+    ),
+  );
+  form.appendChild(replySchema);
+
+  /* --- 谈资 --- */
+  world.topics = world.topics || {};
+  const topics = settingsSection(
+    "谈资",
+    "她把自己经历过的事、聊天里听到的新消息攒成一条条谈资，聊天时当话题讲出来；" +
+      "同一件事在同一个会话里不会翻来覆去讲第二遍。",
+    "默认开着。开着时她会挑几件跟当前话题搭得上的谈资顺口提起，一轮最多提几条、多要紧才提，" +
+      "都写在下面；要不要开口还是由她自己决定——允许提不等于必须提。" +
+      "效果在「事件」页的「谈资」页签里能看到：每条谈资从哪来、跟谁讲过、发过哪些话。",
+  );
+  topics._fields.appendChild(
+    checkboxField(
+      "允许她攒下自己的谈资",
+      world.topics.enabled === true,
+      (value) => (world.topics.enabled = value),
+      { hint: "打开后，她的经历会变成一条条谈资，聊天时能当话题讲；关掉就不再提，页面也不给用。" },
+    ),
+  );
+  topics._fields.appendChild(
+    inputField(
+      "一件事占住的时长（秒）",
+      num(world.topics.claim_ttl_seconds, 120),
+      (value) => (world.topics.claim_ttl_seconds = num(value, 120)),
+      {
+        hint: "她说要讲某件事时会先占住它；万一中途断了，最多占这么久就会放开。",
+        type: "number",
+        min: 1,
+      },
+    ),
+  );
+  topics._fields.appendChild(topicSettingControl(world, "recall_limit", "一轮最多想起几件"));
+  topics._fields.appendChild(topicSettingControl(world, "proactive_limit", "一轮最多主动提几件"));
+  topics._fields.appendChild(topicSettingControl(world, "proactive_min_importance", "多要紧的事才主动提"));
+  topics._fields.appendChild(topicSettingControl(world, "share_purpose_weight", "分享经历目的软权重"));
+  topics._fields.appendChild(topicSettingControl(world, "experience_willingness", "自然带经历的意愿（不影响明确追问）"));
+  topics._fields.appendChild(topicSettingControl(world, "expression_length", "谈资展开字符建议（不是硬裁剪）"));
+  form.appendChild(topics);
+
+  /* --- 语义检索：装配状态与索引清理 --- */
+  /* B1-WP4-BEGIN */
+  const retrieval = settingsSection(
+    "语义检索（向量索引）",
+    "配好 embedding 供应商以后，“翻旧事”会走两路一起看：一路按地点和关键词精确找，" +
+      "一路把候选送去比语义，两路合起来排序再交给大模型（记忆和谈资都吃这一路）；" +
+      "没配就是关着的，检索还是老路子，聊天行为一点不变。",
+    "向量模型就在下面选（只列宿主里真登记过的 embedding 供应商——" +
+      "AstrBot 插件配置页那个下拉只列聊天供应商，选不到这里的）。" +
+      "换供应商等于换向量空间：谈资的旧索引会被当成过期的，后台自动重攒，谈资本身一条不动。" +
+      "记忆不用重建——它是每轮现算现比的，不落索引，换模型下一轮就按新的走。",
+  );
+  // 下拉是真能选的：宿主插件配置页的 `_special: select_provider` 写死了 chat_completion
+  // （`dashboard/src/components/shared/ConfigItemRenderer.vue:4`），embedding 供应商在那一页
+  // 根本出不来（用户 2026-10-20 反馈）。这里走 `embedding/providers` + `embedding/provider`
+  // 两个端点，选完写回插件配置并立即重新装配。
+  const retrievalPicker = el("label");
+  retrievalPicker.appendChild(
+    fieldHead(
+      "换一个向量模型",
+      "选完立刻生效；宿主里还没建 embedding 供应商的话，先去 AstrBot 的「服务提供商 → 嵌入」加一个。",
+    ),
+  );
+  const retrievalSelect = document.createElement("select");
+  retrievalPicker.appendChild(retrievalSelect);
+  retrieval._fields.appendChild(retrievalPicker);
+
+  const retrievalBox = el("div", "status-box");
+  const retrievalProvider = statusLine(retrievalBox, "当前供应商", "正在读…");
+  const retrievalIndexed = statusLine(retrievalBox, "已索引", "正在读…");
+  const retrievalPending = statusLine(retrievalBox, "待索引", "正在读…");
+  const retrievalSpace = statusLine(retrievalBox, "向量空间", "正在读…");
+  const retrievalError = statusLine(retrievalBox, "最近错误", "正在读…");
+  // 重建结果单独一行（刷新状态时**不清掉**它：`已索引/待索引` 只说明当前口径，重建的
+  // added/cleared 是"这一次点了按钮发生了什么"，混在一起看会以为索引没建）。
+  const retrievalRescanResult = statusLine(retrievalBox, "上次重建", "还没重建过");
+  retrieval._fields.appendChild(retrievalBox);
+  const setRetrievalValue = (row, value) => {
+    const node = row.querySelector(".status-val");
+    if (node) node.textContent = value;
+  };
+
+  const retrievalActions = el("div", "row-item");
+  const retrievalClear = el("button", "danger small", "清空索引");
+  retrievalClear.type = "button";
+  retrievalClear.title = "只清排队记录和向量，谈资本身一条不动";
+  retrievalClear.addEventListener("click", async () => {
+    const session = $("status-session") ? $("status-session").value : "";
+    const scopeText = session
+      ? "只清当前选中的会话组的索引"
+      : "当前没选会话组，会清掉全部会话组的索引";
+    // 二次确认：清索引不可撤回，先说清楚清什么、留什么
+    const sure = await confirmDialog({
+      title: "清空语义索引",
+      message:
+        `谈资本身一条都不会少：只清掉「待索引」的排队记录和已经建好的向量，` +
+        `之后会重新慢慢索引一遍。${scopeText}。`,
+      confirmText: "清空索引",
+    });
+    if (!sure) return;
+    try {
+      const result = await apiPost("embedding/index/clear", { scope_id: session });
+      toast(
+        `清空好了：队列 ${num(result.cleared_queue)} 条、向量 ${num(result.cleared_vectors)} 行`,
+      );
+      await refreshRetrievalStatus();
+    } catch (error) {
+      toast(error.message || "清空失败");
+    }
+  });
+  retrievalActions.appendChild(retrievalClear);
+
+  // 「重建索引」：把缺向量的谈资重新排队。和「清空索引」不同，它**只加不减**——老谈资
+  // （早于索引功能建的、或者换过向量空间的）靠它才补得上向量，慢是慢在后台一格格算。
+  const retrievalRescan = el("button", "small", "重建索引");
+  retrievalRescan.type = "button";
+  retrievalRescan.title = "把缺向量的谈资重新排队，后台慢慢算，谈资本身不动";
+  retrievalRescan.addEventListener("click", async () => {
+    const session = $("status-session") ? $("status-session").value : "";
+    retrievalRescan.disabled = true;
+    try {
+      const result = await apiPost("embedding/index/rescan", { scope_id: session });
+      const text = result.reason
+        ? String(result.reason)
+        : `排上 ${num(result.added)} 条，清掉过期 ${num(result.cleared)} 条`;
+      setRetrievalValue(retrievalRescanResult, text);
+      toast(
+        result.reason
+          ? text
+          : `重建好了：新排队 ${num(result.added)} 条、清掉过期 ${num(result.cleared)} 条，` +
+            `向量会在后台慢慢算`,
+      );
+      await refreshRetrievalStatus();
+    } catch (error) {
+      setRetrievalValue(retrievalRescanResult, error.message || "重建失败");
+      toast(error.message || "重建失败");
+    } finally {
+      retrievalRescan.disabled = false;
+    }
+  });
+  retrievalActions.appendChild(retrievalRescan);
+
+  // 「重建记忆向量」：记忆的向量是按轮现算 + 缓存，换了模型 = 换了向量空间，旧空间的缓存
+  // 下次召回不会命中、留着只占地方。这个按钮只清“不属于当前空间”的行，下一轮自然按新
+  // 模型算；没换模型时它几乎什么都不动，所以可以随便点。
+  const retrievalMemoryRebuild = el("button", "small", "重建记忆向量");
+  retrievalMemoryRebuild.type = "button";
+  retrievalMemoryRebuild.title =
+    "清掉不属于当前向量空间的记忆向量缓存（记忆本身不动），顺手把剩下的记忆预热一遍";
+  retrievalMemoryRebuild.addEventListener("click", async () => {
+    retrievalMemoryRebuild.disabled = true;
+    try {
+      const result = await apiPost("embedding/memory/rebuild", {});
+      const text = result.reason
+        ? String(result.reason)
+        : `清掉旧空间 ${num(result.cleared)} 行，当前空间还有 ${num(result.remaining)} 行`;
+      setRetrievalValue(retrievalRescanResult, text);
+      toast(result.reason ? text : `记忆向量：${text}`);
+      await refreshRetrievalStatus();
+      // 「装完就预热」：清完顺手把已有记忆的向量算好，进度在这里一直更新到跑完
+      if (result.warm && result.warm.started) {
+        watchMemoryWarm();
+      } else if (result.warm && result.warm.reason) {
+        setRetrievalValue(retrievalRescanResult, `${text}；预热没跑：${result.warm.reason}`);
+      }
+    } catch (error) {
+      setRetrievalValue(retrievalRescanResult, error.message || "重建失败");
+      toast(error.message || "重建失败");
+    } finally {
+      retrievalMemoryRebuild.disabled = false;
+    }
+  });
+
+  let retrievalWarmTimer = 0;
+
+  /** 轮询预热进度：跑完就停；页面切走或出错也停，绝不留一个永远转的定时器。 */
+  function watchMemoryWarm() {
+    if (retrievalWarmTimer) window.clearTimeout(retrievalWarmTimer);
+    const tick = async () => {
+      retrievalWarmTimer = 0;
+      let state = null;
+      try {
+        state = await apiGet("embedding/memory/warm");
+      } catch (error) {
+        return;
+      }
+      if (!state) return;
+      const warmed = num(state.warmed);
+      const total = num(state.total);
+      const failed = num(state.failed);
+      let line = "";
+      if (state.running) {
+        line = `预热中：${num(state.done)}/${total || "?"} 条（已算 ${warmed}${
+          failed ? `，失败 ${failed}` : ""
+        }）`;
+      } else if (total) {
+        line = `预热完成：算了 ${warmed} 条，跳过已有 ${num(
+          state.skipped,
+        )} 条${failed ? `，失败 ${failed}` : ""}`;
+      } else if (state.reason) {
+        line = `预热：${state.reason}`;
+      }
+      if (line) setRetrievalValue(retrievalRescanResult, line);
+      if (state.running) {
+        retrievalWarmTimer = window.setTimeout(tick, 1500);
+      }
+    };
+    tick();
+  }
+  retrievalActions.appendChild(retrievalMemoryRebuild);
+  retrieval._fields.appendChild(retrievalActions);
+
+  async function refreshRetrievalProviders() {
+    try {
+      const data = await apiGet("embedding/providers");
+      const choices = Array.isArray(data.providers) ? data.providers : [];
+      const current = String(data.current || "");
+      retrievalSelect.replaceChildren();
+      if (!choices.length) {
+        retrievalSelect.appendChild(option("", "宿主里还没有 embedding 供应商"));
+        retrievalSelect.disabled = true;
+        return;
+      }
+      if (!current) retrievalSelect.appendChild(option("", "还没选（语义检索关着）"));
+      choices.forEach((item) => {
+        const id = String(item.id || "");
+        const label = String(item.label || "");
+        retrievalSelect.appendChild(
+          option(id, label && label !== id ? `${label}（${id}）` : id),
+        );
+      });
+      retrievalSelect.disabled = false;
+      retrievalSelect.value = current || "";
+    } catch (error) {
+      retrievalSelect.replaceChildren();
+      retrievalSelect.appendChild(option("", error.message || "读不到供应商列表"));
+      retrievalSelect.disabled = true;
+    }
+  }
+
+  retrievalSelect.addEventListener("change", async () => {
+    const wanted = retrievalSelect.value;
+    retrievalSelect.disabled = true;
+    try {
+      const result = await apiPost("embedding/provider", { provider_id: wanted });
+      if (!wanted) {
+        toast("关掉语义检索了：谈资本身不动，只是不再建向量索引");
+      } else if (result && num(result.dim) > 0) {
+        toast(`换好了：${wanted}，${num(result.dim)} 维；旧索引会被当成过期的、后台重攒`);
+      } else {
+        toast(result && result.reason ? result.reason : "换好了，但还没装起来（看下面那行）");
+      }
+      await refreshRetrievalProviders();
+      await refreshRetrievalStatus();
+    } catch (error) {
+      toast(error.message || "换供应商失败");
+      await refreshRetrievalProviders();
+    } finally {
+      retrievalSelect.disabled = false;
+    }
+  });
+  refreshRetrievalProviders();
+
+  async function refreshRetrievalStatus() {
+    try {
+      const status = await apiGet("embedding/status");
+      const provider = String(status.provider_id || "");
+      setRetrievalValue(
+        retrievalProvider,
+        provider ? provider : "未配置（语义检索关着）",
+      );
+      const pending = num(status.pending_count);
+      setRetrievalValue(retrievalIndexed, `${num(status.indexed_count)} 条`);
+      setRetrievalValue(
+        retrievalPending,
+        pending > 0 ? `${pending} 条` : status.pending_note || "0 条",
+      );
+      setRetrievalValue(
+        retrievalSpace,
+        status.space_fingerprint || "未配置（关闭语义检索）",
+      );
+      setRetrievalValue(
+        retrievalError,
+        status.last_error || status.reason || "没有出错记录",
+      );
+    } catch (error) {
+      setRetrievalValue(retrievalProvider, "读不到");
+      setRetrievalValue(retrievalIndexed, "读不到");
+      setRetrievalValue(retrievalPending, "读不到");
+      setRetrievalValue(retrievalSpace, "读不到");
+      setRetrievalValue(retrievalError, error.message || "读取失败");
+    }
+  }
+  refreshRetrievalStatus();
+  form.appendChild(retrieval);
+  /* B1-WP4-END */
+
+  /* --- Agent（自主能力）：五个开关，住在世界配置里 --- */
+  /* B-AGENT-BEGIN */
+  world.agent = world.agent || {};
+  const agentCard = settingsSection(
+    "Agent（自主能力）",
+    "这些开关决定她能不能自己动手做事：翻历史、做文件、把文件发出来、跑代码。" +
+      "它们与世界的其他配置一起存，在这里改。",
+    "打开总开关之后她才会真的动手：按任务轮流调工具、写文件、把文件发出去。" +
+      "四个子开关各自放权、默认全关，关着的能力她既看不到也用不了；" +
+      "「执行代码」是在跑插件的这台机器上真跑，不是沙箱。改动在点右上角「保存」后生效。",
+  );
+  // Agent 用哪个模型属于插件配置，不在这里选：只读地说明一句，不发请求
+  agentCard._fields.appendChild(
+    el("p", "hint", "Agent 模型在插件配置里选，这里只管开关。"),
+  );
+  // 声明放在开关上方（用户 2026-10-19）：先说清楚能改什么，再让人自己决定
+  // 要不要给这份权力；真正开启时还会再弹一次确认（见 AGENT_FILE_POWER_WARNING）。
+  agentCard._fields.appendChild(
+    el("p", "hint", `⚠️ ${AGENT_FILE_POWER_WARNING}`),
+  );
+
+  // 开关名去掉 agent_ 前缀以后就是世界配置里的键名：与 core/models.py 的
+  // AgentConfig 一一对应（调试快照那边仍用带前缀的键名，契约不变）
+  const AGENT_SWITCH_FIELDS = [
+    ["enabled", "开启Agent功能", "关闭时她不会自己动手，下面几个开关都不生效。"],
+    ["history_lookup_enabled", "查聊天历史", "允许她查阅群聊留档、自己的经历账与记忆，用于寻找线索。"],
+    ["artifact_generation_enabled", "生成文件", "允许她把结果写成文件（表格、文档、图片等）。"],
+    ["file_send_enabled", "发送文件", "允许她把生成好的文件发送到聊天里。"],
+    ["code_execution_enabled", "执行代码", "允许她在所在机器上执行自己写的代码，有安全风险。"],
+    [
+      "research_enabled",
+      "办不成先查资料",
+      "某一步没做成时，允许她先用搜索/知识库查一次做法再试（只多给一次）。",
+    ],
+  ];
+  // 会动文件的几个开关（用户 2026-10-19）：开启前弹一次确认，明细见
+  // AGENT_FILE_POWER_WARNING。只拦「从关到开」，关掉不拦。
+  const AGENT_FILE_POWER_KEYS = new Set([
+    "artifact_generation_enabled",
+    "code_execution_enabled",
+  ]);
+  AGENT_SWITCH_FIELDS.forEach(([name, label, hint]) => {
+    agentCard._fields.appendChild(
+      checkboxField(
+        label,
+        !!world.agent[name],
+        (value) => {
+          world.agent[name] = !!value;
+          markDirty();
+        },
+        {
+          hint,
+          confirm: AGENT_FILE_POWER_KEYS.has(name)
+            ? AGENT_FILE_POWER_WARNING
+            : "",
+        },
+      ),
+    );
+  });
+
+  // 只读的动作说明查看：**独立开关**（不是那五个能力子开关之一，所以不并进上面那张
+  // 表——那张表与世界配置里的五个子开关一一对应）。默认关：关掉时她的提示词里
+  // 不会出现这项能力，她写了也会被回一句中文原因。
+  agentCard._fields.appendChild(
+    checkboxField(
+      "允许她查看动作说明",
+      !!world.agent.inspect_capability_enabled,
+      (value) => {
+        world.agent.inspect_capability_enabled = !!value;
+        markDirty();
+      },
+      {
+        hint: "打开后她可以只读地查看某个动作的完整说明；关上与没有这项能力一样。",
+      },
+    ),
+  );
+
+  // 缺信息时问一句（用户 m00001 第 8 条）：以前这一项只在向导里能改，设置页的
+  // 开关清单里没有它，想再调只能重跑一遍向导。和上面那条一样是平铺 bool、不进
+  // AGENT_SWITCH_FIELDS（那张表与 AgentConfig 的五个子开关一一对应）。
+  agentCard._fields.appendChild(
+    checkboxField(
+      "缺信息时问一句",
+      !!world.agent.ask_user_enabled,
+      (value) => {
+        world.agent.ask_user_enabled = !!value;
+        markDirty();
+      },
+      {
+        hint: "拿不准就问她一句；这类追问不占说话的额度。",
+      },
+    ),
+  );
+
+  // 插件工坊（用户 m31581）：给她造新能力的两个开关，也是平铺 bool、不进上面那张表
+  // （那张表只装与 AgentConfig 前五个子开关一一对应的键）。自装排在写草稿后面：
+  // 先能写、再决定要不要让她直接装——两步都默认关，装上的东西会真的跑起来。
+  agentCard._fields.appendChild(
+    checkboxField(
+      "允许她写插件",
+      !!world.agent.plugin_forge_enabled,
+      (value) => {
+        world.agent.plugin_forge_enabled = !!value;
+        markDirty();
+      },
+      {
+        hint:
+          "打开后她可以自己写一份插件草稿（落在插件数据目录里）；Agent 页的「插件草稿」能看到全文再决定装不装。",
+        confirm: AGENT_FILE_POWER_WARNING,
+      },
+    ),
+  );
+  agentCard._fields.appendChild(
+    checkboxField(
+      "允许她自己装",
+      !!world.agent.plugin_forge_auto_install,
+      (value) => {
+        world.agent.plugin_forge_auto_install = !!value;
+        markDirty();
+      },
+      {
+        hint:
+          "要先打开上面那条。打开后她能直接把自己写的插件装进 AstrBot、挂成动作——会真的跑起来，所以默认关。",
+        confirm: AGENT_FILE_POWER_WARNING,
+      },
+    ),
+  );
+  // 主人裁决（用户 m31581 / 三档 m01035 决定 D4）：空值读旧布尔开关，所以这里
+  // 先把它折算成三档再显示，选完只写新字段（老字段跟着同步，免得旧代码读到相反的值）。
+  agentCard._fields.appendChild(
+    selectField(
+      "动系统的事先问主人",
+      ownerApprovalModeOf(world),
+      OWNER_APPROVAL_MODES,
+      (value) => {
+        world.agent.owner_approval_mode = value;
+        world.agent.owner_approval_enabled = value !== "off";
+        markDirty();
+      },
+      {
+        hint:
+          "不是主人提的麻烦事先私聊主人问一句；回「做」才动手，回「别做」就用她自己的口气跟发起人说清楚。主人自己提的不拦。",
+      },
+    ),
+  );
+
+  // 「看详情」入口：把**已经存下来**的说明铺开看一眼。纯只读——不执行动作、
+  // 不发请求、不改配置（所以这里也不碰 markDirty）。
+  agentCard._fields.appendChild(
+    inputField(
+      "主人是谁（账号 id）",
+      String((world.agent && world.agent.owner_user_id) || ""),
+      (value) => {
+        world.agent.owner_user_id = String(value || "").trim();
+        markDirty();
+      },
+      { hint: "要问谁、谁说了算。留空＝视为没有主人（所有需要主人权限的功能关闭）。" },
+    ),
+  );
+
+  agentCard._fields.appendChild(agentCapabilityLookup());
+  form.appendChild(agentCard);
+  /* B-AGENT-END */
+
+  form.appendChild(searchCard(world));
+  form.appendChild(storageCard(world));
+  form.appendChild(extensionsCard());
+
+  /**
+   * 联网搜索（用户 m10393）：以前这些字段长在 `search_web` 动作上，每个地点配一遍。
+   *
+   * 现在动作藏起来由系统维护，配置只在这里一份；引擎读 `world.search`，动作上残留的
+   * 值只在全局为空时兜底，所以升级前后行为一致。
+   */
+  function searchCard(worldData) {
+    worldData.search = worldData.search || {};
+    const search = worldData.search;
+    const card = settingsSection(
+      "联网搜索",
+      "她查东西用一份全局配置：搜哪家、读不读正文、查多深、要不要出处。",
+      "搜索工具与阅读工具都得先在 AstrBot 里装好；不选就等于没有这项能力。" +
+        "档位是她自己判断的，这里设的是默认档与上限。改动点右上角「保存」后生效。",
+    );
+    card._fields.appendChild(
+      checkboxField(
+        "允许联网搜索",
+        search.enabled !== false,
+        (value) => {
+          search.enabled = value === true;
+          markDirty();
+        },
+        { hint: "关掉以后她就不能查网上的东西，问了也只能说不知道。" },
+      ),
+    );
+    card._fields.appendChild(
+      pickerField(
+        "搜索工具",
+        search.tool_names || [],
+        toolItems(),
+        (chosen) => {
+          search.tool_names = chosen;
+          markDirty();
+          // 选完要重画这一页：不重画的话按钮上还是"点击选择工具…"，
+          // 看起来就像点了没反应（2026-10-21 用户实测）。
+          renderSettings();
+        },
+        {
+          hint: "搜目录用（返回标题+摘要+链接）。选多个按顺序调、结果合并。",
+          empty: "点击选择搜索工具…",
+          renderChips: true,
+        },
+      ),
+    );
+    if (search.enabled !== false && !effectiveSearchTools(worldData).length) {
+      // 「用手机看网页没配置工具」那条提醒以前挂在隐藏动作上，用户既改不了也没必要改；
+      // 现在只在真不可用、而且就在能改的地方说这一句（别处不再提醒）。
+      card._fields.appendChild(
+        el(
+          "p",
+          "section-note search-empty-hint",
+          "还没配搜索工具 —— 她现在查不了网上的东西。选一个就能用；" +
+            "不选也没关系，只是没有这项能力。",
+        ),
+      );
+    }
+    card._fields.appendChild(
+      pickerField(
+        "阅读工具",
+        search.reader_tool_names || [],
+        toolItems(),
+        (chosen) => {
+          search.reader_tool_names = chosen;
+          markDirty();
+          // 选完要重画这一页：不重画的话按钮上还是"点击选择工具…"，
+          // 看起来就像点了没反应（2026-10-21 用户实测）。
+          renderSettings();
+        },
+        {
+          hint: "能传网址、返回正文的工具（把网页转成 markdown）。留空只用摘要。",
+          empty: "点击选择阅读工具…",
+          renderChips: true,
+        },
+      ),
+    );
+    card._fields.appendChild(
+      pillsField(
+        "默认档位",
+        search.depth || "standard",
+        SEARCH_DEPTHS,
+        (value) => {
+          search.depth = value;
+          markDirty();
+          renderSettings();
+        },
+        { hint: "她自己也能按事情大小挑更浅或更深的档。" },
+      ),
+    );
+    card._fields.appendChild(
+      pillsField(
+        "最多开到哪一档",
+        search.depth_max || "deep",
+        SEARCH_DEPTHS,
+        (value) => {
+          search.depth_max = value;
+          markDirty();
+          renderSettings();
+        },
+        { hint: "设成「标准」就是谁也别想深挖：省时间省钱，但复杂问题会答得浅。" },
+      ),
+    );
+    card._fields.appendChild(
+      inputField(
+        "最多几条查询",
+        search.max_queries ?? 3,
+        (value) => {
+          search.max_queries = Math.min(5, Math.max(1, num(value, 3)));
+          markDirty();
+        },
+        { hint: "一次最多给几条查询词，1~5。", type: "number", min: 1, max: 5 },
+      ),
+    );
+    card._fields.appendChild(
+      inputField(
+        "默认读几篇正文",
+        search.max_reads ?? 2,
+        (value) => {
+          search.max_reads = Math.max(0, num(value, 2));
+          markDirty();
+        },
+        {
+          hint: "配了阅读工具才生效；读得越多越慢。标准档用这个数。",
+          type: "number",
+          min: 0,
+          max: 6,
+        },
+      ),
+    );
+    card._fields.appendChild(
+      inputField(
+        "最多补查几轮",
+        search.rounds ?? 1,
+        (value) => {
+          search.rounds = Math.max(0, num(value, 1));
+          markDirty();
+        },
+        { hint: "结果太少时换个角度再查；标准档用这个数。", type: "number", min: 0, max: 3 },
+      ),
+    );
+    card._fields.appendChild(
+      inputField(
+        "太旧的结果直接丢掉",
+        search.freshness_days ?? 365,
+        (value) => {
+          search.freshness_days = Math.max(0, num(value, 365));
+          markDirty();
+        },
+        {
+          hint: "按标题/摘要里的日期算；0 = 不按时效过滤。",
+          type: "number",
+          min: 0,
+          max: 3650,
+        },
+      ),
+    );
+    card._fields.appendChild(
+      inputField(
+        "一轮最多查多久（秒）",
+        search.budget_seconds ?? 20,
+        (value) => {
+          search.budget_seconds = Math.max(5, num(value, 20));
+          markDirty();
+        },
+        { hint: "超了就不再补查、直接用手上的材料回答。", type: "number", min: 5, max: 120 },
+      ),
+    );
+    card._fields.appendChild(
+      inputField(
+        "搜索主题（可选）",
+        search.topic || "",
+        (value) => {
+          search.topic = String(value || "").trim();
+          markDirty();
+        },
+        { hint: "固定查某个主题时写这里；留空就按她当时的意图查。" },
+      ),
+    );
+    card._fields.appendChild(
+      inputField(
+        "查询模板（可选）",
+        search.query_template || "",
+        (value) => {
+          search.query_template = String(value || "").trim();
+          markDirty();
+        },
+        { hint: "占位符 {topic} 与 {date}，例如「{date} 新闻热点」。" },
+      ),
+    );
+    card._fields.appendChild(
+      pillsField(
+        "讲结果时带来源",
+        search.cite !== false ? "yes" : "no",
+        [
+          { key: "no", label: "不带", hint: "来源只进日志与调试输出" },
+          { key: "yes", label: "带一条", hint: "允许她在末尾补一条参考链接" },
+        ],
+        (value) => {
+          search.cite = value === "yes";
+          markDirty();
+          renderSettings();
+        },
+        { hint: "群里通常不想看网址；需要核对来源时再打开。" },
+      ),
+    );
+    return card;
+  }
+
+  /**
+   * 动作说明的只读查看器。
+   *
+   * 为什么从 `ui.config.world.actions` 读而不是再拉一个接口：编辑器手里这份就是
+   * 引擎真正读的那份配置，看它不会出现"页面显示的和实际生效的不是一回事"。
+   */
+  function agentCapabilityLookup() {
+    const wrapper = el("div", "field");
+    const head = document.createElement("div");
+    head.appendChild(el("span", "", "看某个动作的说明"));
+    head.appendChild(
+      tipBox("只读：把这条动作存下来的说明摊开，不会执行它，也不会改配置。"),
+    );
+    wrapper.appendChild(head);
+    const host = ui.config.world || {};
+    const list = Array.isArray(host.actions) ? host.actions : [];
+    const select = document.createElement("select");
+    select.className = "grow";
+    list
+      .slice()
+      .sort((a, b) => String(a.id || "").localeCompare(String(b.id || "")))
+      .forEach((item) => {
+        const option = document.createElement("option");
+        option.value = String(item.id || "");
+        option.textContent = `${item.name || item.id || ""}（${item.id || ""}）`;
+        select.appendChild(option);
+      });
+    const output = el("div", "muted");
+    const draw = () => {
+      const picked = list.find((item) => String(item.id || "") === select.value);
+      output.textContent = agentCapabilityText(picked);
+    };
+    select.addEventListener("change", draw);
+    wrapper.appendChild(select);
+    wrapper.appendChild(output);
+    if (!list.length) {
+      output.textContent = "还没有任何动作。";
+    } else {
+      select.value = String(list[0].id || "");
+      draw();
+    }
+    return wrapper;
+  }
+
+  /** 一条动作的只读说明（认不出的字段就说"没写"，不猜、不编）。 */
+  function agentCapabilityText(action) {
+    if (!action || typeof action !== "object") return "这条动作读不出来。";
+    const found = action.discovery && typeof action.discovery === "object" ? action.discovery : {};
+    const lines = [`${action.name || action.id || ""}（${action.id || ""}）`];
+    const summary = String(found.summary || "").trim();
+    const when = String(found.when_to_use || "").trim();
+    const limits = Array.isArray(found.key_constraints) ? found.key_constraints : [];
+    lines.push(`简述：${summary || "还没有，后台整理之后会有"}`);
+    if (when) lines.push(`什么时候用：${when}`);
+    if (limits.length) lines.push(`关键限制：${limits.join("；")}`);
+    if (found.locked) lines.push("这一段是人工写定的，后台整理不会覆盖它。");
+    const description = String(action.description || "").trim();
+    if (description) lines.push(`完整说明：${description}`);
+    const params = action.params && typeof action.params === "object" ? Object.keys(action.params) : [];
+    if (params.length) lines.push(`要填什么：${params.join("、")}`);
+    return lines.join("\n");
+  }
 
   /* --- 自主决策 --- */
   world.decider = world.decider || {};
@@ -12564,10 +16768,91 @@ function renderSettings() {
     ),
   );
   form.appendChild(decideCard);
+  /* --- 分层候选 --- */
+  world.action_selection = world.action_selection || {};
+  const selectionCard = settingsSection(
+    "分层候选",
+    "她一时能做的事常常不止一件（开口说话、走过去、拿起一样东西、查点东西）。" +
+      "这一项管的是：从这一堆候选里怎么挑出真正要做的那件。",
+    "默认开着。开着时先按硬规矩把不能做的剔掉，再按当下的目的把剩下的分成几层，" +
+      "在合适的那层里带种子加权抽一件，最后复核一次；抽不出合适的就退回原来的顺序，" +
+      "所以开着不会挡住该做的事。关掉就完全按老办法：在固定顺序里挑第一个能做的。",
+    "action_selection",
+  );
+  selectionCard._fields.appendChild(
+    checkboxField(
+      "按目的挑一件要做的事",
+      world.action_selection.enabled === true,
+      (value) => (world.action_selection.enabled = value),
+      { hint: "关掉就退回按固定顺序挑第一个能做的。" },
+    ),
+  );
+  selectionCard._fields.appendChild(
+    inputField(
+      "指挥型动作的冷却（分钟）",
+      world.action_selection.command_quiet_minutes ?? 30,
+      (value) => (world.action_selection.command_quiet_minutes = num(value, 30)),
+      {
+        type: "number",
+        min: 0,
+        step: 5,
+        hint: "拍照、拍腿、自拍算同一类：刚做过一次，这段时间内不再抽这一类。写 0 = 不冷却。",
+      },
+    ),
+  );
+  form.appendChild(selectionCard);
+
+  /* --- 无聊上网池 --- */
+  world.boredom_online = world.boredom_online || {};
+  const idleCard = settingsSection(
+    "无聊了会自己找点事做",
+    "她一个人待着、没什么事干的时候，会自己上网找点事——查点东西、翻翻帖子。" +
+      "具体做哪一件不由这里挑：动作自己声明了「无聊时可以顺手做」才会进这个池子。",
+    "默认开着。无聊到这个值以上、又闲着的时候，从声明过的动作里按权重抽一件去做；" +
+      "同样的动作有冷却，两件事之间也隔一会儿，不会一连串全是同一件。" +
+      "池子里没有可做的就照原来的办法决定，所以开着不会让她杵着不动。",
+    "boredom_online",
+  );
+  idleCard._fields.appendChild(
+    checkboxField(
+      "无聊到一定程度会自己上网找点事做",
+      world.boredom_online.enabled !== false,
+      (value) => (world.boredom_online.enabled = value),
+      { hint: "关掉以后她就只在别人搭话、或按日程安排时才动。" },
+    ),
+  );
+  idleCard._fields.appendChild(
+    inputField(
+      "无聊到多少会自己找点事上网做",
+      world.boredom_online.min_boredom ?? 0.55,
+      (value) => (world.boredom_online.min_boredom = num(value, 0.55)),
+      {
+        type: "number",
+        min: 0,
+        max: 1,
+        step: 0.05,
+        hint: "0~1：越大越难无聊。0.55 大概是「闲着没事，但还没到抓耳挠腮」。",
+      },
+    ),
+  );
+  idleCard._fields.appendChild(
+    inputField(
+      "两次上网找事至少隔几分钟",
+      world.boredom_online.min_gap_minutes ?? 20,
+      (value) => (world.boredom_online.min_gap_minutes = num(value, 20)),
+      {
+        type: "number",
+        min: 0,
+        step: 5,
+        hint: "两件「自己找的事」之间的最短间隔。写 0 = 不限制。",
+      },
+    ),
+  );
+  form.appendChild(idleCard);
 
   /* --- 无人回应保护 --- */
   const engagement = settingsSection(
-    "没人理她时怎么办",
+    "无人回应时的处理",
     "她主动说话但没人回应时的自我保护，避免一个人自说自话。",
     "默认：连续 3 次没人理就安静 2 小时，冷却结束后计数减半再试。",
   );
@@ -12676,7 +16961,7 @@ function renderSettings() {
   );
   sleep._fields.appendChild(
     selectField(
-      "睡觉时被叫怎么办",
+      "睡眠中被叫的回应",
       world.sleep.reply_mode || "template",
       [
         { key: "template", label: "回一句固定文案（推荐）" },
@@ -12722,7 +17007,7 @@ function renderSettings() {
       (value) => (world.sleep.wake_requires_mention = value),
       {
         hint:
-          "开启后：群里随便一句「起床了」不会把她弄醒，必须 @ 她（私聊等同）。\n" +
+          "开启后：群聊中的普通消息（如「起床了」）不会唤醒她，必须 @ 她（私聊同样）。\n" +
           "关掉后：只要消息里出现唤醒词就打断睡眠。",
       },
     ),
@@ -12899,7 +17184,7 @@ function renderSettings() {
       num(world.memory.summary_trigger_messages, 10),
       (value) => (world.memory.summary_trigger_messages = num(value, 10)),
       {
-        hint: "同一段对话攒到这么多条（含她自己说的话）就总结一次。调小=记得更碎、调大=更省调用。",
+        hint: "同一段对话累计到这个条数（含她自己说的话）就总结一次。调小 = 更细碎，调大 = 更省调用。",
         type: "number",
       },
     ),
@@ -12934,6 +17219,144 @@ function renderSettings() {
     ),
   );
   form.appendChild(memory);
+
+  /* --- 记忆上限与淘汰 --- */
+  const memoryBudget = settingsSection(
+    "记忆上限与淘汰",
+    "留多少条、满了先删谁、多久开始变淡。保存后下一轮对话就按新值算。",
+    "容量到顶时按「重复 → 动作噪声 → 久未召回」的顺序淘汰，" +
+      "最近被想起过的和钉住的都不会被删；衰减只把权重压下去，不删记录。" +
+      "这几项填 0 或留空都按默认值处理。",
+    "memory_budget",
+  );
+  memoryBudget._fields.appendChild(
+    inputField(
+      "记忆上限（每个会话最多几条）",
+      positiveNum(world.memory.memory_limit, 1000),
+      (value) => (world.memory.memory_limit = positiveNum(value, 1000)),
+      {
+        hint: "每个会话最多留多少条记忆；到顶按 重复→噪声→久未召回 淘汰。默认 1000。",
+        type: "number",
+        min: 1,
+        step: 1,
+      },
+    ),
+  );
+  memoryBudget._fields.appendChild(
+    inputField(
+      "同一动作多久内合并成一条（分钟）",
+      positiveNum(world.memory.action_merge_minutes, 30),
+      (value) => (world.memory.action_merge_minutes = positiveNum(value, 30)),
+      {
+        hint: "同一地点重复做同一个动作，这段时间内只刷新时间与次数，不再新增一条。",
+        type: "number",
+        min: 1,
+        step: 1,
+      },
+    ),
+  );
+  memoryBudget._fields.appendChild(
+    inputField(
+      "刚用过的记忆保护期（天）",
+      positiveNum(world.memory.evict_protect_days, 7),
+      (value) => (world.memory.evict_protect_days = positiveNum(value, 7)),
+      {
+        hint: "这段时间内被想起过的记忆，容量到顶也不淘汰。默认 7 天。",
+        type: "number",
+        min: 1,
+        step: 1,
+      },
+    ),
+  );
+  memoryBudget._fields.appendChild(
+    inputField(
+      "多久没想起才开始变淡（天）",
+      positiveNum(world.memory.decay_idle_days, 30),
+      (value) => (world.memory.decay_idle_days = positiveNum(value, 30)),
+      {
+        hint: "这段时间内权重一动不动；超过之后才按半衰期慢慢变淡，只降不删。",
+        type: "number",
+        min: 1,
+        step: 1,
+      },
+    ),
+  );
+  memoryBudget._fields.appendChild(
+    inputField(
+      "权重减半的周期（天）",
+      positiveNum(world.memory.decay_half_life_days, 30),
+      (value) => (world.memory.decay_half_life_days = positiveNum(value, 30)),
+      {
+        hint: "开始变淡后，每过这么多天权重减一半，最低停在衰减下限。",
+        type: "number",
+        min: 1,
+        step: 1,
+      },
+    ),
+  );
+  memoryBudget._fields.appendChild(
+    inputField(
+      "衰减下限（0 到 1 之间）",
+      positiveNum(world.memory.decay_floor, 0.1),
+      (value) => (world.memory.decay_floor = positiveNum(value, 0.1)),
+      {
+        hint: "权重再低也停在这个值，记录不会被删掉。默认 0.1。",
+        type: "number",
+        min: 0.01,
+        max: 1,
+        step: 0.01,
+      },
+    ),
+  );
+  memoryBudget._fields.appendChild(
+    inputField(
+      "整理时看最近多少条旧记忆",
+      positiveNum(world.memory.consolidate_memory_window, 240),
+      (value) => (world.memory.consolidate_memory_window = positiveNum(value, 240)),
+      {
+        hint: "整理记忆时从这个窗口里挑能合并的旧条目，太小会看不见早先的记忆。",
+        type: "number",
+        min: 10,
+        step: 10,
+      },
+    ),
+  );
+  form.appendChild(memoryBudget);
+  form.appendChild(knowledgeCard());
+  /* --- 做梦 --- */
+  world.dream = world.dream || {};
+  const dreamCard = settingsSection(
+    "做梦",
+    "她睡觉（小睡或整夜）时会一并整理记忆；本项决定整理时是否同时生成一条梦。",
+    "默认开着。梦是单独一类素材：不算事实、不做关系证据、不会把现实改写掉，" +
+      "只是低权重的记忆，可能出现在她「想起」的那一段里。梦的要紧程度是 0.4，" +
+      "低于「多要紧的事才主动提」的默认门槛，所以她不会自己把梦当谈资讲出来。" +
+      "关掉就只整理、不做梦。",
+    "dream",
+  );
+  dreamCard._fields.appendChild(
+    checkboxField(
+      "睡觉时做一条梦",
+      world.dream.enabled === true,
+      (value) => (world.dream.enabled = value),
+      { hint: "关掉后小睡和整夜整理照跑，只是不再生成梦。" },
+    ),
+  );
+  dreamCard._fields.appendChild(
+    inputField(
+      "每次小睡做梦的概率",
+      num(world.dream.chance, 0.3),
+      (value) => (world.dream.chance = num(value, 0.3)),
+      {
+        hint: "0~1（默认 0.3）：掷不中就只整理、不做梦。",
+        type: "number",
+        step: "0.05",
+        min: 0,
+        max: 1,
+      },
+    ),
+  );
+  form.appendChild(dreamCard);
 
   /* --- 工具 --- */
   const toolsSection = settingsSection(
@@ -13012,17 +17435,23 @@ function renderSettings() {
       { hint: "关掉之后她只按动作和日程生活，不会再有随机事件。" },
     ),
   );
+  // 显示兜底不再就地写死：缺键时先看已加载的世界配置，再看「生活丰富度」标准档
+  // （KNOBS 里那一档本来就是后端默认 1 / 0.3 / 0.028，同一个数不必抄第三份）。
+  const lifeRichLevel = (() => {
+    const knob = KNOBS.find((item) => item.id === "life_rich");
+    return (knob && knob.levels && knob.levels[2]) || {};
+  })();
   [
-    ["micro_per_hour", "微事件：每小时几次", 1, "只影响她自己的状态和记忆，群里不主动说。默认 1 次/小时。"],
-    ["small_per_hour", "小事件：每小时几次", 0.3, "她要做个选择、会掷骰。默认 0.3 次/小时（约三个小时一次）。"],
-    ["big_per_hour", "大事件：每小时几次", 0.02, "会说、可能需要找人商量。默认 0.02 次/小时（约两天一次）。"],
-  ].forEach(([key, label, fallback, hint]) => {
+    ["micro_per_hour", "微事件：每小时几次", "只影响她自己的状态和记忆，群里不主动说。默认 1 次/小时。"],
+    ["small_per_hour", "小事件：每小时几次", "她要做个选择、会掷骰。默认 0.3 次/小时（约三个小时一次）。"],
+    ["big_per_hour", "大事件：每小时几次", "会说、可能需要找人商量。默认 0.028 次/小时（约一天半一件）。"],
+  ].forEach(([key, label, hint]) => {
     eventSection._fields.appendChild(
       inputField(
         label,
-        world.events[key] ?? fallback,
+        world.events[key] ?? lifeRichLevel[`events.${key}`] ?? 0,
         (value) => (world.events[key] = Number(value) || 0),
-        { hint, type: "number", min: "0", max: "12", step: "0.05" },
+        { hint, type: "number", min: "0", max: "12", step: "0.01" },
       ),
     );
   });
@@ -13066,20 +17495,27 @@ function renderSettings() {
       { hint: "大事件要演两幕以上，不拉开间隔就会连着刷屏。默认 15 分钟。", type: "number", min: "0", max: "1440", step: "5" },
     ),
   );
+  // 可选值只有三个（后端 events.share_* 的枚举），用下拉而不是文本框：
+  // 以前能随手打错一个字母，配置存下去就成了"哪一幕都不说"。
+  const EVENT_SHARE_CHOICES = [
+    ["silent", "从不说（silent）"],
+    ["nodes", "只在开场 / 收尾说（nodes）"],
+    ["always", "每一幕都能说（always）"],
+  ];
   [
     ["share_micro", "微事件", "silent", "默认 silent：只进状态和记忆，不出声。"],
-    ["share_small", "小事件", "nodes", "默认 nodes：只在开场和收尾那两幕说，中间静默推演。"],
+    ["share_small", "小事件", "nodes", "默认 nodes：只在开场和收尾那两幕说。"],
     ["share_big", "大事件", "always", "默认 always：大事件每一幕都可以说。"],
   ].forEach(([key, label, fallback, hint]) => {
+    const current = String(world.events[key] || fallback);
+    const known = EVENT_SHARE_CHOICES.some(([value]) => value === current);
     eventSection._fields.appendChild(
-      inputField(
+      selectField(
         `${label}：要不要说出来`,
-        world.events[key] || fallback,
+        known ? current : fallback,
+        EVENT_SHARE_CHOICES,
         (value) => (world.events[key] = value),
-        {
-          hint: `${hint} silent = 从不说；nodes = 只在开场 / 收尾说；always = 每幕都能说。`,
-          placeholder: "silent / nodes / always",
-        },
+        { hint },
       ),
     );
   });
@@ -13178,16 +17614,31 @@ function renderSettings() {
   eventSection._fields.appendChild(
     inputField(
       "每一幕出图的概率",
-      num(world.events.photo_chance, 0.3),
-      (value) => (world.events.photo_chance = num(value, 0.3)),
+      num(world.events.photo_tendency ?? world.events.photo_chance, 0.3),
+      (value) => (world.events.photo_tendency = num(value, 0.3)),
       {
         hint:
-          "事件每推进一幕 / 完结时，按这个概率让她拍一张（自拍或拍照），图片会带上这件事的内容。" +
-          "默认 0.3；填 0 = 关闭。",
+          "事件每推进一幕或完结时各掷一次：同一幕最多一张，" +
+          "总张数由下面那项兜着。默认 0.3；填 0 = 关闭。",
         type: "number",
         min: "0",
         max: "1",
         step: "0.05",
+      },
+    ),
+  );
+  eventSection._fields.appendChild(
+    inputField(
+      "一件事最多拍几张",
+      num(world.events.photo_max_per_event, 3),
+      (value) => (world.events.photo_max_per_event = num(value, 3)),
+      {
+        hint:
+          "同一件事里出图的总张数上限，管着「这件事演太长会不会一路拍下去」。默认 3；填 0 = 不限。",
+        type: "number",
+        min: "0",
+        max: "20",
+        step: "1",
       },
     ),
   );
@@ -13275,6 +17726,34 @@ function renderSettings() {
     ),
   );
   form.appendChild(eventSection);
+  form.appendChild(memeSettingsCard(world));
+  /* --- 群友的回应 --- */
+  world.contributions = world.contributions || {};
+  const helpCard = settingsSection(
+    "群友的回应",
+    "她在群里求助时，群友会接话。这一项管的是：群里连着说的几句话，怎么算「这一轮的建议」。",
+    "默认攒 120 秒：头一句有用的话之后先等两分钟，群里接话、补充、改口都算进同一轮，" +
+      "免得一句话就让她重拿一次主意。写 0 就是收到就立刻处理。" +
+      "追问上限管的是「一轮里最多追问几轮」，免得她揪着同一件事没完没了。",
+    "contributions",
+  );
+  helpCard._fields.appendChild(
+    inputField(
+      "收话的短窗（秒）",
+      num(world.contributions.window_seconds, 120),
+      (value) => (world.contributions.window_seconds = num(value, 120)),
+      { hint: "默认 120 秒。写 0 = 收到就立刻处理。", type: "number", min: 0 },
+    ),
+  );
+  helpCard._fields.appendChild(
+    inputField(
+      "一轮里最多追问几轮",
+      num(world.contributions.max_rounds, 3),
+      (value) => (world.contributions.max_rounds = num(value, 3)),
+      { hint: "默认 3：问不出结果就不再追着问。", type: "number", min: 0 },
+    ),
+  );
+  form.appendChild(helpCard);
 
   /* --- 作息与夜晚 --- */
   world.night = world.night || {};
@@ -13384,7 +17863,7 @@ function renderSettings() {
       "挂起的事留一行「我心里还挂着」",
       world.events.open_thread_hint !== false,
       (value) => (world.events.open_thread_hint = value),
-      { hint: "关掉 = 挂起的事完全不进提示词（她还是记得，只是不会主动提）。" },
+      { hint: "关掉 = 挂起的事完全不进提示词（她仍然记得，只是不会主动提起）。" },
     ),
   );
   journalSection._fields.appendChild(
@@ -13490,11 +17969,34 @@ function renderSettings() {
   );
   form.appendChild(debugSection);
 
+  /* --- 管理员 --- */
+  const adminSection = settingsSection(
+    "管理员",
+    "除 AstrBot 管理员之外，额外允许使用管理指令的 QQ。",
+    "这些 QQ 号能用重载、重置状态、改名片、跑日程等管理指令。",
+    "管理员 QQ",
+  );
+  adminSection._fields.appendChild(
+    tagField(
+      "管理员 QQ",
+      world.admin_ids || [],
+      (value) => {
+        world.admin_ids = value;
+      },
+      {
+        hint: "这些 QQ 号也能用管理类指令（重载、重置状态、改名片、跑日程、调试）。AstrBot 管理员始终可用。",
+        placeholder: "输入 QQ 号后按回车",
+        emptyText: "（没有额外管理员：只有 AstrBot 的管理员能用管理指令）",
+      },
+    ),
+  );
+  form.appendChild(adminSection);
+
   /* --- 上下文 --- */
   world.context = world.context || {};
   const contextSection = settingsSection(
     "上下文",
-    "群聊记录怎么留档、带多少进提示词、超了怎么办。",
+    "群聊记录的留档与提示词用量，以及超出上限时的处理。",
     "留档会持久化，重启后还在；带进提示词的那份可以更小，避免提示词越来越长。",
   );
   contextSection._fields.appendChild(
@@ -13550,16 +18052,39 @@ function renderSettings() {
     ),
   );
   contextSection._fields.appendChild(
-    inputField(
+    minuteSliderField(
       "别处同时听到的带多少行",
       num(world.context.chat_elsewhere_lines, 12),
       (value) => {
         world.context.chat_elsewhere_lines = Math.max(1, Math.round(num(value, 12)));
       },
       {
-        hint: "同一个她在别的群 / 私聊里说的话，只当背景；行数越多提示词越长。",
-        type: "number",
         min: 1,
+        max: 40,
+        step: 1,
+        unit: "行",
+        hint: "同一个她在别的群 / 私聊里说的话，只当背景；行数越多提示词越长（标准 12 行）。",
+      },
+    ),
+  );
+  contextSection._fields.appendChild(
+    checkboxField(
+      "把 AstrBot 自己的会话历史也交给她",
+      world.context.use_host_history === true,
+      (value) => (world.context.use_host_history = value === true),
+      {
+        hint: "默认不带：宿主那份里常有别的机器人的话、也可能是几小时前的，容易答非所问。",
+        confirm: "打开后她会看到 AstrBot 自己记的那段会话历史（可能含别的机器人说过的话、也可能是几小时前的）。确认那段里有她需要的信息再打开。",
+      },
+    ),
+  );
+  contextSection._fields.appendChild(
+    checkboxField(
+      "过滤宿主无关提示词",
+      world.context.filter_host_context !== false,
+      (value) => (world.context.filter_host_context = value === true),
+      {
+        hint: "摘掉 AstrBot 自带的技能清单、Linux 运行环境说明这类跟她无关的话（调试页能看到原文）。",
       },
     ),
   );
@@ -13627,8 +18152,8 @@ function renderSettings() {
   );
   contextSection._fields.appendChild(
     pillsField(
-      "留档超了怎么办",
-      world.context.chat_overflow || "discard",
+      "留档超出上限时的处理",
+      world.context.chat_overflow || "compress",
       [
         {
           key: "discard",
@@ -13797,7 +18322,7 @@ function renderSettings() {
       "小睡也轻整理",
       world.profile && world.profile.nap_consolidate === false ? "off" : "on",
       [
-        { key: "on", label: "开", hint: "小睡做要点化 + 刷新缩略版 + 一条梦，不碰关系与事实。" },
+        { key: "on", label: "开", hint: "小睡做要点化 + 刷新缩略版，不碰关系与事实；梦另有一个开关管着（默认开着）。" },
         { key: "off", label: "关", hint: "小睡完全不整理。" },
       ],
       (value) => {
@@ -13997,7 +18522,7 @@ function renderSettings() {
       "会不会记着他一笔账",
       world.profile && world.profile.grudge_enabled === false ? "off" : "on",
       [
-        { key: "on", label: "开", hint: "他做了让你气着的事（答应的事没做、放鸽子…），记下来。" },
+        { key: "on", label: "开", hint: "他做了让你生气的事（未兑现承诺、失约等），记录一条。" },
         { key: "off", label: "关", hint: "不记，什么都当场过去。" },
       ],
       (value) => {
@@ -14040,7 +18565,7 @@ function renderSettings() {
   );
   [
     ["同时最多记几件", "own_topic_max", 2, "多了她会变成一个待办清单。", "1"],
-    ["一件记几天", "own_topic_days", 3, "到期丢掉：要么早做完了，要么她其实不在意。", "1"],
+    ["一件记几天", "own_topic_days", 3, "到期后清除：要么早已完成，要么她并不在意。", "1"],
   ].forEach(([label, key, fallback, hint, step]) => {
     profileSection._fields.appendChild(
       inputField(
@@ -14078,48 +18603,14 @@ function renderSettings() {
   /* --- 图片转述 --- */
   const visionSection = settingsSection(
     "图片转述",
-    "配了「图片转述模型」（插件配置里那个）之后，群里发的图会先转成文字再进上下文。",
-    "分两步：先「看图」写成画面描述，再用纯文本补一句「和话题的关系」。" +
-      "看图这步与话题无关，所以能按图片缓存、同一张表情包只识别一次。",
+    "在插件配置里选好「图片转述模型」之后，群里发送的图片会先转成文字再进入上下文。",
+    "只把画面写成文字：类型、文字、画面里真有的东西。" +
+      "与话题无关，因此可以按图片缓存，同一张图片只识别一次；" +
+      "这张图和正在聊的事有什么关系，交给主模型自己判断。",
   );
-  const visionFull = el("div", "full");
-  visionFull.appendChild(
-    textareaField(
-      "看图提示词",
-      world.vision.prompt || "",
-      (value) => (world.vision.prompt = value),
-      {
-        hint: "留空用内置默认（推荐）。默认要求输出「画面描述｜类型｜文字」，并照抄图里的关键文字。",
-        rows: 8,
-        placeholder: DEFAULT_CAPTION_PROMPT,
-        onRestore: () => (ui.defaults.captions || {}).look || DEFAULT_CAPTION_PROMPT,
-      },
-    ),
-  );
-  visionFull.appendChild(
-    textareaField(
-      "关系提示词",
-      world.vision.relation_prompt || "",
-      (value) => (world.vision.relation_prompt = value),
-      {
-        hint: "第二步用：拿转述 + 当前消息 + 最近群聊写一句「与话题的关系」。不带图，可用便宜的文本模型。",
-        rows: 4,
-        placeholder: DEFAULT_CAPTION_RELATION_PROMPT,
-        onRestore: () =>
-          (ui.defaults.captions || {}).relation || DEFAULT_CAPTION_RELATION_PROMPT,
-      },
-    ),
-  );
-  visionSection._fields.appendChild(visionFull);
+  // 看图提示词用内置默认，编辑器不提供修改入口（升级后识别效果才稳定）
   visionSection._fields.appendChild(
-    checkboxField(
-      "补一句「与话题的关系」",
-      world.vision.relation_enabled !== false,
-      (value) => (world.vision.relation_enabled = value),
-      {
-        hint: "开启后多一次纯文本调用，她会知道这张图和正在聊的事有什么关系；关闭则交给主模型自行判断。",
-      },
-    ),
+    el("p", "hint", "看图使用内置提示词，编辑器不提供修改。"),
   );
   visionSection._fields.appendChild(
     checkboxField(
@@ -14158,6 +18649,86 @@ function renderSettings() {
       )} 次识别（本次运行 ${num(cacheStats.session_hits, 0)} 次）。`,
     ),
   );
+  const media = (ui.config && ui.config.media) || {};
+  // 看图接话（S6）：不依赖意图路由，她自己看一眼觉得有意思就接一句
+  visionSection._fields.appendChild(
+    checkboxField(
+      "看到有意思的图会自己接一句",
+      world.media.reaction_enabled !== false,
+      (value) => (world.media.reaction_enabled = value),
+      {
+        hint: "群里有人发图、没点她名：她自己看一眼，觉得有意思就在下一拍接一句。不装意图路由也生效。",
+      },
+    ),
+  );
+  visionSection._fields.appendChild(
+    minuteSliderField(
+      "同一个群两次之间至少隔",
+      num(world.media.reaction_cooldown_minutes, 15),
+      (value) => (world.media.reaction_cooldown_minutes = value),
+      { hint: "标准 15 分钟；拖到 0 就是不限。" },
+    ),
+  );
+  visionSection._fields.appendChild(
+    inputField(
+      "几分钟内还值得开口",
+      num(world.media.reaction_window_minutes, 5),
+      (value) => (world.media.reaction_window_minutes = num(value, 5)),
+      { hint: "收到图之后过了这么久还没说上话，就不再补了。", type: "number", min: 1 },
+    ),
+  );
+  visionSection._fields.appendChild(
+    inputField(
+      "多有意思才值得开口（0~3）",
+      num(world.media.reaction_interest, 2),
+      (value) => (world.media.reaction_interest = num(value, 2)),
+      { hint: "0 = 不评，来图就说；2 = 有点意思才说；3 = 只对特别好笑的开口。", type: "number", min: 0, max: 3 },
+    ),
+  );
+  const mediaCount = num(media.count, 0);
+  const mediaBytes = num(media.total_bytes, 0);
+  const mediaBox = el("div", "full");
+  mediaBox.appendChild(
+    el(
+      "p",
+      "muted",
+      mediaCount
+        ? `本机留了 ${mediaCount} 张图（约 ${formatBytes(mediaBytes)}），保留 ${num(
+            (media.limits || {}).retention_days,
+            14,
+          )} 天、最多 ${num((media.limits || {}).max_total_mb, 512)} MB。`
+        : "本机图片资产库还是空的：收进来的图会各留一份副本，平台的临时地址过期了也还找得回来。",
+    ),
+  );
+  const mediaClean = el("button", "ghost small", "清理过期图片…");
+  mediaClean.addEventListener("click", async () => {
+    try {
+      const plan = await apiPost("media/gc", {});
+      const count = num(plan.removed_count, 0);
+      if (!count) {
+        toast("没有需要清理的图片（在保留期内、或者正被引用）");
+        return;
+      }
+      // 插件页在 sandbox iframe 里（没有 allow-modals）：裸 confirm 会被浏览器直接
+      // 拦掉并返回 false，点了像"没反应"。统一走 confirmDialog。
+      const ok = await confirmDialog({
+        title: "清理过期图片",
+        message:
+          `这一下会删掉 ${count} 张图片（约 ${formatBytes(num(plan.removed_bytes, 0))}）。\n` +
+            "只删本机缓存里没人引用的副本，聊天记录里的原图不受影响。要清理吗？",
+      });
+      if (!ok) {
+        return;
+      }
+      const done = await apiPost("media/gc", { confirm: true });
+      toast(`已清理 ${num(done.removed_count, 0)} 张图片`);
+      await loadAll();
+    } catch (error) {
+      toast(error.message || "清理失败");
+    }
+  });
+  mediaBox.appendChild(mediaClean);
+  visionSection._fields.appendChild(mediaBox);
   visionSection._fields.appendChild(
     checkboxField(
       "合并转发压成摘要",
@@ -14184,22 +18755,6 @@ function renderSettings() {
         { hint: "超出的部分截断，摘要太短会丢掉细节。", type: "number", min: 80 },
       ),
     );
-    const forwardFull = el("div", "full");
-    forwardFull.appendChild(
-      textareaField(
-        "转发摘要提示词",
-        world.vision.forward_prompt || "",
-        (value) => (world.vision.forward_prompt = value),
-        {
-          hint: "留空用内置默认（推荐）。默认要求写清谁和谁在聊、事情与结论、图上有用的信息，不分点不换行。",
-          rows: 6,
-          placeholder: DEFAULT_FORWARD_PROMPT,
-          onRestore: () =>
-            (ui.defaults.captions || {}).forward || DEFAULT_FORWARD_PROMPT,
-        },
-      ),
-    );
-    visionSection._fields.appendChild(forwardFull);
   }
   form.appendChild(visionSection);
 
@@ -14232,7 +18787,7 @@ function renderSettings() {
       const data = await apiPost("persona-brief", { session: sessionId, generate: true });
       const state = (data && data.persona_brief) || {};
       briefArea.value = state.brief || "";
-      toast("生成好了，记得点右上角保存");
+      toast("已生成，点右上角「保存」后生效。");
     } catch (error) {
       toast(`生成失败：${error.message || error}`);
     } finally {
@@ -14462,6 +19017,7 @@ function renderSettings() {
   /* --- 高级：原始 JSON --- */
   const advanced = document.createElement("details");
   advanced.className = "raw-json";
+  advanced.id = "world-json-editor";
   advanced.appendChild(el("summary", "", "高级：直接编辑 world.json"));
   const rawArea = document.createElement("textarea");
   rawArea.rows = 12;
@@ -14473,7 +19029,7 @@ function renderSettings() {
       const parsed = JSON.parse(rawArea.value);
       ui.config.world = parsed;
       renderEverything();
-      toast("已应用到编辑器，记得点右上角「保存」");
+      toast("已应用到编辑器，点右上角「保存」后生效。");
     } catch (error) {
       toast(`JSON 解析失败：${error.message}`);
     }
@@ -14485,7 +19041,7 @@ function renderSettings() {
   // 低频但一个都不能少的字段收进「高级设置」，页面第一眼只剩要改的东西
   collapseAdvancedFields(form);
   // 分类标签：只影响显示，不影响存下来的数据结构
-  applySettingsTabs();
+  renderSettingsMode();
 }
 
 async function savePassword() {
@@ -14696,7 +19252,7 @@ async function applyPreset(preset) {
   // 切预设本来是想换世界，把会话一起换掉等于顺手清空了她聊天的地方。
   openFormDialog({
     title: `应用预设「${preset.name || preset.id}」`,
-    hint: "当前配置会先自动备份一份。只勾中的部分会被替换，其它保持你现在这套。",
+    hint: "当前配置会先自动备份一份。只替换勾选的部分，其余保持当前配置。",
     fields: [
       {
         key: "blocks",
@@ -15002,8 +19558,7 @@ function wizardSessionStep(body) {
         el(
           "p",
           "muted",
-          "还没有会话。去群里（或私聊）对她说一句「/vw session add」，" +
-            "她收到之后点下面的「重新获取」就会出现在这里。",
+          "还没有会话。先在群里或私聊里对她说「/vw session add」，再点「重新获取」。",
         ),
       );
     }
@@ -15017,9 +19572,11 @@ function wizardSessionStep(body) {
         markDirty();
       });
       row.appendChild(box);
-      row.appendChild(
-        el("span", "", `${item.session_id}${item.note ? `（${item.note}）` : ""}`),
-      );
+      const name = item.note || (item.type === "private" ? "私聊" : "群聊");
+      const main = el("span", "wizard-session-main", name);
+      main.title = item.session_id;
+      row.appendChild(main);
+      row.appendChild(el("span", "muted wizard-session-id", sessionShortName(item.session_id)));
       listBox.appendChild(row);
     });
   };
@@ -15037,16 +19594,15 @@ function wizardSessionStep(body) {
       "p",
       "muted",
       groups.length
-        ? `勾上的才算「她在这儿生活」。会话组（${groups.join("、")}）在「会话」页里管，` +
-            "组里的会话共享状态和记忆。"
+        ? `勾上的才算「她在这儿生活」。会话组（${groups.join("、")}）在「会话」页管理，组内共享状态和记忆。`
         : "勾上的才算「她在这儿生活」；想让几个会话共享状态和记忆，去「会话」页建一个会话组。",
     ),
   );
 
   const row = el("div", "row");
-  const again = el("button", "small primary", "重新获取");
+  const again = el("button", "small ghost", "重新获取");
   again.type = "button";
-  again.title = "让 bot 加完会话之后点这里，把最新的白名单拉回来";
+  again.title = "加完会话后点这里，把最新的白名单拉回来";
   again.addEventListener("click", async () => {
     const restore = busyButton(again, "获取中…");
     try {
@@ -15075,32 +19631,32 @@ function wizardPersonaStep(body) {
   const world = ui.config.world;
   world.persona = world.persona || { mode: "astrbot", text: "" };
   body.appendChild(
-    inputField("她的名字（Bot 名称）", world.bot_name || "", (value) => {
+    inputField("她的名字", world.bot_name || "", (value) => {
       world.bot_name = value;
       markDirty();
-    }, { hint: "互动动作里的「{bot}」会换成它。留空就先用群名片原名。", placeholder: "例如：小鲸鱼" }),
+    }, { hint: "互动里的「{bot}」会换成它；留空就用群名片原名。", placeholder: "例如：小鲸鱼" }),
   );
   body.appendChild(
-    pillsField("性别（决定文案里的称呼）", world.gender || "female", GENDERS, (value) => {
+    pillsField("性别", world.gender || "female", GENDERS, (value) => {
       world.gender = value;
       markDirty();
       applyPronoun($("app"));
-    }),
+    }, { hint: "只影响文案里的「她 / 他 / ta」。" }),
   );
   body.appendChild(
-    selectField("人设从哪来", world.persona.mode || "astrbot", [
+    selectField("人设来源", world.persona.mode || "astrbot", [
       { key: "astrbot", label: "跟随 AstrBot（每个会话各自的人格）" },
       { key: "plugin", label: "用下面这一份（所有会话共用）" },
-      { key: "append", label: "AstrBot 那份 + 下面这一份（接在后面）" },
+      { key: "append", label: "AstrBot + 下面这一份" },
     ], (value) => {
       world.persona.mode = value;
       markDirty();
-    }, { hint: "想让她不随会话漂移就选「用下面这一份」。" }),
+    }, { hint: "想让她不随会话漂移，就选「用下面这一份」。" }),
   );
   const area = document.createElement("textarea");
   area.rows = 8;
   area.value = world.persona.text || "";
-  area.placeholder = "她是谁、怎么说话、在意什么…留空会回落到 AstrBot 那份，不会把人格弄没";
+  area.placeholder = "她是谁、怎么说话、在意什么。留空会沿用 AstrBot 的人格。";
   area.addEventListener("change", () => {
     world.persona.text = area.value;
     markDirty();
@@ -15137,32 +19693,160 @@ function wizardPersonaStep(body) {
   body.appendChild(wrap);
 }
 
-function wizardProviderStep(body) {
-  const slots = ui.config.providers || {};
-  const rows = [
-    ["主模型", "llm", "说话用的那个"],
-    ["打杂模型", "helper", "补工具参数、压上下文"],
-    ["判断模型", "judge", "挑一个 / 打分这类轻决策"],
-    ["看图模型", "vision", "把图片转成文字"],
-    ["内容生成模型", "creator", "编她身边发生的事"],
-    ["事件模型", "event", "写事件最后怎么样了"],
-    ["睡眠整理模型", "consolidate", "消化记忆与画像"],
-  ];
-  const box = el("div", "wizard-list");
-  rows.forEach(([label, key, note]) => {
-    const row = el("div", "picker-row");
-    row.appendChild(el("span", "", label));
-    row.appendChild(el("span", "muted", note));
-    row.appendChild(el("span", "wizard-provider", String(slots[key] || "（没读到）")));
-    box.appendChild(row);
+/**
+ * 一排三档按钮：点一下立刻写入并重绘选中态。
+ * （`pillsField` 点了不重绘自己，向导里要看得见选了什么。）
+ */
+function wizardChoicesField(label, value, choices, onChange, opts = {}) {
+  const wrap = el("div", "field");
+  const row = el("div", "wizard-choice-row");
+  const paint = () => {
+    row.innerHTML = "";
+    choices.forEach((choice) => {
+      const button = el(
+        "button",
+        `wizard-choice${choice.key === value ? " on" : ""}`,
+        choice.label,
+      );
+      button.type = "button";
+      if (choice.hint) button.title = choice.hint;
+      button.addEventListener("click", () => {
+        if (choice.key === value) return;
+        value = choice.key;
+        onChange(choice.key);
+        paint();
+      });
+      row.appendChild(button);
+    });
+  };
+  paint();
+  wrap.appendChild(fieldHead(label, opts.hint));
+  wrap.appendChild(row);
+  return wrap;
+}
+
+/**
+ * 清单里的一行：条目名 + 状态（已配置 / 未配置）+ 一句说明。
+ * 未配置时红字，能跳过去的给一个「去配」按钮。
+ */
+function wizardCheckRow(item) {
+  const row = el("div", "wizard-check-row");
+  const main = el("div", "wizard-check-main");
+  main.appendChild(el("div", "wizard-check-title", item.title));
+  main.appendChild(
+    el(
+      "div",
+      item.ok ? "wizard-ok" : "wizard-missing",
+      `${item.ok ? "已配置" : "未配置"}：${item.detail}`,
+    ),
+  );
+  if (!item.ok && item.where) main.appendChild(el("div", "hint", item.where));
+  row.appendChild(main);
+  if (!item.ok && item.jump) {
+    const button = el("button", "small ghost", "去配");
+    button.type = "button";
+    button.addEventListener("click", item.jump);
+    row.appendChild(button);
+  }
+  return row;
+}
+
+function wizardTemperamentStep(body) {
+  const world = ui.config.world;
+  world.ui_knobs = world.ui_knobs || {};
+  const presets = KNOB_PRESETS.filter((preset) => preset.id !== "clingy");
+  const grid = el("div", "wizard-preset-grid");
+  const sliderBox = el("div", "field");
+  sliderBox.appendChild(
+    fieldHead("细调（可选）", "上面选整体感觉，下面拖具体滑块；两边是同一套字段。"),
+  );
+
+  let editor = null;
+  // 滑块与预设读写的是同一套字段（`world.ui_knobs` + `applyKnobLevel`）：
+  // 拖了滑块，上面的预设高亮跟着变；点了预设，下面的滑块立刻换到那一档。
+  const drawSliders = () => {
+    if (editor) editor.remove();
+    editor = knobEditor(world, drawPresets, { compact: true, showDetails: false });
+    sliderBox.appendChild(editor);
+  };
+  const drawPresets = () => {
+    grid.innerHTML = "";
+    presets.forEach((preset) => {
+      const button = el(
+        "button",
+        `wizard-preset${knobPresetMatches(world, preset) ? " on" : ""}`,
+      );
+      button.type = "button";
+      button.appendChild(el("span", "wizard-preset-title", preset.label));
+      button.appendChild(el("span", "wizard-preset-desc", preset.desc));
+      button.addEventListener("click", () => {
+        applyKnobPreset(world, preset);
+        drawPresets();
+        drawSliders();
+      });
+      grid.appendChild(button);
+    });
+  };
+  drawPresets();
+  drawSliders();
+  body.appendChild(grid);
+  body.appendChild(
+    el("p", "muted", "先选整体感觉；想细调再拖下面的滑块。只改主动程度、群聊活跃度、黏人和一次说几句。"),
+  );
+  body.appendChild(sliderBox);
+}
+
+/** 模型槽位：指向哪个 Provider、配没配。编辑器改不了（在插件配置里），只做核对。 */
+const WIZARD_MODEL_SLOTS = [
+  {
+    key: "llm",
+    field: "llm_provider_id",
+    label: "主模型",
+    missing: "她不会说话",
+  },
+  {
+    key: "helper",
+    field: "helper_provider_id",
+    label: "打杂模型",
+    missing: "定时整理、事件生成会退化",
+  },
+  {
+    key: "vision",
+    field: "vision_provider_id",
+    label: "看图模型",
+    missing: "群里的图只会显示成 [图片]",
+  },
+];
+
+/** 槽位现在指向的 Provider 名字；没配时后端给的是「（…）」占位。 */
+function wizardSlotValue(key) {
+  return String((ui.config.providers || {})[key] || "").trim();
+}
+
+function wizardSlotConfigured(key) {
+  const value = wizardSlotValue(key);
+  return Boolean(value) && !value.startsWith("（") && !value.startsWith("(");
+}
+
+/** 三行状态灯：主模型 / 打杂 / 看图。未配的红字写清少了什么能力。 */
+function wizardRunCheck(body) {
+  const box = el("div", "wizard-runcheck");
+  WIZARD_MODEL_SLOTS.forEach((slot) => {
+    const ok = wizardSlotConfigured(slot.key);
+    box.appendChild(
+      wizardCheckRow({
+        title: `${slot.label} · ${slot.field}`,
+        ok,
+        detail: ok ? wizardSlotValue(slot.key) : slot.missing,
+      }),
+    );
   });
   body.appendChild(box);
   body.appendChild(
     el(
       "p",
       "muted",
-      "这些在 AstrBot 面板 → 插件 → 虚拟世界VW 里选；留空的会按括号里的规则回落到别的槽位，" +
-        "所以这里全是回落值也能跑。想省钱就把打杂 / 判断换便宜快的模型。",
+      "模型在 AstrBot 面板 → 插件 → virtual_world（虚拟世界VW）里选；这里只做核对。",
     ),
   );
 }
@@ -15175,22 +19859,517 @@ function wizardMemoryStep(body) {
     checkboxField("记住每个人（通讯录）", world.profile.enabled !== false, (value) => {
       world.profile.enabled = value;
       markDirty();
-    }, { hint: "关掉就完全不记画像、也不往提示词里带。" }),
+    }, { hint: "关掉就不记画像，也不往提示词里带。" }),
   );
   body.appendChild(
     checkboxField("睡觉时整理记忆与画像", world.profile.consolidate_enabled !== false, (value) => {
       world.profile.consolidate_enabled = value;
       markDirty();
-    }, { hint: "睡下 20 分钟后整理一次；关掉就一直攒着不消化。" }),
+    }, { hint: "睡下 20 分钟后整理一次；关掉就一直攒着。" }),
   );
   body.appendChild(
-    selectField("聊天留档超了怎么办", world.context.chat_overflow || "compress", [
+    selectField("上下文超限处理", world.context.chat_overflow || "compress", [
       { key: "compress", label: "压成摘要（推荐）" },
-      { key: "discard", label: "直接丢掉最早的" },
+      { key: "discard", label: "丢掉最早的" },
     ], (value) => {
       world.context.chat_overflow = value;
       markDirty();
-    }, { hint: "压成摘要会保留「更早聊过什么」，她不会失忆；丢就是真的没了。" }),
+    }, { hint: "压成摘要会保留「更早聊过什么」；丢掉就是真的没了。" }),
+  );
+  // 记多少：三档够用了，别让新用户对着一个 1~10000 的输入框发呆
+  world.memory = world.memory || {};
+  const limitValue = String(num(world.memory.memory_limit, 1000));
+  body.appendChild(
+    wizardChoicesField(
+      "每个会话最多记几条",
+      limitValue === "500" || limitValue === "3000" ? limitValue : "1000",
+      [
+        { key: "500", label: "500 条" },
+        { key: "1000", label: "1000 条（默认）" },
+        { key: "3000", label: "3000 条" },
+      ],
+      (value) => {
+        world.memory.memory_limit = num(value, 1000);
+        markDirty();
+      },
+      { hint: "满了会按衰减和重复度淘汰；先记 1000 条一般够用。" },
+    ),
+  );
+
+  // 用户 m11008：新认识的人先算什么关系（默认「群友」；这是她对人开口的第一态度）
+  const bonds = Array.isArray(world.profile.bonds) ? world.profile.bonds : [];
+  const bondNames = bonds.map((item) => String((item && item.name) || "")).filter(Boolean);
+  const bondSelect = document.createElement("select");
+  bondNames.forEach((name) => bondSelect.appendChild(option(name, name)));
+  bondSelect.value = String(world.profile.default_bond || bondNames[0] || "");
+  const bondField = el("label");
+  bondField.appendChild(
+    fieldHead(
+      "新认识的人先算什么关系",
+      "第一次见到一个人时先挂这条；聊久了会自己往上走。默认「群友」，不是「陌生人」。",
+    ),
+  );
+  bondField.appendChild(bondSelect);
+  body.appendChild(bondField);
+  bondSelect.addEventListener("change", () => {
+    world.profile.default_bond = bondSelect.value;
+    world.profile.bond_chosen = true;
+    markDirty();
+  });
+
+  // 用户 m10905：向量模型的选择也放进向导（以前只在「记忆与上下文」里）
+  const embedField = el("label");
+  embedField.appendChild(
+    fieldHead(
+      "向量模型（可选）",
+      "翻旧事时按语义挑，比只认关键词多一层。宿主里还没建 embedding 供应商就留空。",
+    ),
+  );
+  const embedSelect = document.createElement("select");
+  embedField.appendChild(embedSelect);
+  body.appendChild(embedField);
+  async function loadEmbeddingChoices() {
+    try {
+      const data = await apiGet("embedding/providers");
+      const choices = Array.isArray(data.providers) ? data.providers : [];
+      embedSelect.replaceChildren(option("", "不用向量（只按关键词翻）"));
+      choices.forEach((item) => {
+        const id = String(item.id || "");
+        const label = String(item.label || "");
+        embedSelect.appendChild(option(id, label && label !== id ? `${label}（${id}）` : id));
+      });
+      embedSelect.value = String(data.current || "");
+      embedSelect.disabled = false;
+    } catch (error) {
+      embedSelect.replaceChildren(option("", error.message || "读不到供应商列表"));
+      embedSelect.disabled = true;
+    }
+  }
+  embedSelect.addEventListener("change", async () => {
+    try {
+      const result = await apiPost("embedding/provider", { provider_id: embedSelect.value });
+      toast(result && result.reason ? result.reason : "选好了，下一轮就按新的向量空间走");
+    } catch (error) {
+      toast(error.message || "选向量模型失败");
+    }
+    await loadEmbeddingChoices();
+  });
+  loadEmbeddingChoices();
+}
+
+/**
+ * 事件热闹程度：三档，只写三档频率。
+ * 不碰 `events.min_gap_minutes`——那是两次事件之间的最小区间（节流），不是热闹度。
+ */
+const WIZARD_EVENTS_PACE = [
+  { key: "quiet", label: "安静", micro: 0.6, small: 0.2, big: 0.015 },
+  { key: "normal", label: "正常", micro: 1, small: 0.3, big: 0.028 },
+  { key: "lively", label: "热闹", micro: 2, small: 0.6, big: 0.04 },
+];
+
+/** 现在最接近哪一档（后端允许任意小数，所以按最接近的一档高亮）。 */
+function eventsPaceOf(world) {
+  const events = world.events || {};
+  let best = "normal";
+  let bestGap = Infinity;
+  WIZARD_EVENTS_PACE.forEach((pace) => {
+    const gap =
+      Math.abs(num(events.micro_per_hour, 1) - pace.micro) +
+      Math.abs(num(events.small_per_hour, 0.3) - pace.small) * 2 +
+      Math.abs(num(events.big_per_hour, 0.028) - pace.big) * 5;
+    if (gap < bestGap) {
+      bestGap = gap;
+      best = pace.key;
+    }
+  });
+  return best;
+}
+
+function applyEventsPace(world, key) {
+  const pace = WIZARD_EVENTS_PACE.find((item) => item.key === key);
+  if (!pace) return;
+  world.events = world.events || {};
+  world.events.micro_per_hour = pace.micro;
+  world.events.small_per_hour = pace.small;
+  world.events.big_per_hour = pace.big;
+  markDirty();
+}
+
+/** 这台电脑能用多少：一次把清理阈值、占用上限和自动清理写全。 */
+const WIZARD_STORAGE_SPACE = [
+  { key: "lean", label: "节省", min_free: 800, max_data: 200 },
+  { key: "normal", label: "标准", min_free: 500, max_data: 300 },
+  { key: "loose", label: "宽松", min_free: 200, max_data: 1000 },
+];
+
+function storageSpaceOf(world) {
+  const storage = world.storage || {};
+  const minFree = num(storage.min_free_mb, 500);
+  const maxData = num(storage.max_data_mb, 300);
+  let best = "normal";
+  let bestGap = Infinity;
+  WIZARD_STORAGE_SPACE.forEach((space) => {
+    const gap =
+      Math.abs(minFree - space.min_free) + Math.abs(maxData - space.max_data) / 4;
+    if (gap < bestGap) {
+      bestGap = gap;
+      best = space.key;
+    }
+  });
+  return best;
+}
+
+function applyStorageSpace(world, key) {
+  const space = WIZARD_STORAGE_SPACE.find((item) => item.key === key);
+  if (!space) return;
+  world.storage = world.storage || {};
+  world.storage.min_free_mb = space.min_free;
+  world.storage.max_data_mb = space.max_data;
+  world.storage.auto_clean_snapshots = true;
+  markDirty();
+}
+
+/**
+ * 「带总开关的功能，要不要开」这一步（用户 m20：带总开关的都进向导）。
+ *
+ * 只放**总开关**：清单与 `core/defaults.py` 里所有带 `enabled` 的世界配置段一一对应
+ * （`WIZARD_FEATURE_SWITCHES` 是唯一来源，测试会核对它没漏也没多）。每项只有一句人话
+ * 说明，子开关留在「全局设置」里——向导不是配置面板，新用户在这里只该回答"要不要"。
+ *
+ * 「记住每个人」「睡觉时整理」两个总开关属于记忆那一档，已经在上一步（记忆与画像）
+ * 问过了，这里不再重复问一遍。
+ */
+const WIZARD_FEATURE_SWITCHES = [
+  ["topics", "谈资", "把经历攒成可讲的素材，聊天时顺口提起。管理在「素材 → 谈资」。"],
+  ["meme", "表情包", "收下群里的表情，之后自己也能发。管理在「素材 → 表情包」。"],
+  ["meme_collect", "攒图评审收藏", "平时看到的图先攒着，隔一阵拼成九宫格让她自己挑；关掉就完全不再收图（聊天里点名收也不收）。"],
+  ["agent", "自主能力（Agent）", "允许她动手做事：查记录、写文件、发文件、跑代码。默认关。"],
+  ["variation", "表达变奏", "关系近、气氛好时，换个说法，不总是同一个腔调。"],
+  ["topic_steer", "拐话头", "闲聊时她可能把话拐到自己正在做的事上，并且之后真的接着讲下去。"],
+  ["action_selection", "动作选择", "先筛出此刻能做的，再按目的挑一件；关掉后退回固定规则。"],
+  ["weather", "天气", "她知道外面天气，聊到出门、下雨时能对上。"],
+  ["media", "图片与媒体", "收到的图留一份本机副本并转述；关掉就不缓存、不描述。"],
+  ["nickname_sync", "名片同步", "把状态写进群名片，例如「小鲸鱼 | 睡觉中」。只改名片，不改通讯录。"],
+  ["follow_up", "追问", "她问完没人接，隔 10 分钟再问一句（默认只追一次）。"],
+  ["dream", "做梦", "睡着后可能做梦，醒来偶尔记得。"],
+  ["boredom_online", "无聊时自己找点事做", "一个人闲着又觉得无聊，会自己上网找点事做（查东西、翻帖子）；具体做哪件由动作自己声明。"],
+  ["search", "联网搜索", "她查东西用一份全局配置（工具、档位、要不要出处），细节在「高级功能 → 联网搜索」。"],
+  ["knowledge", "知识卡", "查过的东西记成一张卡（原文摘要 + 出处），之后聊到能拿出来用；不额外调用模型，也不会自己编。"],
+  ["events", "随机事件", "她一个人待着的时候会遇上点事（出门、被人拉住说话），频率在全局设置里调。"],
+  ["storage", "存储维护", "世界文件太大时自动整理（真空回收、留一份快照），出问题会告诉你。"],
+  ["temp_session", "临时会话接管", "她主动私聊出去的人，先由她接管一阵子，到期自动交回默认路由。"],
+  ["meme_send_scale", "表情发送缩放", "发出去的表情长边缩到 320（动图保真）并转成 GIF，QQ 里尺寸更舒服。"],
+];
+
+/** 审批档位：新字段留空时按旧布尔开关折算（与引擎 ``owner_approval_mode()`` 同口径）。 */
+function ownerApprovalModeOf(world) {
+  const mode = String((world.agent && world.agent.owner_approval_mode) || "");
+  if (mode === "off" || mode === "risky" || mode === "all") return mode;
+  return (world.agent && world.agent.owner_approval_enabled !== false)
+    ? "risky"
+    : "off";
+}
+
+const OWNER_APPROVAL_MODES = [
+  { key: "off", label: "不问，直接做" },
+  { key: "risky", label: "只问危险的（装插件、改配置、删东西、跑代码）" },
+  { key: "all", label: "每件都先问" },
+];
+
+/** Agent 的四个放权开关 + 只读详情（都得先打开上面的总开关才生效）。 */
+const WIZARD_AGENT_SWITCHES = [
+  ["history_lookup_enabled", "查聊天历史与经历", "翻群聊留档、经历账和记忆找线索。"],
+  ["artifact_generation_enabled", "生成文件", "把结果写成表格或文档。"],
+  ["file_send_enabled", "发送文件", "把生成好的文件发到聊天里。"],
+  ["code_execution_enabled", "执行代码", "在这台机器上运行她写的代码。不是沙箱，有真实风险，默认关。"],
+  ["inspect_capability_enabled", "查看动作说明", "只读查看动作能做什么、需要什么。"],
+  ["ask_user_enabled", "缺信息时问一句", "拿不准就问她/他一句；这类追问不占说话的额度。"],
+  ["plugin_forge_enabled", "允许她写插件", "她能自己写一份插件草稿；装不装由你点。"],
+  ["plugin_forge_auto_install", "允许她自己装", "装上会真的跑起来；要先打开上面那条，默认关。"],
+];
+
+function wizardFeatureStep(body) {
+  const world = ui.config.world;
+  const coreKeys = new Set(["topics", "meme", "agent"]);
+  const more = document.createElement("details");
+  more.className = "wizard-more";
+  const moreSummary = document.createElement("summary");
+  const moreLabel = el("span", "", "更多功能");
+  moreSummary.appendChild(moreLabel);
+  more.appendChild(moreSummary);
+  const moreBody = el("div", "wizard-more-body");
+
+  WIZARD_FEATURE_SWITCHES.forEach(([key, label, hint]) => {
+    world[key] = world[key] || {};
+    // 默认值取自世界默认（`agent` 默认关、其余默认开）：向导里没写过就按默认显示
+    const fallback = key === "agent" ? false : true;
+    const target = coreKeys.has(key) ? body : moreBody;
+    let reveal = null; // 只有打开这个总开关才展开的细分项
+    const field = checkboxField(
+      label,
+      world[key].enabled === undefined ? fallback : world[key].enabled === true,
+      (value) => {
+        world[key].enabled = value;
+        markDirty();
+        if (key === "agent") drawAgentSub();
+        if (reveal) reveal.hidden = value !== true;
+      },
+      { hint },
+    );
+    target.appendChild(field);
+
+    if (key === "events") {
+      // 事件频率原来只在全局设置里；新用户开着「随机事件」却不知道她多久遇上一件事
+      reveal = el("div", "wizard-sub");
+      reveal.appendChild(
+        wizardChoicesField(
+          "事件热闹程度",
+          eventsPaceOf(world),
+          WIZARD_EVENTS_PACE,
+          (value) => applyEventsPace(world, value),
+          { hint: "她自己待着时多久遇上一件事；默认「正常」。" },
+        ),
+      );
+      reveal.hidden = world.events.enabled === false;
+      target.appendChild(reveal);
+      return;
+    }
+
+    if (key === "meme") {
+      // 收图不在向导里问：它只有「收图与评审」一条路（攒池 -> 评审 -> 才收藏）。
+      return;
+    }
+
+    if (key === "media") {
+      // 用户口径（m01035 D6）：看图有趣就说话不依赖意图路由，所以这里单独问一句
+      target.appendChild(
+        checkboxField(
+          "看到有意思的图会自己接一句",
+          world.media.reaction_enabled !== false,
+          (value) => {
+            world.media.reaction_enabled = value === true;
+            markDirty();
+          },
+          { hint: "群里有人发图、没点她名，她自己看一眼；觉得有意思就接一句。间隔在全局设置里调。" },
+        ),
+      );
+      return;
+    }
+
+    if (key !== "agent") return;
+    // 自主能力下面几个**具体能力**也在这里问（用户口径：带开关的都进向导）。
+    // 只在总开关打开时才展开，避免新用户先看到 5 个没意义的子开关。
+    const sub = el("div", "wizard-sub");
+    sub.appendChild(
+      el("p", "muted", "这几件事可以分别放权；都要先打开上面的「自主能力」。"),
+    );
+    // 会动这台机器文件的几项：开启前要过一次确认弹窗（用户 2026-10-19），
+    // 声明文案与「全局设置 → Agent」共用同一份。
+    const wizardPowerKeys = new Set([
+      "artifact_generation_enabled",
+      "code_execution_enabled",
+      "plugin_forge_enabled",
+      "plugin_forge_auto_install",
+    ]);
+    WIZARD_AGENT_SWITCHES.forEach(([name, subLabel, subHint]) => {
+      sub.appendChild(
+        checkboxField(subLabel, world.agent[name] === true, (value) => {
+          world.agent[name] = value === true;
+          markDirty();
+        }, {
+          hint: subHint,
+          confirm: wizardPowerKeys.has(name) ? AGENT_FILE_POWER_WARNING : "",
+        }),
+      );
+    });
+    sub.appendChild(el("p", "hint", `⚠️ ${AGENT_FILE_POWER_WARNING}`));
+    // 审批档位（用户 m01035 决定 D4）：三档，默认「只问危险的」
+    sub.appendChild(
+      selectField(
+        "动系统的事先问主人",
+        ownerApprovalModeOf(world),
+        OWNER_APPROVAL_MODES,
+        (value) => {
+          world.agent.owner_approval_mode = value;
+          world.agent.owner_approval_enabled = value !== "off";
+          markDirty();
+        },
+        { hint: "不是主人提的麻烦事先私聊问一句；主人自己提的不拦。" },
+      ),
+    );
+    body.appendChild(sub);
+    sub.hidden = world.agent.enabled !== true;
+
+    function drawAgentSub() {
+      sub.hidden = world.agent.enabled !== true;
+    }
+  });
+
+  if (moreBody.children.length) {
+    moreLabel.textContent = `更多功能（${moreBody.children.length} 项）`;
+    more.appendChild(moreBody);
+    body.appendChild(more);
+  }
+  // 电脑空间：别让新用户自己猜 MB，三档一次写完
+  body.appendChild(
+    wizardChoicesField(
+      "这台电脑能给她用多少",
+      storageSpaceOf(world),
+      WIZARD_STORAGE_SPACE,
+      (value) => applyStorageSpace(world, value),
+      { hint: "磁盘剩多少开始清理、世界文件最多占多少；默认「正常」。" },
+    ),
+  );
+  body.appendChild(
+    el(
+      "p",
+      "muted",
+      "这些随时能在「全局设置」里改；现在选好、点「完成」后统一保存。",
+    ),
+  );
+}
+
+/**
+ * 「谁说了算」：主人（单值）与管理员（数组）。
+ *
+ * 单独一步的原因：这两个 id 决定审批问谁、告警发给谁，留空就等于没人管；
+ * 混在「功能开关」十几项里，新用户会直接跳过。
+ */
+function wizardOwnerStep(body) {
+  const world = ui.config.world;
+  world.agent = world.agent || {};
+  body.appendChild(
+    el(
+      "p",
+      "muted",
+      "这两项只决定「审批和告警发给谁」；都可以留空，但留空就没人收。",
+    ),
+  );
+  body.appendChild(
+    inputField(
+      "主人是谁（账号 id）",
+      String((world.agent && world.agent.owner_user_id) || ""),
+      (value) => {
+        world.agent.owner_user_id = String(value || "").trim();
+        markDirty();
+      },
+      { hint: "要问谁、谁说了算。留空＝视为没有主人（所有需要主人权限的功能关闭）。" },
+    ),
+  );
+  body.appendChild(el("p", "hint", "主人留空时，审批与告警不会发给任何人。"));
+  world.admin_ids = Array.isArray(world.admin_ids) ? world.admin_ids : [];
+  body.appendChild(
+    textareaField(
+      "管理员（逗号或换行分隔）",
+      world.admin_ids.join("\n"),
+      (value) => {
+        // 逗号、换行、顿号都当分隔符：用户不会只按一种写
+        world.admin_ids = String(value || "")
+          .split(/[\s,，、;；]+/)
+          .map((item) => item.trim())
+          .filter(Boolean);
+        markDirty();
+      },
+      { rows: 3, hint: "这些账号能用管理指令；AstrBot 管理员始终可用。" },
+    ),
+  );
+}
+
+/**
+ * 收尾清单：不写"完成"，逐条说还差什么、点哪儿去补。
+ *
+ * 只认已经落盘的配置（`ui.config`）和手上真有的数据（会话列表、模型槽位），
+ * 不做"应该配过了"的猜测——猜错比不提醒更糟。
+ */
+function wizardChecklistStep(body, close) {
+  const world = ui.config.world || {};
+  const go = (fn) => () => {
+    close();
+    fn();
+  };
+  const owner = String((world.agent && world.agent.owner_user_id) || "").trim();
+  const sessions = (Array.isArray(ui.sessions) ? ui.sessions : []).filter(
+    (item) => item && item.enabled !== false,
+  );
+  const media = world.media || {};
+  const storage = world.storage || {};
+  const visionOk = wizardSlotConfigured("vision");
+  const mediaOk = media.enabled !== false && visionOk;
+  const storageOk =
+    num(storage.min_free_mb, 0) > 0 && num(storage.max_data_mb, 0) > 0;
+  const items = [
+    {
+      title: "她要在哪些会话里生活",
+      ok: sessions.length > 0,
+      detail: sessions.length
+        ? `${sessions.length} 个会话`
+        : "一个都没选，她不会在任何群或私聊里说话",
+      jump: go(() => showTab("sessions")),
+    },
+    {
+      title: "谁说了算（主人）",
+      ok: Boolean(owner),
+      detail: owner || "没有主人，审批与告警不会发给任何人",
+      jump: go(() => {
+        showTab("settings");
+        openSettingsTab("advanced");
+      }),
+    },
+    {
+      title: "图片转述",
+      ok: mediaOk,
+      detail: mediaOk
+        ? "开着，群里的图会转述成文字"
+        : media.enabled === false
+          ? "「图片与媒体」关着，群里的图她看不到"
+          : "看图模型没配，群里的图只会显示成 [图片]",
+      where: mediaOk
+        ? ""
+        : "开关在「设置 → 记忆与上下文 → 图片转述」；模型在 AstrBot 面板 → 插件 → virtual_world 里选",
+      jump:
+        media.enabled === false
+          ? go(() => {
+              showTab("settings");
+              openSettingsTab("mind");
+            })
+          : null,
+    },
+    {
+      title: "存储阈值",
+      ok: storageOk,
+      detail: storageOk
+        ? `剩 ${num(storage.min_free_mb, 500)} MB 就清理，最多占 ${num(storage.max_data_mb, 300)} MB`
+        : "阈值没填，满了不会自动清理",
+      jump: go(() => {
+        showTab("settings");
+        openSettingsTab("advanced");
+      }),
+    },
+  ];
+  const missing =
+    items.filter((item) => !item.ok).length +
+    WIZARD_MODEL_SLOTS.filter((slot) => !wizardSlotConfigured(slot.key)).length;
+  body.appendChild(
+    el(
+      "p",
+      missing ? "wizard-missing" : "wizard-ok",
+      missing
+        ? `还差 ${missing} 项才能痛快跑起来；点「去配」直接跳过去。`
+        : "都配好了，现在就能跑。",
+    ),
+  );
+  body.appendChild(el("div", "wizard-check-head", "模型槽位"));
+  wizardRunCheck(body);
+  body.appendChild(el("div", "wizard-check-head", "其他"));
+  const list = el("div", "wizard-check-list");
+  items.forEach((item) => list.appendChild(wizardCheckRow(item)));
+  body.appendChild(list);
+  body.appendChild(
+    el(
+      "p",
+      "muted",
+      "点「完成」保存这一遍改动；没配的部分之后随时能在「设置」里补。",
+    ),
   );
 }
 
@@ -15200,17 +20379,17 @@ function wizardGenerateStep(body) {
     el(
       "p",
       "muted",
-      "这两样都要调一次模型生成，跳过也完全能用——想让她更像她的时候再回来做。",
+      "可选：生成一段给辅助模型用的人设摘要，再攒几句口吻样例。跳过也能正常用。",
     ),
   );
-  // ① 简易人设：给打杂模型用的摘要，事件、整理都靠它
+  // ① 简易人设：给辅助模型用的摘要，事件、整理都靠它
   const briefArea = document.createElement("textarea");
   briefArea.rows = 4;
   briefArea.placeholder = "还没有生成，点下面的按钮从主人设生成一段";
   briefArea.value =
     ($("persona-brief-text") && $("persona-brief-text").value) || "";
   const briefWrap = el("div", "field");
-  briefWrap.appendChild(fieldHead("简易人设（给打杂模型）"));
+  briefWrap.appendChild(fieldHead("简易人设（给辅助模型）"));
   briefWrap.appendChild(briefArea);
   const briefRow = el("div", "row");
   const briefButton = el("button", "small primary", "从主人设生成");
@@ -15263,12 +20442,12 @@ function wizardGenerateStep(body) {
 
   // ② 声音样例：让她学着"自己说过的话"说话
   const sampleWrap = el("div", "field");
-  sampleWrap.appendChild(fieldHead("声音样例（口吻样本）"));
+  sampleWrap.appendChild(fieldHead("口吻样例"));
   sampleWrap.appendChild(
     el(
       "p",
       "muted",
-      "按场景让她说几句，生成的结果先进候选池；之后在「她 / 他 / ta」那一页挑中的才会进提示词。",
+      "按场景生成几句，先放进候选池；挑中的才会写进提示词。",
     ),
   );
   const sampleRow = el("div", "row");
@@ -15283,37 +20462,48 @@ function wizardGenerateStep(body) {
 }
 
 function openWizard() {
-  const world = ui.config.world;
   const steps = [
     {
-      title: "她在哪儿生活",
-      hint: "先告诉插件：她该在哪些群 / 私聊里出现。没选会话，后面配了也不会生效。",
+      title: "接入会话",
+      hint: "选择她要在哪些群或私聊里生活；没选的会话不会生效。",
       build: (body) => wizardSessionStep(body),
     },
     {
       title: "她是谁",
-      hint: "名字、性别、角色卡。都可以先跳过——留空会沿用 AstrBot 那份人格。",
+      hint: "名字、性别和角色卡；留空会沿用 AstrBot 的人格。",
+      optional: true,
       build: (body) => wizardPersonaStep(body),
     },
     {
-      title: "模型配了吗",
-      hint: "这一步不改配置，只是让你看清插件现在用的是哪些模型。",
-      build: (body) => wizardProviderStep(body),
+      title: "她的性格",
+      hint: "先选整体感觉；不对再拖下面的滑块细调。",
+      build: (body) => wizardTemperamentStep(body),
     },
     {
-      title: "调手感",
-      hint: "不用逐个调参数：拖这几个滑块，它会同时改掉一组相关的设置。中间那档就是默认。",
-      build: (body) => body.appendChild(knobEditor(world)),
-    },
-    {
-      title: "记忆与画像",
-      hint: "要不要记住每个人、要不要在她睡觉时消化这些经历。",
+      title: "记忆",
+      hint: "默认记住每个人，并在她睡下后整理；可以关掉。",
       build: (body) => wizardMemoryStep(body),
     },
     {
-      title: "让她说话像自己（可跳过）",
-      hint: "这两样要调模型生成，跳过也完全能用。",
+      title: "谁说了算",
+      hint: "主人收审批与告警，管理员能用管理指令；都可以留空。",
+      build: (body) => wizardOwnerStep(body),
+    },
+    {
+      title: "功能开关",
+      hint: "只决定开不开；具体细节都在「全局设置」里。",
+      build: (body) => wizardFeatureStep(body),
+    },
+    {
+      title: "口吻样例（可选）",
+      hint: "生成几句她说话的样子；跳过也能正常用。",
+      optional: true,
       build: (body) => wizardGenerateStep(body),
+    },
+    {
+      title: "还差这几步才能跑起来",
+      hint: "逐条核对；没配的点「去配」直接跳过去。",
+      build: (body, render, close) => wizardChecklistStep(body, close),
     },
   ];
   let index = 0;
@@ -15328,30 +20518,33 @@ function openWizard() {
   card.appendChild(head);
   const hintBox = el("p", "muted wizard-hint", "");
   card.appendChild(hintBox);
-  // 走完就藏起来了：留一句在哪儿能再打开，省得用户调过一次之后找不着
-  card.appendChild(
-    el(
-      "p",
-      "muted wizard-step",
-      "以后想再走一遍：全局设置 → 基础 → 最上面的「重新运行设置向导…」",
-    ),
-  );
+  const progress = el("div", "wizard-progress");
+  const progressFill = el("i");
+  progress.appendChild(progressFill);
+  card.appendChild(progress);
   const body = el("div", "wizard-body");
   card.appendChild(body);
   const foot = el("div", "wizard-foot");
   const back = el("button", "small ghost", "上一步");
   back.type = "button";
-  const skip = el("button", "small ghost", "跳过这步");
+  const skip = el("button", "small ghost", "跳过此步");
   skip.type = "button";
   const next = el("button", "small primary", "下一步");
   next.type = "button";
-  const done = el("button", "small ghost", "以后再说");
+  const done = el("button", "small ghost", "稍后设置");
   done.type = "button";
   foot.appendChild(done);
   foot.appendChild(skip);
   foot.appendChild(back);
   foot.appendChild(next);
   card.appendChild(foot);
+  card.appendChild(
+    el(
+      "p",
+      "muted wizard-foot-note",
+      "以后可在「设置 → 新手设置」里重新打开向导。",
+    ),
+  );
   backdrop.appendChild(card);
   document.body.appendChild(backdrop);
 
@@ -15362,26 +20555,29 @@ function openWizard() {
   function render() {
     const step = steps[index];
     title.textContent = step.title;
-    stepNote.textContent = `第 ${index + 1} / ${steps.length} 步`;
+    stepNote.textContent = `${index + 1} / ${steps.length}`;
     hintBox.textContent = step.hint || "";
+    progressFill.style.width = `${((index + 1) / steps.length) * 100}%`;
     body.innerHTML = "";
-    step.build(body, render);
+    step.build(body, render, close);
     back.disabled = index === 0;
-    skip.style.display = index === steps.length - 1 ? "none" : "";
+    skip.style.display = step.optional && index < steps.length - 1 ? "" : "none";
     next.textContent = index === steps.length - 1 ? "完成" : "下一步";
   }
 
   async function finish() {
     ui.config.world.wizard_done = true;
     markDirty();
-    close();
     toast("向导走完了，这就保存…");
-    try {
-      await saveAll();
+    // 先看保存结果再说"可以开始用了"：保存失败还报成功，是这个向导最伤信任的一处
+    const saved = await saveAll();
+    if (saved && saved.ok) {
+      close();
       toast("已保存，可以开始用了");
-    } catch (error) {
-      toast(`保存失败：${error.message || error}（点右上角「保存」重试）`);
+      return;
     }
+    // 失败不关窗：草稿留着，让用户能改完重试（点右上角「保存」也行）
+    toast("没有保存成功：改动还在，点「完成」或右上角「保存」重试");
   }
 
   back.addEventListener("click", () => {
@@ -15406,12 +20602,12 @@ function openWizard() {
       finish();
     }
   });
-  // 「以后再说」也标记已看过：不然每次打开都弹
+  // 「稍后设置」也标记已看过：不然每次打开都弹
   done.addEventListener("click", () => {
     ui.config.world.wizard_done = true;
     markDirty();
     close();
-    toast("向导先关了；全局设置顶部有按钮可以再打开");
+    toast("向导先关了；在「设置 → 新手设置」里可以重新打开");
   });
   render();
 }
@@ -15493,8 +20689,96 @@ function renderDebugOutput(data, mode) {
 
   const summary = $("debug-summary");
   if (summary) {
-    const label = mode === "autonomous" ? "自主提示词" : "接管请求（上一轮实际发出的）";
+    const label = mode === "autonomous" ? "自主提示词（模拟预览）" : "接管请求（上一轮实际发出的）";
     summary.textContent = `${label} · ${Number(data.chars || prompt.length)} 字符`;
+  }
+
+  // ⓪ 真实请求账：**模拟预览**和**实跑**分开说，别把预览当成实跑（P0-1 / DBG02）
+  const calls = Array.isArray(data.calls) ? data.calls : [];
+  const callBox = el("div", "debug-block");
+  const callTitle = el(
+    "div",
+    "debug-block-title",
+    `最近的模型请求（${calls.length ? `${calls.length} 条` : "还没有记录"}）`,
+  );
+  callBox.appendChild(callTitle);
+  if (calls.length) {
+    const list = el("div", "debug-kv");
+    calls.slice(0, 8).forEach((call) => {
+      const bits = [
+        String(call.kind_label || call.kind || "未知类型"),
+        String(call.stage || ""),
+        `${String(call.session_id || "").split(":").slice(-1)[0] || "（无会话）"}`,
+        `配置 rev ${call.config_revision ?? "?"}`,
+        call.provider ? `Provider ${call.provider}` : "Provider 未知",
+        call.ok === false ? `失败：${call.error || "原因不明"}` : `${call.reply_chars || 0} 字符回复`,
+      ].filter(Boolean);
+      list.appendChild(el("span", "debug-kv-key", String(call.request_id || "")));
+      const value = el("span", "debug-kv-val", bits.join("｜"));
+      // 进去了 / 没进去的块：每一条都要有理由
+      const included = (call.included || []).join("、");
+      const excluded = (call.excluded || [])
+        .map((item) => `${item.block}（${item.reason}）`)
+        .join("、");
+      if (included) value.appendChild(el("div", "muted", `进去了：${included}`));
+      if (excluded) value.appendChild(el("div", "muted", `没进去：${excluded}`));
+      list.appendChild(value);
+    });
+    callBox.appendChild(list);
+  } else {
+    callBox.appendChild(
+      el("p", "muted", "她还没发出过请求；上面那份只是按当前配置拼出来的模拟预览。"),
+    );
+  }
+  const revision = Number(data.config_revision || 0);
+  callBox.appendChild(
+    el(
+      "p",
+      "muted",
+      `当前配置 version ${revision}；预览不调用模型、不发消息、不动额度。`,
+    ),
+  );
+  box.appendChild(callBox);
+
+  // ①- 收图失败流水（2026-10-20）：她"看不见图"的时候，这里能看出是哪一步掉的
+  const mediaFails = Array.isArray(data.media_cache) ? data.media_cache : [];
+  if (mediaFails.length) {
+    const mediaBox = el("div", "debug-block");
+    mediaBox.appendChild(
+      el("div", "debug-block-title", `没取到的图（最近 ${mediaFails.length} 张）`),
+    );
+    const list = el("div", "debug-kv");
+    mediaFails
+      .slice()
+      .reverse()
+      .forEach((item) => {
+        const reason = String(item.reason || "");
+        const label =
+          {
+            download_failed: "地址失效 / 取不回来",
+            over_round_limit: "超了这一轮上限",
+            timed_out: "等超时了",
+            store_failed: "入库失败",
+            disabled: "本地资产库关着",
+            empty_source: "地址是空的",
+          }[reason] || reason || "原因不明";
+        const when = item.at ? new Date(Number(item.at)).toLocaleTimeString() : "";
+        list.appendChild(el("span", "debug-kv-key", `${when} ${label}`));
+        const src = String(item.source || "");
+        const tail = src.length > 60 ? `…${src.slice(-58)}` : src;
+        list.appendChild(
+          el("span", "debug-kv-val", `${tail}${item.detail ? `（${item.detail}）` : ""}`),
+        );
+      });
+    mediaBox.appendChild(list);
+    mediaBox.appendChild(
+      el(
+        "p",
+        "muted",
+        "重启就清空；放宽「一轮最多收几张图」能减少超限这一种。",
+      ),
+    );
+    box.appendChild(mediaBox);
   }
 
   // ① 状态槽：槽里有东西却没进提示词，只可能是过期了
@@ -15612,5 +20896,4464 @@ function applyDebugExpandState() {
   button.textContent = allOpen ? "全部收起" : "全部展开";
   button.dataset.expanded = allOpen ? "1" : "";
 }
+
+/* ================================================================== */
+/* Agent 页（B0/WP8c 的观测段搬到这里，只读）                            */
+/* ================================================================== */
+/* WP8C-AGENT-BEGIN */
+/* 后端这一轮在 /state 快照里新加了 `agent` 段（core/engine.py 的 agent_section()）。
+ * 这一段是**只读观测**：老实例、或者回调抛异常时后端只留默认骨架，整段可能缺席、
+ * 也可能少几个键，所以下面一律按缺省处理，绝不让这一页因为读不到字段而崩掉。
+ * 这一页只陈列事实：没有开关、没有说明、没有跳转（开关都在全局设置里）。
+ */
+
+/** 「插件草稿」那块面板本身（装完/删完原地重读用）。 */
+let agentDraftsPane = null;
+/** provider.source 的机器名 → 人话（她说的话由哪个模型生成）。 */
+const AGENT_SOURCE_LABELS = {
+  agent: "已配置",
+  llm: "跟插件模型",
+  session: "跟会话模型",
+  none: "没配",
+};
+
+/** 名单类字段：最多列 10 条，多的写成"还有 N 条"（跟状态页人多时的处理一致）。 */
+function agentListText(value) {
+  const list = (Array.isArray(value) ? value : [])
+    .map((item) => String(item == null ? "" : item).trim())
+    .filter(Boolean);
+  if (!list.length) return "";
+  const shown = list.slice(0, 10).join("、");
+  return list.length > 10 ? `${shown}…（还有 ${list.length - 10} 条）` : shown;
+}
+
+/** 状态条上的第一格：开没开 + **能不能真办事**（缺几项前提）。 */
+function agentStatusText(agent) {
+  const info = agent && typeof agent === "object" ? agent : {};
+  if (info.enabled !== true) return "Agent 功能：未开启";
+  const ready = info.ready && typeof info.ready === "object" ? info.ready : null;
+  if (!ready) return "Agent 功能：已开启";
+  const blockers = Array.isArray(ready.blockers) ? ready.blockers.length : 0;
+  return blockers ? `Agent 功能：已开启（还差 ${blockers} 项）` : "Agent 功能：已开启 · 就绪";
+}
+
+/** 「开工条件」卡：一条前提一行，缺的那条直接把"怎么改"写在后面。 */
+function agentReadyRows(agent) {
+  const info = agent && typeof agent === "object" ? agent : {};
+  const ready = info.ready && typeof info.ready === "object" ? info.ready : null;
+  const checks = ready && Array.isArray(ready.checks) ? ready.checks : [];
+  return checks
+    .map((item) => {
+      const row = item && typeof item === "object" ? item : {};
+      const title = String(row.title || row.code || "").trim();
+      if (!title) return null;
+      const detail = String(row.detail || "").trim();
+      const fix = String(row.fix || "").trim();
+      if (row.ok === true) return [title, `✅ 满足${detail ? `：${detail}` : ""}`];
+      return [title, `⚠ ${detail || "还没满足"}${fix ? `｜${fix}` : ""}`];
+    })
+    .filter(Boolean);
+}
+
+/** 状态条上的第二格：她这一轮说话实际用的是哪个模型。 */
+function agentModelText(agent) {
+  const info = agent && typeof agent === "object" ? agent : {};
+  const provider = info.provider && typeof info.provider === "object" ? info.provider : {};
+  const source = String(provider.source || "none");
+  const name = String(provider.resolved || provider.configured || "").trim();
+  const label = AGENT_SOURCE_LABELS[source] || source;
+  const head = name ? `${label} · ${name}` : label;
+  // P0-4：配置里写什么是一回事，"最近一次真的用了哪个"是另一回事——有就补在后面。
+  // 回退也要明说：不能让用户以为"选了 Agent 模型"就一定生效了。
+  const used = provider.used && typeof provider.used === "object" ? provider.used : null;
+  const bits = [head];
+  if (used && (used.provider || used.model)) {
+    const actual = String(used.model || used.provider || "").trim();
+    const how = String(used.source || "") === "agent" ? "配的" : "跟主模型";
+    bits.push(`最近一次实际用：${actual || "不知道"}（${how}）`);
+  }
+  const reason = String(provider.fallback_reason || "").trim();
+  if (reason) bits.push(reason);
+  return bits.join(" · ");
+}
+
+/** 一张只读卡片：标题 + [标签, 文本] 行；一行都没有就写一句空态。
+
+``detail`` 是"名单类"的次要信息：默认收起在「查看全部」里，展开后限高滚动，
+别让四十个工具名或一长串任务把这一页铺成一片。
+*/
+function agentCard(title, rows, emptyText, detail, note = "") {
+  const card = el("div", "card agent-card");
+  card.appendChild(el("h2", "", title));
+  const body = el("div", "agent-kv");
+  if (!rows.length) {
+    body.appendChild(el("p", "muted", emptyText || "没有可显示的项"));
+  }
+  rows.forEach(([label, text]) => {
+    body.appendChild(el("span", "agent-kv-key", label));
+    body.appendChild(el("span", "agent-kv-val", text));
+  });
+  card.appendChild(body);
+  let lines = [];
+  let label = "";
+  let inlineNames = false;
+  if (Array.isArray(detail)) {
+    lines = detail
+      .map((item) => String(item == null ? "" : item).trim())
+      .filter(Boolean);
+    label = `看全部 ${lines.length} 个名字`;
+    inlineNames = true;
+  } else if (detail && Array.isArray(detail.lines)) {
+    lines = detail.lines
+      .map((item) => String(item == null ? "" : item).trim())
+      .filter(Boolean);
+    label = detail.label || `查看全部 ${lines.length} 项`;
+  }
+  if (lines.length) {
+    const more = el("details", "agent-card-more");
+    more.appendChild(el("summary", "", label));
+    let text = null;
+    if (inlineNames) {
+      text = el("div", "agent-card-more-text muted", lines.join("、"));
+    } else {
+      text = el("div", "agent-card-more-text");
+      lines.forEach((line) => text.appendChild(el("div", "agent-card-more-line", line)));
+    }
+    if (note) text.appendChild(el("p", "agent-card-note", note));
+    more.appendChild(text);
+    card.appendChild(more);
+  }
+  return card;
+}
+
+/** 工具来源：宿主给的是 ``{工具名: 来源}``，这里翻成「来源 数量」几个字。 */
+function agentToolSourceText(raw) {
+  const map = raw && typeof raw === "object" ? raw : {};
+  const counts = {};
+  Object.keys(map).forEach((key) => {
+    const source = String(map[key] || "").trim() || "未知";
+    counts[source] = (counts[source] || 0) + 1;
+  });
+  const keys = Object.keys(counts).sort();
+  return keys.map((key) => `${key} ${counts[key]}`).join(" · ");
+}
+
+/** ②③④⑤⑦ 五块只读事实；字段一律按缺省容错。 */
+/** 四个子开关全关时的一句话（说明"宿主里有工具、她一个都不能用"的原因）。 */function agentSwitchOffText(switches) {
+  const flags = switches && typeof switches === "object" ? switches : {};
+  const names = [
+    ["agent_history_lookup_enabled", "查聊天历史与经历"],
+    ["agent_artifact_generation_enabled", "生成文件"],
+    ["agent_file_send_enabled", "发送文件"],
+    ["agent_code_execution_enabled", "执行代码"],
+  ];
+  const off = names.filter(([key]) => flags[key] !== true).map(([, label]) => label);
+  if (!off.length) return "";
+  return `开关关着：${off.join("、")}（在「全局设置 → Agent」里开）`;
+}
+
+/** Agent 的只读详情：工具名单 / 任务与产物 / 最近错误都收在卡片里的 details。 */
+
+function agentFactCards(agent) {
+  const info = agent && typeof agent === "object" ? agent : {};
+  const obj = (value) => (value && typeof value === "object" ? value : {});
+  const budgets = obj(info.budgets);
+  const tools = obj(info.tools);
+  const isolation = obj(info.isolation);
+  const index = obj(info.index);
+  const cards = [];
+
+  // ⓪ 开工条件：缺哪条前提就写哪条，省得人去猜「是不是要在 AstrBot 里开 Agent」。
+  const ready = obj(info.ready);
+  const readyRows = agentReadyRows(info);
+  const readyNote = String(ready.note || "").trim();
+  if (readyNote) readyRows.push(["AstrBot 那边要开什么", readyNote]);
+  if (readyRows.length) {
+    const card = agentCard(
+      ready.ok === true ? "开工条件（都满足了）" : "开工条件（还差几项）",
+      readyRows,
+      "",
+    );
+    // 这卡是整段话里最该先读的：占满一行，别被挤成两三个字一行
+    card.classList.add("agent-card-wide");
+    cards.push(card);
+  }
+
+  // ① 运行参数
+  cards.push(
+    agentCard("运行参数", [
+      ["整件事最多", `${num(budgets.query_total_seconds, 2)} 秒`],
+      ["一次调用最多", `${num(budgets.request_timeout_seconds, 0.8)} 秒`],
+      ["索引批量上限", `${num(budgets.index_batch_seconds, 30)} 秒`],
+      ["最多几步", String(num(info.max_steps, 32))],
+    ]),
+  );
+
+  // ② 工具：卡片只放数量与来源，几十个名字进折叠块（限高滚动）
+  const toolRows = [["已允许", `${num(tools.allowed_count, 0)} 个`]];
+  const allowedText = agentListText(tools.allowed);
+  if (allowedText) toolRows.push(["允许清单", allowedText]);
+  const available = (Array.isArray(tools.available) ? tools.available : [])
+    .map((item) => String(item == null ? "" : item).trim())
+    .filter(Boolean);
+  if (available.length) toolRows.push(["宿主里可用", `${available.length} 个`]);
+  const sourceText = agentToolSourceText(tools.sources);
+  if (sourceText) toolRows.push(["按来源", sourceText]);
+  // P0-6：旧「通用工具名单」的对账——孤儿工具必须点名，否则迁移时会悄悄丢
+  const legacy = obj(tools.legacy);
+  if (!legacy.error && num((legacy.counts || {}).total, 0) > 0) {
+    const orphans = Array.isArray(legacy.orphans) ? legacy.orphans : [];
+    const total = num((legacy.counts || {}).total, 0);
+    toolRows.push([
+      "旧通用名单",
+      orphans.length
+        ? `${total} 个，其中 ${orphans.length} 个没有动作认领：${orphans.join("、")}`
+        : `${total} 个，都已有动作认领`,
+    ]);
+  }
+  if (!num(tools.allowed_count, 0) && available.length) {
+    toolRows.push(["状态", "一个都没放出来"]);
+  }
+  cards.push(
+    agentCard(
+      "工具",
+      toolRows,
+      "还没有可用工具",
+      available,
+      !num(tools.allowed_count, 0) && available.length
+        ? agentSwitchOffText(info.switches) || "四个子开关都关着。"
+        : "",
+    ),
+  );
+
+  // ③ 隔离与记忆范围
+  cards.push(
+    agentCard("隔离与记忆范围", [
+      ["记忆范围", String(isolation.memory_scope_mode || "").trim() || "没设置"],
+      ["空人设时的范围", String(isolation.empty_persona_scope || "").trim() || "group"],
+    ]),
+  );
+
+  // ④ 语义索引：卡片保持 3 行；错误进弹窗，别把卡片撑成三倍高
+  const indexRows = [
+    ["向量模型", index.embedding_configured === true ? "已配置" : "没配"],
+    ["向量空间", String(index.space_fingerprint || "").trim() || "未装配"],
+    ["已索引 / 待处理", `${num(index.indexed, 0)} / ${num(index.pending, 0)}`],
+  ];
+  // 维度：0 表示还没装配好。来路写清楚——是宿主自报的，还是供应商配置里填的
+  // （用户 m26700：宿主供应商不一定实现 get_dim，但配置里填的维度是可信的）
+  const indexDim = Number(index.dim || 0);
+  if (indexDim > 0) {
+    const source = String(index.dim_source || "");
+    const where =
+      source === "provider_config" ? "供应商里填的" : source === "get_dim" ? "供应商自报" : "";
+    indexRows.splice(2, 0, ["维度", where ? `${indexDim} 维（${where}）` : `${indexDim} 维`]);
+  }
+  const indexProblem = String(index.problem || "").trim();
+  const lastError = String(index.last_error || "").trim();
+  if (indexProblem) indexRows.push(["为什么没开", "有，展开看"]);
+  if (lastError) indexRows.push(["最近一次错误", "有，展开看"]);
+  const indexCard = agentCard("语义索引", indexRows);
+  if (indexProblem) {
+    const problemMore = el("details", "agent-card-more");
+    problemMore.appendChild(el("summary", "", "为什么没开"));
+    const problemText = el("div", "agent-card-more-text");
+    problemText.appendChild(el("div", "agent-card-more-line", indexProblem));
+    problemMore.appendChild(problemText);
+    indexCard.appendChild(problemMore);
+  }
+  if (lastError) {
+    const indexMore = el("details", "agent-card-more");
+    indexMore.appendChild(el("summary", "", "查看最近错误"));
+    const indexText = el("div", "agent-card-more-text");
+    indexText.appendChild(el("div", "agent-card-more-line", lastError));
+    indexMore.appendChild(indexText);
+    indexCard.appendChild(indexMore);
+  }
+  cards.push(indexCard);
+
+  return cards;
+}
+
+/** 「任务与产物」这一页：任务一卡、产物一卡，各自把条目逐行列出来（用户 m45903）。 */
+function agentWorkCards(agent) {
+  const info = agent && typeof agent === "object" ? agent : {};
+  const obj = (value) => (value && typeof value === "object" ? value : {});
+  const cards = [];
+  [
+    ["任务", obj(info.tasks), agentTaskLine, "还没有任务", "一次让她动手办的事（写插件、查资料、出文件）。"],
+    ["产物", obj(info.artifacts), agentArtifactLine, "还没有产物", "她办完事留下的文件：发出去的、没发出去的都在这里。"],
+  ].forEach(([title, section, render, emptyText, note]) => {
+    const card = el("div", "card agent-card agent-card-wide");
+    card.appendChild(el("h2", "", title));
+    card.appendChild(el("p", "section-note", note));
+    if (title === "任务" && info.busy === true) {
+      // 用户 m10183：她手上压着一件要动手的事时，页面要说清"正在跑"，以及
+      // "你已经叫停/改口、她还没走到检查点"这两种中间态。
+      const control = obj(info.control);
+      const tail = control.cancel
+        ? "（你已经叫停，它下一步就会停）"
+        : control.amend
+          ? `（你已经改口：${String(control.amend).slice(0, 30)}）`
+          : "（这会儿发「算了」或「改成…」会交到它手上）";
+      card.appendChild(el("p", "hint", `正在跑：她手上还有一件事没做完${tail}`));
+    }
+    const box = el("div", "agent-list");
+    const sectionNote = String((section && section.note) || "").trim();
+    const items = Array.isArray(section.items) ? section.items : [];
+    if (!section || section.supported !== true) {
+      box.appendChild(el("p", "muted", sectionNote || emptyText));
+    } else if (sectionNote) {
+      // 读失败 ≠ 没记录
+      box.appendChild(el("p", "muted", `读不出来：${sectionNote}`));
+    } else if (!items.length) {
+      box.appendChild(el("p", "muted", emptyText));
+    } else {
+      const list = el("div", "agent-list-rows");
+      items.forEach((item) => list.appendChild(el("div", "agent-list-row", render(item))));
+      box.appendChild(list);
+      if (items.length >= 20) {
+        box.appendChild(el("p", "muted", `只列了最近 ${items.length} 条。`));
+      }
+    }
+    card.appendChild(box);
+    cards.push(card);
+  });
+  return cards;
+}
+
+/** 一条任务的一行摘要：目标 / 状态 / 步数 / 用时（失败原因跟在后面）。 */
+function agentTaskLine(task) {
+  const item = task && typeof task === "object" ? task : {};
+  const bits = [String(item.goal || "").trim() || String(item.id || "未命名任务")];
+  bits.push(String(item.status_label || item.status || "未记录"));
+  const steps = Number(item.steps || 0);
+  if (steps > 0) bits.push(`${Number(item.ok_steps || 0)}/${steps} 步`);
+  const ms = Number(item.duration_ms || 0);
+  if (ms > 0) bits.push(`${Math.round(ms / 1000)} 秒`);
+  const tail = String(item.error || item.note || "").trim();
+  return bits.join("｜") + (tail ? `｜${tail.slice(0, 40)}` : "");
+}
+
+/** 一条产物的一行摘要：文件名 / 类型 / 大小 / 发没发出去。 */
+function agentArtifactLine(artifact) {
+  const item = artifact && typeof artifact === "object" ? artifact : {};
+  const bits = [String(item.name || item.id || "未命名文件")];
+  const mime = String(item.mime || "").trim();
+  if (mime) bits.push(mime);
+  const size = Number(item.size_bytes || 0);
+  if (size > 0) bits.push(formatBytes(size));
+  bits.push(item.sent === true ? "已发出" : "还没发出");
+  return bits.join("｜");
+}
+
+/** 「学习状态」标签：她现在学到了什么、上次整理干了什么、为什么还是 0。 */
+function agentLearningPanel(learning) {
+  const data = learning && typeof learning === "object" ? learning : {};
+  const counts = data.counts && typeof data.counts === "object" ? data.counts : {};
+  const skills = data.skill_counts && typeof data.skill_counts === "object" ? data.skill_counts : {};
+  const tidy = data.last_tidy && typeof data.last_tidy === "object" ? data.last_tidy : {};
+  const card = agentCard(
+    "学习状态",
+    [
+      ["能用的经验", `${counts.active || 0} 条（说话时按情境挑相关的几条）`],
+      ["候选经验", `${counts.candidate || 0} 条（证据够了会自动发布）`],
+      ["过时的", `${counts.deprecated || 0} 条（依赖变了，不再教她）`],
+      ["撤销的", `${counts.revoked || 0} 条（你或她明确否掉）`],
+      ["流程", `${skills.active || 0} 条可用 · ${skills.candidate || 0} 条候选`],
+      ["上次整理", tidy.note ? String(tidy.note) : "还没整理过"],
+    ],
+    "",
+    null,
+    String(data.note || "")
+  );
+  // 光有"几条几条"看不出她到底学到了什么（用户 m45903）：把每条经验摆出来
+  const recent = Array.isArray(data.recent) ? data.recent : [];
+  const box = el("div", "agent-learning-list");
+  if (!recent.length) {
+    box.appendChild(
+      el("p", "muted", "还没有记下来的经验。经验只从她真的做成的 Agent 任务里提炼（日常闲聊不进这份账）。")
+    );
+  } else {
+    recent.forEach((raw) => {
+      const item = raw && typeof raw === "object" ? raw : {};
+      const row = el("div", "agent-learning-item");
+      const head = el("div", "agent-skill-head");
+      head.appendChild(el("strong", "", String(item.situation || "（没记情境）")));
+      head.appendChild(el("span", "tag", String(item.status_label || item.status || "")));
+      const confidence = num(item.confidence, 0);
+      if (confidence > 0) head.appendChild(el("span", "badge", `把握 ${confidence}`));
+      const evidence = num(item.evidence, 0);
+      if (evidence > 0) head.appendChild(el("span", "badge", `证据 ${evidence} 条`));
+      row.appendChild(head);
+      const method = String(item.method || "").trim();
+      if (method) row.appendChild(el("p", "agent-learning-method", method));
+      const stamp = num(item.updated_at, 0);
+      if (stamp > 0) row.appendChild(el("p", "muted", `更新于 ${formatStamp(stamp)}`));
+      box.appendChild(row);
+    });
+    if (num(counts.active, 0) + num(counts.candidate, 0) > recent.length) {
+      box.appendChild(el("p", "muted", `只列了最近 ${recent.length} 条。`));
+    }
+  }
+  card.appendChild(box);
+  const foot = el("div", "agent-actions");
+  const button = el("button", "btn small", "现在整理一遍");
+  button.addEventListener("click", () => tidyKnowledgeNow(button));
+  foot.appendChild(button);
+  card.appendChild(foot);
+  return card;
+}
+
+async function tidyKnowledgeNow(button) {
+  if (!button || button.disabled) return;
+  button.disabled = true;
+  try {
+    const result = await apiPost("knowledge/tidy", {});
+    const note = result && result.note ? String(result.note) : "整理完了";
+    toast(note);
+    await loadAgentLearning();
+  } catch (error) {
+    toast(`整理失败：${error && error.message ? error.message : error}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+/** 「技能」卡片：内置 + 提炼出来的流程；内置也能展开看步骤（用户 m5221）。 */
+function agentSkillsPanel(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  const card = el("div", "card agent-card agent-card-wide");
+  const top = el("div", "agent-skill-top");
+  top.appendChild(el("h2", "", `技能（${list.length} 条）`));
+  const formHost = el("div", "agent-skill-form-host");
+  const add = el("button", "btn small", "新增一条流程");
+  add.addEventListener("click", () => agentSkillForm(formHost));
+  top.appendChild(add);
+  // 用户 m12067：内置流程落成插件数据目录里的 skills/*.md，能直接改
+  const folder = el("button", "btn small ghost", "skill 文件夹");
+  folder.addEventListener("click", async () => {
+    try {
+      const result = await apiPost("skills/folder", {});
+      if (result && result.ok) toast(`打开：${result.path || ""}`);
+      else toast(`打不开：${(result && result.reason) || "不知道原因"}`);
+    } catch (error) {
+      toast(`打不开：${error && error.message ? error.message : error}`);
+    }
+  });
+  top.appendChild(folder);
+  card.appendChild(top);
+  card.appendChild(formHost);
+  if (!list.length) {
+    card.appendChild(el("p", "muted", "还没有流程：她先把一件事做成，经验攒够之后才会固化。"));
+    return card;
+  }
+  const box = el("div", "agent-skill-list");
+  list.forEach((raw) => {
+    const item = raw && typeof raw === "object" ? raw : {};
+    const official = String(item.source || "") === "official";
+    const row = el("div", "agent-skill");
+    const head = el("div", "agent-skill-head");
+    head.appendChild(el("strong", "", String(item.title || item.skill_id || "未命名流程")));
+    head.appendChild(el("span", "tag", agentSkillStatusText(item.status)));
+    head.appendChild(
+      el("span", "badge", official ? "内置" : String(item.source_label || "自己加的"))
+    );
+    const missing = Array.isArray(item.missing) ? item.missing.filter(Boolean) : [];
+    if (missing.length) head.appendChild(el("span", "badge off", `缺 ${missing.join("、")}`));
+    row.appendChild(head);
+    const triggers = Array.isArray(item.when_to_use)
+      ? item.when_to_use.filter(Boolean)
+      : Array.isArray(item.triggers)
+        ? item.triggers.filter(Boolean)
+        : [];
+    if (triggers.length) {
+      row.appendChild(el("p", "muted", `什么时候用：${triggers.join("、")}`));
+    }
+    const steps = Array.isArray(item.steps) ? item.steps.filter(Boolean) : [];
+    const summary = String(item.summary || "").trim();
+    if (summary) row.appendChild(el("p", "muted", summary));
+    // 用户 m9693：步骤/说明/示例/坑太多，展开会把列表撑爆——统一放详情弹窗
+    if (official && String(item.file || "").trim()) {
+      const edit = el("button", "btn small ghost", "改");
+      edit.addEventListener("click", () => editSkillFile(String(item.file), edit));
+      head.appendChild(edit);
+    }
+    const detail = el("button", "btn small ghost", steps.length ? `详情（${steps.length} 步）` : "详情");
+    detail.addEventListener("click", () => openSkillDetail(item));
+    head.appendChild(detail);
+    if (!steps.length && String(item.note || "").trim()) {
+      row.appendChild(el("p", "muted", String(item.note)));
+    }
+    const caps = Array.isArray(item.capabilities) ? item.capabilities.filter(Boolean) : [];
+    if (caps.length) {
+      row.appendChild(el("p", "muted", `要用到：${caps.join("、")}`));
+    }
+    if (!official) {
+      const actions = el("div", "agent-actions");
+      if (String(item.status || "") !== "active") {
+        const on = el("button", "btn small", "发布");
+        on.addEventListener("click", () => setSkillStatus(item, "promote", on));
+        actions.appendChild(on);
+      }
+      if (String(item.status || "") !== "revoked") {
+        const off = el("button", "btn small danger", "撤销");
+        off.addEventListener("click", () => setSkillStatus(item, "revoke", off));
+        actions.appendChild(off);
+      }
+      const del = el("button", "btn small danger", "删掉");
+      del.addEventListener("click", () => deleteSkill(item, del));
+      actions.appendChild(del);
+      row.appendChild(actions);
+    }
+    box.appendChild(row);
+  });
+  card.appendChild(box);
+  return card;
+}
+
+/** 手动新增流程的表单（填完存成「自己加的」，直接可用）。 */
+function openSkillDetail(item) {
+  const skill = item && typeof item === "object" ? item : {};
+  const lines = [];
+  const push = (label, value) => {
+    const text = String(value || "").trim();
+    if (text) lines.push(`${label}：${text}`);
+  };
+  push("说明", skill.summary);
+  const triggers = Array.isArray(skill.when_to_use)
+    ? skill.when_to_use.filter(Boolean)
+    : Array.isArray(skill.triggers)
+      ? skill.triggers.filter(Boolean)
+      : [];
+  if (triggers.length) push("什么时候用", triggers.join("、"));
+  push("什么时候别用", skill.when_not);
+  const steps = Array.isArray(skill.steps) ? skill.steps.filter(Boolean) : [];
+  if (steps.length) {
+    lines.push("步骤：");
+    steps.forEach((step, index) => {
+      const text = String((step && step.text) || step || "").trim();
+      const action = String((step && step.action) || "").trim();
+      if (text) lines.push(`  ${index + 1}. ${text}${action ? `（${action}）` : ""}`);
+    });
+  }
+  push("做完检查", skill.verify);
+  const caps = Array.isArray(skill.capabilities) ? skill.capabilities.filter(Boolean) : [];
+  const missing = Array.isArray(skill.missing) ? skill.missing.filter(Boolean) : [];
+  if (caps.length) {
+    push("要用到", missing.length ? `${caps.join("、")}（现在缺：${missing.join("、")}）` : caps.join("、"));
+  }
+  push("备注", skill.note);
+  confirmDialog({
+    title: String(skill.title || "这条流程"),
+    message: lines.join("\n"),
+    confirmText: "知道了",
+    danger: false,
+  });
+}
+
+async function editSkillFile(file, button) {
+  if (button) button.disabled = true;
+  try {
+    const data = await apiGet("skills/files", {});
+    const found = (Array.isArray(data && data.files) ? data.files : []).find(
+      (row) => String(row.file || "") === file
+    );
+    if (!found) {
+      toast("没找到这一份文件，刷新一下再试");
+      return;
+    }
+    openFormDialog({
+      title: `改「${found.title || file}」`,
+      hint: "改完保存，下一轮就按新的走。「## 步骤」这一节不能删。",
+      wide: true,
+      fields: [{ key: "text", label: `内容（${file}）`, type: "textarea", rows: 22 }],
+      values: { text: String(found.text || "") },
+      confirmText: "保存",
+      onSubmit: async (values) => {
+        const result = await apiPost("skills/files/save", {
+          file,
+          text: String(values.text || ""),
+        });
+        if (result && result.ok) {
+          toast(`改好了：${result.skill || file}`);
+          loadAgentLearning();
+          return true;
+        }
+        toast(`没保存：${(result && result.reason) || "不知道原因"}`);
+        return false;
+      },
+    });
+  } catch (error) {
+    toast(`读不出来：${error && error.message ? error.message : error}`);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function agentSkillForm(slot) {
+  if (!slot) return;
+  if (slot.childElementCount) {
+    slot.innerHTML = "";
+    return;
+  }
+  const box = el("div", "agent-skill-form");
+  const title = el("input", "input");
+  title.placeholder = "标题（例如「查账单之前先确认时间」）";
+  const triggers = el("input", "input");
+  triggers.placeholder = "什么时候用（逗号分开，例如：查账单, 对不上）";
+  const steps = el("textarea", "input");
+  steps.rows = 4;
+  steps.placeholder = "一步一步怎么写，一行一步";
+  const caps = el("input", "input");
+  caps.placeholder = "要用到的工具（可选，逗号分开，例如：deepseek_web_search）";
+  const summary = el("input", "input");
+  summary.placeholder = "一句话说明（可选，例如：发之前先对一遍数字）";
+  const whenNot = el("input", "input");
+  whenNot.placeholder = "什么时候别用（可选）";
+  const examples = el("textarea", "input");
+  examples.rows = 3;
+  examples.placeholder = "示例（可选，一行一个）";
+  const pitfalls = el("textarea", "input");
+  pitfalls.rows = 3;
+  pitfalls.placeholder = "常见坑（可选，一行一个）";
+  const verify = el("input", "input");
+  verify.placeholder = "怎么算做成（可选，例如：文件对方能打开）";
+  [title, triggers, summary, whenNot, steps, caps, examples, pitfalls, verify].forEach((field) =>
+    box.appendChild(field)
+  );
+  const actions = el("div", "agent-actions");
+  const save = el("button", "btn small", "存下这条流程");
+  save.addEventListener("click", () =>
+    saveSkill(
+      {
+        title: title.value,
+        triggers: triggers.value,
+        steps: steps.value,
+        capabilities: caps.value,
+        summary: summary.value,
+        when_not: whenNot.value,
+        examples: examples.value,
+        pitfalls: pitfalls.value,
+        verify: verify.value,
+      },
+      save
+    )
+  );
+  const cancel = el("button", "btn small ghost", "取消");
+  cancel.addEventListener("click", () => {
+    slot.innerHTML = "";
+  });
+  actions.appendChild(save);
+  actions.appendChild(cancel);
+  box.appendChild(actions);
+  slot.appendChild(box);
+}
+
+async function saveSkill(payload, button) {
+  if (!button || button.disabled) return;
+  if (!String(payload.title || "").trim() || !String(payload.steps || "").trim()) {
+    toast("标题和至少一步都要写");
+    return;
+  }
+  button.disabled = true;
+  try {
+    await apiPost("skills/create", payload);
+    toast("记下了：这条流程现在就能用");
+    await loadAgentLearning();
+  } catch (error) {
+    toast(`没存下：${error && error.message ? error.message : error}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function deleteSkill(skill, button) {
+  if (!button || button.disabled) return;
+  const item = skill && typeof skill === "object" ? skill : {};
+  const ok = await confirmDialog({
+    title: "删掉这条流程？",
+    message: `「${String(item.title || item.skill_id || "")}」删掉之后她就用不上了。`,
+    confirmText: "删掉",
+    danger: true,
+  });
+  if (!ok) return;
+  button.disabled = true;
+  try {
+    await apiPost("skills/delete", { skill_id: item.skill_id });
+    toast("已删掉");
+    await loadAgentLearning();
+  } catch (error) {
+    toast(`没删成：${error && error.message ? error.message : error}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function agentSkillStatusText(status) {
+  const key = String(status || "");
+  if (key === "active") return "可用";
+  if (key === "candidate") return "候选";
+  if (key === "revoked") return "已撤销";
+  return key || "未记录";
+}
+
+async function setSkillStatus(skill, action, button) {
+  if (!button || button.disabled) return;
+  const item = skill && typeof skill === "object" ? skill : {};
+  button.disabled = true;
+  try {
+    await apiPost("skills/status", { skill_id: item.skill_id, action });
+    toast(action === "revoke" ? "已撤销这条流程" : "已发布这条流程");
+    await loadAgentLearning();
+  } catch (error) {
+    toast(`没改成：${error && error.message ? error.message : error}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+/**
+ * 页签里那一块的内容：只有真的切过去（或刷新）才去拉。
+ *
+ * 首次渲染不该顺手打三个请求——`renderAgentPage` 每刷新一次状态都会跑，
+ * 而「看着的页签」永远是其中一页（用户 m45903 要的是翻页/切换，不是三份并发）。
+ */
+function agentPaneLoader(name) {
+  if (name === "learning") return loadAgentLearning();
+  if (name === "drafts") {
+    const host = $("agent-drafts");
+    if (host && !host.children.length) host.appendChild(agentDraftsPanel().card);
+    return loadAgentDrafts();
+  }
+  if (name === "runs") return loadAgentRuns();
+  return null;
+}
+
+/** 切 Agent 页的四个页签（用户 m45903）：任务与产物 / 学习 / 插件草稿 / 工具调用。 */
+function showAgentPane(name, reload = false) {
+  const keys = ["work", "learning", "drafts", "runs"];
+  const key = keys.includes(name) ? name : "work";
+  ui.agent.pane = key;
+  const seg = $("agent-seg");
+  // 冒烟测试里的 DOM 桩只有最小实现，没有 querySelectorAll；页面本身有，别让少一个节点就崩。
+  if (seg && typeof seg.querySelectorAll === "function") {
+    Array.from(seg.querySelectorAll("button[data-seg]")).forEach((button) => {
+      button.classList.toggle("on", button.dataset.seg === key);
+    });
+  }
+  keys.forEach((item) => {
+    const pane = $(`agent-pane-${item}`);
+    if (pane) pane.classList.toggle("hidden", item !== key);
+  });
+  if (reload) {
+    const job = agentPaneLoader(key);
+    if (job && typeof job.catch === "function") job.catch(() => {});
+  }
+  return key;
+}
+
+/** 学习页：经验逐条列 + 技能清单（用户 m45903 把两个小标签并成一页，别再让人点空按钮）。 */
+async function loadAgentLearning() {
+  const body = $("agent-learning");
+  if (!body) return;
+  body.innerHTML = "";
+  body.appendChild(el("p", "muted", "读取中…"));
+  try {
+    // 列表走 /skills（内置带 file，才渲染得出「改 md」）；读不到就退回 learning 那份
+    const [data, skillsData] = await Promise.all([
+      apiGet("learning"),
+      apiGet("skills").catch(() => null),
+    ]);
+    const skills =
+      skillsData && Array.isArray(skillsData.skills)
+        ? skillsData.skills
+        : data && data.skills;
+    body.innerHTML = "";
+    body.appendChild(agentLearningPanel(data));
+    body.appendChild(agentSkillsPanel(skills));
+  } catch (error) {
+    body.innerHTML = "";
+    body.appendChild(el("p", "muted", `读不到学习状态：${error && error.message ? error.message : error}`));
+  }
+}
+
+/**
+ * Agent 页开关清单（用户 m8694）：和「全局设置 → Agent（自主能力）」那一节是同一批
+ * 世界配置，只是标签更口语、不带说明。两处**必须**覆盖同一组键 ——
+ * 以前这一页少了 `inspect_capability_enabled` / `ask_user_enabled`，同一件事在
+ * 设置页能开、在 Agent 页看不到（用户 m00001 第 8 条）。测试按这张表逐键核对。
+ */
+function agentSwitchesCard() {
+  const world = ui.config.world || {};
+  const agent = world.agent || (world.agent = {});
+  const card = el("div", "card agent-card agent-card-wide");
+  card.appendChild(el("h2", "", "开关"));
+  card.appendChild(
+    el(
+      "p",
+      "muted",
+      "和 全局设置 → Agent（自主能力）是同一批开关（同一份世界配置）；改完点右上角保存。",
+    ),
+  );
+  const body = el("div", "agent-switch-body");
+  const flip = (key) => (value) => {
+    agent[key] = value === true;
+    markDirty();
+  };
+  [
+    ["总开关（允许她做事）", "enabled"],
+    ["翻聊天记录", "history_lookup_enabled"],
+    ["生成文件", "artifact_generation_enabled"],
+    ["把文件发出去", "file_send_enabled"],
+    ["跑代码", "code_execution_enabled"],
+    ["办不成先查资料", "research_enabled"],
+    ["允许她写插件", "plugin_forge_enabled"],
+    ["允许她自己装", "plugin_forge_auto_install"],
+    // 这两项设置页一直能改、Agent 页却看不到（用户 m00001 第 8 条）：补在这里，
+    // 免得同一件事在两页里对不上。
+    ["查看动作说明", "inspect_capability_enabled"],
+    ["缺信息时问一句", "ask_user_enabled"],
+  ].forEach(([label, key]) => {
+    body.appendChild(checkboxField(label, agent[key] === true, flip(key), {}));
+  });
+  body.appendChild(
+    selectField(
+      "动系统的事先问主人",
+      ownerApprovalModeOf(world),
+      OWNER_APPROVAL_MODES,
+      (value) => {
+        agent.owner_approval_mode = value;
+        agent.owner_approval_enabled = value !== "off";
+        markDirty();
+      },
+      { hint: "只问危险的 / 每件都问 / 不问。主人是谁在全局设置里配。" },
+    ),
+  );
+  card.appendChild(body);
+  return card;
+}
+
+/** Agent 页正文：状态条 + 五块事实卡，其余四块按页签现取（用户 m45903）。 */
+function renderAgentPage(agent) {
+  const info = agent && typeof agent === "object" ? agent : {};
+  const head = $("agent-head");
+  if (head) {
+    head.innerHTML = "";
+    head.appendChild(el("span", "chip", agentStatusText(info)));
+    head.appendChild(el("span", "chip", `模型：${agentModelText(info)}`));
+  }
+  const box = $("agent-cards");
+  if (!box) return;
+  box.innerHTML = "";
+  box.appendChild(agentSwitchesCard());
+  agentFactCards(info).forEach((card) => box.appendChild(card));
+  const work = $("agent-work");
+  if (work) {
+    work.innerHTML = "";
+    agentWorkCards(info).forEach((card) => work.appendChild(card));
+  }
+  showAgentPane(ui.agent.pane || "work");
+}
+
+/** 插件草稿：她自己写的东西，装不装由人按（用户 m31581 / m31660）。 */
+function agentDraftsPanel() {
+  const card = el("div", "card agent-card agent-card-wide");
+  card.appendChild(el("h2", "", "插件草稿"));
+  const body = el("div", "agent-draft-body");
+  body.appendChild(el("p", "muted", "读不到草稿清单。"));
+  card.appendChild(body);
+  // 记住这块面板：装完/删完要原地重读一遍，重新渲染整页会把滚动位置和别的页签状态丢掉。
+  agentDraftsPane = body;
+  return { card, body };
+}
+
+/** 一份草稿：叫什么、几个文件、装没装，以及三个只读动作。 */
+function agentDraftLines(data) {
+  const rows = [];
+  const forge = (data && data.forge) || {};
+  const drafts = (data && Array.isArray(data.drafts) && data.drafts) || [];
+  if (!forge.enabled) {
+    rows.push(["开关", "她还没被允许写插件（全局设置 → Agent（自主能力）里的「允许她写插件」）"]);
+  } else if (!forge.auto_install) {
+    rows.push(["自装", "关着：她只写草稿，装不装由你按"]);
+  }
+  if (!drafts.length) {
+    rows.push(["草稿", "还没有。让她办一件要动手的事，才可能写出一份。"]);
+    return rows;
+  }
+  drafts.forEach((item, index) => {
+    const files = Array.isArray(item.files) ? item.files : [];
+    const state = item.installed ? "已装进宿主" : "还没装";
+    rows.push([
+      `草稿 ${index + 1}`,
+      `${item.name}（${item.dir}）· ${files.length} 个文件 · ${state}`,
+    ]);
+  });
+  return rows;
+}
+
+async function loadAgentDrafts(pane = null) {
+  // 一律由 renderAgentPage 把面板交进来：这一段会被单独抽出来跑，别在模块里找 id。
+  // 装完/删完的重新加载不给 pane，走这里记住的那块（见 agentDraftsPanel）。
+  const body = pane || agentDraftsPane;
+  if (!body) return;
+  let data = null;
+  try {
+    data = await apiGet("plugin-drafts");
+  } catch (exc) {
+    body.innerHTML = "";
+    body.appendChild(el("p", "muted", `读不到草稿清单：${exc && exc.message ? exc.message : exc}`));
+    return;
+  }
+  body.innerHTML = "";
+  agentDraftLines(data).forEach(([label, text]) => {
+    const row = el("div", "agent-draft-row");
+    row.appendChild(el("span", "muted", label));
+    row.appendChild(el("span", "", text));
+    body.appendChild(row);
+  });
+  const drafts = (data && Array.isArray(data.drafts) && data.drafts) || [];
+  drafts.forEach((item) => {
+    const row = el("div", "agent-draft-actions");
+    row.appendChild(el("span", "muted", item.name));
+    const look = el("button", "small", "看全文");
+    look.type = "button";
+    look.addEventListener("click", () => showDraftDetail(item.slug));
+    row.appendChild(look);
+    if (!item.installed) {
+      const install = el("button", "small", "装上");
+      install.type = "button";
+      install.addEventListener("click", () => installDraft(item.slug, install));
+      row.appendChild(install);
+    }
+    const drop = el("button", "small danger", "删掉");
+    drop.type = "button";
+    drop.addEventListener("click", () => deleteDraft(item.slug, drop));
+    row.appendChild(drop);
+    body.appendChild(row);
+  });
+}
+
+async function showDraftDetail(slug) {
+  try {
+    const data = await apiGet(`plugin-drafts/detail?slug=${encodeURIComponent(slug)}`);
+    const files = (data && data.files) || {};
+    const names = Object.keys(files);
+    if (!names.length) {
+      toast("这份草稿读不出来");
+      return;
+    }
+    const parts = names.map((name) => `${name}（${String(files[name]).length} 字）`);
+    const check = (data && data.check) || {};
+    const trouble = [].concat(check.errors || [], check.warnings || []);
+    toast(
+      `${data.name}：${parts.join("、")}${trouble.length ? `｜${trouble[0]}` : "｜校验通过"}`,
+    );
+  } catch (exc) {
+    toast(`读不到这份草稿：${exc && exc.message ? exc.message : exc}`);
+  }
+}
+
+async function installDraft(slug, button) {
+  if (button) button.disabled = true;
+  try {
+    const result = await apiPost("plugin-drafts/install", { slug });
+    toast((result && result.reason) || "已装进 AstrBot，重启后生效");
+    await loadAgentDrafts();
+  } catch (exc) {
+    toast(`装不上：${exc && exc.message ? exc.message : exc}`);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function deleteDraft(slug, button) {
+  if (button) button.disabled = true;
+  try {
+    const result = await apiPost("plugin-drafts/delete", { slug });
+    toast((result && result.reason) || "已删掉这份草稿");
+    await loadAgentDrafts();
+  } catch (exc) {
+    toast(`删不掉：${exc && exc.message ? exc.message : exc}`);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+/* WP8C-AGENT-END */
+
+/** 进 Agent 页就现读一次 /state：跟控制台同一份快照，读不到就照旧渲染上次那份。 */
+async function loadAgentPage() {
+  const select = $("status-session");
+  const sessionId = select ? select.value : "";
+  if (!sessionId) {
+    renderAgentPage(null);
+    return;
+  }
+  try {
+    const data = await apiGet("state", { session: sessionId });
+    ui.status = data;
+    renderAgentPage(data.agent);
+  } catch (error) {
+    renderAgentPage((ui.status || {}).agent);
+    const head = $("agent-head");
+    // 一句 muted 就够：这一页是事实陈列，读不到不该弹错误框打断
+    if (head) {
+      const reason = error && error.message ? String(error.message) : String(error);
+      head.appendChild(el("span", "chip", `读取失败：${reason}`));
+    }
+  }
+}
+
+/* ---------------- 工具调用：她调用过哪些工具（只读，倒序分页） ---------------- */
+
+/** 一页拉多少条。后端硬上限 100，这里 50，翻页只认 next_cursor。 */
+const AGENT_RUNS_PAGE = 50;
+
+function agentRunStamp(seconds) {
+  const value = num(seconds, 0);
+  return value > 0 ? formatStamp(value) : "—";
+}
+
+/** 耗时：毫秒 → 人话（跨 tick 的动作能跑几十分钟，写 3628227 ms 没人看得懂）。 */
+function agentDurationText(value) {
+  const ms = num(value, 0);
+  if (ms <= 0) return "—";
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  // 先取整到秒再进位，否则 899989ms 会写成「14 分 60 秒」
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${Math.round(ms / 100) / 10} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  const restSeconds = seconds % 60;
+  if (minutes < 60) {
+    return restSeconds ? `${minutes} 分 ${restSeconds} 秒` : `${minutes} 分`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const restMinutes = minutes % 60;
+  return restMinutes ? `${hours} 小时 ${restMinutes} 分` : `${hours} 小时`;
+}
+
+/** 一行明细：只写有值的字段，缺字段就跳过（这一页一律按缺省容错）。 */
+function agentRunDetail(item) {
+  const kv = el("div", "agent-kv");
+  const add = (label, value) => {
+    const text = String(value === null || value === undefined ? "" : value).trim();
+    if (!text) return;
+    kv.appendChild(el("span", "agent-kv-key", label));
+    kv.appendChild(el("span", "agent-kv-val", text));
+  };
+  add("事件编号", item.id);
+  add("会话", item.session);
+  add("工具调用", item.tool_call_id);
+  add("任务", item.task_id);
+  add("产物句柄", item.artifact_id);
+  add("下一页游标", item.next_cursor);
+  add("副作用", (item.side_effects || []).join("、"));
+  add("来源事件", (item.source_event_ids || []).join("、"));
+  const content = String(item.content || "");
+  if (content) {
+    const chars = num(item.content_chars, 0);
+    add(`回执原文（${chars} 字${item.truncated ? "，已截断" : ""}）`, content);
+  }
+  return kv;
+}
+
+/** 一行：一句话看完，点开才是编号、回执原文这些排查用的东西。 */
+function agentRunRow(item) {
+  const wrap = el("details", "agent-run");
+  const head = el("summary", "agent-run-row");
+  head.appendChild(el("span", "agent-run-cell time", agentRunStamp(item.at)));
+  head.appendChild(el("span", "agent-run-cell name", item.name || "（没记名字）"));
+  head.appendChild(el("span", "agent-run-cell where", item.target || "—"));
+  head.appendChild(
+    el("span", `agent-run-cell status ${item.ok ? "ok" : "bad"}`, item.status_label || ""),
+  );
+  head.appendChild(el("span", "agent-run-cell cost", agentDurationText(item.duration_ms)));
+  head.appendChild(el("span", "agent-run-cell note", item.summary || ""));
+  wrap.appendChild(head);
+  const body = el("div", "agent-run-body");
+  body.appendChild(agentRunDetail(item));
+  wrap.appendChild(body);
+  return wrap;
+}
+
+function renderAgentRuns() {
+  const box = $("agent-runs");
+  if (!box) return;
+  const state = ui.agent;
+  const rows = state.items || [];
+  box.innerHTML = "";
+  if (state.loading && !rows.length) {
+    box.appendChild(el("p", "muted", "读取中…"));
+  }
+  if (rows.length) {
+    const table = el("div", "agent-run-table");
+    rows.forEach((row) => table.appendChild(agentRunRow(row)));
+    box.appendChild(table);
+    // 已经有记录了：这一句只是"这一页没拉全"的说明，不能把表顶掉
+    if (state.note) box.appendChild(el("p", "muted", state.note));
+  } else if (!state.loading) {
+    box.appendChild(el("p", "muted", state.note || "她还没有调用过工具。"));
+  }
+  const count = $("agent-runs-count");
+  if (count) {
+    count.textContent = rows.length ? `第 ${state.page || 1} 页 · ${rows.length} 条` : "";
+  }
+  const prev = $("agent-runs-prev");
+  if (prev) prev.classList.toggle("hidden", !((state.page || 1) > 1 && !state.loading));
+  const more = $("agent-runs-more");
+  if (more) more.classList.toggle("hidden", !(state.hasMore && !state.loading));
+}
+
+/** 拉第 N 页（用户 m45903：要能前后翻）。游标是"比它更早"，所以往回翻靠手上记的游标栈。 */
+async function loadAgentRunsPage(page = 1) {
+  const state = ui.agent;
+  if (state.loading) return;
+  const wanted = Math.max(1, Math.floor(num(page, 1)) || 1);
+  const before = num((state.cursors || [])[wanted - 1], 0);
+  const select = $("status-session");
+  const sessionId = select ? select.value : "";
+  const params = { limit: AGENT_RUNS_PAGE };
+  // 不传 session = 全部会话（用户 m20719：默认看全部会话最近 50 条）
+  if (sessionId) params.session = sessionId;
+  if (before) params.before = before;
+  if (state.onlyFailed) params.only_failed = 1;
+  state.loading = true;
+  renderAgentRuns();
+  try {
+    const data = await apiGet("agent/runs", params);
+    if (!data || data.ok === false) {
+      state.note = String((data && data.reason) || "读不到工具调用记录");
+      return;
+    }
+    const rows = Array.isArray(data.items) ? data.items : [];
+    state.items = rows;
+    state.cursor = num(data.next_cursor, 0);
+    state.hasMore = data.has_more === true;
+    state.note = rows.length ? "" : "她还没有调用过工具。";
+    state.page = wanted;
+    state.cursors[wanted - 1] = before;
+    if (state.hasMore) state.cursors[wanted] = state.cursor;
+    state.cursors.length = state.hasMore ? wanted + 1 : wanted;
+  } catch (error) {
+    state.note = `读取工具调用记录失败：${error && error.message ? error.message : error}`;
+  } finally {
+    state.loading = false;
+    renderAgentRuns();
+  }
+}
+
+/** 回到第一页（换会话、换筛选、点刷新都走这里）。 */
+function loadAgentRuns() {
+  ui.agent.cursors = [0];
+  return loadAgentRunsPage(1);
+}
+
+/** Agent 页的刷新：五块事实现取，页签里那一块在看着才跟着重取（用户 m45903）。 */
+function refreshAgentPage() {
+  loadAgentPage();
+  showAgentPane(ui.agent.pane || "work", true);
+}
+
+/* ================================================================== */
+/* 谈资：她经历的事里能拿去讲给别人听的信息                              */
+/* ================================================================== */
+
+/** 列表一页拉多少条。后端硬上限 100，这里默认 20，翻页只认 next_cursor。 */
+const TOPIC_PAGE_SIZE = 20;
+
+const TOPIC_SOURCE_LABELS = {
+  chat: "聊天",
+  event: "事件",
+  activity: "经历",
+  tool: "工具",
+  media: "媒体",
+  manual: "手写",
+  dream: "梦境",
+};
+
+function topicPolicyText(topic) {
+  const policy = ((topic.details || {}).visibility || {});
+  const state = topic.policy_state || topic.policy_status || topic.authority || policy.authority || "legacy_unknown";
+  if (topic.invalid_reason || state === "invalid" || policy.deny_all) return "来源失效 / 不可使用";
+  if (state === "legacy_unknown" || !(topic.source_event_ids || []).length) return "旧版 / 来源不明（受限）";
+  if (policy.hard_private) return "用户保密硬锁";
+  return state === "explicit" ? "明确授权" : "来源规则许可";
+}
+
+const TOPIC_STATUS_LABELS = {
+  archived: "已归档",
+  available: "可用",
+  disabled: "已禁用",
+  expired: "已过期",
+  deleted: "已删除",
+};
+
+const TOPIC_ACT_LABELS = {
+  introduce: "主动介绍",
+  progress: "进展",
+  outcome: "结果",
+  answer: "回答",
+  reference: "引用",
+};
+
+function topicLabel(table, raw, fallback) {
+  const key = raw === null || raw === undefined ? "" : String(raw);
+  if (!key) return fallback;
+  return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : key;
+}
+
+/** 状态给 CSS 用：只放行纯小写字母，别把后端字段直接拼进 class。 */
+function topicStatusKey(topic) {
+  const key = String((topic || {}).status || "available");
+  return /^[a-z]+$/.test(key) ? key : "unknown";
+}
+
+function topicStamp(seconds) {
+  const value = num(seconds, 0);
+  return value > 0 ? formatStamp(value) : "";
+}
+
+/** 谈资一律挂在全局会话选择器上：换会话就得把上一条会话的数据丢掉。 */
+function topicSession() {
+  const node = $("status-session");
+  return node ? String(node.value || "") : "";
+}
+
+function topicVersion(topic) {
+  return num((topic || {}).version, 0);
+}
+
+function topicForget() {
+  ui.topics.session = "";
+  ui.topics.items = [];
+  ui.topics.total = 0;
+  ui.topics.nextCursor = "";
+  ui.topics.enabled = null;
+  ui.topics.selected = "";
+  ui.topics.detail = null;
+  ui.topics.shares = [];
+  // 召回轨迹也是按会话存的：换了会话就得连它一起丢掉
+  ui.topics.recall = { session: "", records: [], note: "", loading: false };
+}
+
+/**
+ * 版本冲突。bridge 把 HTTP 409 包成什么样没人保证过，
+ * 所以状态码、响应体、文案三路都认一遍。
+ */
+function topicConflict(error) {
+  if (!error) return false;
+  const response = error.response || {};
+  const status =
+    num(error.status, 0) || num(error.statusCode, 0) || num(response.status, 0);
+  if (status === 409) return true;
+  const data = error.data || error.body || response.data || {};
+  if (num(data.status, 0) === 409 || data.conflict === true) return true;
+  return /409|conflict|冲突/i.test(`${error.message || error} ${error.statusText || ""}`);
+}
+
+function topicFailText(error) {
+  return error && error.message ? String(error.message) : String(error);
+}
+
+function topicConflictText() {
+  return "这条谈资在别处被改过，刷新后再试";
+}
+
+function topicConflictError() {
+  const conflict = new Error(topicConflictText());
+  conflict.status = 409;
+  return conflict;
+}
+
+/**
+ * 写操作统一走这里：把 409 归一成一种带 status 的错误，
+ * 调用方只需要判断一次。``run`` 里那一行要写字面量的接口名（注释里别写样例，
+ * 否则会被 tests/test_web_routes.py 的正则当成真调用的接口去核对后端注册表）。
+ */
+async function topicSend(run) {
+  try {
+    const data = await run();
+    if (data && data.ok === false && num(data.status, 0) === 409) {
+      throw topicConflictError();
+    }
+    return data || {};
+  } catch (error) {
+    if (topicConflict(error)) throw topicConflictError();
+    throw error;
+  }
+}
+
+/** 已向哪些会话分享过：后端给什么形状就认什么形状，去重后按顺序返回。 */
+function topicSharedSessions(topic) {
+  const seen = [];
+  const push = (value) => {
+    const text = value === null || value === undefined ? "" : String(value);
+    if (text && seen.indexOf(text) < 0) seen.push(text);
+  };
+  const row = topic || {};
+  if (Array.isArray(row.share_session_ids)) {
+    row.share_session_ids.forEach((item) => push(item));
+  }
+  if (Array.isArray(row.shared_sessions)) {
+    row.shared_sessions.forEach((item) => push(item));
+  }
+  if (Array.isArray(row.shares)) {
+    row.shares.forEach((item) => {
+      if (item && typeof item === "object") push(item.session_id);
+      else push(item);
+    });
+  }
+  return seen;
+}
+
+function topicSharedText(topic) {
+  const ids = topicSharedSessions(topic);
+  if (ids.length) {
+    const head = ids.slice(0, 3).join("、");
+    return ids.length > 3 ? `已分享给 ${head} 等 ${ids.length} 个会话` : `已分享给 ${head}`;
+  }
+  const count = num((topic || {}).share_count, 0);
+  return count > 0 ? `已分享给 ${count} 个会话` : "";
+}
+
+/** 来源事实：details.facts 可能是字符串、也可能是对象列表。 */
+function topicFacts(topic) {
+  const details = (topic || {}).details || {};
+  const raw = details.facts || details.fact || [];
+  const list = Array.isArray(raw) ? raw : [raw];
+  return list
+    .filter((item) => item !== null && item !== undefined && String(item).trim() !== "")
+    .map((item) => (typeof item === "string" ? item : JSON.stringify(item)));
+}
+
+function topicFeedback(topic) {
+  const row = topic || {};
+  const details = row.details || {};
+  const raw = row.feedback || details.feedback || details.feedbacks || [];
+  const list = Array.isArray(raw) ? raw : [raw];
+  return list
+    .filter((item) => item !== null && item !== undefined && String(item).trim() !== "")
+    .map((item) => (typeof item === "string" ? item : JSON.stringify(item)));
+}
+
+function topicStoreRow(row) {
+  if (!row || !row.topic_id) return;
+  ui.topics.items = (ui.topics.items || []).map((item) =>
+    item.topic_id === row.topic_id ? row : item,
+  );
+  if (ui.topics.selected === row.topic_id) ui.topics.detail = row;
+}
+
+/** 功能开关 + 底部那一行小字 + 「加载更多」的显隐。 */
+function topicSyncFlag() {
+  const enabled = ui.topics.enabled !== false;
+  const button = $("material-seg-topics");
+  if (button) {
+    button.classList.toggle("off", !enabled);
+    button.setAttribute("aria-disabled", enabled ? "false" : "true");
+    button.setAttribute(
+      "title",
+      enabled
+        ? "她能拿去讲给别人听的信息"
+        : "谈资功能关着，去「全局设置 → 说话与决策 → 谈资」里打开",
+    );
+  }
+  const pane = $("topic-pane");
+  if (pane) pane.classList.toggle("off", !enabled);
+  const note = $("topic-note");
+  if (note) {
+    if (ui.topics.enabled === null) note.textContent = "";
+    else if (!enabled)
+      note.textContent = "谈资功能关着：在「全局设置 → 说话与决策 → 谈资」里打开";
+    else if (!(ui.topics.items || []).length) note.textContent = "没有谈资";
+    else note.textContent = `共 ${ui.topics.total || ui.topics.items.length} 条`;
+  }
+  const more = $("topic-more");
+  if (more) more.classList.toggle("hidden", !ui.topics.nextCursor);
+}
+
+/* ---------------------------------------------------------------- */
+/* 最近召回：她最近几次回话时系统翻过哪些谈资、哪几条进了上下文           */
+/* 只读。没通过授权检查的谈资后端不给摘要，这里也只显示位置与原因。        */
+/* ---------------------------------------------------------------- */
+/* RECALL-VIEW-BEGIN */
+
+const TOPIC_RECALL_USAGE_LABELS = {
+  reference: "被动回复",
+  introduce: "主动提起",
+};
+
+const TOPIC_RECALL_RANKING_LABELS = {
+  semantic_vector: "语义重排",
+  lexical_substring: "字面命中",
+  neutral: "按时间",
+};
+
+/** 没进她上下文的原因（短句，一行放得下；完整说法在悬停提示里）。 */
+const TOPIC_RECALL_REASON_LABELS = {
+  blocked_by_policy: "没通过授权检查",
+  authorized_but_over_limit: "名额用完",
+  disabled: "谈资功能关着",
+};
+
+/** 一次召回明细里最多铺几行候选（再多就写「还有 N 条」）。 */
+const TOPIC_RECALL_ROWS = 3;
+
+function topicRecallUsageText(raw) {
+  const key = raw === null || raw === undefined ? "" : String(raw);
+  if (!key) return "（未知路径）";
+  return Object.prototype.hasOwnProperty.call(TOPIC_RECALL_USAGE_LABELS, key)
+    ? TOPIC_RECALL_USAGE_LABELS[key]
+    : key;
+}
+
+function topicRecallModeText(raw) {
+  const key = raw === null || raw === undefined ? "" : String(raw);
+  if (!key) return "（未知模式）";
+  return Object.prototype.hasOwnProperty.call(TOPIC_RECALL_RANKING_LABELS, key)
+    ? TOPIC_RECALL_RANKING_LABELS[key]
+    : key;
+}
+
+function topicRecallStamp(seconds) {
+  return topicStamp(seconds) || "（时间不详）";
+}
+
+/** 悬停提示里的完整说法（页面上只印短句，别让每一行都写一长串）。 */
+function topicRecallReasonText(row) {
+  if (row && row.injected) return "已经进了她这次的上下文";
+  const reason = String((row && row.reason) || "");
+  if (!reason || reason === "injected") return "没进她这次的上下文";
+  if (Object.prototype.hasOwnProperty.call(TOPIC_RECALL_REASON_LABELS, reason)) {
+    return `没进她这次的上下文：${TOPIC_RECALL_REASON_LABELS[reason]}`;
+  }
+  return `没进她这次的上下文（${reason}）`;
+}
+
+/** 行内那一格：短到一眼看完（没通过授权检查时**不显示内容**这条纪律不变）。 */
+function topicRecallShortReason(row) {
+  if (row && row.injected) return "已进入上下文";
+  const reason = String((row && row.reason) || "");
+  if (!reason || reason === "injected") return "没进上下文";
+  if (Object.prototype.hasOwnProperty.call(TOPIC_RECALL_REASON_LABELS, reason)) {
+    return TOPIC_RECALL_REASON_LABELS[reason];
+  }
+  return "没进上下文";
+}
+
+/** 内部编号拆成能读懂的部分：谈资 id 与「一次经历」的位置格式不同。 */
+function topicRecallIdInfo(raw) {
+  const value = String(raw || "");
+  const info = { kind: "topic", label: "一条谈资", action: "", session: "" };
+  if (!value.startsWith("episode:")) return info;
+  const parts = value.slice("episode:".length).split(":");
+  if (parts.length > 1 && /^plan\d+\.\d+$/.test(parts[parts.length - 1])) parts.pop();
+  info.kind = "episode";
+  info.label = "一段经历记录";
+  if (parts.length > 1 && /^\d+$/.test(parts[parts.length - 1])) {
+    parts.pop();
+    info.action = parts.pop() || "";
+  }
+  info.session = parts.join(":");
+  return info;
+}
+
+/** 主信息：有摘要就显示摘要；没有摘要只说清这是什么，不自己编内容。 */
+function topicRecallHeadline(row) {
+  const summary = String((row && row.summary) || "").trim();
+  if (summary) return summary;
+  return topicRecallIdInfo(row && row.topic_id).kind === "episode"
+    ? "一段经历记录（没有摘要）"
+    : "一条谈资（没有摘要）";
+}
+
+/** 没有摘要时补一句它是哪儿来的：本会话还是别处（不再印会话 id）。 */
+function topicRecallScopeText(row) {
+  const info = topicRecallIdInfo(row && row.topic_id);
+  if (!info.session) return "当前会话";
+  return info.session === topicSession() ? "当前会话" : "其它会话";
+}
+
+/** 字面命中还是意思相近：一眼看出这条是凭什么被翻出来的。 */
+function topicRecallHowText(row) {
+  const bits = [];
+  if (row && row.lexical) bits.push("字面命中");
+  const score = row ? row.semantic : null;
+  if (typeof score === "number" && Number.isFinite(score)) {
+    bits.push(`意思相近 ${Math.round(score * 100)}%`);
+  }
+  return bits.length ? bits.join(" · ") : "没记下翻出来的方式";
+}
+
+/**
+ * 面板只搭一次（谈资页签反复进出，不能每次进来都多长一层）。
+ *
+ * 版面口径（用户 m20「你自己看下谈资页面 是给人看的吗 重做」）：**这一页的主角是谈资本身**，
+ * 所以「最近召回」只剩一行小结 + 一个默认收起的「看每次召回的明细」——以前它铺满整屏，
+ * 真正的列表被压到看不见。
+ */
+function topicRecallBox() {
+  const host = $("topic-recall");
+  if (!host) return null;
+  if (!host.dataset.built) {
+    host.dataset.built = "1";
+    const section = settingsSection("最近召回", "", "", "topic-recall");
+    const bar = el("div", "toolbar");
+    const refresh = el("button", "ghost small", "刷新");
+    refresh.type = "button";
+    refresh.addEventListener("click", () => loadTopicRecall());
+    bar.appendChild(refresh);
+    const summary = el("span", "muted topic-recall-summary");
+    bar.appendChild(summary);
+    const body = el("div", "topic-recall");
+    const more = el("details", "topic-recall-more");
+    more.appendChild(el("summary", "", "看每次召回的明细"));
+    more.appendChild(body);
+    // 卡片里那一格 .fields 是网格：整块占满一行，别让按钮和记录并排成两列
+    const wrap = el("div", "full");
+    wrap.appendChild(bar);
+    wrap.appendChild(more);
+    section._fields.appendChild(wrap);
+    host.appendChild(section);
+    host._recallSummary = summary;
+    host._recallBody = body;
+  }
+  return host;
+}
+
+/** 一行候选：这是什么 / 进没进 / 凭什么翻出来的（长解释与内部编号都收起来）。 */
+function topicRecallCandidateLine(row) {
+  const line = el("div", "topic-recall-candidate");
+  const injected = !!(row && row.injected);
+  const authorized = !!(row && row.authorized);
+  line.appendChild(el("span", "topic-recall-mark", injected ? "✓" : authorized ? "·" : "⨯"));
+  const main = el("div", "topic-recall-main");
+  main.appendChild(el("span", "topic-recall-title", topicRecallHeadline(row)));
+  const verdict = el("span", "topic-recall-verdict", topicRecallShortReason(row));
+  verdict.classList.add(injected ? "on" : "off");
+  verdict.setAttribute("title", topicRecallReasonText(row));
+  main.appendChild(verdict);
+  if (!String((row && row.summary) || "").trim()) {
+    main.appendChild(el("span", "muted topic-recall-how", topicRecallScopeText(row)));
+  }
+  main.appendChild(el("span", "muted topic-recall-how", topicRecallHowText(row)));
+  // 内部编号降到次要位置：默认收起，排查时才展开
+  const detail = el("details", "topic-recall-id");
+  detail.appendChild(el("summary", "", "编号"));
+  detail.appendChild(
+    el("span", "topic-recall-id-value", String((row && row.topic_id) || "（没有编号）")),
+  );
+  main.appendChild(detail);
+  line.appendChild(main);
+  return line;
+}
+
+function topicRecallRecordBlock(record) {
+  const block = el("div", "topic-recall-record");
+  const head = el("div", "topic-recall-head");
+  head.appendChild(el("span", "topic-recall-when", topicRecallStamp(record.at)));
+  head.appendChild(el("span", "pill", topicRecallUsageText(record.usage)));
+  head.appendChild(el("span", "muted", topicRecallModeText(record.ranking)));
+  const all = Array.isArray(record.candidates) ? record.candidates : [];
+  const picked = all.filter((row) => row && row.injected).length;
+  head.appendChild(el("span", "muted", `翻到 ${all.length} 条，进入 ${picked} 条`));
+  block.appendChild(head);
+  // 她这一轮看到的原话：只有一句，放在明细里
+  const text = String(record.query_text || "");
+  if (text) block.appendChild(el("p", "muted topic-recall-query", `她看到的原话：${text}`));
+  if (!all.length) {
+    block.appendChild(el("p", "muted", "这一轮没有候选。"));
+    return block;
+  }
+  const shown = all.slice(0, TOPIC_RECALL_ROWS);
+  shown.forEach((row) => block.appendChild(topicRecallCandidateLine(row)));
+  if (all.length > shown.length) {
+    block.appendChild(
+      el("p", "muted topic-recall-rest", `还有 ${all.length - shown.length} 条没显示`),
+    );
+  }
+  return block;
+}
+
+function renderTopicRecall() {
+  const host = topicRecallBox();
+  if (!host) return;
+  const body = host._recallBody;
+  const summary = host._recallSummary;
+  const state = ui.topics.recall;
+  const records = state.records || [];
+  body.innerHTML = "";
+  if (summary) summary.textContent = "";
+  if (state.loading) {
+    body.appendChild(el("p", "muted", "读取中…"));
+    return;
+  }
+  if (state.note) body.appendChild(el("p", "muted", state.note));
+  if (!records.length) {
+    if (!state.note) body.appendChild(el("p", "muted", "还没有记录。"));
+    return;
+  }
+  // 一行小结：几轮、翻到几条、几条真进了上下文
+  let total = 0;
+  let picked = 0;
+  records.forEach((record) => {
+    const rows = Array.isArray(record.candidates) ? record.candidates : [];
+    total += rows.length;
+    picked += rows.filter((row) => row && row.injected).length;
+  });
+  if (summary) {
+    summary.textContent = `最近 ${records.length} 轮：翻到 ${total} 条，进入上下文 ${picked} 条`;
+  }
+  records.forEach((record) => body.appendChild(topicRecallRecordBlock(record)));
+}
+
+async function loadTopicRecall() {
+  const state = ui.topics.recall;
+  const session = topicSession();
+  // 同一个会话正在读就别重复发；换了会话必须重来
+  if (state.loading && state.session === session) return;
+  state.session = session;
+  state.records = [];
+  state.note = "";
+  if (!session) {
+    state.note = "还没有会话。";
+    renderTopicRecall();
+    return;
+  }
+  state.loading = true;
+  renderTopicRecall();
+  try {
+    const data = await apiGet("topics/recall", { session });
+    if (state.session !== session) return; // 读的过程中换了会话
+    if (!data || data.ok === false) {
+      state.note = String((data && data.reason) || "还没有召回记录");
+      return;
+    }
+    state.records = (Array.isArray(data.records) ? data.records : []).slice(0, 5);
+    state.note = state.records.length ? "" : "还没有召回记录。";
+  } catch (error) {
+    if (state.session !== session) return;
+    state.note = `读取最近召回失败：${topicFailText(error)}`;
+  } finally {
+    if (state.session === session) {
+      state.loading = false;
+      renderTopicRecall();
+    }
+  }
+}
+
+async function loadTopics({ append = false } = {}) {
+  const box = $("topic-list");
+  if (!box) return;
+  const session = topicSession();
+  if (!session) {
+    topicForget();
+    box.innerHTML = "";
+    box.appendChild(el("p", "muted", "还没有会话。"));
+    topicSyncFlag();
+    return;
+  }
+  // 换了会话：先丢掉上一个会话的谈资，再拉新的
+  if (ui.topics.session && ui.topics.session !== session) topicForget();
+  ui.topics.session = session;
+  if (append && !ui.topics.nextCursor) return;
+  if (ui.topics.loading) return;
+  ui.topics.loading = true;
+  if (!append) {
+    box.innerHTML = "";
+    box.appendChild(el("p", "muted", "读取中…"));
+  }
+  const params = { session, limit: TOPIC_PAGE_SIZE };
+  if (ui.topics.status) params.status = ui.topics.status;
+  if (ui.topics.source) params.source = ui.topics.source;
+  if (append) params.cursor = ui.topics.nextCursor;
+  try {
+    const data = await apiGet("topics", params);
+    if (ui.topics.session !== session) return; // 拉的过程中换了会话
+    if (data.error || data.degraded) throw new Error(data.error || "谈资查询降级，请稍后重试");
+    ui.topics.enabled = data.enabled !== false;
+    ui.topics.total = num(data.total, 0);
+    const rows = Array.isArray(data.items) ? data.items : [];
+    ui.topics.items = append ? ui.topics.items.concat(rows) : rows;
+    ui.topics.nextCursor = String(data.next_cursor || "");
+    const stillHere = ui.topics.items.some(
+      (item) => item.topic_id === ui.topics.selected,
+    );
+    if (ui.topics.selected && !stillHere) {
+      ui.topics.selected = "";
+      ui.topics.detail = null;
+      ui.topics.shares = [];
+    }
+    renderTopicsList();
+    renderTopicDetail();
+  } catch (error) {
+    if (ui.topics.session !== session) return;
+    if (append) {
+      toast(`加载更多失败：${topicFailText(error)}`);
+    } else {
+      box.innerHTML = "";
+      box.appendChild(el("p", "muted", `读取谈资失败：${topicFailText(error)}`));
+    }
+  } finally {
+    ui.topics.loading = false;
+    topicSyncFlag();
+  }
+}
+
+function renderTopicsList() {
+  const box = $("topic-list");
+  if (!box) return;
+  box.innerHTML = "";
+  if (ui.topics.enabled === false) {
+    box.appendChild(
+      el(
+        "p",
+        "muted",
+        "谈资功能关着：在「全局设置 → 说话与决策 → 谈资」里打开，这里才会出现内容。",
+      ),
+    );
+    return;
+  }
+  const items = ui.topics.items || [];
+  if (!items.length) {
+    box.appendChild(
+      el(
+        "p",
+        "muted",
+        "还没有谈资。她经历的事和聊天里的新信息都会成为素材，也可以点「新建谈资」自己写一条。",
+      ),
+    );
+    return;
+  }
+  items.forEach((topic) => box.appendChild(topicListRow(topic)));
+}
+
+/**
+ * 列表行：**一眼看懂这一条是什么**。
+ *
+ * 版面口径（m20）：一行摘要 + 一行出处与时间；状态只在"不是正常可用"时出现，
+ * 授权口径的长句子从列表里去掉（放详情），会话 id 不印（这一页本来就按会话筛过）。
+ */
+function topicListRow(topic) {
+  const row = el("div", "list-item topic-row");
+  if (topic.topic_id === ui.topics.selected) row.classList.add("selected");
+  const main = el("div", "list-main");
+  const head = el("div", "topic-row-head");
+  head.appendChild(el("strong", "", topic.summary || "（还没有表达）"));
+  if (topic.pinned) head.appendChild(el("span", "pill topic-pin", "已固定"));
+  const state = topic.status || "available";
+  if (state !== "available") {
+    head.appendChild(
+      el(
+        "span",
+        `pill topic-status topic-status-${topicStatusKey(topic)}`,
+        topicLabel(TOPIC_STATUS_LABELS, state, state),
+      ),
+    );
+  }
+  // 不可用/受限的谈资必须一眼认出来（能改的那几种，详情里有完整说明）
+  const policy = topicPolicyShort(topic);
+  if (policy) head.appendChild(el("span", "pill topic-status topic-status-disabled", policy));
+  main.appendChild(head);
+  const bits = [
+    topicLabel(TOPIC_SOURCE_LABELS, topic.source_kind, "未知来源"),
+    topicStamp(topic.updated_at) ? topicStamp(topic.updated_at) : "",
+    topicSharedText(topic),
+  ].filter((item) => Boolean(item));
+  main.appendChild(el("div", "meta", bits.join(" · ")));
+  row.appendChild(main);
+  row.addEventListener("click", () => loadTopicDetail(topic.topic_id));
+  return row;
+}
+
+/** 授权口径的一句话版本：正常可用就不占地方，受限/失效才标出来。 */
+function topicPolicyShort(topic) {
+  const state = String((topic && (topic.policy_state || topic.policy_status || topic.authority)) || "");
+  if (topic && topic.invalid_reason) return "已失效";
+  if (state === "invalid") return "已失效";
+  if (topic && (topic.details || {}).visibility && (topic.details || {}).visibility.deny_all) {
+    return "不可使用";
+  }
+  if (state === "legacy_unknown") return "来源不明";
+  if (!Array.isArray(topic && topic.source_event_ids) || !(topic.source_event_ids || []).length) {
+    return "来源不明";
+  }
+  const hard = ((topic && topic.details) || {}).visibility || {};
+  return hard.hard_private ? "用户保密" : "";
+}
+
+async function loadTopicDetail(topicId) {
+  const id = String(topicId || "");
+  const box = $("topic-detail");
+  const session = ui.topics.session || topicSession();
+  if (!id || !session) return;
+  ui.topics.selected = id;
+  renderTopicsList();
+  if (box) {
+    box.innerHTML = "";
+    box.appendChild(el("p", "muted", "读取中…"));
+  }
+  try {
+    const data = await apiGet("topics/item", { session, topic: id });
+    if (ui.topics.selected !== id) return;
+    ui.topics.detail = data.topic || null;
+    ui.topics.shares = Array.isArray(data.shares) ? data.shares : [];
+    renderTopicDetail();
+  } catch (error) {
+    if (ui.topics.selected !== id) return;
+    if (box) {
+      box.innerHTML = "";
+      box.appendChild(el("p", "muted", `读取详情失败：${topicFailText(error)}`));
+    }
+  }
+}
+
+/** 只重拉曝光记录：分享是异步发生的，可能刚讲出去。 */
+async function topicReloadShares(topicId) {
+  const session = ui.topics.session || topicSession();
+  if (!session || !topicId) return;
+  try {
+    const data = await apiGet("topics/shares", { session, topic: topicId });
+    if (ui.topics.selected !== topicId) return;
+    ui.topics.shares = Array.isArray(data.shares) ? data.shares : [];
+    renderTopicDetail();
+  } catch (error) {
+    toast(`读不到分享记录：${topicFailText(error)}`);
+  }
+}
+
+function topicSection(parent, heading, action) {
+  const head = el("div", "section-head topic-section");
+  head.appendChild(el("h3", "", heading));
+  if (action) head.appendChild(action);
+  parent.appendChild(head);
+  return head;
+}
+
+function topicLine(parent, label, value) {
+  const text = value === null || value === undefined || value === "" ? "—" : String(value);
+  const row = el("div", "topic-line");
+  row.appendChild(el("span", "topic-line-label", label));
+  row.appendChild(el("span", "topic-line-value", text));
+  parent.appendChild(row);
+  return row;
+}
+
+function topicSharesNode(shares) {
+  const list = el("div", "list topic-shares");
+  if (!shares.length) {
+    list.appendChild(el("p", "muted", "还没讲出去过。"));
+    return list;
+  }
+  shares.forEach((share) => {
+    const row = el("div", "list-item");
+    const main = el("div", "list-main");
+    const head = el("div", "topic-row-head");
+    head.appendChild(
+      el(
+        "strong",
+        "",
+        `${share.session_id || "未知会话"} · ${topicLabel(TOPIC_ACT_LABELS, share.communicative_act, "分享")}`,
+      ),
+    );
+    head.appendChild(el("span", "pill", String(share.status || "未知状态")));
+    main.appendChild(head);
+    if (share.text) main.appendChild(el("div", "topic-share-text", share.text));
+    const bits = [
+      topicStamp(share.created_at) ? `创建 ${topicStamp(share.created_at)}` : "",
+      topicStamp(share.sent_at) ? `发出 ${topicStamp(share.sent_at)}` : "还没发出",
+      `信息版本 ${num(share.information_revision, 0)}`,
+      Array.isArray(share.media_ids) && share.media_ids.length
+        ? `媒体 ${share.media_ids.join("、")}`
+        : "",
+      Array.isArray(share.platform_message_ids) && share.platform_message_ids.length
+        ? `消息 ${share.platform_message_ids.join("、")}`
+        : "",
+    ].filter((item) => Boolean(item));
+    main.appendChild(el("div", "meta", bits.join(" · ")));
+    row.appendChild(main);
+    list.appendChild(row);
+  });
+  return list;
+}
+
+function renderTopicDetail() {
+  const box = $("topic-detail");
+  if (!box) return;
+  const title = $("topic-title");
+  if (title) title.textContent = "谈资详情";
+  box.innerHTML = "";
+  const topic = ui.topics.detail;
+  if (!topic) {
+    box.appendChild(
+      el("p", "muted", "左边点一条谈资，这里看它的来源事实、曝光记录和能做的操作。"),
+    );
+    return;
+  }
+  if (ui.topics.enabled === false) {
+    box.appendChild(
+      el("p", "muted", "谈资功能关着：在「全局设置 → 说话与决策 → 谈资」里打开才能改。"),
+    );
+    return;
+  }
+
+  const head = el("div", "topic-head");
+  head.appendChild(
+    el(
+      "span",
+      `pill topic-status topic-status-${topicStatusKey(topic)}`,
+      topicLabel(TOPIC_STATUS_LABELS, topic.status, "可用"),
+    ),
+  );
+  head.appendChild(
+    el("span", "pill", topicLabel(TOPIC_SOURCE_LABELS, topic.source_kind, "未知来源")),
+  );
+  if (topic.pinned) head.appendChild(el("span", "pill topic-pin", "已固定"));
+  if (topic.user_edited) head.appendChild(el("span", "pill", "人工改过"));
+  head.appendChild(el("span", "pill", `版本 v${topicVersion(topic)}`));
+  box.appendChild(head);
+
+  topicLine(box, "能不能用", topicPolicyText(topic));
+  if (topic.invalid_reason) topicLine(box, "为什么不能用", topic.invalid_reason);
+  if (topic.archived_at) topicLine(box, "归档时间", topicStamp(topic.archived_at));
+  topicLine(box, "信息版本", String(num(topic.information_revision, 0)));
+  topicLine(box, "重要度", `${Math.round(num(topic.importance, 0) * 100)}%`);
+  topicLine(
+    box,
+    "时间",
+    [topicStamp(topic.created_at) ? `创建 ${topicStamp(topic.created_at)}` : "",
+     topicStamp(topic.updated_at) ? `更新 ${topicStamp(topic.updated_at)}` : ""]
+      .filter(Boolean)
+      .join(" · "),
+  );
+  topicLine(box, "什么时候过期", topic.expires_at ? topicStamp(topic.expires_at) : "不过期");
+
+  const edit = el("button", "ghost small", "改表达");
+  edit.addEventListener("click", () => openTopicEditDialog(topic));
+  topicSection(box, "她怎么讲（表达）", edit);
+  box.appendChild(el("p", "topic-summary", topic.summary || "（还没有表达）"));
+  box.appendChild(
+    el("p", "muted topic-note-line", "这里只改她怎么讲；事实要去下面的来源事件里改。"),
+  );
+
+  const sharesRefresh = el("button", "ghost small", "刷新分享记录");
+  sharesRefresh.addEventListener("click", () => topicReloadShares(topic.topic_id));
+  topicSection(box, "来源事实", sharesRefresh);
+  const ids = Array.isArray(topic.source_event_ids) ? topic.source_event_ids : [];
+  if (!ids.length) {
+    box.appendChild(el("p", "muted", "这条谈资没有关联的源事件（是手工写的一条）。"));
+  }
+  ids.forEach((id) => {
+    const link = el("button", "ghost small topic-source", String(id));
+    link.addEventListener("click", () => openTopicSourceDialog(id));
+    box.appendChild(link);
+  });
+  const facts = topicFacts(topic);
+  if (facts.length) {
+    const list = el("ul", "topic-facts");
+    facts.forEach((item) => list.appendChild(el("li", "", item)));
+    box.appendChild(list);
+  }
+
+  topicSection(box, "曝光记录（她什么时候讲给了谁）", null);
+  box.appendChild(topicSharesNode(ui.topics.shares || []));
+
+  const feedback = topicFeedback(topic);
+  if (feedback.length) {
+    topicSection(box, "相关反馈", null);
+    const list = el("ul", "topic-facts");
+    feedback.forEach((item) => list.appendChild(el("li", "", item)));
+    box.appendChild(list);
+  }
+
+  topicSection(box, "操作", null);
+  box.appendChild(topicActions(topic));
+}
+
+function topicActions(topic) {
+  const wrap = el("div", "toolbar topic-actions");
+  const pin = el("button", "ghost small", topic.pinned ? "取消固定" : "固定");
+  pin.addEventListener("click", () =>
+    topicPatch(
+      topic,
+      { pinned: !topic.pinned },
+      topic.pinned ? "已经取消固定" : "已经固定",
+    ),
+  );
+  wrap.appendChild(pin);
+
+  const live = topic.status !== "disabled";
+  const toggle = el("button", "ghost small", live ? "禁用" : "启用");
+  toggle.addEventListener("click", () =>
+    topicPatch(
+      topic,
+      { status: live ? "disabled" : "available" },
+      live ? "已经禁用" : "已经启用",
+    ),
+  );
+  wrap.appendChild(toggle);
+
+  if (topic.status === "deleted") {
+    const restore = el("button", "ghost small", "恢复");
+    restore.addEventListener("click", () =>
+      topicPatch(topic, { status: "available" }, "已经恢复"),
+    );
+    wrap.appendChild(restore);
+  }
+
+  const remove = el("button", "danger small", "删除");
+  remove.addEventListener("click", () => topicDelete(topic));
+  wrap.appendChild(remove);
+  return wrap;
+}
+
+/** 版本冲突时提示 + 重新拉这条谈资（列表也一起对齐）。 */
+async function topicAfterConflict(topicId) {
+  toast(topicConflictText());
+  await loadTopicDetail(topicId);
+  await loadTopics();
+}
+
+async function topicPatch(topic, patch, okText) {
+  if (!topic || !topic.topic_id) return false;
+  const body = {
+    session: ui.topics.session || topicSession(),
+    topic: topic.topic_id,
+    version: topicVersion(topic),
+  };
+  Object.keys(patch).forEach((key) => {
+    body[key] = patch[key];
+  });
+  try {
+    const data = await topicSend(() => apiPost("topics/update", body));
+    if (data.topic) topicStoreRow(data.topic);
+    toast(okText || "已经保存");
+    renderTopicsList();
+    renderTopicDetail();
+    return true;
+  } catch (error) {
+    if (topicConflict(error)) {
+      await topicAfterConflict(topic.topic_id);
+      return false;
+    }
+    toast(`改不动：${topicFailText(error)}`);
+    return false;
+  }
+}
+
+async function topicDelete(topic) {
+  if (!topic || !topic.topic_id) return;
+  const yes = await confirmDialog({
+    title: "删除这条谈资",
+    message:
+      "删除只是把这条谈资标成已删除，她以后不会再讲它。" +
+      "不会删掉来源聊天、来源事件，也不会撤回已经发出去的消息。",
+    confirmText: "删除",
+  });
+  if (!yes) return;
+  const body = {
+    session: ui.topics.session || topicSession(),
+    topic: topic.topic_id,
+    version: topicVersion(topic),
+  };
+  try {
+    await topicSend(() => apiPost("topics/delete", body));
+    toast("已经删除（源聊天、源事件和已发出的消息都没动）");
+    ui.topics.selected = "";
+    ui.topics.detail = null;
+    ui.topics.shares = [];
+    await loadTopics();
+  } catch (error) {
+    if (topicConflict(error)) {
+      await topicAfterConflict(topic.topic_id);
+      return;
+    }
+    toast(`删不掉：${topicFailText(error)}`);
+  }
+}
+
+/** 把来源事实（源事件 + 它当时讲出去的样子）单独开一个弹窗看。 */
+function openTopicSourceDialog(eventId) {
+  const id = String(eventId || "");
+  const session = ui.topics.session || topicSession();
+  if (!id || !session) return;
+  const state = { id, session, body: null };
+  openCustomDialog({
+    title: "来源事实",
+    hint:
+      "这是谈资的出处。要纠正事实请在来源事件里改，系统会留下审计记录；" +
+      "谈资页面只改她怎么讲。",
+    confirmText: "关闭",
+    hideCancel: true,
+    build: (body, inner) => {
+      inner.body = body;
+      body.appendChild(el("p", "muted", `读取事件 ${id}…`));
+      topicRenderSource(inner);
+    },
+    onSubmit: () => true,
+  });
+}
+
+function topicSourceAlive(state) {
+  return Boolean(
+    state &&
+      state.body &&
+      state.body.isConnected &&
+      dialogState &&
+      dialogState.values === state,
+  );
+}
+
+async function topicRenderSource(state) {
+  let data = null;
+  try {
+    data = await apiGet("experience", { session: state.session, id: state.id });
+  } catch (error) {
+    if (!topicSourceAlive(state)) return;
+    state.body.innerHTML = "";
+    state.body.appendChild(el("p", "muted", `读不到这个事件：${topicFailText(error)}`));
+    return;
+  }
+  if (!topicSourceAlive(state)) return;
+  const body = state.body;
+  body.innerHTML = "";
+  const experience = data.experience || {};
+  topicLine(body, "事件", experience.id || state.id);
+  Object.keys(experience)
+    .filter((key) => {
+      const value = experience[key];
+      return value === null || value === undefined ? false : typeof value !== "object";
+    })
+    .slice(0, 12)
+    .forEach((key) => topicLine(body, key, experience[key]));
+  const dump = el("pre", "topic-json", JSON.stringify(experience, null, 2));
+  const fold = document.createElement("details");
+  fold.appendChild(el("summary", "", "这个事件的全部字段"));
+  fold.appendChild(dump);
+  body.appendChild(fold);
+
+  topicSection(body, "这条事实当时讲出去的样子", null);
+  body.appendChild(
+    topicSharesNode(Array.isArray(data.shares) ? data.shares : []),
+  );
+}
+
+function openTopicCreateDialog() {
+  const session = ui.topics.session || topicSession();
+  if (!session) {
+    toast("先在右上角选一个会话");
+    return;
+  }
+  openFormDialog({
+    title: "新建谈资",
+    hint: "手工写的谈资没有来源事件；事实仍以事件和聊天为准，这里只定她怎么讲。",
+    confirmText: "创建",
+    fields: [
+      {
+        key: "summary",
+        label: "她怎么讲",
+        type: "textarea",
+        rows: 3,
+        placeholder: "例如：她学会了用烤箱",
+      },
+      {
+        key: "facts",
+        label: "来源事实（一行一条，可选）",
+        type: "textarea",
+        rows: 3,
+        placeholder: "一行写一条",
+      },
+      {
+        key: "importance",
+        label: "重要度（0~1）",
+        type: "number",
+        min: 0,
+        max: 1,
+        step: 0.1,
+        value: "0.5",
+      },
+      { key: "pinned", label: "固定（优先讲）", type: "checkbox" },
+    ],
+    onSubmit: async (values) => {
+      const summary = String(values.summary || "").trim();
+      if (!summary) {
+        toast("先写一句她怎么讲");
+        return false;
+      }
+      const facts = String(values.facts || "")
+        .split("\n")
+        .map((item) => item.trim())
+        .filter((item) => Boolean(item));
+      const body = {
+        session,
+        summary,
+        details: facts.length ? { facts } : {},
+        importance: num(values.importance, 0),
+        pinned: Boolean(values.pinned),
+      };
+      let created = null;
+      try {
+        const data = await topicSend(() => apiPost("topics/create", body));
+        created = data.topic || null;
+      } catch (error) {
+        toast(`建不了：${topicFailText(error)}`);
+        return false;
+      }
+      toast("已经新建");
+      await loadTopics();
+      if (created) await loadTopicDetail(created.topic_id);
+      return true;
+    },
+  });
+}
+
+function openTopicEditDialog(topic) {
+  if (!topic) return;
+  openFormDialog({
+    title: "改表达",
+    hint:
+      "只改她怎么讲这句话，事实不动。要纠正事实请回来源事实里改，" +
+      "系统会记下审计记录。",
+    confirmText: "保存",
+    fields: [
+      {
+        key: "summary",
+        label: "她怎么讲",
+        type: "textarea",
+        rows: 4,
+        value: topic.summary || "",
+      },
+      {
+        key: "importance",
+        label: "重要度（0~1）",
+        type: "number",
+        min: 0,
+        max: 1,
+        step: 0.1,
+        value: String(num(topic.importance, 0)),
+      },
+      { key: "pinned", label: "固定（优先讲）", type: "checkbox", value: Boolean(topic.pinned) },
+      { key: "status", label: "启用", type: "checkbox", value: topic.status !== "disabled" },
+    ],
+    onSubmit: async (values) => {
+      const summary = String(values.summary || "").trim();
+      if (!summary) {
+        toast("表达不能是空的");
+        return false;
+      }
+      const patch = {
+        summary,
+        importance: num(values.importance, 0),
+        pinned: Boolean(values.pinned),
+        status: values.status ? "available" : "disabled",
+      };
+      return topicPatch(topic, patch, "已经保存");
+    },
+  });
+}
+
+function showMaterialPane(name) {
+  const paneKey = name === "meme" ? "meme" : "topics";
+  ui.materialPane = paneKey;
+  const seg = $("material-seg");
+  if (seg) {
+    seg.querySelectorAll("button[data-seg]").forEach((item) => {
+      item.classList.toggle("on", item.dataset.seg === paneKey);
+    });
+  }
+  const topics = $("topic-pane");
+  const meme = $("meme-pane");
+  if (topics) topics.classList.toggle("hidden", paneKey !== "topics");
+  if (meme) meme.classList.toggle("hidden", paneKey !== "meme");
+  if (paneKey === "topics") {
+    loadTopics();
+    loadTopicRecall();
+  } else {
+    // 这三块（配额 / 发送缩放 / 攒图）只在 init 建过一次，切走再切回就显示旧值：
+    // 每次进入都按当前世界配置重画一遍。
+    // 设置默认收起，但人已经切到表情包这一栏，多半就是来调的：进来就展开。
+    const settingsDetails = $("meme-settings-details");
+    if (settingsDetails) settingsDetails.open = true;
+    memeMasterField();
+    memeMasterBox();
+    memeQuotaFields();
+    memeScaleFields();
+    memeCollectFields();
+    loadMemes();
+  }
+}
+
+function bindTopics() {
+  const seg = $("material-seg");
+  if (seg) {
+    seg.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-seg]");
+      if (button) showMaterialPane(button.dataset.seg);
+    });
+  }
+  if ($("topic-refresh")) {
+    $("topic-refresh").addEventListener("click", () => loadTopics());
+  }
+  if ($("topic-add")) {
+    $("topic-add").addEventListener("click", openTopicCreateDialog);
+  }
+  if ($("topic-more")) {
+    $("topic-more").addEventListener("click", () => loadTopics({ append: true }));
+  }
+  if ($("topic-status")) {
+    $("topic-status").addEventListener("change", () => {
+      ui.topics.status = $("topic-status").value;
+      loadTopics();
+    });
+  }
+  if ($("topic-source")) {
+    $("topic-source").addEventListener("change", () => {
+      ui.topics.source = $("topic-source").value;
+      loadTopics();
+    });
+  }
+  topicSyncFlag();
+  renderTopicsList();
+  renderTopicDetail();
+  topicRecallBox();
+  renderTopicRecall();
+}
+
+/* ================================================================== */
+/* MEME-VIEW-BEGIN 表情包：收着的图、还能不能用                        */
+/*                                                                     */
+/* M1 只管"收藏 / 展示记录 / 可用状态"这一层：这里能看、能改名字与含义、  */
+/* 能停用与删除、能清过期的展示记录。提示词与动作在 M2/M3 才接。         */
+/* 总开关关着时这一页照常能看与清理，只是聊天里不会出现表情包动作。      */
+/* ================================================================== */
+
+/** 一进页面先主动排这么多张的缩略图（再多的等滚到视口附近再补，别一次把首页刷爆）。 */
+const MEME_THUMB_LIMIT = 36;
+
+/** 列表一次铺多少张卡片（用户 m18846：一百多张一起渲染太卡，先 30 张 + 「加载更多」）。 */
+const MEME_PAGE_SIZE = 30;
+
+/** 缩略图同时发几个请求：串行太慢（60 张要等半天），一次全发又会把宿主打满。 */
+const MEME_THUMB_CONCURRENCY = 4;
+
+/** 滚动补取的提前量：图位离视口还有这么远就开始取，滚到底时图已经在路上了。 */
+const MEME_THUMB_MARGIN = "400px 0px";
+
+/** 等发出去的缩略图（按 media id 去重）；正在跑的放在 MEME_THUMB_RUNNING 里。 */
+const MEME_THUMB_QUEUE = [];
+const MEME_THUMB_RUNNING = new Set();
+
+/** 滚动补取用的 observer：重渲染时先 disconnect 再建，别让旧图位一直挂在上面。 */
+let memeThumbObserver = null;
+
+const MEME_STATE_LABELS = {
+  enabled: "可用",
+  disabled: "已禁用",
+  deleted: "已删除（文件还在）",
+  missing: "文件缺失",
+};
+
+/** 收藏编号 ``meme_000123`` 在页面上只显示尾号，方便对照回执里的话。 */
+function memeShortId(value) {
+  const text = String(value || "");
+  const digits = text.replace(/^meme_/, "");
+  return digits ? `meme_${digits}` : text;
+}
+
+/** 一条收藏的搜索键：名字、含义、什么时候用、编号都算。 */
+function memeSearchText(entry) {
+  return [
+    entry.entry_id,
+    entry.name,
+    entry.meaning,
+    entry.use_when,
+    entry.avoid_when,
+    entry.personal_note,
+  ]
+    .map((item) => String(item || ""))
+    .join(" ")
+    .toLowerCase();
+}
+
+/** 按页面上的筛选条件挑出要显示的那些（在本地筛，翻页由后端给）。 */
+function memeVisibleItems() {
+  const state = (ui.meme.state || "").trim();
+  const keyword = (ui.meme.search || "").trim().toLowerCase();
+  return (ui.meme.items || []).filter((entry) => {
+    if (state && String(entry.state || "") !== state) return false;
+    if (keyword && !memeSearchText(entry).includes(keyword)) return false;
+    return true;
+  });
+}
+
+function memeScopeParams(offset) {
+  // 表情包一律通用（用户 m20）：范围维度已经不参与判定，页面也不再传它。
+  // 一页 30 条（用户 m18846/m18961）：后端按 offset+limit 分页，页面靠「加载更多」翻页。
+  // 排序（用户 m21273）：收藏时间 / 使用次数，正序倒序都能切；默认收藏时间倒序。
+  const order = ui.meme.order === "used" ? "used" : "collected";
+  const desc = ui.meme.desc !== false;
+  return {
+    limit: MEME_PAGE_SIZE,
+    offset: Math.max(0, Number(offset) || 0),
+    order,
+    desc: desc ? "1" : "0",
+  };
+}
+
+async function loadMemes() {
+  if (ui.meme.loading) return;
+  ui.meme.loading = true;
+  const box = $("meme-grid");
+  if (box) {
+    box.innerHTML = "";
+    box.appendChild(el("p", "muted", "读取中…"));
+  }
+  try {
+    const data = await apiGet("meme/list", memeScopeParams(0));
+    ui.meme.enabled = data.enabled !== false;
+    ui.meme.reason = String(data.global_reason || "");
+    ui.meme.summary = data.summary || null;
+    ui.meme.items = data.entries || [];
+    ui.meme.total = Number(data.total) || (ui.meme.items || []).length;
+    ui.meme.hasMore = data.has_more === true;
+    // 选中集只保留库里还在的 id：删掉的、别的页面删掉的、这次没取回来的，
+    // 统统移出去。否则「导出选中（N）」的 N 是虚的，点下去后端过滤后为空。
+    memePruneChecked();
+    // 列表一变，按钮上的 N 也得跟着变：计数只认「交集」，不能等下次点勾选框才更新。
+    memeSyncCheckedButtons();
+    if (ui.meme.selected) {
+      const hit = ui.meme.items.filter((item) => item.entry_id === ui.meme.selected)[0];
+      if (!hit) ui.meme.selected = "";
+    }
+    renderMemeList();
+    renderMemeDetail();
+    // 卡片一进来就去取缩略图（用户 m20：不要点了才显示）
+    memeLoadThumbnails();
+  } catch (error) {
+    if (box) {
+      box.innerHTML = "";
+      box.appendChild(el("p", "muted", `读取失败：${error.message || error}`));
+    }
+    const note = $("meme-note");
+    if (note) note.textContent = `读取失败：${error.message || error}`;
+  } finally {
+    ui.meme.loading = false;
+    memeMasterBox();
+    memeSummaryBox();
+  }
+}
+
+/** 卡片的图位：`data-media` 标着它属于哪张图，缩略图到了就地填上去（不整页重绘）。 */
+function memeThumbSlot(mediaId) {
+  const box = el("div", "meme-thumb-box loading");
+  box.dataset.media = String(mediaId || "");
+  box.appendChild(el("span", "meme-thumb-label", "读取中…"));
+  return box;
+}
+
+/** 缩略图拿到之后，把所有指向这张图的图位填上（同一张图可能出现在列表与详情两处）。 */
+function memeFillThumb(mediaId, dataUrl, firstFrameOnly) {
+  const slots = document.querySelectorAll(`.meme-thumb-box[data-media="${mediaId}"]`);
+  Array.prototype.forEach.call(slots, (box) => {
+    box.innerHTML = "";
+    box.classList.remove("loading", "empty");
+    const image = el("img", "meme-thumb-image");
+    image.src = dataUrl;
+    image.alt = "表情包";
+    box.appendChild(image);
+    if (firstFrameOnly) box.appendChild(el("span", "meme-thumb-label meme-thumb-badge", "GIF 首帧"));
+  });
+}
+
+/** 缩略图拿不到（文件不在/格式怪）：把图位改成说明性文字，别一直转圈。 */
+function memeMarkThumbMissing(mediaId, reason) {
+  const slots = document.querySelectorAll(`.meme-thumb-box[data-media="${mediaId}"]`);
+  Array.prototype.forEach.call(slots, (box) => {
+    box.innerHTML = "";
+    box.classList.remove("loading");
+    box.classList.add("empty");
+    box.appendChild(el("span", "meme-thumb-label", String(reason || "没有图片文件")));
+  });
+}
+
+/** 把一张图排进取图队列（已经在排队/在跑/取过/已知取不到的都不重复排）。 */
+function memeQueueThumb(mediaId) {
+  const key = String(mediaId || "");
+  if (!key) return;
+  if (ui.meme.previews[key] || ui.meme.missing[key]) return;
+  if (MEME_THUMB_RUNNING.has(key) || MEME_THUMB_QUEUE.indexOf(key) >= 0) return;
+  MEME_THUMB_QUEUE.push(key);
+  memeDrainThumbs();
+}
+
+/** 并发池：同时最多跑 MEME_THUMB_CONCURRENCY 个；坏一张不挡整批（失败由 memePreview 记进 missing）。 */
+function memeDrainThumbs() {
+  while (MEME_THUMB_RUNNING.size < MEME_THUMB_CONCURRENCY && MEME_THUMB_QUEUE.length) {
+    const key = MEME_THUMB_QUEUE.shift();
+    MEME_THUMB_RUNNING.add(key);
+    const done = () => {
+      MEME_THUMB_RUNNING.delete(key);
+      memeDrainThumbs();
+    };
+    memePreview(key, { silent: true }).then(done, done);
+  }
+}
+
+/** 滚动补取：图位进到视口（外 400px）才取，首屏之外的不用一进场就全发出去。
+ *
+ *  ``renderMemeList`` 每次重渲染都会调这里：旧图位已经不在 DOM 里了，先 disconnect
+ *  再建，否则 observer 会一个接一个攒着（也把旧节点一起攒着）。
+ */
+function memeObserveThumbs() {
+  if (memeThumbObserver) {
+    memeThumbObserver.disconnect();
+    memeThumbObserver = null;
+  }
+  const box = $("meme-grid");
+  if (!box) return;
+  const slots = box.querySelectorAll(".meme-thumb-box.loading[data-media]");
+  if (!slots.length) return;
+  if (typeof IntersectionObserver !== "function") {
+    // 没有 IntersectionObserver 的浏览器：退回一次全排，总比图位一直停在"读取中"好
+    Array.prototype.forEach.call(slots, (slot) => memeQueueThumb(slot.dataset.media));
+    return;
+  }
+  memeThumbObserver = new IntersectionObserver(
+    (entries) => {
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return;
+        const slot = entry.target;
+        if (memeThumbObserver) memeThumbObserver.unobserve(slot);
+        // 还是"读取中"才排：已经填上图或标成缺失的图位不用再要一次
+        if (slot.classList.contains("loading")) memeQueueThumb(slot.dataset.media);
+      });
+    },
+    { root: null, rootMargin: MEME_THUMB_MARGIN },
+  );
+  Array.prototype.forEach.call(slots, (slot) => memeThumbObserver.observe(slot));
+}
+
+/** 先给头几张排队取图（其余的在滚到视口附近时由 memeObserveThumbs 补取）。 */
+function memeLoadThumbnails() {
+  // 只在"已经铺出来的卡片"里主动取图（用户 m18846：列表只铺 30 张，就别去要 36 张图）；
+  // 加载更多之后新卡片仍由 IntersectionObserver 滚到附近才取。
+  const shown = Math.max(MEME_PAGE_SIZE, Number(ui.meme.shown) || MEME_PAGE_SIZE);
+  const rows = memeVisibleItems().slice(0, Math.min(MEME_THUMB_LIMIT, shown));
+  rows.forEach((entry) => memeQueueThumb(memeMediaOf(entry)));
+  memeObserveThumbs();
+}
+
+async function loadMemeDetail(entryId) {
+  if (!entryId) {
+    ui.meme.detail = null;
+    renderMemeDetail();
+    return;
+  }
+  try {
+    const data = await apiGet("meme/detail", { id: entryId });
+    ui.meme.detail = data.ok ? data : null;
+    if (!data.ok) toast(data.reason || "读不到这条收藏");
+  } catch (error) {
+    ui.meme.detail = null;
+    toast(error.message || "读不到这条收藏");
+  }
+  renderMemeDetail();
+}
+
+/** 拿一张缩略图（取过的留在内存里不重复要；到了就地填进图位，不整页重绘）。 */
+async function memePreview(mediaId, { silent = false } = {}) {
+  const key = String(mediaId || "");
+  if (!key) return null;
+  if (Object.prototype.hasOwnProperty.call(ui.meme.previews, key)) {
+    return ui.meme.previews[key];
+  }
+  if (Object.prototype.hasOwnProperty.call(ui.meme.missing, key)) return null;
+  if (ui.meme.previews[key] === undefined) {
+    ui.meme.previews[key] = null;
+    try {
+      const data = await apiGet("meme/preview", { media: key });
+      if (data.ok && data.data_url) {
+        ui.meme.previews[key] = data;
+      } else {
+        ui.meme.missing[key] = data.reason || "取不到这张图";
+      }
+    } catch (error) {
+      ui.meme.missing[key] = error.message || "取不到这张图";
+    }
+  }
+  const ready = ui.meme.previews[key];
+  if (ready && !ui.meme.missing[key]) {
+    memeFillThumb(key, ready.data_url, ready.first_frame_only);
+  } else if (ui.meme.missing[key]) {
+    memeMarkThumbMissing(key, ui.meme.missing[key]);
+  }
+  return ready;
+}
+
+function memeMediaOf(entry) {
+  return String((entry && (entry.media_id || entry.asset_media_id)) || "");
+}
+
+function memeThumbBox(entry) {
+  const mediaId = memeMediaOf(entry);
+  if (!mediaId) {
+    const wrap = el("div", "meme-thumb-box empty");
+    wrap.appendChild(el("span", "meme-thumb-label", "没有图片文件"));
+    return wrap;
+  }
+  const preview = ui.meme.previews[mediaId];
+  if (preview && preview.data_url) {
+    const image = el("img", "meme-thumb-image");
+    image.src = preview.data_url;
+    image.alt = entry.name || "表情包";
+    const wrap = el("div", "meme-thumb-box");
+    wrap.dataset.media = mediaId;
+    wrap.appendChild(image);
+    if (preview.first_frame_only) {
+      wrap.appendChild(el("span", "meme-thumb-label meme-thumb-badge", "GIF 首帧"));
+    }
+    return wrap;
+  }
+  const missing = ui.meme.missing[mediaId];
+  if (missing) {
+    const wrap = el("div", "meme-thumb-box empty");
+    wrap.dataset.media = mediaId;
+    wrap.appendChild(el("span", "meme-thumb-label", String(missing)));
+    wrap.setAttribute("title", String(missing));
+    return wrap;
+  }
+  // 还没取到：先占位（缩略图一到就填进去），点一下也能立刻取这张
+  // 注意：这里不能拦事件冒泡——点一张还没出图的卡，应当同时取图并打开抽屉
+  const wrap = memeThumbSlot(mediaId);
+  wrap.addEventListener("click", () => {
+    memePreview(mediaId);
+  });
+  return wrap;
+}
+
+function memeStateChip(entry) {
+  const state = String(entry.state || "");
+  const chip = el("span", `meme-chip meme-chip-${state}`, MEME_STATE_LABELS[state] || state || "未知");
+  if (entry.state_reason) chip.setAttribute("title", String(entry.state_reason));
+  return chip;
+}
+
+/** 卡片上的操作：只改状态与删除，改文案与看细节在右边那一栏。 */
+function memeCardActions(entry) {
+  const box = el("div", "meme-card-actions");
+  const add = (label, handler, hide) => {
+    if (hide) return;
+    const button = el("button", "ghost small", label);
+    button.type = "button";
+    button.addEventListener("click", (event) => {
+      // 卡片本身是选中并看详情的按钮，卡片上的按钮不能顺带触发它
+      event.stopPropagation();
+      handler();
+    });
+    box.appendChild(button);
+  };
+  const status = String((entry && entry.status) || "");
+  add("启用", () => memeSetEnabled(entry, true), status !== "disabled");
+  add("停用", () => memeSetEnabled(entry, false), status === "disabled" || status === "deleted");
+  // 只有「删除」一个入口：删就连图片文件一起删（用户 2026-10-29 口径）。
+  // 「只是不想让她用」点停用，停用不删任何东西。
+  add("删除", () => memeDelete(entry), false);
+  return box;
+}
+
+/** 多选辅助：Shift 连选用的"上一次点过的位置"（只在当前列表内有效）。 */
+let memeAnchorIndex = -1;
+
+/** 当前列表在页面上的顺序（筛选后的顺序，不是库里的顺序）。 */
+function memeVisibleRows() {
+  return Array.from(document.querySelectorAll("#meme-grid .meme-tile"));
+}
+
+/** 按 id 同步勾选状态到界面（拖框与全选都走这里，不再逐个点）。 */
+function memeApplySelection() {
+  const box = $("meme-grid");
+  if (!box) return;
+  Array.from(box.querySelectorAll(".meme-tile")).forEach((tile) => {
+    const id = String(tile.dataset.entryId || "");
+    const on = Boolean(id) && ui.meme.checked.has(id);
+    tile.classList.toggle("checked", on);
+    const input = tile.querySelector("input.meme-tile-check");
+    if (input) input.checked = on;
+  });
+  memeSyncCheckedButtons();
+}
+
+/** 全选当前筛选结果 / 清空。 */
+function memeSelectAll(select) {
+  if (!ui.meme.checked) ui.meme.checked = new Set();
+  if (select) {
+    memeVisibleItems().forEach((entry) => {
+      if (entry.entry_id) ui.meme.checked.add(entry.entry_id);
+    });
+  } else {
+    ui.meme.checked.clear();
+  }
+  memeApplySelection();
+}
+
+/**
+ * 拖框多选：在网格上按下左键拖一个框，碰到的卡片都加进选中集。
+ *
+ * 用户 m21273：「能不能在卡片上也可以拖拽选取 而且拖拽似乎会错乱」。
+ * 老实现的三个毛病：①`pointerdown` 只绑在网格上，卡片铺满格子，按在卡片上根本起不来；
+ * ②选框用**视口坐标**算、命中却用**文档滚动后的**卡片 rect，滚一下就错位；
+ * ③拖到空白处松手才收尾，指针移出网格后 `pointerup` 收不到，选框就留在屏幕上。
+ * 改成：文档级 pointer 事件 + 文档坐标算矩形 + rAF 拖边自动滚 + 任何位置松手都收尾。
+ */
+function memeBindMarquee() {
+  const box = $("meme-grid");
+  if (!box || box.dataset.marquee === "1") return;
+  box.dataset.marquee = "1";
+
+  let start = null; // {x, y} 文档坐标
+  let base = null; // 按下时已经选中的集合（Ctrl/Shift 拖框是"追加"）
+  let marquee = null;
+  let raf = 0;
+  let dragging = false;
+  let pointer = { x: 0, y: 0 };
+  let dragEndedAt = 0;
+
+  const marqueeRect = () => {
+    const scrollX = window.scrollX || window.pageXOffset || 0;
+    const scrollY = window.scrollY || window.pageYOffset || 0;
+    const left = Math.min(start.x, pointer.x) - scrollX;
+    const top = Math.min(start.y, pointer.y) - scrollY;
+    return {
+      left,
+      top,
+      width: Math.abs(pointer.x - start.x),
+      height: Math.abs(pointer.y - start.y),
+    };
+  };
+
+  const paint = () => {
+    if (!marquee || !start) return;
+    const rect = marqueeRect();
+    marquee.style.left = `${rect.left}px`;
+    marquee.style.top = `${rect.top}px`;
+    marquee.style.width = `${rect.width}px`;
+    marquee.style.height = `${rect.height}px`;
+    // 命中：卡片 rect 是视口坐标，选框也算成视口坐标再比（滚动不会错位）
+    const hit = new Set(base || []);
+    Array.prototype.forEach.call(box.querySelectorAll(".meme-tile"), (tile) => {
+      const card = tile.getBoundingClientRect();
+      const overlap =
+        card.left < rect.left + rect.width &&
+        card.right > rect.left &&
+        card.top < rect.top + rect.height &&
+        card.bottom > rect.top;
+      if (overlap && tile.dataset.entryId) hit.add(String(tile.dataset.entryId));
+    });
+    const before = ui.meme.checked.size;
+    let changed = before !== hit.size;
+    if (!changed) {
+      for (const id of hit) {
+        if (!ui.meme.checked.has(id)) {
+          changed = true;
+          break;
+        }
+      }
+    }
+    if (changed) {
+      ui.meme.checked = hit;
+      memeApplySelection();
+    }
+  };
+
+  const tick = () => {
+    if (!dragging) return;
+    // 拖到边缘自动滚：长列表里不用来回松手
+    const margin = 64;
+    const speed = 18;
+    if (pointer.y > window.innerHeight - margin) window.scrollBy(0, speed);
+    else if (pointer.y < margin) window.scrollBy(0, -speed);
+    paint();
+    raf = window.requestAnimationFrame(tick);
+  };
+
+  const cleanup = () => {
+    if (raf) window.cancelAnimationFrame(raf);
+    raf = 0;
+    if (marquee && marquee.parentNode) marquee.parentNode.removeChild(marquee);
+    marquee = null;
+    start = null;
+    base = null;
+    dragging = false;
+    document.body.classList.remove("meme-dragging");
+  };
+
+  document.addEventListener(
+    "pointerdown",
+    (event) => {
+      if (event.button !== 0) return;
+      if (event.pointerType === "touch") return; // 触屏上拖框和滚动冲突，保持原样
+      const grid = event.target.closest ? event.target.closest("#meme-grid") : null;
+      if (!grid) return;
+      if (event.target.closest("input, button, a, textarea, select, label")) return;
+      start = {
+        x: event.clientX + (window.scrollX || 0),
+        y: event.clientY + (window.scrollY || 0),
+      };
+      pointer = { x: start.x, y: start.y };
+      base = new Set(event.ctrlKey || event.metaKey || event.shiftKey ? ui.meme.checked : []);
+      dragging = false;
+    },
+    true,
+  );
+
+  document.addEventListener("pointermove", (event) => {
+    if (!start) return;
+    if (event.buttons === 0) {
+      cleanup();
+      return;
+    }
+    pointer = {
+      x: event.clientX + (window.scrollX || 0),
+      y: event.clientY + (window.scrollY || 0),
+    };
+    const moved = Math.hypot(pointer.x - start.x, pointer.y - start.y);
+    if (!dragging) {
+      // 手抖几像素不算拖：否则点一下卡片就变成"框选"，抽屉打不开
+      if (moved < 6) return;
+      dragging = true;
+      document.body.classList.add("meme-dragging");
+      marquee = el("div", "meme-marquee");
+      document.body.appendChild(marquee);
+      if (window.getSelection) window.getSelection().removeAllRanges();
+      raf = window.requestAnimationFrame(tick);
+    }
+    paint();
+  });
+
+  const finish = () => {
+    if (!start) return;
+    if (dragging) dragEndedAt = Date.now();
+    cleanup();
+  };
+  document.addEventListener("pointerup", finish, true);
+  document.addEventListener("pointercancel", finish, true);
+  window.addEventListener("blur", finish);
+
+  // 拖图会把图片本身拖走（浏览器默认行为），期间一律拦掉
+  box.addEventListener("dragstart", (event) => event.preventDefault());
+
+  box.addEventListener(
+    "click",
+    (event) => {
+      // 刚拖完紧跟一次 click：吞掉它，别顺手打开某张卡的抽屉
+      if (Date.now() - dragEndedAt < 320) {
+        event.stopPropagation();
+        event.preventDefault();
+        return;
+      }
+      const tile = event.target.closest(".meme-tile");
+      if (!tile) return;
+      if (event.target.closest("input, button, a, label")) return;
+      const id = String(tile.dataset.entryId || "");
+      if (!id) return;
+      if (event.shiftKey) {
+        // Shift 连选：从上次点过的那张到这里，中间的一起选上
+        const tiles = memeVisibleRows();
+        const index = tiles.indexOf(tile);
+        if (memeAnchorIndex >= 0 && index >= 0) {
+          const [from, to] = [Math.min(index, memeAnchorIndex), Math.max(index, memeAnchorIndex)];
+          tiles.slice(from, to + 1).forEach((node) => {
+            if (node.dataset.entryId) ui.meme.checked.add(String(node.dataset.entryId));
+          });
+          memeApplySelection();
+          event.stopPropagation();
+          event.preventDefault();
+          return;
+        }
+      }
+      if (event.ctrlKey || event.metaKey) {
+        if (ui.meme.checked.has(id)) ui.meme.checked.delete(id);
+        else ui.meme.checked.add(id);
+        memeAnchorIndex = memeVisibleRows().indexOf(tile);
+        memeApplySelection();
+        event.stopPropagation();
+        event.preventDefault();
+        return;
+      }
+      memeAnchorIndex = memeVisibleRows().indexOf(tile);
+    },
+    true,
+  );
+}
+
+function openMemeDrawer(entryId) {
+  if (entryId) ui.meme.selected = entryId;
+  const backdrop = $("meme-drawer-backdrop");
+  const drawer = $("meme-drawer");
+  if (backdrop) backdrop.classList.remove("hidden");
+  if (drawer) drawer.classList.remove("hidden");
+  // 用户 m21273：「点开详情怎么还要再发一次请求」——列表一页已经带了描述、用途、
+  // 状态原因和使用次数，直接用那一行；只有本地没有这条（比如刷新后深链）才去问后端。
+  const row = (ui.meme.items || []).filter((item) => item.entry_id === ui.meme.selected)[0];
+  if (row) {
+    ui.meme.detail = { entry: row, ...memeDetailFromRow(row) };
+    renderMemeDetail();
+    return;
+  }
+  if (ui.meme.selected) loadMemeDetail(ui.meme.selected);
+}
+
+/** 列表行 → 详情视图（不查库：字段本来就在同一行里）。 */
+function memeDetailFromRow(row) {
+  return {
+    state: row.state,
+    state_label: row.state_label,
+    state_reason: row.state_reason || "",
+    file_present: row.file_present,
+    media_id: row.media_id || "",
+    pinned: !!row.pinned,
+    use_count: Number(row.use_count) || 0,
+    asset: {
+      mime: row.asset_mime,
+      size_bytes: row.asset_size_bytes,
+      width: row.asset_width,
+      height: row.asset_height,
+      frame_count: row.asset_frame_count,
+      is_animated: row.asset_is_animated,
+    },
+  };
+}
+
+function closeMemeDrawer() {
+  const backdrop = $("meme-drawer-backdrop");
+  const drawer = $("meme-drawer");
+  if (backdrop) backdrop.classList.add("hidden");
+  if (drawer) drawer.classList.add("hidden");
+}
+
+
+/** 选中集的唯一可信读法：与当前列表求交。
+ * 直接数 ``checked.size`` 会把已经删掉、或这次没取回来的 id 也算进去，
+ * 于是按钮写着「导出选中（2）」，发出去却是一条都不在库里的幽灵 id。
+ * 计数、按钮亮不亮、真正发出去的 ids 都从这里取，三者才不会各说各话。
+ */
+function memeCheckedIds() {
+  const live = new Set((ui.meme.items || []).map((item) => entryIdOf(item)));
+  return [...(ui.meme.checked || [])].filter((entryId) => live.has(entryId));
+}
+
+/** 把不在当前列表里的 id 从选集中摘掉（保留还在的，丢掉没了的）。 */
+function memePruneChecked() {
+  if (!ui.meme.checked) return;
+  const live = new Set((ui.meme.items || []).map((item) => entryIdOf(item)));
+  [...ui.meme.checked].forEach((entryId) => {
+    if (!live.has(entryId)) ui.meme.checked.delete(entryId);
+  });
+}
+
+function entryIdOf(item) {
+  return String((item && item.entry_id) || "");
+}
+
+/** 勾选状态变了：让「删除选中 / 导出选中 / 全部导出」跟着亮或灰。 */
+function memeSyncCheckedButtons() {
+  const count = memeCheckedIds().length;
+  const del = $("meme-delete-checked");
+  const exp = $("meme-export-checked");
+  if (del) {
+    del.disabled = count === 0;
+    del.textContent = count ? `删除选中（${count}）` : "删除选中";
+    del.title = count ? `删除选中的 ${count} 条（连图片文件一起删）` : "先选几张";
+  }
+  if (exp) {
+    exp.disabled = count === 0;
+    exp.textContent = count ? `导出选中（${count}）` : "导出选中";
+  }
+  // 全部导出跟勾选无关，只看列表里有没有东西：空列表点它只会换来一句失败。
+  const all = $("meme-export-all");
+  if (all) all.disabled = !(ui.meme.items || []).length;
+}
+
+/** 把一份 base64 存成用户的下载文件。 */
+/** 导出：选中了几张就只导这几张，``null`` 才是全部。
+ *
+ * 空数组不再等于「全部」：勾选集与列表求交后为空时（刚把选中的都删了这类），
+ * 顺手导出全库会让人以为勾选没生效。那种情况下直接返回，顺手把按钮刷新一遍。
+ */
+async function memeExport(ids) {
+  const picked = Array.isArray(ids) ? ids.filter(Boolean) : [];
+  if (Array.isArray(ids) && !picked.length) {
+    memeSyncCheckedButtons();
+    return;
+  }
+  const button = picked.length ? $("meme-export-checked") : $("meme-export-all");
+  const label = button ? button.textContent : "";
+  if (button) button.disabled = true;
+  try {
+    const params = picked.length ? { ids: picked.join(",") } : {};
+    const data = await apiGet("meme/export", params);
+    if (!data.ok) {
+      // 后端把「选中的没了 / 一条都没收藏 / 文件不在盘」拆成了不同的人话，
+      // 这里照抄；只有它什么都没说时才用兜底文案。
+      toast(String(data.reason || data.error || data.message || "导出失败"), "warn");
+      return;
+    }
+    // 包直接落在宿主的插件数据目录里（<data>/exports/…）：页面不下载，只报路径。
+    const where = String(data.relative || data.filename || "");
+    toast(`导出 ${data.count} 张 → ${where}`, "ok");
+    if (data.path) console.info("表情包导出：", data.path);
+  } catch (error) {
+    toast(`导出失败：${error.message || error}`, "warn");
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = label || "导出";
+    }
+    memeSyncCheckedButtons();
+  }
+}
+
+/** 多选删除（默认只删记录，文件留给资产库清理；与单条删除同一套语义）。 */
+async function memeDeleteChecked() {
+  const ids = memeCheckedIds();
+  if (!ids.length) return;
+  const ok = await confirmDialog({
+    title: `删除这 ${ids.length} 条收藏？`,
+    message:
+      "收藏记录与图片文件都会一起删掉，不能恢复。" +
+      "同一张图如果还挂在别的收藏上、或者正被使用，文件会先留着。",
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    const data = await apiPost("meme/delete", { ids });
+    toast(String(data.message || "删好了"), "ok");
+    ui.meme.checked.clear();
+    ui.meme.selected = "";
+    await loadMemes();
+  } catch (error) {
+    toast(`删除失败：${error.message || error}`, "warn");
+  }
+}
+
+/** 导入压缩包（同名冲突默认改名，另一台机器导出的包可直接吃）。 */
+async function memeImportPack(file) {
+  if (!file) return;
+  // 几十 MB 的包过一遍 base64 页面桥并不可靠（用户 m07774：导出那么干就失败过）：
+  // 超过 1.5MB 就让他把包放进 data/exports/，从下拉框里导。
+  if (Number(file.size || 0) > 1.5 * 1024 * 1024) {
+    toast("这个包太大，页面传不过去：把它放进插件数据目录的 exports/ 里，再用「导入压缩包」里的下拉框导入", "warn");
+    return;
+  }
+  try {
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.onerror = () => reject(reader.error || new Error("读不出文件"));
+      reader.readAsDataURL(file);
+    });
+    const data = await apiPost("meme/import-pack", {
+      data: dataUrl,
+      on_conflict: "rename",
+    });
+    if (!data) {
+      toast("后端没有响应这条导入接口：插件可能还没重载，重启 AstrBot 再试", "warn");
+      return;
+    }
+    if (!data.ok) {
+      toast(String(data.reason || "这个压缩包用不了"), "warn");
+      return;
+    }
+    toast(String(data.message || "导入完成"), "ok");
+    await loadMemes();
+  } catch (error) {
+    toast(`导入失败：${error.message || error}`, "warn");
+  }
+}
+
+/** 「导入压缩包」：先列 data/exports 里现成的包（大包不过页面桥），也能转去选本机文件。 */
+async function memeTogglePackBar() {
+  const bar = $("meme-pack-bar");
+  const select = $("meme-pack-select");
+  const note = $("meme-pack-note");
+  if (!bar || !select) return;
+  if (!bar.classList.contains("hidden")) {
+    bar.classList.add("hidden");
+    return;
+  }
+  if (note) note.textContent = "正在看导出目录…";
+  try {
+    const data = await apiGet("meme/export/packs");
+    if (!data) {
+      if (note) note.textContent = "";
+      toast("后端没有响应导出目录列表：插件可能还没重载，重启 AstrBot 再试", "warn");
+      return;
+    }
+    const packs = data.packs || [];
+    select.innerHTML = "";
+    if (!packs.length) {
+      select.appendChild(el("option", "", "（导出目录里还没有压缩包）"));
+      select.value = "";
+      if (note) note.textContent = `把压缩包放进 data/${(data && data.relative) || "exports"}/，刷新这里就能选`;
+    } else {
+      packs.forEach((pack) => {
+        const size = Number(pack.size || 0);
+        const text = `${pack.name}（${(size / 1024 / 1024).toFixed(1)} MB）`;
+        const node = el("option", "", text);
+        node.value = pack.name;
+        select.appendChild(node);
+      });
+      if (note) note.textContent = `共 ${packs.length} 个，按时间新的在前`;
+    }
+    bar.classList.remove("hidden");
+  } catch (error) {
+    if (note) note.textContent = "";
+    toast(`读不出导出目录：${error.message || error}`, "warn");
+  }
+}
+
+/** 从 data/exports 里导一个包：只传文件名，字节由服务端自己读。 */
+async function memeImportPackFromDir() {
+  const select = $("meme-pack-select");
+  const note = $("meme-pack-note");
+  const name = select ? String(select.value || "") : "";
+  if (!name) {
+    toast("先选一个压缩包", "warn");
+    return;
+  }
+  if (note) note.textContent = "导入中…";
+  try {
+    const data = await apiPost("meme/import-pack/file", { name, on_conflict: "rename" });
+    if (!data) {
+      if (note) note.textContent = "";
+      toast("后端没有响应这条导入接口：插件可能还没重载，重启 AstrBot 再试", "warn");
+      return;
+    }
+    if (!data.ok) {
+      if (note) note.textContent = "";
+      toast(String(data.reason || "这个压缩包用不了"), "warn");
+      return;
+    }
+    if (note) note.textContent = "";
+    toast(String(data.message || "导入完成"), "ok");
+    await loadMemes();
+  } catch (error) {
+    if (note) note.textContent = "";
+    toast(`导入失败：${error.message || error}`, "warn");
+  }
+}
+
+/** 「加载更多」：先多铺 30 张；本地不够了就跟后端要下一页（用户 m18846/m18961）。 */
+async function memeLoadMore() {
+  ui.meme.shown = (Number(ui.meme.shown) || MEME_PAGE_SIZE) + MEME_PAGE_SIZE;
+  const loaded = (ui.meme.items || []).length;
+  const needMore = ui.meme.hasMore && loaded < (Number(ui.meme.total) || 0);
+  if (needMore && memeVisibleItems().length < ui.meme.shown) {
+    try {
+      const data = await apiGet("meme/list", memeScopeParams(loaded));
+      const page = data.entries || [];
+      if (page.length) ui.meme.items = (ui.meme.items || []).concat(page);
+      ui.meme.hasMore = data.has_more === true;
+      if (Number(data.total)) ui.meme.total = Number(data.total);
+    } catch (error) {
+      toast(`读下一页失败：${error.message || error}`);
+    }
+  }
+  renderMemeList();
+  memeLoadThumbnails();
+  const last = document.querySelector("#meme-grid .meme-more");
+  if (last && last.scrollIntoView) last.scrollIntoView({ block: "nearest" });
+}
+
+function renderMemeList() {
+  const box = $("meme-grid");
+  const note = $("meme-note");
+  if (!box) return;
+  box.innerHTML = "";
+  const all = ui.meme.items || [];
+  const rows = memeVisibleItems();
+  if (!all.length) {
+    box.appendChild(
+      el(
+        "p",
+        "muted",
+        "还没有收藏。等她在群里决定收下第一张表情，这里就会出现；" +
+          "总开关关着时只会记录，不会在聊天里发图。",
+      ),
+    );
+  } else if (!rows.length) {
+    box.appendChild(el("p", "muted", "按当前筛选条件没有符合条件的收藏。"));
+  }
+  // 只铺前 N 张（用户 m18846）：剩下的靠「加载更多」，别一次把一百多张卡片塞进 DOM
+  const shown = Math.max(
+    MEME_PAGE_SIZE,
+    Math.min(Number(ui.meme.shown) || MEME_PAGE_SIZE, rows.length)
+  );
+  const pageRows = rows.slice(0, shown);
+  pageRows.forEach((entry) => {
+    const state = String(entry.state || "");
+    const name = entry.name || "还没有起名字";
+    const tile = el("div", "meme-tile");
+    tile.dataset.entryId = String(entry.entry_id || "");
+    tile.classList.toggle("selected", entry.entry_id === ui.meme.selected);
+    tile.classList.toggle("checked", ui.meme.checked.has(entry.entry_id));
+    // 多选：点勾选框不打开详情（stopPropagation），选中态独立于"正在看哪条"
+    const check = el("input", "meme-tile-check");
+    check.type = "checkbox";
+    check.checked = ui.meme.checked.has(entry.entry_id);
+    check.title = "选中这一张";
+    check.addEventListener("click", (event) => event.stopPropagation());
+    check.addEventListener("change", () => {
+      if (check.checked) ui.meme.checked.add(entry.entry_id);
+      else ui.meme.checked.delete(entry.entry_id);
+      tile.classList.toggle("checked", check.checked);
+      memeSyncCheckedButtons();
+    });
+    tile.appendChild(check);
+    tile.classList.toggle("off", state !== "enabled");
+    tile.setAttribute("role", "button");
+    tile.setAttribute("tabindex", "0");
+    tile.setAttribute("aria-label", `查看 ${name} 的收藏详情`);
+    tile.title = [name, MEME_STATE_LABELS[state] || state || "未知", String(entry.meaning || "").trim()]
+      .filter(Boolean)
+      .join(" · ");
+
+    const media = el("div", "meme-tile-media");
+    media.appendChild(memeThumbBox(entry));
+    const overlay = el("div", "meme-tile-overlay");
+    overlay.appendChild(el("strong", "meme-tile-name", name));
+    const used = Number(entry.use_count) || 0;
+    const meta = [
+      MEME_STATE_LABELS[state] || state || "未知",
+      entry.is_animated || entry.asset_is_animated ? "动图" : "",
+      memePixelText(entry),
+      used > 0 ? `已用 ${used} 次` : "还没用过",
+    ].filter(Boolean);
+    overlay.appendChild(el("span", "meme-tile-meta", meta.join(" · ")));
+    const meaning = String(entry.meaning || "").trim();
+    if (meaning) overlay.appendChild(el("span", "meme-tile-meaning", meaning));
+    if (entry.state_reason) overlay.title = String(entry.state_reason);
+    media.appendChild(overlay);
+    media.appendChild(
+      el("span", `meme-tile-state ${state}`, MEME_STATE_LABELS[state] || state || "未知"),
+    );
+    tile.appendChild(media);
+
+    const open = () => {
+      ui.meme.selected = entry.entry_id;
+      renderMemeList();
+      openMemeDrawer(entry.entry_id);
+    };
+    tile.addEventListener("click", open);
+    tile.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        open();
+      }
+    });
+    box.appendChild(tile);
+  });
+  // 「加载更多」：一次多铺 MEME_PAGE_SIZE 张；本地翻完了就跟后端要下一页（用户 m18846/m18961）
+  const rest = rows.length - pageRows.length;
+  const totalHint = Number(ui.meme.total) || rows.length;
+  const backendRest = Math.max(0, totalHint - all.length);
+  if (rest > 0 || ui.meme.hasMore) {
+    const more = el("button", "ghost meme-more");
+    more.type = "button";
+    const remain = Math.max(rest, backendRest);
+    more.textContent = remain > 0 ? `加载更多（还有 ${remain} 张）` : "加载更多";
+    more.addEventListener("click", () => {
+      memeLoadMore();
+    });
+    box.appendChild(more);
+  }
+  // 重新渲染后旧图位已经不在了：observer 在这里重挂，滚到附近才补取缩略图
+  memeObserveThumbs();
+  memeBindMarquee();
+  memeSyncCheckedButtons();
+  if (note) {
+    const total = Number(ui.meme.total) || (ui.meme.summary && ui.meme.summary.count) || all.length;
+    const parts = [];
+    if (rows.length !== all.length) parts.push(`筛出 ${rows.length} 条`);
+    // 铺不满（还有没显示的）就把「已显示多少」写出来，别让人以为收藏少了
+    if (pageRows.length < rows.length) {
+      parts.push(`已显示 ${pageRows.length} 条，点下面「加载更多」看剩下的`);
+    }
+    if (total > all.length) {
+      parts.push(`这次只读了最近 ${all.length} 条，共 ${total} 条收藏`);
+    } else {
+      parts.push(`共 ${total} 条收藏`);
+    }
+    note.textContent = parts.join("，");
+    note.classList.toggle("meme-note-capped", total > all.length);
+  }
+}
+
+function memeLine(label, value) {
+  const row = el("p", "meme-line");
+  row.appendChild(el("span", "meme-line-label", label));
+  row.appendChild(el("span", "", String(value === undefined || value === null || value === "" ? "—" : value)));
+  return row;
+}
+
+function renderMemeDetail() {
+  const box = $("meme-detail");
+  const title = $("meme-detail-title");
+  if (!box) return;
+  box.innerHTML = "";
+  const entry = (ui.meme.detail && ui.meme.detail.entry) || null;
+  if (!entry) {
+    if (title) title.textContent = "收藏详情";
+    box.appendChild(el("p", "muted", "从左侧选择一条收藏，这里显示它的可用状态与原因。"));
+    return;
+  }
+  if (title) title.textContent = entry.name || memeShortId(entry.entry_id);
+  const view = ui.meme.detail;
+  box.appendChild(memeThumbBox(entry));
+  box.appendChild(memeStateChip(entry));
+  if (view.state_reason) box.appendChild(el("p", "muted", view.state_reason));
+  box.appendChild(el("p", "muted", view.file_present ? "底层图片文件在本机。" : "底层图片文件不在本机。"));
+
+  const fields = el("div", "meme-fields");
+  fields.appendChild(
+    inputField("名字", entry.name || "", (value) => memePatch(entry, { name: value })),
+  );
+  fields.appendChild(
+    textareaField("含义", entry.meaning || "", (value) => memePatch(entry, { meaning: value })),
+  );
+  fields.appendChild(
+    textareaField("什么时候用", entry.use_when || "", (value) => memePatch(entry, { use_when: value })),
+  );
+  fields.appendChild(
+    textareaField("什么时候不要用", entry.avoid_when || "", (value) => memePatch(entry, { avoid_when: value })),
+  );
+  fields.appendChild(
+    textareaField("备注", entry.personal_note || "", (value) => memePatch(entry, { personal_note: value })),
+  );
+  // 范围那一栏已经拆掉：表情包一律通用（用户 m20），没有再让用户填会话的理由
+  box.appendChild(fields);
+
+  const actions = el("div", "topic-actions");
+  const enableButton = el("button", "ghost small", "启用");
+  enableButton.type = "button";
+  if (entry.status !== "disabled") enableButton.classList.add("hidden");
+  enableButton.addEventListener("click", () => memeSetEnabled(entry, true));
+  const disableButton = el("button", "ghost small", "停用");
+  disableButton.type = "button";
+  if (entry.status === "disabled" || entry.status === "deleted") disableButton.classList.add("hidden");
+  disableButton.addEventListener("click", () => memeSetEnabled(entry, false));
+  const forgetButton = el("button", "ghost small", "删掉收藏记录");
+  forgetButton.type = "button";
+  forgetButton.addEventListener("click", () => memeDelete(entry, false));
+  const purgeButton = el("button", "ghost small", "彻底清掉这条记录");
+  purgeButton.type = "button";
+  purgeButton.addEventListener("click", () => memeDelete(entry, true));
+  actions.appendChild(enableButton);
+  actions.appendChild(disableButton);
+  actions.appendChild(forgetButton);
+  actions.appendChild(purgeButton);
+  box.appendChild(actions);
+  box.appendChild(
+    el(
+      "p",
+      "muted",
+      "停用与删除都只改收藏记录，底层图片文件留在资产库里（需要释放空间时用「媒体」一节的清理）。",
+    ),
+  );
+
+  const facts = el("div", "topic-section");
+  facts.appendChild(el("div", "pane-label", "这条收藏的明细"));
+  facts.appendChild(memeLine("编号", memeShortId(entry.entry_id)));
+  facts.appendChild(memeLine("图片身份", entry.media_id || "—"));
+  facts.appendChild(memeLine("类型", entry.asset_mime || "—"));
+  facts.appendChild(memeLine("大小", entry.asset_size_bytes ? formatBytes(entry.asset_size_bytes) : "—"));
+  facts.appendChild(memeLine("尺寸", entry.asset_width ? `${entry.asset_width}×${entry.asset_height}` : "—"));
+  facts.appendChild(memeLine("帧数", entry.asset_frame_count || "—"));
+  facts.appendChild(memeLine("修改次数", entry.revision || 1));
+  facts.appendChild(memeLine("收藏时间", memeTimeText(entry.created_at)));
+  const sources = (view.sources || []).map((item) => {
+    const where = item.session_id || "未知会话";
+    const who = item.sender_id || item.origin_kind || "";
+    return `${where}${who ? ` / ${who}` : ""}`;
+  });
+  facts.appendChild(memeLine("来源", sources.length ? sources.join("；") : "—"));
+  const variants = (view.variants || []).map((item) => {
+    const other = item.entry_a === entry.entry_id ? item.entry_b : item.entry_a;
+    const relation = item.relation === "confirmed" ? "确认是变体" : "疑似是变体";
+    return `${relation}：${memeShortId(other)}`;
+  });
+  facts.appendChild(memeLine("相似条目", variants.length ? variants.join("；") : "—"));
+  const usage = (view.usage || []).map((item) => {
+    const kind = MEME_USAGE_LABELS[item.kind] || item.kind;
+    return `${kind}${item.reason ? `（${item.reason}）` : ""}`;
+  });
+  facts.appendChild(memeLine("最近使用记录", usage.length ? usage.slice(0, 5).join("；") : "—"));
+  box.appendChild(facts);
+}
+
+const MEME_USAGE_LABELS = {
+  attempted: "尝试使用",
+  sent: "已发出",
+  receipt: "平台回执",
+  accepted: "平台已接收",
+  rejected: "发送被拒",
+  failed: "发送失败",
+};
+
+function memeTimeText(value) {
+  const seconds = Number(value || 0);
+  if (!seconds) return "—";
+  const date = new Date(seconds * 1000);
+  if (Number.isNaN(date.getTime())) return "—";
+  const pad = (number) => String(number).padStart(2, "0");
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  );
+}
+
+/** 改一条收藏的语义（带上 revision，撞上别人改过就提示刷新）。 */
+async function memePatch(entry, fields) {
+  const body = {
+    id: entry.entry_id,
+    revision: entry.revision || 0,
+    fields,
+  };
+  try {
+    const data = await apiPost("meme/edit", body);
+    if (!data.ok) {
+      toast(data.reason || "改不动这条收藏");
+      await loadMemeDetail(entry.entry_id);
+      return;
+    }
+    toast("已经保存");
+    await loadMemes();
+    await loadMemeDetail(entry.entry_id);
+  } catch (error) {
+    toast(error.message || "改不动这条收藏");
+  }
+}
+
+async function memeSetEnabled(entry, enabled) {
+  try {
+    const data = await apiPost("meme/toggle", { id: entry.entry_id, enabled });
+    if (!data.ok) {
+      toast(data.reason || "改不动这条收藏");
+      return;
+    }
+    toast(enabled ? "已经启用" : "已经停用（聊天里不会再发这一张）");
+    await loadMemes();
+    await loadMemeDetail(entry.entry_id);
+  } catch (error) {
+    toast(error.message || "改不动这条收藏");
+  }
+}
+
+async function memeDelete(entry) {
+  // 裸 confirm 在插件的 sandbox iframe 里会被拦掉（没有 allow-modals），
+  // 点了像"没反应"；统一走 confirmDialog。
+  const ok = await confirmDialog({
+    title: "删除这条收藏？",
+    message:
+      `删除 ${memeShortId(entry.entry_id)}：收藏记录、来源与用法记录一起删掉，` +
+      "图片文件也会从本机删掉，不能恢复。「只是不想让她用」请点停用。",
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!ok) {
+    return;
+  }
+  const body = { id: entry.entry_id };
+  try {
+    const data = await apiPost("meme/delete", body);
+    if (!data.ok) {
+      toast(data.reason || "删不掉这条收藏");
+      return;
+    }
+    toast(data.note || "已经删掉");
+    // 删掉的这条必须同时离开多选集合。留着它，「导出选中（2）」会一直显示 2，
+    // 点下去后端按 id 过滤后一条都不剩——真机就是这么报「图都不在本机了」的。
+    if (ui.meme.checked) ui.meme.checked.delete(entry.entry_id);
+    ui.meme.selected = "";
+    ui.meme.detail = null;
+    closeMemeDrawer();
+    await loadMemes();
+    renderMemeDetail();
+  } catch (error) {
+    toast(error.message || "删不掉这条收藏");
+  }
+}
+
+/** 顶部总开关：读写的是世界配置，跟别的设置一样"保存后生效"。 */
+function memeMasterField() {
+  const box = $("meme-master-field");
+  if (!box) return;
+  box.innerHTML = "";
+  const world = (ui.config && ui.config.world) || {};
+  const meme = world.meme || {};
+  const on = meme.enabled !== false;
+  const field = checkboxField(
+    "打开表情包动作",
+    on,
+    (value) => {
+      if (!ui.config.world) ui.config.world = {};
+      if (!ui.config.world.meme) ui.config.world.meme = {};
+      ui.config.world.meme.enabled = value;
+      ui.settingsTab = "world";  // 表情包那一节在「世界与事件」里
+      markDirty();
+      memeMasterBox();
+      memeSummaryBox();
+    },
+    { hint: "关掉之后聊天里不会出现表情包动作；已收的图与记录都不会被删除。" },
+  );
+  box.appendChild(field);
+  // 这里以前每次渲染都往「收图与评审」里追加一个「自动收图」开关（绑的字段前端
+  // 根本不读），切几次标签就叠出两三个一模一样的开关（用户 2026-10-29 的截图）。
+  // 那个字段与这段追加都删了：收图只有「攒进池子 → 拼图评审 → 通过才收藏」一条路。
+}
+
+function memeMasterBox() {
+  const badge = $("meme-state-badge");
+  const note = $("meme-master-note");
+  const hint = $("meme-master-hint");
+  const world = (ui.config && ui.config.world) || {};
+  const meme = world.meme || {};
+  const on = meme.enabled !== false;
+  const live = ui.meme.enabled;
+  if (badge) {
+    badge.textContent = on ? "开着" : "关着";
+    badge.classList.toggle("off", !on);
+  }
+  if (note) {
+    if (!on) {
+      note.textContent =
+        "表情包总开关关着，聊天里不会出现表情包动作。这一页照常能看、能改、能清理，" +
+        "已收的图与记录都不会被删除。";
+    } else if (live === false) {
+      note.textContent = "配置里已经打开；保存并生效之后聊天里才会有表情包动作。";
+    } else {
+      note.textContent = ui.meme.reason || "表情包总开关开着，表情包动作可用。";
+    }
+  }
+  if (hint) {
+    hint.textContent = "当前生效状态：" + (live === false ? "关着" : "开着") + "。";
+  }
+}
+
+/**
+ * 「发图额度」：三档上限直接在这页改（用户口径：能点的就别去手改 world.json）。
+ *
+ * 这里只放**发图相关**的三档——其余二十来个媒体预算属于"调参"，留在世界配置里；
+ * 少一个输入框就少一次误改。写完 markDirty，跟别的设置一样"保存后生效"。
+ */
+function memeQuotaFields() {
+  const box = $("meme-quota-fields");
+  if (!box) return;
+  box.innerHTML = "";
+  const world = (ui.config && ui.config.world) || {};
+  const meme = world.meme || {};
+  // 世界配置里**没有**这个键时不能显示 0：那样看起来像"一张都不发"，而实际生效值
+  // 是后端的默认（1/20/100）。所以回退顺序是：配置里的值 → 后端报的生效值 → 内置默认。
+  const effective = ((ui.meme.summary || {}).budget) || {};
+  const fallback = { max_send_per_reply: 1, send_meme_per_hour: 20, max_send_per_day: 100 };
+  const shown = (key) => {
+    const configured = meme[key];
+    if (configured !== undefined && configured !== null && configured !== "") {
+      return Math.round(num(configured, fallback[key]));
+    }
+    const live = effective[key];
+    return Math.round(num(live === undefined || live === null ? fallback[key] : live, fallback[key]));
+  };
+  const write = (key, value) => {
+    if (!ui.config.world) ui.config.world = {};
+    if (!ui.config.world.meme) ui.config.world.meme = {};
+    ui.config.world.meme[key] = value;
+    ui.settingsTab = "world";  // 表情包那一节在「世界与事件」里
+    markDirty();
+    memeSummaryBox();
+  };
+  const limits = [
+    ["max_send_per_reply", "一次回复最多发几张", "0 = 这一轮不发；实际上限还会被「一轮最多附几张图」压住。", 0, 3],
+    ["send_meme_per_hour", "每小时最多发几张", "跨会话一起算：一小时内所有群发出的表情加起来不超过它。", 0, 200],
+    ["max_send_per_day", "每天最多发几张", "0 = 不发；跨会话一起算，第二天零点重新计。", 0, 1000],
+  ];
+  limits.forEach(([key, label, hint, low, high]) => {
+    box.appendChild(
+      // 数字输入用 inputField 的 number 形态（编辑器里没有单独的 numberField）
+      inputField(
+        label,
+        String(shown(key)),
+        (value) => write(key, Math.max(low, Math.min(high, Math.round(num(value, 0))))),
+        { type: "number", min: low, max: high, step: 1, hint },
+      ),
+    );
+  });
+}
+
+/**
+ * 发送前缩图：长边 320、动图保真（用户要求“发出去省流量，但动图不能变静态”）。
+ *
+ * 三个控件都读写 `ui.config.world.meme_send_scale`（后端 `MemeSendScaleConfig`），
+ * 走的是和小节里其它控件同一条 `saveAll` 通道，不新增 API。缺键时回退到后端默认，
+ * 不能显示成 0——那看起来像"关掉了缩图"。
+ */
+function memeScaleFields() {
+  const box = $("meme-scale-fields");
+  if (!box) return;
+  box.innerHTML = "";
+  const world = (ui.config && ui.config.world) || {};
+  const section = world.meme_send_scale || {};
+  const fallback = { enabled: true, max_side: 320, animated: "keep", gif: true };
+  const shown = (key) => {
+    const value = section[key];
+    return value === undefined || value === null || value === "" ? fallback[key] : value;
+  };
+  const write = (key, value) => {
+    if (!ui.config.world) ui.config.world = {};
+    if (!ui.config.world.meme_send_scale) ui.config.world.meme_send_scale = {};
+    ui.config.world.meme_send_scale[key] = value;
+    ui.settingsTab = "world"; // 表情包那一节在「世界与事件」里
+    markDirty();
+    ui.memeScalePending = true; // 保存成功后提示「下一张生效」
+  };
+  const enabled = !!shown("enabled");
+  box.appendChild(
+    checkboxField(
+      "发表情包前先缩图",
+      enabled,
+      (value) => {
+        write("enabled", !!value);
+        memeScaleFields(); // 关掉时下面两项要一起变灰，立刻重画一次
+      },
+      {
+        hint: "只改发出去的那一份：原图和收藏都不动，管理页里看到的还是原图。",
+      },
+    ),
+  );
+  const gifField = checkboxField(
+    "发出去的表情转成 GIF",
+    !!shown("gif"),
+    (value) => write("gif", !!value),
+    {
+      hint: "QQ 里 GIF 的显示尺寸比同尺寸 PNG 更舒服；本身就是动图的不转（会掉帧）。",
+    },
+  );
+  box.appendChild(gifField);
+  const gifInput = gifField.querySelector("input");
+  if (gifInput) gifInput.disabled = !enabled;
+  if (!enabled) gifField.classList.add("field-disabled");
+  const maxSideField = inputField(
+    "缩图长边（像素）",
+    String(Math.round(num(shown("max_side"), fallback.max_side))),
+    (value) => write("max_side", Math.max(240, Math.min(1024, Math.round(num(value, 320))))),
+    {
+      type: "number",
+      min: 240,
+      max: 1024,
+      step: 40,
+    },
+  );
+  // 缩图总开关关着时，长边与动图两个控件没有意义：置灰并禁用，避免改了却没效果
+  const maxSideInput = maxSideField.querySelector("input");
+  if (maxSideInput) maxSideInput.disabled = !enabled;
+  if (!enabled) maxSideField.classList.add("field-disabled");
+  box.appendChild(maxSideField);
+  box.appendChild(
+    el("p", "field-note", "320 与管理页卡片缩略图同尺度；改小更省流量，改大更清楚。"),
+  );
+  const animatedField = selectField(
+    "动图处理方式",
+    String(shown("animated") || "keep"),
+    [
+      ["keep", "保持动图（逐帧缩放到长边 320）"],
+      ["first", "转静态（只发第一帧）"],
+      ["skip", "原样发送（不缩放）"],
+    ],
+    (value) => write("animated", value),
+    {
+      hint: "保持动图是最费 CPU 的一档：超过 120 帧、或算得超过 3 秒，会自动退回原图。",
+    },
+  );
+  const animatedSelect = animatedField.querySelector("select");
+  if (animatedSelect) animatedSelect.disabled = !enabled;
+  if (!enabled) animatedField.classList.add("field-disabled");
+  box.appendChild(animatedField);
+  // 小图时 keep 与 skip 结果完全一样，只有 first 会改内容：常驻说明，别只放在 title 里
+  box.appendChild(
+    el(
+      "p",
+      "field-note",
+      "长边已不超过 320 时，保持动图与原样发送的结果相同；只有转静态会改变内容。",
+    ),
+  );
+}
+
+/** 攒图收藏：她平时把看到过的图按概率攒着，够一批了再拼图评审（用户 2026-10-24）。
+ *
+ * 八个控件读写 `ui.config.world.meme_collect`（后端 `MemeCollectConfig`），和本节
+ * 其它控件走同一条 `saveAll` 通道，不新增 API。缺键回退后端默认，不能显示成 0。
+ * `enabled` 关掉 = 整个收图机制关闭（连聊天里的即时 `collect_meme` 也不出现）。
+ */
+function memeCollectFields() {
+  const box = $("meme-collect-fields");
+  if (!box) return;
+  box.innerHTML = "";
+  // 「候选保留几天」跟清理按钮同属「清理与存储」组，单独挂到那个容器
+  const cleanupBox = $("meme-cleanup-fields");
+  if (cleanupBox) cleanupBox.innerHTML = "";
+  const world = (ui.config && ui.config.world) || {};
+  const section = world.meme_collect || {};
+  const fallback = {
+    enabled: true,
+    batch_probability: 0.35,
+    min_batch: 6,
+    max_batch: 18,
+    review_interval_hours: 12,
+    max_reviews_per_day: 3,
+    sheet_size: 9,
+    candidate_ttl_days: 7,
+  };
+  const shown = (key) => {
+    const value = section[key];
+    return value === undefined || value === null || value === "" ? fallback[key] : value;
+  };
+  const write = (key, value) => {
+    if (!ui.config.world) ui.config.world = {};
+    if (!ui.config.world.meme_collect) ui.config.world.meme_collect = {};
+    ui.config.world.meme_collect[key] = value;
+    ui.settingsTab = "world";
+    markDirty();
+  };
+  box.appendChild(
+    checkboxField(
+      "开启攒图收藏（她看到的图攒够一批再问要不要收）",
+      !!shown("enabled"),
+      (value) => write("enabled", !!value),
+      {
+        hint: "关掉后连聊天里的即时收图也一起停；已收藏的表情包照常能发、能搜。",
+      },
+    ),
+  );
+  const numbers = [
+    [
+      "batch_probability",
+      "每张图入池概率",
+      0,
+      1,
+      0.05,
+      "0 = 只在聊天里被明确要求时收（不自动攒）；1 = 看到就攒。",
+      null,
+    ],
+    ["min_batch", "攒够几张才评审", 1, 18, 1, "低于这个数不动，免得为一张图单独调模型。", "round"],
+    ["max_batch", "一次评审最多几张", 1, 18, 1, "超过就截断，分到下一次。", "round"],
+    [
+      "review_interval_hours",
+      "两次评审的间隔（小时）",
+      1,
+      72,
+      1,
+      "两次之间不再打扰她；攒着的图不会过期（见下面的保留天数）。",
+      "round",
+    ],
+    [
+      "max_reviews_per_day",
+      "一天最多评审几次",
+      0,
+      12,
+      1,
+      "0 = 不自动评（仍可手动触发）；跨会话一起算。",
+      "round",
+    ],
+    ["sheet_size", "每张拼图放几格", 1, 9, 1, "默认 3×3=9；两张拼图最多覆盖 18 张。", "round"],
+    [
+      "candidate_ttl_days",
+      "候选保留几天",
+      1,
+      60,
+      1,
+      "攒着一直没轮到的候选到期清掉，不再出现在拼图里。",
+      "round",
+    ],
+  ];
+  numbers.forEach(([key, label, low, high, step, hint, kind]) => {
+    const scale = key === "batch_probability" ? 100 : 1;
+    const current = num(shown(key), fallback[key]);
+    const target = key === "candidate_ttl_days" && cleanupBox ? cleanupBox : box;
+    target.appendChild(
+      inputField(
+        label,
+        String(kind === "round" ? Math.round(current) : Math.round(current * scale) / scale),
+        (value) => {
+          const raw = num(value, fallback[key]);
+          const next =
+            kind === "round" ? Math.round(raw) : Math.round(raw * scale) / scale;
+          write(key, Math.max(low, Math.min(high, next)));
+        },
+        {
+          type: "number",
+          min: low,
+          max: high,
+          step,
+          hint,
+        },
+      ),
+    );
+  });
+}
+
+/** 计数、配额与"本轮最多几张"的只读说明。 */
+function memeSummaryBox() {
+  const box = $("meme-summary");
+  if (!box) return;
+  box.innerHTML = "";
+  const summary = ui.meme.summary;
+  if (!summary) return;
+  const counts = summary.counts || {};
+  // 用前端自己那份短文案：后端那份带「（底层文件还在）」这种长尾，而且还有已经取消的
+  // 「范围不可用」那一态（用户 m20 去掉会话限制）
+  const labels = MEME_STATE_LABELS;
+  const card = el("div", "card");
+  card.appendChild(el("h2", "", "收藏总览"));
+  const line = el("p", "muted");
+  line.textContent = Object.keys(labels)
+    .map((key) => `${labels[key]} ${num(counts[key], 0)}`)
+    .join("　");
+  card.appendChild(line);
+  const quota = num(summary.quota_bytes, 0);
+  card.appendChild(
+    el(
+      "p",
+      "muted",
+      quota
+        ? `收藏占用约 ${formatBytes(num(summary.used_bytes, 0))}，上限 ${formatBytes(quota)}。`
+        : `收藏占用约 ${formatBytes(num(summary.used_bytes, 0))}。`,
+    ),
+  );
+  const budget = summary.budget || {};
+  card.appendChild(
+    el(
+      "p",
+      "muted",
+      "单轮上限：表情包补附 " +
+        `${num(budget.meme_image_max, 0)} 张、候选预览 ${num(
+          budget.max_candidate_images_per_prompt,
+          0,
+        )} 张、实际发出 ${num(budget.max_send_per_reply, 0)} 张；` +
+        `每小时最多发出 ${num(budget.send_meme_per_hour, 0)} 张，` +
+        `单次请求最多带 ${num(budget.max_prompt_images, 0)} 张图。`,
+    ),
+  );
+  const exposures = summary.exposures || {};
+  card.appendChild(
+    el(
+      "p",
+      "muted",
+      "展示记录：" +
+        `待补 ${num(exposures.pending, 0)}、认领中 ${num(exposures.claimed, 0)}、` +
+        `已展示 ${num(exposures.delivered, 0)}、失败 ${num(exposures.failed, 0)}；` +
+        `保留 ${num(budget.exposure_keep_days, 30)} 天（只有"已展示"会封住那次出现）。`,
+    ),
+  );
+  box.appendChild(card);
+}
+
+async function memeCleanup() {
+  try {
+    const plan = await apiPost("meme/cleanup", {});
+    if (!plan.ok) {
+      toast(plan.reason || "无法计算需要清理的内容");
+      return;
+    }
+    const info = plan.plan || {};
+    const ok = await confirmDialog({
+      title: "清理过期记录",
+      message:
+        `将清理超过 ${num(info.exposure_keep_days, 30)} 天的展示记录，` +
+          "以及没有被引用的资产元数据。图片文件不受影响。是否继续？",
+    });
+    if (!ok) {
+      return;
+    }
+    const done = await apiPost("meme/cleanup", { confirm: true });
+    if (!done.ok) {
+      toast(done.reason || "清理失败");
+      return;
+    }
+    toast(
+      `已清理 ${num(done.removed_exposures, 0)} 条展示记录、` +
+        `${num(done.removed_assets, 0)} 条没有被引用的资产元数据`,
+    );
+    await loadMemes();
+  } catch (error) {
+    toast(error.message || "清理失败");
+  }
+}
+
+/** 读一个本地文件成 data URL（上传表情包用；浏览器自己的 FileReader，不引依赖）。 */
+function memeReadFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("读不到这个文件"));
+    reader.readAsDataURL(file);
+  });
+}
+
+/** 「上传表情包」：点按钮就是打开选文件，选完立刻传——不额外弹窗问名字。 */
+function memeOpenUpload() {
+  const input = $("meme-upload-file");
+  if (!input) return;
+  // 同一个文件连着选两次也要能触发 change
+  input.value = "";
+  input.click();
+}
+
+/** 一张一张传（用户可以一次选多张，见 :func:`memeUploadFiles`）。 */
+async function memeUploadFile(file) {
+  if (!file) return { ok: false, reason: "没有文件" };
+  if (!String(file.type || "").startsWith("image/")) {
+    return { ok: false, reason: "只能上传图片" };
+  }
+  try {
+    const dataUrl = await memeReadFile(file);
+    const comma = dataUrl.indexOf(",");
+    const body = {
+      data: comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl,
+      // 文件名去掉扩展名当默认名字；之后能在右侧详情里改
+      name: String(file.name || "").replace(/\.[^.]+$/, ""),
+    };
+    const result = await apiPost("meme/upload", body);
+    if (!result || result.ok === false) {
+      return { ok: false, reason: (result && result.reason) || "传不上去" };
+    }
+    return { ok: true, id: String(result.id || ""), created: result.created !== false };
+  } catch (error) {
+    return { ok: false, reason: error && error.message ? error.message : "传不上去" };
+  }
+}
+
+/** 「上传表情包」支持一次选多张：逐个传，最后一句汇总（失败的把原因写清）。 */
+async function memeUploadFiles(files) {
+  const list = Array.prototype.slice.call(files || []);
+  if (!list.length) return;
+  const note = $("meme-note");
+  let added = 0;
+  let existed = 0;
+  const problems = [];
+  const ids = [];
+  for (let index = 0; index < list.length; index += 1) {
+    if (note) note.textContent = `上传中…（${index + 1}/${list.length}）`;
+    // 一张一张传，所以进度是"已传张数 / 总张数"（用户 m18755 要进度条）
+    memeProgress(
+      `上传中 ${index}/${list.length}（新增 ${added} 张）`,
+      index,
+      list.length
+    );
+    const result = await memeUploadFile(list[index]);
+    if (!result.ok) {
+      problems.push(`${list[index].name || "这张图"}：${result.reason}`);
+      continue;
+    }
+    if (result.created) added += 1;
+    else existed += 1;
+    if (result.id) ids.push(result.id);
+  }
+  if (note) note.textContent = "";
+  const parts = [];
+  if (added) parts.push(`新增 ${added} 张`);
+  if (existed) parts.push(`已有 ${existed} 张（没重复收）`);
+  if (problems.length) parts.push(`${problems.length} 张没传上`);
+  toast(parts.length ? parts.join("，") : "什么都没传");
+  if (problems.length) console.warn("[virtual_world] 上传失败：", problems);
+  // 一张没传上的时候把进度条留成红的再收（一眼能看出这次不是全成功）
+  if (problems.length) {
+    memeProgress(
+      `上传完：新增 ${added} 张，${problems.length} 张没传上`,
+      list.length,
+      list.length,
+      { error: true }
+    );
+  } else {
+    memeProgressHide();
+  }
+  await loadMemes();
+  if (ids.length) {
+    ui.meme.selected = ids[0];
+    renderMemeList();
+    await loadMemeDetail(ui.meme.selected);
+  }
+}
+
+/** 「查一遍本机文件」：把列表里那些图各取一次，取不到的就标成文件缺失。 */
+async function memeScanFiles() {
+  const rows = ui.meme.items || [];
+  const keys = [];
+  rows.forEach((entry) => {
+    const mediaId = memeMediaOf(entry);
+    if (mediaId && keys.indexOf(mediaId) < 0) keys.push(mediaId);
+  });
+  if (!keys.length) {
+    toast("还没有可以检查的图片");
+    return;
+  }
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(ui.meme.previews, key)) continue;
+    await memePreview(key);
+  }
+  renderMemeList();
+  toast(`已检查 ${keys.length} 张图片`);
+}
+
+/**
+ * 「补齐图片信息」（M5）：把已收图的宽高与帧数补上。
+ *
+ * 两步走：先预览（一个字节都不写），确认之后再点一次才落盘——避免用户手一抖就把
+ * 几百张图重读一遍。探不出来的（坏图/超大/没装 Pillow）如实报数，不编尺寸。
+ */
+async function memeBackfillFacts() {
+  try {
+    const dry = await apiPost("meme/backfill", {});
+    if (!dry.ok) {
+      toast(dry.reason || "补齐失败");
+      return;
+    }
+    const plan = `${num(dry.scanned, 0)} 张待看：可补 ${num(dry.filled, 0) + num(dry.created, 0)} 张` +
+      `、已经有了 ${num(dry.unchanged, 0) + num(dry.skipped, 0)} 张` +
+      (num(dry.failed, 0) ? `、${num(dry.failed, 0)} 张读不出来` : "");
+    if (!num(dry.filled, 0) && !num(dry.created, 0)) {
+      toast(`没有要补的：${plan}`);
+      return;
+    }
+    if (
+      !(await confirmDialog({
+        title: "现在补齐图片信息？",
+        message: `${plan}。写完就存进本机清单，随时能再点一次（只会补空的）。`,
+        confirmText: "补齐",
+      }))
+    ) {
+      return;
+    }
+    const done = await apiPost("meme/backfill", { confirm: true });
+    if (!done.ok) {
+      toast(done.reason || "补齐失败");
+      return;
+    }
+    toast(`已补 ${num(done.filled, 0) + num(done.created, 0)} 张` +
+      (num(done.failed, 0) ? `，${num(done.failed, 0)} 张读不出来` : ""));
+    await loadMemes();
+  } catch (error) {
+    toast(error.message || "补齐失败");
+  }
+}
+
+/** 宽高与帧数的一句话（没有就不显示，不硬编"未知"）。 */
+function memePixelText(entry) {
+  const width = num(entry && entry.asset_width, 0);
+  const height = num(entry && entry.asset_height, 0);
+  const frames = num(entry && entry.asset_frame_count, 0);
+  const parts = [];
+  if (width > 0 && height > 0) parts.push(`${width}×${height}`);
+  if (frames > 1) parts.push(`${frames} 帧`);
+  return parts.join(" · ");
+}
+
+/**
+ * 「给没描述的补一句」（S7）：上传只写了文件名，而她检索靠 `meaning` 这几个字段。
+ *
+ * 两步走：先要一份清单（不调模型），确认之后才真看。数量多时不再一次 12 张地挤
+ * （用户 m18541）：后端起一个后台任务并发看图，页面只轮询进度，随时能停。
+ */
+async function memeDescribeMissing() {
+  // 正在跑：这一次点击就是「停」。
+  if (ui.meme.describeTimer) {
+    try {
+      const stopped = await apiPost("meme/describe", { stop: true });
+      const job = (stopped && stopped.job) || {};
+      const note = $("meme-note");
+      if (note) {
+        note.textContent = `正在停…（已完成 ${num(job.done, 0)}/${num(job.total, 0)}）`;
+      }
+    } catch (error) {
+      toast(error.message || "停不下来");
+    }
+    return;
+  }
+  try {
+    // 刷新过页面也能接上正在跑的那一轮（后端只允许一个任务）。
+    const current = await apiPost("meme/describe", { status: true });
+    const running = (current && current.job) || {};
+    if (
+      num(running.total, 0) &&
+      ["running", "cancelling"].indexOf(String(running.status || "")) >= 0
+    ) {
+      ui.meme.describeJob = running;
+      memeDescribePoll();
+      return;
+    }
+    // 勾了几张就只重写这几张（哪怕它们已经有描述）；没勾就从"没写含义的"里挑。
+    const checked = Array.from(ui.meme.checked || []);
+    const body = checked.length ? { ids: checked, force: true } : {};
+    const dry = await apiPost("meme/describe", body);
+    if (!dry.ok) {
+      toast(dry.reason || "读不出要补的");
+      return;
+    }
+    // 后端会带"扫了多少条 / 其中多少条含义是空的"（用户 m18371 要能核对）。
+    const total = num(dry.blank, 0) || num(dry.total, 0);
+    if (!total) {
+      toast(dry.reason || "都有描述了");
+      return;
+    }
+    const scanned = num(dry.scanned, 0);
+    const workers = Math.max(1, Math.min(4, Math.ceil(total / 8)));
+    const minutes = Math.max(1, Math.round((total * 6) / (workers * 60)));
+    const names = (dry.targets || [])
+      .map((item) => String(item.name || item.id || ""))
+      .filter(Boolean)
+      .slice(0, 5)
+      .join("、");
+    if (
+      !(await confirmDialog({
+        title: checked.length ? "重写这些的描述？" : "把这些的描述补上？",
+        message:
+          (checked.length ? `选中的 ${total} 张` : `有 ${total} 张还没写含义或用法`) +
+          (scanned ? `（这一页共 ${scanned} 条）` : "") +
+          `。每张会写「含义 / 什么时候用 / 什么时候不用」三栏。` +
+          `开始后会并发 ${workers} 个请求在后台一张张看，估计 ${minutes} 分钟，` +
+          "期间可以再点这个按钮停下。" +
+          (names ? `先从：${names} 这几张开始。` : ""),
+        confirmText: "开始补",
+      }))
+    ) {
+      return;
+    }
+    const started = await apiPost("meme/describe", {
+      ...body,
+      all: true,
+      confirm: true,
+      workers,
+    });
+    if (!started.ok) {
+      toast(started.reason || "起不来批量任务");
+      return;
+    }
+    const job = started.job || {};
+    if (!job.id) {
+      toast("后端没有交出任务编号");
+      return;
+    }
+    ui.meme.describeJob = job;
+    memeDescribePoll();
+  } catch (error) {
+    toast(error.message || "补描述失败");
+  }
+}
+
+/** 轮询批量任务的进度；跑完（或出错）就停表，并把结果说清楚。 */
+function memeDescribePoll() {
+  const note = $("meme-note");
+  const button = $("meme-describe");
+  const paint = (job) => {
+    if (button) button.textContent = job && job.total ? "停止补描述" : "给没描述的补一句";
+    if (!job || !job.total) return;
+    const where = job.status === "cancelling" ? "正在停" : "补描述中";
+    const line =
+      `${where} ${num(job.done, 0)}/${num(job.total, 0)}，写好 ${num(job.updated, 0)} 张` +
+      (num(job.failed, 0) ? `，${num(job.failed, 0)} 张没成` : "");
+    if (note) note.textContent = line;
+    // 同一条进度条（用户 m18755）：补描述也走它
+    memeProgress(line, num(job.done, 0), num(job.total, 0));
+  };
+  paint(ui.meme.describeJob);
+  const tick = async () => {
+    if (!ui.meme.describeTimer) return;
+    try {
+      const data = await apiPost("meme/describe", { status: true });
+      const job = (data && data.job) || {};
+      ui.meme.describeJob = job;
+      paint(job);
+      const status = String(job.status || "");
+      if (status === "running" || status === "cancelling") return;
+      window.clearInterval(ui.meme.describeTimer);
+      ui.meme.describeTimer = 0;
+      if (button) button.textContent = "给没描述的补一句";
+      if (note) note.textContent = "";
+      if (status === "error") {
+        memeProgress(`补描述出错了：${job.error || "未知原因"}`, num(job.done, 0), num(job.total, 0), {
+          error: true,
+        });
+      } else {
+        memeProgressHide();
+      }
+      const failed = num(job.failed, 0);
+      if (status === "error") {
+        toast(job.error || "批量补描述出错了");
+      } else {
+        toast(
+          `${status === "cancelled" ? "停下了" : "补完了"}：写好 ${num(job.updated, 0)} 张` +
+            (failed ? `，${failed} 张没成` : "") +
+            (failed && (job.failures || []).length
+              ? `（例如 ${(job.failures || [])
+                  .slice(0, 2)
+                  .map((item) => String(item.reason || ""))
+                  .filter(Boolean)
+                  .join("；")}）`
+              : ""),
+        );
+      }
+      await loadMemes();
+    } catch (error) {
+      // 一两次网络抖动不该把整轮停掉：等下一拍；连续失败由用户点停。
+      if (note) note.textContent = `查进度失败：${error.message || error}`;
+    }
+  };
+  ui.meme.describeTimer = window.setInterval(tick, 1500);
+}
+
+/** 表情包页的进度条（用户 m18755）：导入与补描述共用同一条。 */
+function memeProgress(label, done, total, options) {
+  const box = $("meme-progress");
+  const text = $("meme-progress-text");
+  const fill = $("meme-progress-fill");
+  if (!box || !fill) return;
+  const cap = Math.max(0, num(total, 0));
+  const did = Math.max(0, num(done, 0));
+  const ratio = cap > 0 ? Math.min(1, did / cap) : 0;
+  box.classList.remove("hidden");
+  box.classList.toggle("is-error", Boolean(options && options.error));
+  if (text) text.textContent = label || (cap > 0 ? `${did}/${cap}` : "");
+  fill.style.width = `${cap > 0 ? Math.round(ratio * 100) : 8}%`;
+  box.setAttribute(
+    "aria-valuenow",
+    String(cap > 0 ? Math.round(ratio * 100) : 0)
+  );
+}
+
+function memeProgressHide() {
+  const box = $("meme-progress");
+  if (!box) return;
+  box.classList.add("hidden");
+  box.classList.remove("is-error");
+  const fill = $("meme-progress-fill");
+  if (fill) fill.style.width = "0";
+}
+
+/** 「从文件夹导入」的后台任务（用户 m18755）：起任务 → 轮询进度 → 报数。 */
+async function memeImportPoll() {
+  const button = $("meme-import-go");
+  const note = $("meme-import-note");
+  const job = ui.meme.importJob || {};
+  const status = String(job.status || "");
+  const total = num(job.total, 0);
+  const done = num(job.done, 0);
+  memeProgress(
+    status === "cancelling"
+      ? `正在停…（${done}/${total}）`
+      : `导入中 ${done}/${total}（新增 ${num(job.created, 0)} 张）`,
+    done,
+    total
+  );
+  if (button) button.textContent = total ? "停止导入" : "开始导入";
+  if (["running", "cancelling"].includes(status)) return;
+  ui.meme.importTimer = 0;
+  ui.meme.importJob = null;
+  if (button) button.textContent = "开始导入";
+  const bits = [];
+  if (num(job.created, 0) > 0) bits.push(`收下 ${num(job.created, 0)} 张`);
+  if (num(job.existed, 0) > 0) bits.push(`${num(job.existed, 0)} 张以前就有`);
+  if (num(job.failed, 0) > 0) bits.push(`${num(job.failed, 0)} 张没成`);
+  if (job.total > job.done) bits.push(`只跑了 ${done}/${total}，剩下的是你停掉的`);
+  const reasons = (job.reasons || []).slice(0, 3);
+  if (status === "error") {
+    memeProgress(`导到一半出错了：${job.error || "未知原因"}`, done, total, {
+      error: true,
+    });
+    toast(job.error || "导入失败");
+  } else {
+    memeProgressHide();
+    toast(bits.length ? bits.join("，") : "没有可导入的图片");
+  }
+  if (note) note.textContent = reasons.length ? reasons.join("；") : "";
+  await loadMemes();
+}
+
+async function memeImportFolder() {
+  const button = $("meme-import-go");
+  if (ui.meme.importTimer) {
+    const stopped = await apiPost("meme/import", { stop: true });
+    if (stopped && stopped.job) ui.meme.importJob = stopped.job;
+    if (button) button.textContent = "正在停…";
+    return false;
+  }
+  const path = String(($("meme-import-path") || {}).value || "").trim();
+  if (!path) {
+    toast("先写一个目录（服务器上存图的那个文件夹）");
+    return false;
+  }
+  const recursive = ($("meme-import-recursive") || {}).checked !== false;
+  const note = $("meme-import-note");
+  if (note) note.textContent = "正在扫描…";
+  try {
+    const started = await apiPost("meme/import", { path, recursive, all: true });
+    if (!started || !started.ok) {
+      toast((started && started.reason) || "导入失败");
+      if (note) note.textContent = "";
+      return false;
+    }
+    const job = started.job || {};
+    if (!job.id) {
+      toast("后端没有交出任务编号");
+      if (note) note.textContent = "";
+      return false;
+    }
+    if (note) note.textContent = "";
+    ui.meme.importJob = job;
+    if (num(job.total, 0) > num(started.picked, 0)) {
+      toast(
+        `这个文件夹里共 ${num(job.total, 0)} 张，这次先导 ${num(started.picked, 0)} 张（再点一次接着导）`
+      );
+    }
+    memeProgress(`导入中 0/${num(job.total, 0)}`, 0, num(job.total, 0));
+    if (Number(ui.meme.importTimer || 0) === 0) {
+      ui.meme.importTimer = window.setInterval(memeImportPoll, 1000);
+    }
+    return true;
+  } catch (error) {
+    toast(error.message || "导入失败");
+    if (note) note.textContent = "";
+    return false;
+  }
+}
+
+function bindMemes() {
+  if ($("meme-drawer-close")) {
+    $("meme-drawer-close").addEventListener("click", closeMemeDrawer);
+  }
+  if ($("meme-drawer-backdrop")) {
+    $("meme-drawer-backdrop").addEventListener("click", closeMemeDrawer);
+  }
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    const drawer = $("meme-drawer");
+    if (drawer && !drawer.classList.contains("hidden")) closeMemeDrawer();
+  });
+  if ($("meme-refresh")) {
+    $("meme-refresh").addEventListener("click", () => loadMemes());
+  }
+  if ($("meme-scan")) {
+    $("meme-scan").addEventListener("click", () => memeScanFiles());
+  }
+  if ($("meme-facts")) {
+    $("meme-facts").addEventListener("click", () => memeBackfillFacts());
+  }
+  if ($("meme-describe")) {
+    $("meme-describe").addEventListener("click", () => memeDescribeMissing());
+  }
+  if ($("meme-import")) {
+    $("meme-import").addEventListener("click", () => {
+      const bar = $("meme-import-bar");
+      if (bar) bar.classList.toggle("hidden");
+      const input = $("meme-import-path");
+      if (bar && !bar.classList.contains("hidden") && input) input.focus();
+    });
+  }
+  if ($("meme-select-all")) {
+    $("meme-select-all").addEventListener("click", () => memeSelectAll(true));
+  }
+  if ($("meme-clear-select")) {
+    $("meme-clear-select").addEventListener("click", () => memeSelectAll(false));
+  }
+  if ($("meme-delete-checked")) {
+    $("meme-delete-checked").addEventListener("click", () => memeDeleteChecked());
+  }
+  if ($("meme-export-checked")) {
+    // 发出去的 ids 与按钮上的 N 同一来源（交集），不可能"显示 2 却导不出"
+    $("meme-export-checked").addEventListener("click", () => memeExport(memeCheckedIds()));
+  }
+  if ($("meme-export-all")) {
+    // null 才是"全部"；空数组现在表示"勾选里一条都不剩"，不会再误当成全部
+    $("meme-export-all").addEventListener("click", () => memeExport(null));
+  }
+  if ($("meme-import-pack")) {
+    $("meme-import-pack").addEventListener("click", () => memeTogglePackBar());
+  }
+  if ($("meme-pack-go")) {
+    $("meme-pack-go").addEventListener("click", () => memeImportPackFromDir());
+  }
+  if ($("meme-pack-browse")) {
+    $("meme-pack-browse").addEventListener("click", () => $("meme-pack-file").click());
+  }
+  if ($("meme-pack-file")) {
+    $("meme-pack-file").addEventListener("change", (event) => {
+      const file = event.target.files && event.target.files[0];
+      memeImportPack(file);
+      event.target.value = "";
+    });
+  }
+  if ($("meme-import-go")) {
+    $("meme-import-go").addEventListener("click", () => memeImportFolder());
+  }
+  if ($("meme-import-path")) {
+    $("meme-import-path").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") memeImportFolder();
+    });
+  }
+  if ($("meme-upload")) {
+    $("meme-upload").addEventListener("click", () => memeOpenUpload());
+  }
+  if ($("meme-upload-file")) {
+    $("meme-upload-file").addEventListener("change", () => {
+      const input = $("meme-upload-file");
+      memeUploadFiles(input && input.files ? input.files : null);
+    });
+  }
+  if ($("meme-cleanup")) {
+    $("meme-cleanup").addEventListener("click", () => memeCleanup());
+  }
+  if ($("meme-filter-state")) {
+    $("meme-filter-state").addEventListener("change", () => {
+      ui.meme.state = $("meme-filter-state").value;
+      // 换了筛选条件就从第一页重新铺（用户 m18846）
+      ui.meme.shown = MEME_PAGE_SIZE;
+      renderMemeList();
+      memeLoadThumbnails();
+    });
+  }
+  if ($("meme-sort")) {
+    $("meme-sort").addEventListener("change", () => {
+      ui.meme.order = $("meme-sort").value === "used" ? "used" : "collected";
+      // 排序变了要重排：从库里重新取第一页（本地顺序已经不对了）
+      void loadMemes();
+    });
+  }
+  if ($("meme-sort-dir")) {
+    $("meme-sort-dir").addEventListener("click", () => {
+      ui.meme.desc = !(ui.meme.desc !== false);
+      if ($("meme-sort-dir")) {
+        $("meme-sort-dir").textContent = ui.meme.desc ? "倒序 ↓" : "正序 ↑";
+      }
+      void loadMemes();
+    });
+  }
+  if ($("meme-search")) {
+    $("meme-search").addEventListener("input", () => {
+      ui.meme.search = $("meme-search").value;
+      ui.meme.shown = MEME_PAGE_SIZE;
+      renderMemeList();
+      memeLoadThumbnails();
+    });
+  }
+  memeMasterField();
+  memeQuotaFields();
+  memeScaleFields();
+  memeCollectFields();
+  memeMasterBox();
+  renderMemeList();
+  renderMemeDetail();
+}
+
+/* MEME-VIEW-END */
 
 boot();

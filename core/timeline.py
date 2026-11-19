@@ -36,6 +36,49 @@ EVENT_SOURCE_LABELS: dict[str, str] = {
     "follow": "线索续演",
 }
 
+# 意图生命周期（``intention_state`` 事件）的 ``reason`` 码 → 中文。
+# 引擎写的是"为什么变"的机器码（``ttl`` / ``commitment_done`` …），日志里要说人话；
+# 认不出来的码原样显示 —— 排查时那一串英文比"未知原因"有用得多。
+INTENTION_REASON_LABELS: dict[str, str] = {
+    "ttl": "时间到了",
+    "still_busy": "还在忙别的",
+    "no_progress": "连着几拍没推进",
+    "commitment_done": "答应的事做到了",
+    "commitment_dropped": "答应的事没做到",
+    "own_topic_done": "自己的事做完了",
+    "closed": "事情了结",
+}
+
+
+def _intention_state_label(state: str) -> str:
+    """意图状态码 → 中文。文案表在 :mod:`core.state`（编辑器与日志共用一份）。"""
+
+    if not state:
+        return ""
+    try:
+        from .state import INTENTION_STATE_LABELS
+    except Exception:  # noqa: BLE001 —— 取不到文案表也不能让时间线渲染挂掉
+        INTENTION_STATE_LABELS = {}
+    return INTENTION_STATE_LABELS.get(state, state)
+
+
+# 单条消息时间线的打点名 → 中文（每一段量的是"从上一个点到这里"花了多久）
+TIMELINE_SPAN_LABELS: dict[str, str] = {
+    "hook": "安静期（路由/宿主排队）",
+    "reply_lock": "VW 等待期（等上一条回复）",
+    "reply_start": "拿到锁→开跑",
+    # 用户 m30538：reply_done 原来把"等锁 + 拼提示词 + 调模型 + 动作 + 写库"全包住，
+    # 34.4s 拆不开。补两个点后，这三段依次是：
+    #   reply_start → llm_start  = 拼提示词与预取
+    #   llm_start  → llm_done    = 调模型
+    #   llm_done   → reply_done  = 执行动作与写库
+    "llm_start": "拼提示词与预取",
+    "llm_done": "调模型",
+    "reply_done": "动作与写库",
+    "send_start": "动作完→开始发",
+    "send_done": "发送",
+}
+
 
 def node_name(node_id: str, world: WorldConfig | None) -> str:
     if world is not None:
@@ -85,6 +128,9 @@ def render_event(
 
     ``ext_render``：扩展注册的渲染器 ``(类型, detail) -> str``。扩展自己的事件
     （``ext_*``）优先交给它，写不出中文才走下面的通用兜底。
+
+    落点写在行尾：``session`` 是"她以为发到哪"（→「在 群 123「小米粥群」」），
+    ``sent`` 是"平台实际投递到哪"；两个都有而且不一样时，再补一句「实际发到 …」。
     """
 
     text = ""
@@ -96,7 +142,13 @@ def render_event(
     if not text:
         text = _render_body(event, world, compact=compact)
     where = _place_text(event)
-    return f"{text}　〔在 {where}〕" if where else text
+    if where:
+        text = f"{text}　〔在 {where}〕"
+    # 「她以为发到哪」和「平台实际投递到哪」不一样时才补一句：一样就没什么好说的
+    sent = _sent_text(event)
+    if sent and sent != where:
+        text = f"{text}　〔实际发到 {sent}〕"
+    return text
 
 
 def _place_text(event: dict[str, Any]) -> str:
@@ -106,6 +158,15 @@ def _place_text(event: dict[str, Any]) -> str:
     if not isinstance(detail, dict):
         return ""
     return " ".join(str(detail.get("session") or "").split())
+
+
+def _sent_text(event: dict[str, Any]) -> str:
+    """平台**实际**把这条投到了哪个会话（和她以为的落点对不上时才写出来）。"""
+
+    detail = event.get("detail") or {}
+    if not isinstance(detail, dict):
+        return ""
+    return " ".join(str(detail.get("sent") or "").split())
 
 
 def _render_body(
@@ -221,6 +282,14 @@ def _render_body(
             text += "（静默）"
         return text
 
+    if kind == "speech_dropped":
+        # 已经想好、但被新消息打断没发出去的那几句（2026-10-28 实机：日志里
+        # 只有一条「被打断」，说了什么完全查不到）
+        said = _join(detail.get("texts"), sep=chr(10) + "　　")
+        reason = _clip(detail.get("reason"), 20) or "被打断"
+        text = f"没发出去（{reason}）"
+        return f"{text}：{said}" if said else text
+
     if kind == "move":
         return f"走到「{node_name(str(detail.get('to', '')), world)}」"
 
@@ -274,8 +343,35 @@ def _render_body(
     if kind == "interrupt":
         return f"动作被打断：{action_name(str(detail.get('action') or ''), world)}"
 
+    # T12 Step 1：这一轮她没照做时留下的那一笔（协商 / 反问 / 只做一半）
+    if kind == "agency_choice":
+        label = {
+            "negotiate": "说等会儿",
+            "ask_first": "先问一句",
+            "partial": "只做一部分",
+        }.get(str(detail.get("mode") or ""), str(detail.get("mode") or ""))
+        text = f"她没照做（{label}）"
+        note = _clip(detail.get("note"), 40)
+        if note:
+            text += f"：{note}"
+        dropped = _join(detail.get("dropped_actions"), limit=4)
+        if dropped:
+            text += f"　〔没做：{dropped}〕"
+        return text
+
     if kind == "cancel":
         return f"按对方说的停了：{_clip(detail.get('note'), 60)}"
+
+    # 用户 m30450：主动私聊"没配过的人"（日限额凭据）与被限额挡下的那一句
+    if kind == "dm_send":
+        return f"主动私聊：{_clip(detail.get('target'), 60)}"
+    if kind == "delivery_skip":
+        reason = {
+            "dm_daily_max": "最近 24 小时主动私聊的次数用完了",
+        }.get(str(detail.get("reason") or ""), str(detail.get("reason") or ""))
+        count = int(detail.get("messages") or 0)
+        suffix = f"（{count} 句）" if count else ""
+        return f"这条没发到 {_clip(detail.get('target'), 40)}{suffix}：{reason or '发了但平台没收'}"
 
     if kind == "vision":
         count = int(detail.get("images") or 0)
@@ -438,6 +534,20 @@ def _render_body(
     if kind == "skip":
         return f"跳过：{_clip(detail.get('note'), 120)}"
 
+    if kind == "image_reaction":
+        # 「看图接话」真的开口了：这是她自己看着图主动说的，不是回谁的话
+        said = "／".join(str(item) for item in (detail.get("messages") or []) if str(item))
+        head = f"看图接话：{_clip(said, 100) or '接了一句'}"
+        score = detail.get("score")
+        if isinstance(score, (int, float)) and not isinstance(score, bool):
+            head += f"（有趣分 {int(score)}/3）"
+        return head
+
+    if kind == "image_reaction_skip":
+        # 看图接话这条支线**没接上**：不是"某一步没做成"，别让她/用户读成回复失败。
+        # 单独一类，时间线上才看得出是"看了图、没插话"（而不是"回复被跳过了"）。
+        return f"看图接话：{_clip(detail.get('note'), 120) or '没插话'}"
+
     if kind == "engagement":
         return f"进入安静期：{_clip(detail.get('reason'), 80)}"
 
@@ -454,6 +564,31 @@ def _render_body(
 
     if kind == "bot_spoke":
         return "她说了话，等待回应"
+
+    if kind == "timeline":
+        # 单条消息从到达、到宿主把请求交到模型钩子、到排队、到真的调模型、到发出去
+        total = float(detail.get("total") or 0.0)
+        spans = detail.get("spans") or {}
+        head = f"这条消息从头到尾 {total:.1f} 秒"
+        reason = _clip(detail.get("reason"), 20)
+        if reason:
+            head += f"（{reason}）"
+        measured = [
+            (str(key), float(value))
+            for key, value in spans.items()
+            if isinstance(value, (int, float))
+        ]
+        if compact:
+            slowest = max(measured, key=lambda item: item[1], default=("", 0.0))
+            if slowest[0]:
+                label = TIMELINE_SPAN_LABELS.get(slowest[0], slowest[0])
+                return f"{head}｜最慢：{label} {slowest[1]:.1f}s"
+            return head
+        parts = [
+            f"{TIMELINE_SPAN_LABELS.get(key, key)} {value:.1f}s"
+            for key, value in measured
+        ]
+        return head + ("　" + "｜".join(parts) if parts else "")
 
     # ---------------- 事件系统 ----------------
 
@@ -626,6 +761,27 @@ def _render_body(
             return "睡醒说了句早安"
         return "睡醒了，没吭声"
 
+    if kind == "intention_state":
+        # 她"打算做某件事"的生命周期变化（用户 2026-10 新增）：刚立下 → 还在惦记 →
+        # 兑现 / 过时 / 放弃。引擎只写键（``from`` / ``to`` / ``reason`` / ``rounds``），
+        # 这里翻成人话；**认不出来的原因码原样带出来**，排查时那一串英文反而有用。
+        text = _clip(detail.get("text") or "", 40) or "一件事"
+        before = _intention_state_label(str(detail.get("from") or ""))
+        after = _intention_state_label(str(detail.get("to") or ""))
+        if before and after and before != after:
+            line = f"打算「{text}」：{before} → {after}"
+        elif after:
+            line = f"打算「{text}」{after}"
+        else:
+            line = f"打算「{text}」有变化"
+        reason = str(detail.get("reason") or "").strip()
+        if reason:
+            line += f"（{INTENTION_REASON_LABELS.get(reason, reason)}）"
+        rounds = int(detail.get("rounds") or 0)
+        if rounds > 0:
+            line += f"，已经推进 {rounds} 轮"
+        return line
+
     # 未知类型：把 detail 原样压成一行，至少不丢信息
     if detail:
         # session 由外层统一补在行尾，这里不再重复一份
@@ -652,6 +808,81 @@ def build_timeline(
         item = dict(event)
         item["text"] = render_event(event, world, ext_render=ext_render)
         result.append(item)
+    return result
+
+
+# ---------------- 工具调用（Agent 页的「她调用了哪些工具」） ----------------
+#
+# 只认工具回执（``tool_receipt``，E1 的权威账：每次工具调用一行，带 id、真实起止
+# 时间与终态）。**世界动作不进这里**——移动、小睡这类是她的日常生活，归「日志 / 事件」页
+# （用户 m20782 的纠正：Agent 页只该显示与自主能力有关的记录）。
+
+# 只有 ``ok`` 算成功：``partial`` 只成功了一部分，``unknown`` 是"不知道成没成"
+RUN_STATUS_LABELS: dict[str, str] = {
+    "ok": "成功",
+    "failed": "失败",
+    "timeout": "超时",
+    "unknown": "结果不明",
+    "partial": "只成功一部分",
+}
+
+# 回执正文这一页只给前这么多字：它是"调用了什么"的账，不是正文阅读器
+RUN_CONTENT_CHARS = 300
+
+
+def _run_status_label(status: Any) -> str:
+    key = str(status or "").strip()
+    # 缺 status 的回执（老数据）：别假装成功，也别写"未知"这种含糊话
+    return RUN_STATUS_LABELS.get(key, key or "未记录")
+
+
+def _run_item(row: Any) -> dict[str, Any]:
+    """一行 ``tool_receipt`` → 工具调用记录的一行。"""
+
+    detail = row.get("detail")
+    detail = detail if isinstance(detail, dict) else {}
+    name = str(detail.get("tool") or detail.get("action") or "")
+    started = float(detail.get("started_at") or 0.0)
+    finished = float(detail.get("finished_at") or 0.0)
+    duration_ms = max(0.0, (finished - started) * 1000.0) if started and finished else 0.0
+    content = str(detail.get("content") or "")
+    status = str(detail.get("status") or "")
+    return {
+        "id": int(row.get("id") or 0),
+        "at": float(row.get("created_at") or 0.0),
+        "world_time": int(row.get("world_time") or 0),
+        "name": name or "（没记名字）",
+        "session": str(row.get("session_id") or ""),
+        "status": status,
+        "status_label": _run_status_label(status),
+        "ok": status == "ok",
+        "target": str(detail.get("target") or ""),
+        "summary": str(detail.get("summary") or ""),
+        "duration_ms": round(duration_ms, 1),
+        "tool_call_id": str(row.get("tool_call_id") or detail.get("tool_call_id") or ""),
+        "task_id": str(detail.get("task_id") or ""),
+        "artifact_id": str(detail.get("artifact_id") or ""),
+        "next_cursor": str(detail.get("next_cursor") or ""),
+        "truncated": bool(detail.get("truncated")),
+        "side_effects": [str(item) for item in (detail.get("side_effects") or [])],
+        "source_event_ids": [str(item) for item in (detail.get("source_event_ids") or [])],
+        "content": _clip(content, RUN_CONTENT_CHARS),
+        "content_chars": len(content),
+    }
+
+
+def build_agent_runs(rows: Any) -> list[dict[str, Any]]:
+    """把 :meth:`Database.list_agent_runs` 的行归一成工具调用记录（顺序照旧，倒序）。
+
+    单行读不动就跳过那一行：这一页是只读观测，一行脏数据不该让整页变成错误。
+    """
+
+    result: list[dict[str, Any]] = []
+    for row in rows or []:
+        try:
+            result.append(_run_item(dict(row)))
+        except Exception:  # noqa: BLE001 - 一行读不动不影响别的行
+            continue
     return result
 
 

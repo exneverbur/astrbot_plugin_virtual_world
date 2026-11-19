@@ -8,7 +8,7 @@
   },
   "web_enabled": {
     "description": "启用网页编辑器",
-    "hint": "在 WebUI 插件详情页显示「虚拟世界编辑器」。地图、动作、日程、记忆都在里面配。",
+    "hint": "在 WebUI 插件详情页显示「SOLIS世界编辑器」。地图、动作、日程、记忆都在里面配。",
     "obvious_hint": true,
     "type": "bool",
     "default": true
@@ -23,7 +23,7 @@
   },
   "sampling_enabled": {
     "description": "接管采样参数",
-    "hint": "关着（默认）＝用 Provider 自己的设置。打开后本插件发起的调用会带上下面几个采样参数——多轮聊天复读、腔调固定，一半是采样参数的事。Provider 不认这些参数时会自动退回只用温度，不会让回复挂掉。",
+    "hint": "关着（默认）＝用 Provider 自己的设置。打开后本插件发起的调用会带上下面几个采样参数——多轮聊天复读、腔调固定，部分原因在采样参数。Provider 不认这些参数时会自动退回只用温度，不会让回复挂掉。",
     "obvious_hint": false,
     "type": "bool",
     "default": false
@@ -98,11 +98,67 @@
   },
   "event_provider_id": {
     "description": "事件模型（事件结算）",
-    "hint": "事件最后怎么样了由它一句话定下场：写的是人话，还带着情绪与能力值的变化。留空跟随打杂模型。",
+    "hint": "事件结果由它一次调用定稿：写的是人话，还带着情绪与能力值的变化。留空跟随打杂模型。",
     "_special": "select_provider",
     "obvious_hint": false,
     "type": "string",
     "default": ""
+  },
+  "embedding_provider_id": {
+    "description": "向量模型（语义检索）",
+    "hint": "这个入口在插件配置页选不到向量供应商，收起来了；换向量模型请到「世界编辑器 → 设置 → 语义检索」。",
+    "invisible": true,
+    "obvious_hint": true,
+    "type": "string",
+    "default": ""
+  },
+  "agent_provider_id": {
+    "description": "Agent 模型（她自主干活时用）",
+    "hint": "留空＝跟插件用主模型，再回退到当前会话的模型。世界编辑器里那个同名老值只在留空时代替使用。",
+    "_special": "select_provider",
+    "obvious_hint": false,
+    "type": "string",
+    "default": ""
+  },
+  "agent_enabled": {
+    "description": "允许她自主干活（已搬到世界编辑器）",
+    "hint": "已搬到「世界编辑器 → 设置 → Agent（自主能力）」；此键只为兼容旧配置的一次性读取保留，面板不显示，后续版本会删。",
+    "invisible": true,
+    "obvious_hint": true,
+    "type": "bool",
+    "default": false
+  },
+  "agent_history_lookup_enabled": {
+    "description": "允许她查历史（已搬到世界编辑器）",
+    "hint": "已搬到「世界编辑器 → 设置 → Agent（自主能力）」；此键只为兼容旧配置的一次性读取保留，面板不显示，后续版本会删。",
+    "invisible": true,
+    "obvious_hint": false,
+    "type": "bool",
+    "default": false
+  },
+  "agent_artifact_generation_enabled": {
+    "description": "允许她做文件（已搬到世界编辑器）",
+    "hint": "已搬到「世界编辑器 → 设置 → Agent（自主能力）」；此键只为兼容旧配置的一次性读取保留，面板不显示，后续版本会删。",
+    "invisible": true,
+    "obvious_hint": false,
+    "type": "bool",
+    "default": false
+  },
+  "agent_file_send_enabled": {
+    "description": "允许她把文件发出来（已搬到世界编辑器）",
+    "hint": "已搬到「世界编辑器 → 设置 → Agent（自主能力）」；此键只为兼容旧配置的一次性读取保留，面板不显示，后续版本会删。",
+    "invisible": true,
+    "obvious_hint": false,
+    "type": "bool",
+    "default": false
+  },
+  "agent_code_execution_enabled": {
+    "description": "允许她执行代码（已搬到世界编辑器）",
+    "hint": "已搬到「世界编辑器 → 设置 → Agent（自主能力）」；此键只为兼容旧配置的一次性读取保留，面板不显示，后续版本会删。",
+    "invisible": true,
+    "obvious_hint": false,
+    "type": "bool",
+    "default": false
   },
   "tick_interval": {
     "description": "tick 间隔（秒）",

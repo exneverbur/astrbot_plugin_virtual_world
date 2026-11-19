@@ -60,11 +60,26 @@ SELF_CARE_IDLE = 0.3
 # 不设冷却的话她会每隔几分钟就查同一件事，群里看到的就是她在刷新闻。
 SEARCH_COOLDOWN_MINUTES = 45
 
+SEARCH_CURIOSITY_BASE = 0.6
+"""好奇心多少算"够想查了"（用户 m30450：0.7 太高，改 0.6）。
+
+以前她用的是手机、在哪儿都能查，但门槛还是当年"要去书房开电脑"那一版的 0.7，
+所以一整天才查一两回。基准落到 0.6，再按此刻的状态浮动（见
+:meth:`Decider.search_curiosity_threshold`）。
+"""
+SEARCH_CURIOSITY_MIN = 0.45
+SEARCH_CURIOSITY_MAX = 0.85
+"""浮动范围：再闲也不会低于 0.45，再累也不会高到 0.85（那样等于永远不查）。"""
+
 DESIRE_HUNGRY = 0.7
 """欲求过了这条线，她会更愿意往有人那边凑（"找人"这条分支权重抬高）。"""
 
 DESIRE_CUDDLE = 0.7
 """欲求过了这条线，她甚至会主动凑过去要贴贴（挑一个"肢体接触"的动作做）。"""
+
+# 精力低于这条线就算"没力气了"：她该歇着，但**不等于困**——
+# 困不困由 sleep_pressure 说了算（下面第 1 条规则）。
+EXHAUSTED_ENERGY = 0.25
 
 # 白天小睡睡多久：按小睡动作自己写的「每持续 1 分钟恢复多少精力」反推，
 # 睡到大约这个精力为止，再卡在动作声明的时长范围内。
@@ -246,11 +261,15 @@ class Decider:
         *,
         group_chatting: bool = False,
         interject_allowed: bool = True,
+        deterministic_only: bool = False,
     ) -> dict[str, Any] | None:
         """按优先级给出一段计划；无法判断时返回 None。
 
         ``group_chatting``：群里最近是否有人在聊（由引擎提供）。
         ``interject_allowed``：插话冷却与上限是否允许（由引擎提供）。
+        ``deterministic_only``：只走"非做不可"的那两层（插话 / 睡觉），
+        剩下的软候选交回引擎做分层抽样（阶段 D）。规则本身留着当候选生产器，
+        所以这里不是删掉它们，而是**不替她掷骰**。
 
         「想被碰一碰」不在这里：那条要交给她自己决定（去哪、找谁、做什么），
         走引擎的 :meth:`VirtualWorldEngine._maybe_desire_push`。
@@ -275,29 +294,38 @@ class Decider:
                     source="rule",
                 )
 
-        # 1) 精力过低 -> 该休息了（刚被叫醒的保护期里不安排，免得叫醒几分钟又被抓回去睡）。
-        #    夜里睡整觉，白天先小睡：白天一睡八小时，醒来正好是半夜，日子直接过乱。
-        #    除了精力，困意（sleep_pressure）攒够了也算——熬夜、被打断、被留住都会攒困意，
-        #    但它不像"到点就困"那样天一黑就翻脸。
+        # 1) 困了就睡、没力气就歇着——**这两件事分开算**：
+        #    精力是"还剩多少劲"（低 → 懒洋洋、动作慢、只想做点轻的），
+        #    困意（sleep_pressure）才是"困不困"的唯一依据。
+        #    夜里睡整觉、白天小睡都只由困意触发；只是精力低（没到真撑不住）时
+        #    只安排"歇一会儿"（小睡），不再一觉睡到大天亮——累了不等于困，
+        #    不然她刚被弄舒服、精力掉下来就被按进被窝，再被叫醒就挂着起床气。
         #    「等会儿再睡」的延迟窗口里两条路都不走：她答应了，就真的再待一会儿。
-        exhausted = state.energy < 0.25
+        #    （连续几天精力掉到极低的兜底仍在极端保护里，那是另一条路。）
         sleepy = self.sleep_pressure_high(state)
+        weary = state.energy < EXHAUSTED_ENERGY
         if (
-            (exhausted or sleepy)
+            (sleepy or weary)
             and state.world_time >= state.no_sleep_until
             and not state.sleep_delayed
         ):
             steps = self._travel_then(node_id, home, graph)
-            if self.is_night() or not self.can_nap():
+            if weary and not sleepy:
+                if self.can_nap():
+                    steps.append({"action": "nap", "duration": self.nap_seconds(state)})
+                    reason = "没什么力气了，先歇一会儿"
+                else:
+                    # 小睡不可用（动作停用 / 不回精力）：只能按老办法睡下
+                    steps.append(
+                        {"action": "sleep", "duration": self._action_duration("sleep")}
+                    )
+                    reason = "没力气了，先睡下"
+            elif self.is_night() or not self.can_nap():
                 steps.append({"action": "sleep", "duration": self._action_duration("sleep")})
-                reason = "困得撑不住了，该睡了" if sleepy and not exhausted else "夜深了，该睡了"
+                reason = "困得撑不住了，该睡了"
             else:
                 steps.append({"action": "nap", "duration": self.nap_seconds(state)})
-                reason = (
-                    "白天困得撑不住了，先眯一会儿"
-                    if sleepy and not exhausted
-                    else "白天精力低，先小睡一会儿"
-                )
+                reason = "困得撑不住了，先眯一会儿"
             return create_plan(
                 steps=steps,
                 world_time=state.world_time,
@@ -309,6 +337,9 @@ class Decider:
         # 2~5) 剩下的几件事都**不是**非做不可的：各自先判断"够不够格"，
         #      再由今天的基调给它们拨权重，从够格的里面挑一件。
         #      （精力那条是安全阀，按原样强制，不参与加权。）
+        if deterministic_only:
+            # 阶段 D：软候选不再由规则掷骰，交给引擎的分层抽样（见 `_layered_action_plan`）。
+            return None
         candidates: list[tuple[str, dict[str, Any]]] = []
 
         # （原来这里有一条"孤独 → 走到大厅喊一声"。删掉了：
@@ -317,10 +348,11 @@ class Decider:
         #   （见引擎的 `_maybe_miss_push`）。孤独感会让她涨得更想他——
         #   见 `branch_weights` 里 reach_out 那一档，现在用来抬主动找他的意愿。）
 
-        # 3) 好奇心高且在书房 -> 上网搜索并分享
+        # 3) 好奇心高 -> 掏手机查一下并分享
+        #    （她用的是手机，所以在哪儿都能查；以前要求人站在书房，等于把"想知道"这件事
+        #     拴在一台电脑上——用户 2026-10-17 的口径：不是电脑搜索，是用手机搜索。）
         if (
-            state.curiosity > 0.7
-            and node_id == "study"
+            state.curiosity > self.search_curiosity_threshold(state)
             and self.action_usable("search_web")
             and not self.searched_recently(state)
         ):
@@ -347,29 +379,30 @@ class Decider:
         # 而不是等着谁来看穿她（安全阀是行为倾向，不是触发一个动作）。
         low_mood = float(state.valence) < SELF_CARE_VALENCE
 
-        # 4) 无聊 -> 换个地方发呆
+        # 4) 无聊 -> 换个地方发呆。
+        #    **去哪不在规则里定**：用户 m26298 要求这条和"想出门"都改成调一次大模型
+        #    决定目的地，所以这里先用老办法挑一个当兜底，同时把标记挂上去，
+        #    由引擎在真正执行前问那一句（问不出来就按兜底走）。
         wander_eligible = state.boredom > (SELF_CARE_BOREDOM if low_mood else 0.8)
         if wander_eligible:
             target = self._pick_idle_node(exclude=node_id)
             steps = self._travel_then(node_id, target, graph) if target else []
             steps.append({"action": "stare"})
-            candidates.append(
-                (
-                    "wander",
-                    create_plan(
-                        steps=steps,
-                        world_time=state.world_time,
-                        valid_for=self._plan_valid(),
-                        reason="太无聊了，换个环境",
-                        source="rule",
-                    ),
-                )
+            wander_plan = create_plan(
+                steps=steps,
+                world_time=state.world_time,
+                valid_for=self._plan_valid(),
+                reason="太无聊了，换个环境",
+                source="rule",
             )
+            if wander_plan is not None:
+                wander_plan["llm_dest"] = {"kind": "wander", "why": "太无聊了，换个环境"}
+                candidates.append(("wander", wander_plan))
 
         # 5) 在家待腻了 -> 出门走走。
-        #    没有这一条她可以连着几天不出门：规则里"找人就近去客厅"、"看书去书房"，
-        #    全是屋里；发呆那条虽然可能抽到公园 / 海边，但门槛高、还老被别的动机挤掉。
-        #    这里只管"在家待腻了"这一种：好奇心那条走的是上网查，不是出门。
+        #    没有这一条她可以连着几天不出门：规则里别处都是屋里的动作；发呆那条虽然
+        #    可能抽到公园 / 海边，但门槛高、还老被别的动机挤掉。
+        #    去哪、到了做什么同样交给大模型（用户 m26298），这里只留兜底 + 标记。
         if (
             self.world.is_home_zone(node_id)
             and not self.is_night()
@@ -381,39 +414,19 @@ class Decider:
             steps = self._travel_then(node_id, target, graph) if target else []
             if doing:
                 steps.append({"action": doing})
-            candidates.append(
-                (
-                    "outdoor",
-                    create_plan(
-                        steps=steps,
-                        world_time=state.world_time,
-                        valid_for=self._plan_valid(),
-                        reason="在家待久了，想出去走走",
-                        source="rule",
-                    ),
-                )
+            outdoor_plan = create_plan(
+                steps=steps,
+                world_time=state.world_time,
+                valid_for=self._plan_valid(),
+                reason="在家待久了，想出去走走",
+                source="rule",
             )
-
-        # 6) 精力尚可且是白天 -> 去书房看书
-        if (
-            state.energy > 0.5
-            and state.boredom > (SELF_CARE_IDLE if low_mood else 0.45)
-            and node_id != "study"
-        ):
-            steps = self._travel_then(node_id, "study", graph)
-            steps.append({"action": "read", "duration": self._action_duration("read")})
-            candidates.append(
-                (
-                    "read",
-                    create_plan(
-                        steps=steps,
-                        world_time=state.world_time,
-                        valid_for=self._plan_valid(),
-                        reason="有点闲，去看会儿书",
-                        source="rule",
-                    ),
-                )
-            )
+            if outdoor_plan is not None:
+                outdoor_plan["llm_dest"] = {
+                    "kind": "outdoor",
+                    "why": "在家待久了，想出去走走",
+                }
+                candidates.append(("outdoor", outdoor_plan))
 
         return self._pick_branch(state, candidates)
 
@@ -636,6 +649,34 @@ class Decider:
 
         action = self.world.action_map().get(action_id)
         return str(getattr(action, "search_topic", "") or "").strip() if action else ""
+
+    def search_curiosity_threshold(self, state: WorldState) -> float:
+        """好奇心到多少才"够想查了"（用户 m30450：基准 0.6，并随其它数值浮动）。
+
+        为什么不写死：好奇心是长期性格值，涨得慢；再用一个固定门槛，她一天也就
+        冒一两次"想查点什么"。而"此刻想不想查"其实还取决于别的状态——
+
+        - 闲着（无聊高）：更容易随手掏手机查 → 门槛往下
+        - 累（精力低）：只想躺着，不想动脑子 → 门槛往上
+        - 心情差：先自我修复，不主动查东西 → 门槛往上
+        - 很想找人（孤独高）：她的出口是"去找他"，不是刷手机 → 门槛往上
+
+        浮动结果夹在 [``SEARCH_CURIOSITY_MIN``, ``SEARCH_CURIOSITY_MAX``]，
+        免得累到极点变成永远不查、或者闲到极点什么都查。
+        """
+
+        threshold = SEARCH_CURIOSITY_BASE
+        if float(getattr(state, "boredom", 0.0) or 0.0) > 0.6:
+            threshold -= 0.08
+        if float(getattr(state, "energy", 1.0) or 0.0) < 0.35:
+            threshold += 0.10
+        if float(getattr(state, "valence", 0.5) or 0.0) < SELF_CARE_VALENCE:
+            threshold += 0.06
+        if float(getattr(state, "loneliness", 0.0) or 0.0) > 0.6:
+            threshold += 0.06
+        return round(
+            min(SEARCH_CURIOSITY_MAX, max(SEARCH_CURIOSITY_MIN, threshold)), 3
+        )
 
     def searched_recently(self, state: WorldState, action_id: str = "search_web") -> bool:
         """她刚查过没有：查一次只降一点点好奇心，不拦一下会变成每隔几分钟查同一件事。"""

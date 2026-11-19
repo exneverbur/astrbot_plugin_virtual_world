@@ -119,10 +119,19 @@ AROUSAL_BASE = 0.30
 """心潮的静止位置：不吵不闹时的那根弦。"""
 
 AROUSAL_ENERGY_WEIGHT = 0.25
-"""精力越低，心潮基线整体下移——累了就不容易被打动。"""
+"""精力越低，心潮基线整体下移——累了就不容易被打动（是"慢下来"，不是"变坏"）。"""
 
 VALENCE_BASE = 0.5
 VALENCE_ENERGY_WEIGHT = 0.30
+"""精力在"有精神"那一侧（energy > 0.5）对心情的加成，保持原样。"""
+
+VALENCE_LOW_ENERGY_WEIGHT = 0.15
+"""精力在"没力气"那一侧（energy < 0.5）的扣分，只有加成的一半（原 0.30）。
+
+非对称是故意的：有精神是加分项，没力气只是"提不起劲"，不该单独把她推进
+负面情绪里——心情的方向由真实的事（孤独 / 无聊 / 被顶撞）说了算。
+（和 ``AROUSAL_ENERGY_WEIGHT`` 一样，只往下压一点，不整体挪。）
+"""
 VALENCE_LONELINESS_WEIGHT = 0.30
 VALENCE_BOREDOM_WEIGHT = 0.25
 VALENCE_CURIOSITY_WEIGHT = 0.15
@@ -177,6 +186,14 @@ UNDERSTOOD_MAX_PER_DAY = 3
 SOOTHE_LOG_KEEP = 30
 """安抚记录最多留几条（够算当天次数就行）。"""
 
+COMPANY_RELIEF_INTIMACY_FLOOR = 0.4
+"""被认真搭话缓解孤独时，"不太熟的人"能领到的那一份（四成）。
+
+剩下六成按关系远近给：最亲近的人一句抵得上生人两句半。理由是"孤独感"
+量的是**有没有人能说上话**——群里随口点她一声也该算数，但它不该跟
+"他一直在陪着她说话"拿同一个数（见 :meth:`StateDynamics.company_relief`）。
+"""
+
 REPEAT_TRACKED = ("mention_bot", "positive_words", "hug_bot")
 """会被"连着来"磨掉效力的事件：被叫、被夸、被哄。
 
@@ -189,6 +206,14 @@ REPEAT_MAGNITUDES = (1.0, 0.6, 0.35, 0.2, 0.12)
 
 REPEAT_FLOOR = 0.08
 """麻木之后保留的效力：不是完全没有反应，只是不再叠加。"""
+
+REPEAT_LONELINESS_FLOOR = 0.0
+"""「有人陪着我」这部分的麻木底线：第 6 次起一点都不再降孤独。
+
+心情/心潮麻木了还剩 0.08（被夸第 20 次心里还是有点动静），但"有人陪"这件事
+连着来就是同一件事，再抱一次不该当第二次陪伴——所以这一项归零。刷一小时亲密
+最多把孤独感从 1.0 拉到 0.3 左右（另有 ``company_relief`` 那本每小时上限的账）。
+"""
 
 REPEAT_RESET_MINUTES = 20
 """隔这么久没有同类好事，就当"缓过来了"，重新按第一次算。"""
@@ -290,10 +315,16 @@ def arousal_baseline(state: WorldState, *, hour: int | None = None) -> float:
 
 
 def valence_baseline(state: WorldState, *, hour: int | None = None) -> float:
-    """效价基线：由五维与时段推导，本身不存历史。"""
+    """效价基线：由五维与时段推导，本身不存历史。
+
+    精力只是一个小的修饰，而且**两侧不一样重**：有精神加一点分，
+    没力气只轻轻扣一点（见 ``VALENCE_LOW_ENERGY_WEIGHT``）——低精力不等于心情差，
+    真正的负面来自孤独 / 无聊 / 好奇长期没被满足，以及发生的事。
+    """
 
     base = VALENCE_BASE
-    base += (float(state.energy or 0.0) - 0.5) * VALENCE_ENERGY_WEIGHT
+    gap = float(state.energy or 0.0) - 0.5
+    base += gap * (VALENCE_ENERGY_WEIGHT if gap >= 0 else VALENCE_LOW_ENERGY_WEIGHT)
     base -= max(0.0, float(state.loneliness or 0.0) - 0.4) * VALENCE_LONELINESS_WEIGHT
     base -= max(0.0, float(state.boredom or 0.0) - 0.4) * VALENCE_BOREDOM_WEIGHT
     base -= max(0.0, float(state.curiosity or 0.0) - 0.5) * VALENCE_CURIOSITY_WEIGHT
@@ -652,8 +683,12 @@ class StateDynamics:
         magnitude: float = 1.0,
         *,
         now: float | None = None,
+        intimate: bool = False,
     ) -> bool:
-        """事件脉冲。返回 True 表示顺带触发了安全阀。"""
+        """事件脉冲。返回 True 表示顺带触发了安全阀。
+
+        ``intimate``：这一下是亲密互动（见 ``_apply_pulse`` / ``_spend_chat_valence``）。
+        """
 
         effects = EVENT_EFFECTS.get(kind)
         if not effects:
@@ -661,6 +696,13 @@ class StateDynamics:
         if kind in REPEAT_TRACKED:
             # 连着被哄会麻木：第二次起同样的好事推不动那么多了
             magnitude = float(magnitude) * self.repeat_magnitude(state, kind, now=now)
+            if "loneliness" in effects:
+                # 「有人陪着我」单独一条更陡的麻木曲线：第 6 次起一点都不降孤独
+                # （心情照旧按上面的曲线衰减，见 REPEAT_LONELINESS_FLOOR）
+                effects = dict(effects)
+                effects["loneliness"] = float(effects["loneliness"]) * self.repeat_magnitude(
+                    state, f"{kind}:loneliness", now=now, floor=REPEAT_LONELINESS_FLOOR
+                )
         return self._apply_pulse(
             state,
             effects,
@@ -668,6 +710,7 @@ class StateDynamics:
             now=now,
             cause=MOOD_CAUSE_TEXT.get(kind, ""),
             chat=kind in REPEAT_TRACKED,
+            intimate=intimate,
         )
 
     def soothed(
@@ -728,6 +771,7 @@ class StateDynamics:
         now: float | None = None,
         cause: str = "",
         chat: bool = False,
+        intimate: bool = False,
     ) -> bool:
         """按事件的规则施加一个临时增量。
 
@@ -736,6 +780,7 @@ class StateDynamics:
 
         ``chat=True`` 表示这一下是**聊天**推的（不是她真经历了什么）：
         正向部分要占当天的聊天额度，见 ``_spend_chat_valence``。
+        ``intimate=True`` 表示这一轮是**亲密互动**：额度换更宽的那本账。
         """
 
         if not delta:
@@ -747,6 +792,7 @@ class StateDynamics:
             now=now,
             cause=cause,
             chat=chat,
+            intimate=intimate,
         )
 
     def apply_pulse(
@@ -757,11 +803,13 @@ class StateDynamics:
         now: float | None = None,
         cause: str = "",
         chat: bool = False,
+        intimate: bool = False,
     ) -> bool:
         """事件系统给的一串状态脉冲（``{字段: 增量}``）。
 
         和 ``apply_event`` 走同一条路：饱和、两轴耦合、夹紧、重算心情都照旧，
         只是这次的数值不是预设好的事件表，而是当场算出来的。
+        ``intimate`` 的含义同 ``apply_event_delta``。
         """
 
         if not effects:
@@ -780,7 +828,13 @@ class StateDynamics:
         if not clean:
             return False
         return self._apply_pulse(
-            state, clean, magnitude=1.0, now=now, cause=cause, chat=chat
+            state,
+            clean,
+            magnitude=1.0,
+            now=now,
+            cause=cause,
+            chat=chat,
+            intimate=intimate,
         )
 
     def _apply_pulse(
@@ -792,6 +846,7 @@ class StateDynamics:
         now: float | None = None,
         cause: str = "",
         chat: bool = False,
+        intimate: bool = False,
     ) -> bool:
         """事件脉冲的公共实现：先补衰减，再用同一个快照算两轴的互相影响。
 
@@ -800,6 +855,10 @@ class StateDynamics:
 
         ``chat``：这一下是聊天推的。**正向**的效价要占当天的聊天额度——
         日常陪伴改的是好感度，不是心情的量程；负向不占（难过不因为今天被怼过就不算数）。
+
+        ``intimate``：这一下是**亲密互动**推的（亲昵口吻 / 肢体接触动作）。
+        正向效价改走 ``intimacy_valence_daily_cap`` 那本更宽的账，
+        见 :meth:`_spend_chat_valence`。
         """
 
         reset = self._sync_emotions(state, now=now)
@@ -823,7 +882,9 @@ class StateDynamics:
                 value *= valence_saturation(snap_valence)
                 value *= arousal_scale(snap_affect)
                 if chat and value > 0:
-                    value = self._spend_chat_valence(state, value, now=now)
+                    value = self._spend_chat_valence(
+                        state, value, now=now, intimate=intimate
+                    )
                 if not value:
                     continue
                 state.valence_offset = clamp_value(
@@ -914,12 +975,12 @@ class StateDynamics:
     # ---------------- mood ----------------
 
     def derive_mood(self, state: WorldState, *, world: WorldConfig | None = None) -> str:
-        """心情词：由情绪两轴派生（精力只作修饰）。
+        """心情词：由情绪两轴派生（精力只作"没劲"修饰，困不困由困意说了算）。
 
         动作里写了 `mood:温柔` 时，覆盖期内直接用它——那是她在"演"这个语气，
         不是心境变了。
 
-        标签 = 格子词 + 修饰（困 / 想找人 / 闲得发慌 / 心痒）+ 来源（为什么变成这样）。
+        标签 = 格子词 + 修饰（没劲 / 困 / 想找人 / 闲得发慌 / 心痒）+ 来源（为什么变成这样）。
         修饰和来源都是**当下成立**才加：来源超过半小时就不再挂了。
         """
 
@@ -929,6 +990,7 @@ class StateDynamics:
             state.affect,
             state.valence,
             energy=state.energy,
+            sleep_pressure=float(getattr(state, "sleep_pressure", 0.0) or 0.0),
             loneliness=state.loneliness,
             boredom=state.boredom,
             curiosity=state.curiosity,
@@ -999,12 +1061,20 @@ class StateDynamics:
         return magnitude
 
     def repeat_magnitude(
-        self, state: WorldState, kind: str, *, now: float | None = None
+        self,
+        state: WorldState,
+        kind: str,
+        *,
+        now: float | None = None,
+        floor: float | None = None,
     ) -> float:
         """同一类好事连着来的递减力度（被夸第 N 次就不稀奇了）。
 
         和 ``ignored_magnitude`` 同一套思路，只是按事件名分开记：
         "被叫了 20 次"和"被夸了 20 次"是两回事，不该互相磨掉。
+
+        ``floor``：麻木之后保留多少效力，默认 ``REPEAT_FLOOR``（0.08）。
+        "有人陪着我"那一项传 0——连着来的陪伴不该当第二次陪伴。
         """
 
         stamp = self._now() if now is None else float(now)
@@ -1014,10 +1084,9 @@ class StateDynamics:
         streak = 0 if (last and stamp - last >= REPEAT_RESET_MINUTES * 60) else max(
             0, int(streak_map.get(kind) or 0)
         )
+        rest = REPEAT_FLOOR if floor is None else max(0.0, float(floor))
         magnitude = (
-            REPEAT_MAGNITUDES[streak]
-            if streak < len(REPEAT_MAGNITUDES)
-            else REPEAT_FLOOR
+            REPEAT_MAGNITUDES[streak] if streak < len(REPEAT_MAGNITUDES) else rest
         )
         streak_at[kind] = stamp
         streak_map[kind] = streak + 1
@@ -1126,6 +1195,69 @@ class StateDynamics:
         state.desire = clamp_value(before + bonus, 0.0, 1.0)
         return float(state.desire) - before
 
+    def company_relief(
+        self,
+        state: WorldState,
+        *,
+        intimacy: float = 1.0,
+        now: float | None = None,
+    ) -> float:
+        """被**真的搭上话**了一轮：孤独感落一小截，落多少看关系远近。
+
+        返回实际落了多少（0 表示这一轮不算"有人陪着说话"）。
+
+        以前这条路是没有的：孤独感只涨不落（自然增长 + tone 表里那几项），
+        所以跟角色连着亲亲抱抱聊二十分钟，她的孤独感还是满的，提示词一路写着
+        "有点被晾着"——眼前明明有人在陪她。聊天是最高频的事，这条回落**必须**小，
+        但一条都不给就成了"状态不认互动"。
+
+        三道护栏（和 :meth:`satisfy_desire` 一个套路）：
+
+        - 单轮基数 ``loneliness_company_relief``（默认 0.02）再乘
+          ``COMPANY_RELIEF_INTIMACY_FLOOR``~1.0 的亲疏系数——生人一句只值四成；
+        - 每小时上限 ``loneliness_company_relief_hour_cap``（默认 0.35）：
+          按小时累计，当前小时用完就不再落（记录见 ``state.loneliness_company_*``）。
+          这条才是主闸门：孤独感自然增长只有 0.048/小时，上限 0.35/小时的意思是
+          "十分钟十轮闲聊最多掉 0.2，连着陪满一小时才可能把 1.0 拉下 0.3 左右"，
+          不会被几轮寒暄刷成满血；自然增长那边仍会把它慢慢顶回来。
+        - 已经贴底（0）时不再落，也不占额度——和 :meth:`soothed` 的"推不动不记账"一致。
+        """
+
+        base = max(0.0, float(self._desire_config("loneliness_company_relief", 0.02)))
+        if base <= 0:
+            return 0.0
+        before = float(state.loneliness)
+        if before <= 0:
+            return 0.0
+        closeness = max(0.0, min(1.0, float(intimacy or 0.0)))
+        relief = base * (
+            COMPANY_RELIEF_INTIMACY_FLOOR
+            + (1.0 - COMPANY_RELIEF_INTIMACY_FLOOR) * closeness
+        )
+        cap = max(
+            0.0, float(self._desire_config("loneliness_company_relief_hour_cap", 0.35))
+        )
+        if cap > 0:
+            hour = int(float(now or 0.0) // 3600)
+            if int(getattr(state, "loneliness_company_hour_marker", 0) or 0) != hour:
+                state.loneliness_company_hour_marker = hour
+                state.loneliness_company_hour_sum = 0.0
+            used = max(
+                0.0, float(getattr(state, "loneliness_company_hour_sum", 0.0) or 0.0)
+            )
+            left = max(0.0, cap - used)
+            if left <= 0:
+                return 0.0
+            relief = min(relief, left)
+        state.loneliness = clamp_value(before - relief, 0.0, 1.0)
+        dropped = before - float(state.loneliness)
+        if dropped > 0 and cap > 0:
+            state.loneliness_company_hour_sum = (
+                float(getattr(state, "loneliness_company_hour_sum", 0.0) or 0.0)
+                + dropped
+            )
+        return dropped
+
     # ---------------- 工具 ----------------
 
     def _valence_decay_per_min(self) -> float:
@@ -1138,20 +1270,43 @@ class StateDynamics:
         return value if value > 0 else VALENCE_DECAY_PER_MIN
 
     def _spend_chat_valence(
-        self, state: WorldState, value: float, *, now: float | None = None
+        self,
+        state: WorldState,
+        value: float,
+        *,
+        now: float | None = None,
+        intimate: bool = False,
     ) -> float:
         """聊天能推动的效价走当天额度：额度用完了就不再推。
 
         正负各算一份：今天开心够了不该挡着她难过。
         额度是"聊天"这条路专用的——她真经历一件事（事件系统）不受它限制。
+
+        ``intimate=True``（这一轮在亲密互动）：走**另一本账**
+        （``intimacy_valence_daily_cap`` + ``state.intimacy_valence_*``）。
+        理由：日常闲聊的 0.15/天是为了不让"被夸两句"盖过她真经历的一件事，
+        而被人抱着亲着聊二十分钟显然不是"被夸两句"——但也不能就此把全局上限调大，
+        那等于把所有闲聊一起放宽。所以给它单开一份额度：宽松、仍然封顶。
         """
 
-        try:
-            budget = float(
-                getattr(self.config, "chat_valence_daily_cap", 0.15) or 0.0
+        if intimate:
+            budget_field, day_field, spent_field = (
+                "intimacy_valence_daily_cap",
+                "intimacy_valence_day",
+                "intimacy_valence_spent",
             )
+            fallback = 0.45
+        else:
+            budget_field, day_field, spent_field = (
+                "chat_valence_daily_cap",
+                "chat_day",
+                "chat_valence_spent",
+            )
+            fallback = 0.15
+        try:
+            budget = float(getattr(self.config, budget_field, fallback) or 0.0)
         except (TypeError, ValueError):
-            budget = 0.15
+            budget = fallback
         if budget <= 0:
             return value
         stamp = self._now() if now is None else float(now)
@@ -1159,18 +1314,18 @@ class StateDynamics:
             today = datetime.fromtimestamp(stamp).strftime("%Y-%m-%d")
         except (OverflowError, OSError, ValueError):
             today = ""
-        if str(state.chat_day or "") != today:
-            state.chat_day = today
-            state.chat_valence_spent = 0.0
+        if str(getattr(state, day_field, "") or "") != today:
+            setattr(state, day_field, today)
+            setattr(state, spent_field, 0.0)
         try:
-            spent = float(state.chat_valence_spent or 0.0)
+            spent = float(getattr(state, spent_field, 0.0) or 0.0)
         except (TypeError, ValueError):
             spent = 0.0
         left = budget - max(0.0, spent)
         allowed = min(float(value), max(0.0, left))
         if allowed <= 0:
             return 0.0
-        state.chat_valence_spent = spent + allowed
+        setattr(state, spent_field, spent + allowed)
         return allowed
 
     @staticmethod

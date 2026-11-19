@@ -7,8 +7,10 @@
 
 - **能力值**是慢变量（体力/智力/灵巧/心性），只由事件结果改变，几乎不随时间衰减；
   和"精力"不是一回事：精力睡一觉就回来，能力值是她的底子。
-- **判定**是纯计算：``p = 能力值 × 情境修正 × 难度``，夹在 0.05~0.95，
-  掷一次分四档。每次判定都要能写成一行人话，进日志和调试输出。
+- **判定**是纯计算：``p = 能力值 × 情境修正 × 难度倍率``，夹在 0.05~0.95，
+  掷一次分四档。**难度越大越难**（0.5 是中性），而且只有 ``check_probability``
+  一处公式：提示词里的预览和真正掷骰必须同式，否则她的"我觉得能行"和实际概率
+  会各说各话。每次判定都要能写成一行人话，进日志和调试输出。
 - **主观档位**（她觉得自己行不行）和客观概率**允许不一致**：心潮高会高估自己，
   精力低会低估。这个偏差就是"以为稳却翻车"的来源。
 - **线索**是一串事件：一步步追加"她选了什么 → 结果如何"，续线时整条喂回去。
@@ -17,10 +19,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+from . import aliases
+
+# 注意：``json_actions`` 在模块顶层不能导（它 → source_events → state → 本模块，成环）。
+# 修复函数只在 :func:`parse_json_object` 里局部导入。
 
 # ---------------- 能力值 ----------------
 
@@ -141,6 +149,56 @@ def apply_ability_delta(abilities: dict[str, float], delta: dict[str, float]) ->
 CHECK_FLOOR = 0.05
 CHECK_CEIL = 0.95
 
+DIFFICULTY_NEUTRAL = 0.5
+"""难度 0.5 = 不额外加难也不减难（倍率 1.0）。"""
+
+
+def difficulty_factor(difficulty: float) -> float:
+    """难度 → 概率倍率：**难度越大越难**。
+
+    以前这里是拿难度直接当倍率用（``p = 能力 × 难度``），于是"难度 0.8 的棘手事"
+    反而比 0.3 的轻松事更容易成——语义正好反了。现在 0.5 是中性，0.8 压到 ×0.4，
+    0.2 提到 ×1.6，与提示词里"0.2 很轻松 / 0.8 相当棘手"的说法一致。
+    """
+
+    try:
+        value = max(0.05, min(0.95, float(difficulty)))
+    except (TypeError, ValueError):
+        value = DIFFICULTY_NEUTRAL
+    return max(0.05, (1.0 - value) / (1.0 - DIFFICULTY_NEUTRAL))
+
+
+def modifier_factor(modifiers: list[tuple[str, float]] | None) -> float:
+    """情境修正连乘（坏值跳过，不让一个脏数字毁掉整次判定）。"""
+
+    factor = 1.0
+    for _label, value in modifiers or []:
+        try:
+            factor *= float(value)
+        except (TypeError, ValueError):
+            continue
+    return factor
+
+
+def check_probability(
+    ability_value: float,
+    difficulty: float,
+    modifiers: list[tuple[str, float]] | None = None,
+) -> float:
+    """一次判定的成功概率——**整个工程只有这一处公式**。
+
+    提示词里的预览（她"觉得"行不行之前看的客观概率）和真正掷骰必须调这个函数，
+    否则两处各算各的，校准就无从谈起。
+    """
+
+    try:
+        ability = float(ability_value)
+    except (TypeError, ValueError):
+        ability = 0.0
+    probability = ability * modifier_factor(modifiers) * difficulty_factor(difficulty)
+    return max(CHECK_FLOOR, min(CHECK_CEIL, probability))
+
+
 TIER_GREAT = "great"
 TIER_SUCCESS = "success"
 TIER_NARROW = "narrow"
@@ -250,18 +308,11 @@ def roll_check(
 ) -> CheckResult:
     """掷一次骰子。``roll`` 便于测试注入固定值。"""
 
-    factor = 1.0
-    for _label, value in modifiers or []:
-        try:
-            factor *= float(value)
-        except (TypeError, ValueError):
-            continue
     try:
         diff = max(0.05, min(0.95, float(difficulty)))
     except (TypeError, ValueError):
-        diff = 0.5
-    probability = float(ability_value) * factor * diff
-    probability = max(CHECK_FLOOR, min(CHECK_CEIL, probability))
+        diff = DIFFICULTY_NEUTRAL
+    probability = check_probability(ability_value, diff, modifiers)
     dice = float(roll()) if callable(roll) else 0.5
     dice = max(0.0, min(1.0, dice))
     margin = probability - dice
@@ -371,6 +422,378 @@ SCOPE_ACT = "act"
 SCOPE_SESSION = "session"
 SCOPE_DAY = "day"
 
+# ---- 事件跨度（T15-S2） ----
+#
+# 一件事不是都该在一回合里结束：买瓶酱油是 ``scene``，修漏水的水管是
+# ``hours``，跟房东扯押金是 ``days``。跨度决定**节奏**和**上限**，
+# 但什么时候结束由剧情判（check / stake 结算 + 没有未兑现的伏笔），
+# 不是到点硬收尾——见 ``core/engine.py`` 的 ``_resolve_event_step`` / ``_continue_thread``。
+
+SPAN_SCENE = "scene"
+SPAN_HOURS = "hours"
+SPAN_DAYS = "days"
+EVENT_SPANS: tuple[str, ...] = (SPAN_SCENE, SPAN_HOURS, SPAN_DAYS)
+
+SPAN_LABELS = {SPAN_SCENE: "一回合", SPAN_HOURS: "几小时", SPAN_DAYS: "跨天"}
+
+# 每档的天花板：步数 / 存活时长（分钟）。配置项 ``scene_max_minutes`` /
+# ``hours_max_hours`` / ``days_max_days`` 会覆盖时长；缺键时用这里的默认。
+SPAN_MAX_STEPS = {SPAN_SCENE: 6, SPAN_HOURS: 12, SPAN_DAYS: 40}
+SPAN_MAX_MINUTES = {
+    SPAN_SCENE: 120.0,
+    SPAN_HOURS: 72.0 * 60.0,
+    SPAN_DAYS: 30.0 * 24.0 * 60.0,
+}
+
+# 每步最小间隔（秒）：跨度越大节奏越慢，防"一天推八步"式刷屏。
+SPAN_MIN_GAP_SECONDS = {
+    SPAN_SCENE: 0.0,
+    SPAN_HOURS: 30.0 * 60.0,
+    SPAN_DAYS: 6.0 * 3600.0,
+}
+
+# ---- 独占（T15-S2） ----
+EXCLUSIVITY_EXCLUSIVE = "exclusive"
+EXCLUSIVITY_AMBIENT = "ambient"
+EVENT_EXCLUSIVITIES: tuple[str, ...] = (EXCLUSIVITY_EXCLUSIVE, EXCLUSIVITY_AMBIENT)
+
+# ---- 事的代价（T16） ----
+#
+# 以前失败只是"没长经验"：大事件输了既不掉精力也不掉人情，她自然不可能怕。
+# 这里给每次没成（含勉强成功）配一份**量小但真实**的代价，按 ``stake_kind``
+# 决定从哪扣：精力 / 人情 / 东西 / 机会。三条硬护栏都在
+# :func:`plan_event_cost` 里算好：精力不下 0.10、单日总量不超 0.30、
+# 同一线程连续第 3 次失败只说话不扣。
+
+STAKE_ENERGY = "energy"
+STAKE_RELATION = "relation"
+STAKE_ITEM = "item"
+STAKE_OPPORTUNITY = "opportunity"
+STAKE_NONE = "none"
+
+EVENT_STAKES: tuple[str, ...] = (
+    STAKE_ENERGY,
+    STAKE_RELATION,
+    STAKE_ITEM,
+    STAKE_OPPORTUNITY,
+    STAKE_NONE,
+)
+
+STAKE_LABELS: dict[str, str] = {
+    STAKE_ENERGY: "精力",
+    STAKE_RELATION: "人情",
+    STAKE_ITEM: "东西",
+    STAKE_OPPORTUNITY: "机会",
+    STAKE_NONE: "说不清",
+}
+
+_STAKE_ALIASES: dict[str, str] = {
+    "energy": STAKE_ENERGY,
+    "stamina": STAKE_ENERGY,
+    "strength": STAKE_ENERGY,
+    "body": STAKE_ENERGY,
+    "精力": STAKE_ENERGY,
+    "体力": STAKE_ENERGY,
+    "力气": STAKE_ENERGY,
+    "身体": STAKE_ENERGY,
+    "relation": STAKE_RELATION,
+    "bond": STAKE_RELATION,
+    "trust": STAKE_RELATION,
+    "face": STAKE_RELATION,
+    "关系": STAKE_RELATION,
+    "人情": STAKE_RELATION,
+    "面子": STAKE_RELATION,
+    "信任": STAKE_RELATION,
+    "好感": STAKE_RELATION,
+    "item": STAKE_ITEM,
+    "object": STAKE_ITEM,
+    "thing": STAKE_ITEM,
+    "money": STAKE_ITEM,
+    "东西": STAKE_ITEM,
+    "物品": STAKE_ITEM,
+    "物件": STAKE_ITEM,
+    "钱": STAKE_ITEM,
+    "opportunity": STAKE_OPPORTUNITY,
+    "chance": STAKE_OPPORTUNITY,
+    "timing": STAKE_OPPORTUNITY,
+    "机会": STAKE_OPPORTUNITY,
+    "时机": STAKE_OPPORTUNITY,
+    "名额": STAKE_OPPORTUNITY,
+    "none": STAKE_NONE,
+    "nothing": STAKE_NONE,
+    "无": STAKE_NONE,
+    "没有": STAKE_NONE,
+}
+
+
+def stake_kind_of(raw: Any) -> str:
+    """把模型写的"输在哪儿"收敛到固定枚举；认不出就算 ``none``（按精力兜底）。"""
+
+    text = " ".join(str(raw or "").split()).strip().lower()
+    if not text:
+        return STAKE_NONE
+    if text in EVENT_STAKES:
+        return text
+    return _STAKE_ALIASES.get(text, STAKE_NONE)
+
+
+COST_TIER_NARROW = "narrow"
+COST_TIER_FAIL = "fail"
+COST_TIER_BIG_FAIL = "big_fail"
+"""代价档位：勉强成功 / 失败 / 大事件失败（都来自 ``TIER_NARROW`` / ``TIER_FAIL``）。"""
+
+EVENT_COST_TIERS: tuple[str, ...] = (
+    COST_TIER_NARROW,
+    COST_TIER_FAIL,
+    COST_TIER_BIG_FAIL,
+)
+
+EVENT_COST_ENERGY: dict[str, float] = {
+    COST_TIER_NARROW: 0.05,
+    COST_TIER_FAIL: 0.09,
+    COST_TIER_BIG_FAIL: 0.12,
+}
+"""精力档位：勉强成功 −0.05、失败 −0.09、大事件失败 −0.12。"""
+
+EVENT_COST_RELATION: dict[str, float] = {
+    COST_TIER_NARROW: -0.02,
+    COST_TIER_FAIL: -0.03,
+    COST_TIER_BIG_FAIL: -0.04,
+}
+"""人情档位（负值）：扣当事人的好感度。"""
+
+EVENT_COST_NEUTRAL = 0.03
+"""``stake_kind`` 缺失 / 说不清时的兜底：照扣 0.03 精力，只是没有名字。"""
+
+EVENT_COST_ENERGY_FLOOR = 0.10
+"""精力不得低于这个值：代价再大也不把人扣瘫。"""
+
+EVENT_COST_DAY_LIMIT = 0.30
+"""单个会话单日内事件扣减总量上限（按幅度算，不超过这个数）。"""
+
+EVENT_COST_STREAK_LIMIT = 3
+"""同一线程连续第 N 次失败只说话不扣：别让模型学会"瘫着最省事"。"""
+
+EVENT_COST_RETRY_BONUS = 0.1
+"""失败之后下一次判定的降难补偿（只给一次，用完清零）。"""
+
+EVENT_COST_NOTE_LIMIT = 20
+"""代价短句的字数上限：她得能用一句话说出来。"""
+
+EVENT_TOPIC_DAYS = 3
+"""东西弄丢 / 机会错过留下的心事挂几天（``note_own_topic`` 的按条过期）。"""
+
+EVENT_EFFECT_LIMIT = 0.05
+"""事件包自带 ``effects`` 的单字段幅度上限（T16：small/big 也吃这份脉冲）。"""
+
+EVENT_FAIL_METHOD_GAIN = 0.01
+"""失败时唯一的能力值增长：只有"真学会了新方法"才给这么多。"""
+
+
+def event_cost_tier(tier: str, package_tier: str = TIER_SMALL) -> str:
+    """判定档位 → 代价档位；成功 / 主动放弃返回空串（成功不受影响）。"""
+
+    key = str(tier or "").strip().lower()
+    if key == TIER_NARROW:
+        return COST_TIER_NARROW
+    if key != TIER_FAIL:
+        return ""
+    if str(package_tier or "").strip().lower() == TIER_BIG:
+        return COST_TIER_BIG_FAIL
+    return COST_TIER_FAIL
+
+
+def _clip_text(text: Any, limit: int) -> str:
+    return " ".join(str(text or "").split())[: max(0, int(limit))]
+
+
+def event_cost_note(
+    kind: str,
+    *,
+    tier: str = "",
+    stake: str = "",
+    who: str = "",
+) -> str:
+    """这一下**弄丢了什么 / 错过了什么**——一句话，≤20 字，她随时能说出口。
+
+    结算文案里必须带它：只有一个静默的数值变化，等于什么都没发生。
+    """
+
+    stake_kind = stake_kind_of(kind)
+    thing = _clip_text(stake, 12).strip("，。、…~ ")
+    if stake_kind == STAKE_ITEM:
+        text = f"把{thing}弄丢了" if thing else "弄丢了一样东西"
+    elif stake_kind == STAKE_OPPORTUNITY:
+        text = f"错过了{thing}" if thing else "错过了一次机会"
+    elif stake_kind == STAKE_RELATION:
+        person = _clip_text(who, 8).strip()
+        text = f"跟{person}生分了" if person else "跟人弄僵了"
+    elif stake_kind == STAKE_ENERGY:
+        text = f"把{thing}耗掉了" if thing else "把力气耗光了"
+    else:
+        text = f"{thing}也折腾进去了" if thing else "白折腾了一场"
+    return _clip_text(text, EVENT_COST_NOTE_LIMIT)
+
+
+def event_cost_topic(kind: str, *, stake: str = "") -> str:
+    """东西 / 机会类的代价写成一件**她心里搁着的事**（``note_own_topic`` 用）。"""
+
+    stake_kind = stake_kind_of(kind)
+    thing = _clip_text(stake, 24).strip("，。、…~ ")
+    if stake_kind == STAKE_OPPORTUNITY:
+        return f"错过了{thing}" if thing else "错过了一次机会"
+    return f"把{thing}弄丢了" if thing else "弄丢了一样东西"
+
+
+@dataclass
+class EventCost:
+    """一次失败的代价明细（算好了再落账，便于单测直接断言数值）。"""
+
+    stake_kind: str = STAKE_NONE
+    tier: str = ""
+    energy: float = 0.0
+    """精力的增量（负值，已经夹过下限与单日额度）。"""
+
+    relation: float = 0.0
+    """人情（好感度）的增量（负值）。"""
+
+    own_topic: str = ""
+    """要写成心事的那句话（东西 / 机会类才有）。"""
+
+    note: str = ""
+    """她说的出口的那半句（≤20 字）。"""
+
+    capped: bool = False
+    """被某条护栏截断过（额度用完 / 触底 / 连续失败）。"""
+
+    skipped: bool = False
+    """这一档不该扣（成功 / 主动放弃 / 第 3 次连续失败）。"""
+
+    retry_bonus: float = 0.0
+    """这次失败留下的降难补偿（用一次就清）。"""
+
+    @property
+    def delta(self) -> float:
+        """这次扣掉的幅度（≥0，只用来记单日额度）。"""
+
+        return round(abs(float(self.energy)) + abs(float(self.relation)), 4)
+
+    def as_detail(self) -> dict[str, Any]:
+        """进 ``event_log`` 的那几个字段（事后能核对）。"""
+
+        return {
+            "stake_kind": self.stake_kind,
+            "delta": self.delta,
+            "capped": bool(self.capped),
+            "cost_tier": self.tier,
+            "energy": round(float(self.energy), 4),
+            "relation": round(float(self.relation), 4),
+            "own_topic": self.own_topic,
+            "note": self.note,
+            "retry_bonus": round(float(self.retry_bonus), 3),
+        }
+
+
+def plan_event_cost(
+    *,
+    stake_kind: Any = "",
+    cost_tier: str = "",
+    energy: float = 1.0,
+    budget_left: float = EVENT_COST_DAY_LIMIT,
+    fail_streak: int = 0,
+    stake: str = "",
+    who: str = "",
+) -> EventCost:
+    """算这一次的代价：按 ``stake_kind`` 兜底，三条硬护栏在这里。
+
+    - ``energy``：她此刻的精力，扣完不许低于 ``EVENT_COST_ENERGY_FLOOR``；
+    - ``budget_left``：今天还剩多少额度（``EVENT_COST_DAY_LIMIT`` 减已扣）；
+    - ``fail_streak``：这条线索**连续**第几次失败（第 3 次只说话不扣）。
+    """
+
+    kind = stake_kind_of(stake_kind)
+    key = str(cost_tier or "").strip().lower()
+    if key not in EVENT_COST_TIERS:
+        return EventCost(stake_kind=kind, skipped=True)
+    # 人情得有当事人：线索上没记谁，就退回按精力兜底，别去扣一个不存在的人。
+    if kind == STAKE_RELATION and not _clip_text(who, 8).strip():
+        kind = STAKE_NONE
+    note = event_cost_note(kind, tier=key, stake=stake, who=who)
+    streak = max(0, int(fail_streak or 0))
+    if streak >= EVENT_COST_STREAK_LIMIT:
+        # 连着第三回没成：只说话，不再叠数值——不然模型学到的是"瘫着最省"。
+        return EventCost(
+            stake_kind=kind,
+            tier=key,
+            note=note,
+            capped=True,
+            skipped=True,
+            retry_bonus=EVENT_COST_RETRY_BONUS,
+        )
+    if kind in (STAKE_ITEM, STAKE_OPPORTUNITY):
+        return EventCost(
+            stake_kind=kind,
+            tier=key,
+            own_topic=event_cost_topic(kind, stake=stake),
+            note=note,
+            retry_bonus=EVENT_COST_RETRY_BONUS,
+        )
+    room = max(0.0, float(energy) - EVENT_COST_ENERGY_FLOOR)
+    budget = max(0.0, float(budget_left))
+    if kind == STAKE_RELATION:
+        want = abs(float(EVENT_COST_RELATION[key]))
+        allowed = round(min(want, budget), 4)
+        return EventCost(
+            stake_kind=kind,
+            tier=key,
+            relation=-allowed if allowed > 0 else 0.0,
+            note=note,
+            capped=(want - allowed) > 1e-9,
+            skipped=allowed <= 0,
+            retry_bonus=EVENT_COST_RETRY_BONUS,
+        )
+    want = float(EVENT_COST_ENERGY[key]) if kind == STAKE_ENERGY else float(EVENT_COST_NEUTRAL)
+    allowed = round(min(want, room, budget), 4)
+    return EventCost(
+        stake_kind=kind,
+        tier=key,
+        energy=-allowed if allowed > 0 else 0.0,
+        note=note,
+        capped=(want - allowed) > 1e-9,
+        skipped=allowed <= 0,
+        retry_bonus=EVENT_COST_RETRY_BONUS,
+    )
+
+
+def clamp_event_effects(
+    effects: dict[str, Any] | None,
+    *,
+    limit: float = EVENT_EFFECT_LIMIT,
+    energy: float | None = None,
+    energy_floor: float = EVENT_COST_ENERGY_FLOOR,
+) -> dict[str, float]:
+    """把事件包自带的 ``effects`` 夹到护栏内（T16：small/big 也吃这份脉冲）。
+
+    单字段幅度不超过 ``limit``；负向精力不许把人扣到 ``energy_floor`` 以下。
+    """
+
+    cap = abs(float(limit))
+    result: dict[str, float] = {}
+    for name, raw in (effects or {}).items():
+        key = str(name).strip()
+        if key not in _STATE_FIELDS:
+            continue
+        value = _as_float(raw)
+        if abs(value) > cap:
+            value = cap if value > 0 else -cap
+        if key == "energy" and value < 0 and energy is not None:
+            room = max(0.0, float(energy) - float(energy_floor))
+            value = -min(abs(value), room)
+        if not value:
+            continue
+        result[key] = round(value, 4)
+    return result
+
 
 @dataclass
 class EventOption:
@@ -380,6 +803,8 @@ class EventOption:
     no_check: bool = False
     difficulty: float = 0.0
     """相对整件事的难度偏移（正数更难），0 表示用事件本身的难度。"""
+    risk: str = ""
+    """这个选法输了会失去什么（≤20 字）。只进提示词，让她掂量代价用。"""
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -388,6 +813,7 @@ class EventOption:
             "hint": self.hint,
             "no_check": bool(self.no_check),
             "difficulty": float(self.difficulty),
+            "risk": self.risk,
         }
 
 
@@ -397,7 +823,31 @@ class EventPackage:
 
     title: str = ""
     scene: str = ""
+    lead: str = ""
+    """这件事是从哪儿来的（用户 2026-10-28）。
+
+    ``hook`` 只写"这一刻发生了什么"，单拿出来是半句话；``lead`` 交代来路：
+    她本来在做什么、什么东西先有了动静、谁先开的口。一句话、不依赖上下文
+    就能读懂（谁 / 在哪 / 因为什么）。讲出去的那句话要能点住它，读者才知道
+    你在说哪件事——没有 lead 的事件就是"没头没尾"。
+    """
+
     hook: str = ""
+    stake: str = ""
+    """这件事要是没成，她会失去什么（一句具体的话，≤30 字；T15-S1）。
+
+    没写的时候引擎会从 ``followup.fail`` 派生；再没有就填一句中性的
+    （见 ``core/engine.py`` 的 ``_ensure_event_stake``）。它只用于质量闸和
+    提示词，不进聊天记录。
+    """
+
+    stake_kind: str = STAKE_NONE
+    """输在哪儿：``energy`` / ``relation`` / ``item`` / ``opportunity`` / ``none``。
+
+    T16 起失败真的会按它扣东西（见 :func:`plan_event_cost`）；模型没写就是
+    ``none``，按 0.03 精力兜底——**永远不能让"没写"变成"没代价"**。
+    """
+
     tier: str = TIER_SMALL
     kind: str = KIND_SOLO
     mode: str = MODE_REAL
@@ -410,6 +860,12 @@ class EventPackage:
     difficulty: float = 0.5
     critical: bool = False
     """危险 / 紧急：日程撞上它时要让路（比如该睡觉了也得先处理完）。"""
+
+    span: str = SPAN_SCENE
+    """这件事拖多久：``scene`` 一回合内、``hours`` 几小时、``days`` 跨天。"""
+
+    exclusivity: str = EXCLUSIVITY_AMBIENT
+    """``exclusive`` 占住全局事件槽（同时最多一条）；``ambient`` 可与主线并存。"""
 
     options: list[EventOption] = field(default_factory=list)
     followup: dict[str, str] = field(default_factory=dict)
@@ -430,11 +886,20 @@ class EventPackage:
     def needs_help(self) -> bool:
         return self.kind == KIND_NEED_INTERVENE
 
+    @property
+    def exclusive(self) -> bool:
+        """只读派生：兼容"独占"口述成 bool 的写法。改请改 ``exclusivity``。"""
+
+        return self.exclusivity == EXCLUSIVITY_EXCLUSIVE
+
     def as_payload(self) -> dict[str, Any]:
         return {
             "title": self.title,
             "scene": self.scene,
+            "lead": self.lead,
             "hook": self.hook,
+            "stake": self.stake,
+            "stake_kind": self.stake_kind,
             "tier": self.tier,
             "kind": self.kind,
             "mode": self.mode,
@@ -442,6 +907,8 @@ class EventPackage:
             "place_name": self.place_name,
             "difficulty": float(self.difficulty),
             "critical": bool(self.critical),
+            "span": self.span,
+            "exclusivity": self.exclusivity,
             "options": [item.as_payload() for item in self.options],
             "followup": dict(self.followup),
             "outcome": self.outcome,
@@ -483,6 +950,7 @@ def _parse_options(raw: Any) -> list[EventOption]:
                 hint=_as_text(item.get("hint"), 12) or "",
                 no_check=bool(item.get("no_check")),
                 difficulty=_as_float(item.get("difficulty"), 0.0),
+                risk=_as_text(item.get("risk"), 20),
             )
         )
     return options
@@ -506,6 +974,13 @@ def event_from_payload(payload: dict[str, Any], *, source: str = "") -> EventPac
     mode = str(payload.get("mode") or "").strip().lower()
     if mode not in (MODE_REAL, MODE_IMAGINED):
         mode = MODE_REAL
+    span = str(payload.get("span") or "").strip().lower()
+    if span not in EVENT_SPANS:
+        span = SPAN_SCENE
+    exclusivity = str(payload.get("exclusivity") or "").strip().lower()
+    if exclusivity not in EVENT_EXCLUSIVITIES:
+        # 兼容只给 bool 的写法（``"exclusive": true``）
+        exclusivity = EXCLUSIVITY_EXCLUSIVE if bool(payload.get("exclusive")) else EXCLUSIVITY_AMBIENT
     followup = payload.get("followup")
     followups: dict[str, str] = {}
     if isinstance(followup, dict):
@@ -525,10 +1000,21 @@ def event_from_payload(payload: dict[str, Any], *, source: str = "") -> EventPac
         for name, value in dict(payload.get("effects") or {}).items()
         if str(name) in ("affect", "valence", "energy", "loneliness", "curiosity", "boredom")
     }
+    options = _parse_options(payload.get("options"))
+    if tier == TIER_BIG:
+        # T16：大事件不留"全身而退"的路。提示词里已经这么要求，但模型会忘——
+        # 这里把 ``no_check`` 直接抹掉：躲开那条照样要掷骰、照样可能失手。
+        for option in options:
+            option.no_check = False
     return EventPackage(
         title=title,
         scene=_as_text(payload.get("scene"), 60),
+        lead=_as_text(payload.get("lead") or payload.get("cause") or payload.get("setup"), 160),
         hook=hook,
+        stake=_as_text(payload.get("stake"), 30),
+        stake_kind=stake_kind_of(
+            payload.get("stake_kind") or payload.get("stake_type") or payload.get("lose_kind")
+        ),
         tier=tier,
         kind=kind,
         mode=mode,
@@ -536,7 +1022,9 @@ def event_from_payload(payload: dict[str, Any], *, source: str = "") -> EventPac
         place_name=_as_text(payload.get("place_name") or payload.get("place"), 40),
         difficulty=max(0.05, min(0.95, _as_float(payload.get("difficulty"), 0.5))),
         critical=bool(payload.get("critical")),
-        options=_parse_options(payload.get("options")),
+        span=span,
+        exclusivity=exclusivity,
+        options=options,
         followup=followups,
         outcome=_as_text(payload.get("outcome"), 200),
         effects=effects,
@@ -548,28 +1036,93 @@ def event_from_payload(payload: dict[str, Any], *, source: str = "") -> EventPac
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 
+_EVENT_JSON_KEYS = frozenset(
+    {
+        # 事件包
+        "id",
+        "key",
+        "source",
+        "kind",
+        "title",
+        "place",
+        "node",
+        "options",
+        "option",
+        "desc",
+        "action",
+        "ask_help",
+        "help",
+        "abilities",
+        "difficulty",
+        "no_check",
+        "pick",
+        "choice",
+        # 抉择 / 结算
+        "phase",
+        "reason",
+        "send_to",
+        "actions",
+        "type",
+        "intent",
+        "params",
+        "content",
+        "messages",
+        "target",
+        "target_node",
+        "duration",
+        # 收尾台词（``lines`` 里至少要有 ``text``）
+        "say",
+        "plan",
+        "success",
+        "fail",
+        "lines",
+        "text",
+        "delay",
+    }
+)
+"""事件这条解析路径认的键名——``repair_json_keys`` 的白名单（见 ``json_actions``）。
+
+只收协议里真的出现过的键；不在表里的键名被劈开也**不猜**。
+"""
+
+_LOGGER = logging.getLogger(__name__)
+
 
 def parse_json_object(text: str) -> dict[str, Any] | None:
-    """从模型输出里挖一个 JSON 对象（容忍前后废话和 ``` 包裹）。"""
+    """从模型输出里挖一个 JSON 对象（容忍前后废话和 ``` 包裹）。
+
+    上游中转会把输出按显示宽度折行，于是 JSON 字符串里出现**真换行**：
+    ``json.loads`` 整段失败，事件收尾那句、抉择、结算全部解析不出来。这里和聊天那条
+    解析路径走同一套修复（``json_actions.loads_json_repaired``）：裸换行按 CJK 规则
+    粘回去，被换开的键名接回已知键。修不好仍然返回 ``None``，调用方照旧兜底。
+    """
 
     body = str(text or "").strip()
     if not body:
         return None
     if body.startswith("```"):
         body = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", body).strip()
-    try:
-        data = json.loads(body)
-        return data if isinstance(data, dict) else None
-    except (TypeError, ValueError):
-        pass
+    from .json_actions import loads_json_repaired  # 局部导入：顶层会成环（见文件头注释）
+
+    candidates = [body]
     match = _JSON_BLOCK_RE.search(body)
-    if not match:
-        return None
-    try:
-        data = json.loads(match.group(0))
-    except (TypeError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+    if match and match.group(0) != body:
+        candidates.append(match.group(0))
+    for candidate in candidates:
+        data, repaired, newlines = loads_json_repaired(candidate, known=_EVENT_JSON_KEYS)
+        if data is None:
+            continue
+        if repaired:
+            _LOGGER.warning(
+                "事件输出的 JSON 有裸控制字符 / 被劈开的键名，已修复："
+                "repaired=%s raw_len=%d in_string_newlines=%d",
+                repaired,
+                len(str(text or "")),
+                newlines,
+            )
+        if isinstance(data, dict):
+            return data
+    return None
 
 
 def parse_event_package(text: str, *, source: str = "") -> EventPackage | None:
@@ -579,6 +1132,7 @@ def parse_event_package(text: str, *, source: str = "") -> EventPackage | None:
 # ---------------- 抉择 / 结算 / 建议筛选 ----------------
 
 SAY_SLOTS = ("plan", "success", "fail")
+"""``success``/``fail`` 是旧格式（预先写好两版台词）；新流程只用 ``plan``。"""
 
 PHASE_ACT = "act"
 """她这一轮先去做点什么（查资料、试一下），做完再拿主意。"""
@@ -588,27 +1142,136 @@ PHASE_DECIDE = "decide"
 
 
 def _parse_say_plan(raw: Any) -> dict[str, list[dict[str, Any]]]:
-    """解析她的发送计划：``{plan|success|fail: [{text, delay}]}``。"""
+    """解析她的发送计划：``{plan|success|fail: [{text, delay}]}``。
+
+    ``success``/``fail`` 是旧格式（预先写好两版台词）——现在还认，是为了老数据
+    和旧测试能继续读；新流程只写 ``plan``，真正的台词等结果落定后再说。
+    """
 
     result: dict[str, list[dict[str, Any]]] = {}
     if not isinstance(raw, dict):
         return result
     for slot in SAY_SLOTS:
-        lines: list[dict[str, Any]] = []
-        for item in list(raw.get(slot) or [])[:8]:
-            if isinstance(item, str):
-                text, delay = item, 0.0
-            elif isinstance(item, dict):
-                text = str(item.get("text") or item.get("message") or "").strip()
-                delay = max(0.0, min(30.0, _as_float(item.get("delay"), 0.0)))
-            else:
-                continue
-            text = " ".join(str(text or "").split())[:200]
-            if text:
-                lines.append({"text": text, "delay": delay})
+        lines = _normalize_lines(raw.get(slot))
         if lines:
             result[slot] = lines
     return result
+
+
+def _loose_keys(mapping: Any) -> dict[str, Any]:
+    """把键名两端的空白与大小写抹平。
+
+    只给"事件收尾那句"这条解析用（``parse_event_speech`` / ``_normalize_lines``
+    的 ``loose_keys`` 分支）：线上见过模型返回 ``{" lines": [...]}``——键名前面多了
+    一个空格，``payload.get("lines")`` 就取不到，她写的话整句丢掉。这里只归一这一层
+    的键，不动 ``parse_json_object`` 的全局行为，免得到处掩盖真的写错了键。
+    """
+
+    if not isinstance(mapping, dict):
+        return {}
+    return {str(key).strip().lower(): value for key, value in mapping.items()}
+
+
+def _normalize_lines(raw: Any, *, limit: int = 8, loose_keys: bool = False) -> list[dict[str, Any]]:
+    """把 ``[{text, delay}]`` / ``["..."]`` / ``"..."`` 统一成发送计划的行。
+
+    ``loose_keys`` 打开时元素里的键名也容忍两端空白与大小写（``" text"``、
+    ``" Delay"``），只给 ``parse_event_speech`` 用；``_parse_say_plan`` 保持严格。
+    """
+
+    lines: list[dict[str, Any]] = []
+    items = raw if isinstance(raw, (list, tuple)) else [raw]
+    for item in list(items)[: max(1, int(limit))]:
+        if isinstance(item, str):
+            text, delay = item, 0.0
+        elif isinstance(item, dict):
+            fields = _loose_keys(item) if loose_keys else item
+            text = str(fields.get("text") or fields.get("message") or "").strip()
+            delay = max(0.0, min(30.0, _as_float(fields.get("delay"), 0.0)))
+        else:
+            continue
+        text = " ".join(str(text or "").split())[:200]
+        if text:
+            lines.append({"text": text, "delay": delay})
+    return lines
+
+
+# ---------------- 结果落定之后的发言（阶段 E1/E5） ----------------
+#
+# 台词不再"预先写两版、按结果挑一版"：判定和结算先把事实提交进线索，
+# 然后才让她**照着已经发生的事**说这一句。
+
+SPEECH_INTENT_INTRODUCE = "introduce"
+SPEECH_INTENT_REQUEST = "request"
+SPEECH_INTENT_CLARIFY = "clarify"
+SPEECH_INTENT_ACK = "ack"
+SPEECH_INTENT_PROGRESS = "progress"
+SPEECH_INTENT_OUTCOME = "outcome"
+SPEECH_INTENT_QUIET = "quiet"
+
+SPEECH_INTENTS: tuple[str, ...] = (
+    SPEECH_INTENT_INTRODUCE,
+    SPEECH_INTENT_REQUEST,
+    SPEECH_INTENT_CLARIFY,
+    SPEECH_INTENT_ACK,
+    SPEECH_INTENT_PROGRESS,
+    SPEECH_INTENT_OUTCOME,
+    SPEECH_INTENT_QUIET,
+)
+
+SPEECH_INTENT_LABELS: dict[str, str] = {
+    SPEECH_INTENT_INTRODUCE: "起个头",
+    SPEECH_INTENT_REQUEST: "求人帮忙",
+    SPEECH_INTENT_CLARIFY: "问清楚",
+    SPEECH_INTENT_ACK: "应一声",
+    SPEECH_INTENT_PROGRESS: "说说进展",
+    SPEECH_INTENT_OUTCOME: "说结果",
+    SPEECH_INTENT_QUIET: "这幕不说",
+}
+
+
+def parse_event_speech(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """解析"结果定了之后那一句"：``(intent, lines)``。
+
+    认 ``{"intent": "...", "lines": [{"text", "delay"}]}``；模型只给了一串话
+    （数组或纯文本）时按 ``outcome`` 收下。``intent=quiet`` = 这一幕她不说。
+
+    键名容忍两端空白与大小写（线上见过 ``{" lines": [...]}``）：只在这一次解析里
+    归一，``parse_json_object`` 本身不动。
+    """
+
+    payload = parse_json_object(text)
+    if isinstance(payload, dict):
+        fields = _loose_keys(payload)
+        intent = str(fields.get("intent") or "").strip().lower()
+        if intent not in SPEECH_INTENTS:
+            intent = SPEECH_INTENT_OUTCOME
+        raw = fields.get("lines")
+        if raw is None:
+            raw = fields.get("say") if fields.get("say") is not None else fields.get("text")
+        return intent, _normalize_lines(raw, limit=4, loose_keys=True)
+    text = str(text or "").strip()
+    if not text:
+        # 模型什么都没说（或者这次调用没成）：不算"她决定不说"，交回调用方——
+        # 通常那边会退回她抉择时写的那一句。
+        return SPEECH_INTENT_OUTCOME, []
+    if text.startswith("["):
+        try:
+            data = json.loads(text)
+        except (TypeError, ValueError):
+            data = None
+        if isinstance(data, list):
+            return SPEECH_INTENT_OUTCOME, _normalize_lines(data, limit=4, loose_keys=True)
+    stripped = text.lstrip()
+    if stripped.startswith("{") or stripped.startswith("[") or stripped.startswith("```"):
+        # 长得像 JSON 却连修复都解析不出来：宁可这一句不说，也绝不把她没写完的
+        # JSON 当台词发进聊天里（线上 10-26 10:41 / 10:43 各发过一次原样 JSON）。
+        _LOGGER.warning(
+            "事件收尾句是解析不出来的 JSON，已丢弃（不发原样 JSON）：raw_len=%d",
+            len(text),
+        )
+        return SPEECH_INTENT_OUTCOME, []
+    return SPEECH_INTENT_OUTCOME, _normalize_lines(text, limit=4, loose_keys=True)
 
 
 @dataclass
@@ -762,6 +1425,12 @@ class Settlement:
     next_gap_minutes: float = 0.0
     """她自己决定"下一步隔多久再来"（分钟）。0 = 没给，用配置里的固定间隔。"""
 
+    new_method: bool = False
+    """这一下**学会了一个新办法**（T16）：失败时唯一允许的能力值增长入口。
+
+    模型写 ``new_method: true`` 才给 +0.01；没写就当没学到，失败一分经验都不涨。
+    """
+
 
 _STATE_FIELDS = ("affect", "valence", "energy", "loneliness", "curiosity", "boredom")
 
@@ -785,6 +1454,9 @@ def parse_settlement(text: str) -> Settlement | None:
     }
     followup = _as_text(payload.get("followup"), 120)
     memory = _as_text(payload.get("memory"), 80)
+    new_method = str(
+        payload.get("new_method") or payload.get("learned_method") or ""
+    ).strip().lower() in ("1", "true", "yes", "on", "是")
     try:
         next_gap = max(0.0, float(payload.get("next_gap") or 0.0))
     except (TypeError, ValueError):
@@ -798,7 +1470,54 @@ def parse_settlement(text: str) -> Settlement | None:
         followup=followup,
         memory=memory,
         next_gap_minutes=min(next_gap, 360.0),
+        new_method=new_method,
     )
+
+
+CONTRIBUTION_KINDS = (
+    "question",
+    "advice",
+    "new_fact",
+    "offer",
+    "cheer",
+    "joke",
+    "refusal",
+    "unrelated",
+)
+"""群友那句话属于哪一种（阶段 E3）。
+
+问清楚 / 出主意 / 带来新情况 / 愿意帮忙 / 打气 / 起哄 / 拒绝 / 无关。
+"""
+
+CONTRIBUTION_LABELS = {
+    "question": "问情况",
+    "advice": "出主意",
+    "new_fact": "带来新情况",
+    "offer": "愿意帮忙",
+    "cheer": "打气",
+    "joke": "起哄",
+    "refusal": "不看好",
+    "unrelated": "无关",
+}
+
+CONTRIBUTION_ACTIONABLE = ("advice", "new_fact", "offer")
+"""这些才算"真的改变了做法"：打气和起哄只是接住，不该替她改路线。"""
+
+_KIND_ALIASES: dict[str, str] = aliases.CONTRIBUTION_ALIASES
+"""群友贡献类型的中文/英文别名（A 线收尾：表已收到 ``core/aliases.py`` 一处）。
+
+同形不同义提醒：这里的 ``refuse``→``refusal`` 与口吻表里的 ``refuse`` 是两个域，
+``hug`` 既是口吻取值也是动作 id——**别拿这个表去查动作**。
+"""
+
+
+def contribution_kind(raw: Any) -> str:
+    """把模型写的分类收敛到固定枚举；认不出就算"出了个主意"。"""
+
+    kind = str(raw or "").strip().lower()
+    if not kind:
+        return "advice"
+    return _KIND_ALIASES.get(kind, "advice")
 
 
 @dataclass
@@ -811,10 +1530,20 @@ class Suggestions:
     irrelevant: list[dict[str, Any]] = field(default_factory=list)
 
     @property
-    def alignment(self) -> int:
-        """可用于情境修正的建议条数。"""
+    def useful(self) -> list[dict[str, Any]]:
+        """真的能改变做法的那几条（阶段 E3：建议 / 新情况 / 愿意帮忙）。"""
 
-        return len(self.suggestions)
+        return [
+            item
+            for item in self.suggestions
+            if str(item.get("kind") or "") in CONTRIBUTION_ACTIONABLE
+        ]
+
+    @property
+    def alignment(self) -> int:
+        """可用于情境修正的条数：只有**真的改变做法**的才算。"""
+
+        return len(self.useful)
 
     @property
     def related(self) -> list[dict[str, Any]]:
@@ -874,14 +1603,18 @@ def parse_suggestions(text: str) -> Suggestions | None:
         point = _as_text(item.get("point") or item.get("text") or item.get("desc"), 100)
         if not point:
             continue
-        entry = {"from": _as_text(item.get("from") or item.get("who"), 24), "point": point}
-        kind = str(item.get("kind") or "suggestion").strip().lower()
-        if kind in ("tease", "joke", "heckle", "起哄"):
-            result.teasers.append(entry)
-        elif kind in ("cheer", "support", "打气"):
-            result.cheers.append(entry)
-        elif kind in ("irrelevant", "noise"):
-            result.irrelevant.append(entry)
+        entry = {
+            "from": _as_text(item.get("from") or item.get("who"), 24),
+            "point": point,
+            "kind": contribution_kind(item.get("kind") or item.get("type")),
+        }
+        if entry["kind"] in ("joke", "cheer", "unrelated"):
+            if entry["kind"] == "joke":
+                result.teasers.append(entry)
+            elif entry["kind"] == "cheer":
+                result.cheers.append(entry)
+            else:
+                result.irrelevant.append(entry)
         else:
             result.suggestions.append(entry)
     for item in list(payload.get("irrelevant") or []):
@@ -893,9 +1626,83 @@ def parse_suggestions(text: str) -> Suggestions | None:
                 {
                     "from": _as_text(item.get("from") or item.get("who"), 24),
                     "point": text_value,
+                    "kind": "unrelated",
                 }
             )
     if not (result.suggestions or result.teasers or result.cheers or result.irrelevant):
+        return None
+    return result
+
+
+def contribution_row(
+    item: dict[str, Any],
+    *,
+    event_id: str = "",
+    user_id: str = "",
+    user_name: str = "",
+    session_id: str = "",
+    step: int = 0,
+    revision: int = 0,
+    now: float = 0.0,
+    kind: str = "",
+) -> dict[str, Any]:
+    """把群友的一句话记成一条**可追溯**的贡献（阶段 E3 的"来源"要求）。
+
+    记下来源（哪件事、哪一幕、哪个版本、谁说的、在哪个会话）之后，迟到的话
+    才判得出来"它是对哪个版本的回应"，也才能不重复消费同一句。
+    """
+
+    return {
+        "kind": contribution_kind(kind or item.get("kind")),
+        "point": _as_text(item.get("point") or item.get("text"), 100),
+        "who": _as_text(user_id, 40),
+        "who_name": _as_text(user_name or item.get("from"), 24),
+        "session": _as_text(session_id, 60),
+        "event_id": _as_text(event_id, 40),
+        "step": max(0, int(step or 0)),
+        "revision": max(0, int(revision or 0)),
+        "at": float(now or 0.0),
+    }
+
+
+def contribution_digest(rows: list[dict[str, Any]] | None, *, limit: int = 3) -> str:
+    """一行摘要：谁出了什么主意（给日志和调试输出用）。"""
+
+    parts = []
+    for item in list(rows or [])[-limit:]:
+        if not isinstance(item, dict):
+            continue
+        label = CONTRIBUTION_LABELS.get(str(item.get("kind") or ""), "回应")
+        who = str(item.get("who_name") or item.get("who") or "有人")
+        point = " ".join(str(item.get("point") or "").split())[:40]
+        if point:
+            parts.append(f"{who}（{label}）：{point}")
+    return "；".join(parts)
+
+
+def suggestions_from_contributions(rows: list[dict[str, Any]] | None) -> "Suggestions | None":
+    """把记下来的贡献还原成一份 :class:`Suggestions`（短窗收集后再处理用）。"""
+
+    result = Suggestions()
+    for item in list(rows or []):
+        if not isinstance(item, dict):
+            continue
+        entry = {
+            "from": str(item.get("who_name") or item.get("who") or "有人"),
+            "point": str(item.get("point") or ""),
+            "kind": contribution_kind(item.get("kind")),
+        }
+        if not entry["point"]:
+            continue
+        if entry["kind"] == "joke":
+            result.teasers.append(entry)
+        elif entry["kind"] == "cheer":
+            result.cheers.append(entry)
+        elif entry["kind"] == "unrelated":
+            result.irrelevant.append(entry)
+        else:
+            result.suggestions.append(entry)
+    if not (result.suggestions or result.teasers or result.cheers):
         return None
     return result
 
@@ -923,16 +1730,194 @@ def new_thread(
         "place_name": package.place_name,
         "tier": package.tier,
         "mode": package.mode,
+        "span": package.span if package.span in EVENT_SPANS else SPAN_SCENE,
+        "exclusivity": (
+            package.exclusivity
+            if package.exclusivity in EVENT_EXCLUSIVITIES
+            else EXCLUSIVITY_AMBIENT
+        ),
         "opened_at": float(now),
         "updated_at": float(now),
         "closed_at": 0.0,
         "scope": scope if scope in (SCOPE_ACT, SCOPE_SESSION, SCOPE_DAY) else SCOPE_SESSION,
         "status": "open",
         "root": package.as_payload(),
+        "current_step": {},
+        "revision": 0,
+        "phase": PHASE_PROPOSED,
         "steps": [],
         "line": "",
         "next_step_at": 0.0,
     }
+
+
+# ---------------- 事件实例的状态机（阶段 E） ----------------
+#
+# 一件事（thread）从"刚冒出来"到"收尾"要经过几个阶段。**转换由代码负责**：
+# 模型只能提议，代码决定能不能走到下一步、要不要留期限、同一步不能提交两次。
+
+PHASE_PROPOSED = "proposed"
+PHASE_VALIDATED = "validated"
+PHASE_QUIET = "quiet"
+PHASE_INTRODUCED = "introduced"
+PHASE_DISCUSSING = "discussing"
+PHASE_COMMITTED = "committed"
+PHASE_EXECUTING = "executing"
+PHASE_OUTCOME_COMMITTED = "outcome_committed"
+PHASE_FOLLOWUP_READY = "followup_ready"
+PHASE_CLOSED = "closed"
+
+EVENT_PHASES: tuple[str, ...] = (
+    PHASE_PROPOSED,
+    PHASE_VALIDATED,
+    PHASE_QUIET,
+    PHASE_INTRODUCED,
+    PHASE_DISCUSSING,
+    PHASE_COMMITTED,
+    PHASE_EXECUTING,
+    PHASE_OUTCOME_COMMITTED,
+    PHASE_FOLLOWUP_READY,
+    PHASE_CLOSED,
+)
+
+# 允许的下一步：写死在这里，模型说"直接上"也得先经过中间阶段。
+PHASE_NEXT: dict[str, tuple[str, ...]] = {
+    PHASE_PROPOSED: (PHASE_VALIDATED, PHASE_QUIET, PHASE_DISCUSSING),
+    PHASE_VALIDATED: (PHASE_INTRODUCED, PHASE_QUIET, PHASE_DISCUSSING),
+    PHASE_QUIET: (PHASE_INTRODUCED, PHASE_DISCUSSING, PHASE_CLOSED),
+    PHASE_INTRODUCED: (PHASE_DISCUSSING, PHASE_COMMITTED, PHASE_QUIET, PHASE_CLOSED),
+    PHASE_DISCUSSING: (PHASE_COMMITTED, PHASE_QUIET, PHASE_CLOSED),
+    PHASE_COMMITTED: (PHASE_EXECUTING, PHASE_DISCUSSING, PHASE_CLOSED),
+    PHASE_EXECUTING: (PHASE_OUTCOME_COMMITTED, PHASE_CLOSED),
+    PHASE_OUTCOME_COMMITTED: (PHASE_FOLLOWUP_READY, PHASE_CLOSED),
+    PHASE_FOLLOWUP_READY: (PHASE_DISCUSSING, PHASE_CLOSED),
+    PHASE_CLOSED: (),
+}
+
+# 已经"定了"的阶段：进到这里之后，新的聊天输入只能讨论，不能改写结果。
+PHASE_SETTLED: tuple[str, ...] = (
+    PHASE_EXECUTING,
+    PHASE_OUTCOME_COMMITTED,
+    PHASE_FOLLOWUP_READY,
+    PHASE_CLOSED,
+)
+
+
+def thread_revision(thread: dict[str, Any] | None) -> int:
+    """这条线索是第几版（每换一幕 +1）。"""
+
+    try:
+        return int((thread or {}).get("revision") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def thread_phase(thread: dict[str, Any] | None) -> str:
+    """这条线索现在处在哪个阶段；老数据没写就按已有痕迹推断。"""
+
+    item = thread or {}
+    phase = str(item.get("phase") or "").strip()
+    if phase in EVENT_PHASES:
+        return phase
+    if str(item.get("status") or "open") != "open":
+        return PHASE_CLOSED
+    if list(item.get("steps") or []):
+        return PHASE_DISCUSSING
+    return PHASE_PROPOSED
+
+
+def phase_settled(thread: dict[str, Any] | None) -> bool:
+    """结果是否已经定了（定了之后迟到的话只能用来讨论，不能改写）。"""
+
+    return thread_phase(thread) in PHASE_SETTLED
+
+
+def advance_phase(thread: dict[str, Any], phase: str, *, now: float = 0.0) -> bool:
+    """把线索推进到 ``phase``。
+
+    幂等：已经在那个阶段就什么都不做（不改 revision、不动 updated_at）。
+    不允许的跳跃直接拒绝（返回 ``False``），由调用方决定要不要记一笔。
+    """
+
+    if not isinstance(thread, dict):
+        return False
+    target = str(phase or "").strip()
+    if target not in EVENT_PHASES:
+        return False
+    current = thread_phase(thread)
+    if target == current:
+        return False
+    allowed = PHASE_NEXT.get(current, ())
+    if target not in allowed:
+        return False
+    previous = thread.get("phase")
+    thread["phase"] = target
+    if previous != target:
+        thread["updated_at"] = float(now) if now else float(thread.get("updated_at") or 0.0)
+    if target == PHASE_CLOSED:
+        thread["status"] = "closed"
+        thread["closed_at"] = float(now) if now else float(thread.get("closed_at") or 0.0)
+        thread["pending_followup"] = ""
+        thread["next_step_at"] = 0.0
+    elif str(thread.get("status") or "open") != "open":
+        thread["status"] = "open"
+        thread["closed_at"] = 0.0
+    return True
+
+
+def set_current_step(
+    thread: dict[str, Any], package: EventPackage, *, now: float = 0.0
+) -> int:
+    """把"现在正在演的那一幕"换成 ``package``，并让 revision +1。
+
+    **``root`` 永远不动**：开局的前提是这件事的原始事实，后面每一幕都只是它的
+    一个当下切片。以前续线时直接覆盖 ``root``，于是"她当初到底遇到了什么"被
+    后来的一幕替换掉了，帮她的模型看到的前提也跟着变——这就是 E1 要修的那处。
+    """
+
+    if not isinstance(thread, dict) or package is None:
+        return thread_revision(thread)
+    thread["current_step"] = package.as_payload()
+    thread["revision"] = thread_revision(thread) + 1
+    thread["updated_at"] = float(now) if now else float(thread.get("updated_at") or 0.0)
+    return thread["revision"]
+
+
+def current_step_payload(thread: dict[str, Any] | None) -> dict[str, Any]:
+    """此刻那一幕的包；老数据没有 ``current_step`` 就回落到 ``root``。"""
+
+    item = thread or {}
+    payload = item.get("current_step")
+    if isinstance(payload, dict) and payload:
+        return dict(payload)
+    root = item.get("root")
+    return dict(root) if isinstance(root, dict) else {}
+
+
+def thread_deadline(thread: dict[str, Any] | None) -> float:
+    """这件事的期限（秒时间戳；0 = 没有期限）。"""
+
+    item = thread or {}
+    for key in ("deadline", "next_step_at"):
+        try:
+            value = float(item.get(key) or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            return value
+    return 0.0
+
+
+def set_thread_deadline(thread: dict[str, Any], when: float) -> None:
+    """给这件事定个期限：到点没进展就走"她自己拿主意"那条路。"""
+
+    if not isinstance(thread, dict):
+        return
+    try:
+        stamp = float(when or 0.0)
+    except (TypeError, ValueError):
+        stamp = 0.0
+    thread["deadline"] = stamp
 
 
 STEP_MAX_TEXT = 80
@@ -986,17 +1971,128 @@ def thread_digest(thread: dict[str, Any]) -> str:
     return "\n".join(line for line in lines if line.strip())
 
 
-def thread_exhausted(
-    thread: dict[str, Any], *, now: float, max_steps: int, max_minutes: float
-) -> bool:
-    """步数或时长到顶就必须收尾，不能无限连环。"""
+THREAD_OPEN = "open"
+THREAD_DORMANT = "dormant"
+THREAD_CLOSED = "closed"
 
-    if len(list(thread.get("steps") or [])) >= max(1, int(max_steps)):
+
+def thread_status(thread: dict[str, Any]) -> str:
+    if not isinstance(thread, dict):
+        return THREAD_CLOSED
+    return str(thread.get("status") or THREAD_OPEN).strip().lower()
+
+
+def thread_span(thread: dict[str, Any]) -> str:
+    """这条线索的跨度：线程自己记的那份优先，老存档回落到根事件包。"""
+
+    if not isinstance(thread, dict):
+        return SPAN_SCENE
+    for source in (thread, thread.get("root") or {}, thread.get("current_step") or {}):
+        if isinstance(source, dict):
+            value = str(source.get("span") or "").strip().lower()
+            if value in EVENT_SPANS:
+                return value
+    return SPAN_SCENE
+
+
+def thread_exclusivity(thread: dict[str, Any]) -> str:
+    """这条线索占不占全局槽：``exclusive`` 只能有一条，``ambient`` 可并存。"""
+
+    if not isinstance(thread, dict):
+        return EXCLUSIVITY_AMBIENT
+    for source in (thread, thread.get("root") or {}, thread.get("current_step") or {}):
+        if not isinstance(source, dict):
+            continue
+        value = str(source.get("exclusivity") or "").strip().lower()
+        if value in EVENT_EXCLUSIVITIES:
+            return value
+        if source.get("exclusive") is True:
+            return EXCLUSIVITY_EXCLUSIVE
+    return EXCLUSIVITY_AMBIENT
+
+
+def thread_exclusive(thread: dict[str, Any]) -> bool:
+    return thread_exclusivity(thread) == EXCLUSIVITY_EXCLUSIVE
+
+
+def thread_alive(thread: dict[str, Any]) -> bool:
+    """还占着她心里的位置吗：``open`` 和 ``dormant``（睡着等下次唤醒）都算。"""
+
+    return thread_status(thread) in (THREAD_OPEN, THREAD_DORMANT)
+
+
+def live_threads(threads: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    return [item for item in list(threads or []) if isinstance(item, dict) and thread_alive(item)]
+
+
+def thread_exhausted(
+    thread: dict[str, Any],
+    *,
+    now: float,
+    max_steps: int | None = None,
+    max_minutes: float | None = None,
+    span: str = "",
+) -> bool:
+    """步数或时长到顶就必须收尾，不能无限连环。
+
+    ``span`` 缺省时按线索自己记的那档取上限（``SPAN_MAX_STEPS`` /
+    ``SPAN_MAX_MINUTES``）；显式给了 ``max_steps`` / ``max_minutes`` 就用给的
+    （配置项优先，老调用点照旧传 6 / 120 也不会变）。
+    """
+
+    if not isinstance(thread, dict):
+        return True
+    span = span if span in EVENT_SPANS else thread_span(thread)
+    steps_limit = int(max_steps) if max_steps else SPAN_MAX_STEPS.get(span, 6)
+    minutes_limit = float(max_minutes) if max_minutes else SPAN_MAX_MINUTES.get(span, 120.0)
+    if len(list(thread.get("steps") or [])) >= max(1, steps_limit):
         return True
     opened = float(thread.get("opened_at") or 0.0)
-    if opened > 0 and max_minutes > 0:
-        return (float(now) - opened) >= max_minutes * 60.0
+    if opened > 0 and minutes_limit > 0:
+        return (float(now) - opened) >= minutes_limit * 60.0
     return False
+
+
+def _uniform(rng: Any, low: float, high: float) -> float:
+    """取一个 [low, high) 的随机数；注入的假 rng 没有 uniform 就取中值。"""
+
+    fn = getattr(rng, "uniform", None)
+    if callable(fn):
+        try:
+            return float(fn(float(low), float(high)))
+        except Exception:  # 假 rng 抛错不该让一整步挂掉
+            pass
+    return (float(low) + float(high)) / 2.0
+
+
+def span_gap_seconds(
+    span: str,
+    *,
+    base_gap: float = 60.0,
+    asked_gap: float = 0.0,
+    rng: Any = None,
+) -> float:
+    """这一步之后隔多久再推进（秒）。
+
+    跨度越小节奏越快：``scene`` 用 ``step_gap_seconds``，``hours`` 30–90 分钟，
+    ``days`` 大约一天一次（带抖动，免得像定时器）。每档都有下限（防刷），
+    模型给的 ``next_gap`` 只在区间内生效。
+    """
+
+    span = span if span in EVENT_SPANS else SPAN_SCENE
+    minimum = float(SPAN_MIN_GAP_SECONDS.get(span, 0.0))
+    if span == SPAN_SCENE:
+        gap = max(float(base_gap or 0.0), minimum)
+        if asked_gap and float(asked_gap) > 0:
+            gap = max(gap, min(float(asked_gap), 360.0 * 3600.0))
+        return max(1.0, gap)
+    if span == SPAN_HOURS:
+        low, high, cap = 30.0 * 60.0, 90.0 * 60.0, 6.0 * 3600.0
+    else:
+        low, high, cap = 20.0 * 3600.0, 28.0 * 3600.0, 24.0 * 3600.0
+    if asked_gap and float(asked_gap) > 0:
+        return max(minimum, min(float(asked_gap), cap))
+    return max(minimum, _uniform(rng, low, high))
 
 
 def open_threads(threads: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -1005,3 +2101,102 @@ def open_threads(threads: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
         for item in list(threads or [])
         if isinstance(item, dict) and str(item.get("status") or "open") == "open"
     ]
+
+
+# ---------------- 触发加权（T15-S2） ----------------
+#
+# 一次事件候选的权重 = 基础频率 × 地点 × 她正在干的事 × 未兑现的伏笔 × 独占冲突。
+# 全是纯函数：引擎只把世界状态翻译成标签 / 计数，排序方向可以单独测。
+
+
+PLACE_WEIGHTS = {
+    "厨房": 3.0,
+    "浴室": 3.0,
+    "街道": 1.0,
+}
+
+ACTION_WEIGHTS = {
+    "做饭": 3.0,
+    "洗澡": 3.0,
+    "睡觉": 0.3,
+    "通勤": 2.0,
+}
+
+
+def place_factor(*labels: Any) -> float:
+    """地点系数：在厨房 / 浴室容易出事，街道和其它地方维持 1。"""
+
+    for label in labels:
+        text = str(label or "").strip()
+        if not text:
+            continue
+        for key, value in PLACE_WEIGHTS.items():
+            if key in text:
+                return float(value)
+    return 1.0
+
+
+def action_factor(*labels: Any) -> float:
+    """她正在做的事的系数：做饭 / 洗澡最容易被打断，睡觉时基本别出事。"""
+
+    for label in labels:
+        text = str(label or "").strip()
+        if not text:
+            continue
+        for key, value in ACTION_WEIGHTS.items():
+            if key in text:
+                return float(value)
+    return 1.0
+
+
+def unresolved_factor(
+    *,
+    pending_followups: int = 0,
+    promised_hours: float = 0.0,
+    self_topics: int = 0,
+) -> float:
+    """没兑现的伏笔抬权重：有挂着的下一步 ×3，承诺超过 24 小时没回 ×4，自己的话题 ×2。"""
+
+    factor = 1.0
+    if int(pending_followups) > 0:
+        factor *= 3.0
+    if float(promised_hours) >= 24.0:
+        factor *= 4.0
+    if int(self_topics) > 0:
+        factor *= 2.0
+    return min(factor, 24.0)
+
+
+def conflict_factor(*, exclusive_active: bool = False, related: bool = False) -> float:
+    """独占进行中，跟它无关的事降频（×0.2），相关的照常。"""
+
+    if exclusive_active and not related:
+        return 0.2
+    return 1.0
+
+
+def ambient_dampen_factor(*, exclusive_active: bool = False) -> float:
+    """独占进行中，别的事整体再降频（×1/3）——一山不容二虎。"""
+
+    return (1.0 / 3.0) if exclusive_active else 1.0
+
+
+def event_weight(
+    *,
+    tier_rate: float,
+    place: float = 1.0,
+    action: float = 1.0,
+    unresolved: float = 1.0,
+    conflict: float = 1.0,
+) -> float:
+    """一次候选的权重；负数一律当 0（权重不能是负的）。"""
+
+    weight = (
+        float(tier_rate)
+        * float(place)
+        * float(action)
+        * float(unresolved)
+        * float(conflict)
+    )
+    return max(0.0, weight)
+

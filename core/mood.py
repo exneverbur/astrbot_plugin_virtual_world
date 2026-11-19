@@ -514,6 +514,10 @@ BORED_LABEL = 0.7
 CURIOUS_LABEL = 0.8
 DESIRE_LABEL = 0.7
 TIRED_LABEL = 0.3
+"""困意（``sleep_pressure``）过了这条线才是「困倦」。"""
+
+WEARY_LABEL = 0.3
+"""精力低于这条线是「没劲」——累了不等于困，两者不再共用一个修饰词。"""
 
 
 def desire_text(value: float) -> str:
@@ -552,6 +556,7 @@ def mood_label(
     valence: float,
     *,
     energy: float = 0.5,
+    sleep_pressure: float | None = None,
     loneliness: float | None = None,
     boredom: float | None = None,
     curiosity: float | None = None,
@@ -561,8 +566,13 @@ def mood_label(
 ) -> str:
     """给状态页和提示词看的心情标签：格子词 + 修饰（+ 来源）。
 
-    修饰来自"别的维度也明显地怎么样了"（困、想找人、闲得发慌、心痒），
+    修饰来自"别的维度也明显地怎么样了"（困、没劲、想找人、闲得发慌、心痒），
     来源是最近一次让情绪变化的事（``cause``），过期后自动不显示。
+
+    **困与没劲分开**：``sleep_pressure`` 过 ``TIRED_LABEL`` 才叫「困倦」，
+    精力过 ``WEARY_LABEL`` 只说「没劲」——累了不等于困（用户要求：精力是活动能力，
+    困意才是睡意）。老调用方不给 ``sleep_pressure`` 时就不再报「困倦」（那时无从判断困意，
+    宁可只说「没劲」，也不要拿精力冒充困意）。
 
     ``vague`` 是「模糊档」：这一天的基调就是"说不上来"时，本来就写着
     "说不上好坏"的那几格（见 ``VAGUE_CELLS``）换成这个词——她照样有起伏，
@@ -573,8 +583,11 @@ def mood_label(
     if vague and cell.key in VAGUE_CELLS:
         cell = StyleCell(key=cell.key, mood=vague, style=cell.style, say_limit=cell.say_limit)
     modifiers: list[str] = []
-    if float(energy if energy is not None else 0.5) < TIRED_LABEL:
+    energy_value = float(energy if energy is not None else 0.5)
+    if sleep_pressure is not None and float(sleep_pressure) >= TIRED_LABEL:
         modifiers.append("困倦")
+    if energy_value < WEARY_LABEL:
+        modifiers.append("没劲")
     if loneliness is not None and float(loneliness) >= LONELY_LABEL:
         modifiers.append("想找人" if float(valence or 0.5) >= 0.4 else "有点被晾着")
     if boredom is not None and float(boredom) >= BORED_LABEL:

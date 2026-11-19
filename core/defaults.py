@@ -36,7 +36,9 @@ DEFAULT_SLEEP_DELAY_WORDS = (
 # 图片转述模型的默认提示词（在「全局设置 → 图片转述」里可以改）。
 # 除了画面本身，还要认出「这是不是表情包」——接梗图接错比接不上更尴尬。
 # 「看图」提示词：只描述图片本身，**不写**与话题的关系——
-# 关系由下面那段纯文本提示词单独生成，这样这段结果可以跨话题复用（缓存）。
+# 这样结果与话题无关，可以按图片指纹缓存、跨话题复用。
+# （2026-10-21 删掉了"再补一句与话题的关系"那一步：真机上一半以上是"看不出直接关系"，
+# 却每批多一次纯文本调用；相关性交给主模型自己判断。）
 DEFAULT_CAPTION_PROMPT = (
     "你是群聊图片转述器，只把图片转成一行中文，供没有多模态能力的主模型接话。"
     "只输出一行，不换行、不分点、不客套、不写「这张图片」、不编造看不到的内容。\n"
@@ -52,17 +54,6 @@ DEFAULT_CAPTION_PROMPT = (
     "**别在「文字」里写画面描述、场景想象或你的推断**。"
     "文字里禁止出现「｜」和换行，用逗号或空格代替。\n"
     "不要写这张图和话题的关系——那部分由另一段提示词单独生成。"
-)
-
-# 「关系」提示词：输入是上一步的文字转述 + 当前消息 + 最近群聊，**不带图**。
-DEFAULT_CAPTION_RELATION_PROMPT = (
-    "你会拿到图片的文字转述，以及机器人收到的那条消息和最近群聊。"
-    "你不需要看图，只判断这张图和正在聊的事有什么关系。\n"
-    "**只有一张图**：只输出一行，格式固定：与话题的关系：…（不要写「图1：」）。\n"
-    "**多张图**：每张各一行，**只**以「图1：」「图2：」开头，"
-    "后面直接写关系本身——**不要再写一次「与话题的关系」这几个字**。\n"
-    "说清这张图在回应什么、和大家聊的事有什么关联；看不出直接关系就写「看不出直接关系」。"
-    "不要复述画面描述、不要客套、不要分点。"
 )
 
 # 天气归一化提示词：输入可能是天气工具返回的一段文字，也可能是天气图的转述结果。
@@ -85,6 +76,92 @@ DEFAULT_FORWARD_PROMPT = (
     "图里的内容（画面、图上的字）如果和话题有关就写进去，用「图1」指代。\n"
     "用一句话到几句话讲明白，不分段、不换行；读不出重点就直接说这段记录没什么实质内容。"
 )
+
+DEFAULT_AGENT_MAX_STEPS = 32
+"""她一次任务最多**做成**多少步（一次工具调用算一步）。
+
+为什么是 32 而不是 128（用户 2026-10-22 定）：真机上 ``world.json`` 里还留着最初
+那版默认值 5，复杂点的活（先查再写、写完再装）走两步就到头，看起来像"工具调用次数
+被限死了"；而一步一调模型，128 步的 token 成本又没人愿意买单。32 步够做完一件像样的
+事，也就上下可预期。配置层照旧可改，迁移只认"等于旧默认 5"的那一份。
+
+放在 ``defaults.py`` 里而不是 ``models.py``：``models`` 反过来 import ``defaults``
+（提示词常量在那边），常量放这里才不会绕成循环。
+"""
+
+# {{{ 单一真源：这几段的默认值只认 core/models.py 里那个配置模型
+#
+# T1（用户 2026-10-24）踩到的坑：``world.json`` 的 ``storage`` 段只有 9 个键，
+# 后加的 ``vacuum_enabled`` / ``vacuum_pages_per_run`` / ``notify_write_failure``
+# 永远补不上去——因为 T1 回填只认 ``default_world()`` 里存在的键，而这几段以前是
+# 手写死在下面那个静态 dict 里的。静态 dict 与模型默认值就是"两份真源"，新字段
+# 只加在模型上时，盘上永远落后一版。
+#
+# 现在反过来：段名 → 模型类名，默认值由模型的默认实例派生（``_section_from_model``），
+# 键集合 = 字段集合，所以模型里新加一个字段，下次启动 ``default_world()`` 就有它，
+# T1 回填才会把它写进 ``world.json``。``DEFAULT_WORLD`` 里同名的手写段即使还在，
+# 也**只作为档位/注释的历史参考，运行时一律被派生值覆盖**（以模型为准，含冲突项）。
+_SECTION_MODELS: dict[str, str] = {
+    "storage": "StorageConfig",
+    "memory": "MemoryConfig",
+    "temp_session": "TempSessionConfig",
+    "meme_send_scale": "MemeSendScaleConfig",
+    "meme_collect": "MemeCollectConfig",
+    "agent": "AgentConfig",
+    "history": "HistoryConfig",
+    "events": "EventConfig",
+    "knowledge": "KnowledgeConfig",
+}
+"""``default_world()`` 里由配置模型派生的段：段名 → ``core/models.py`` 的类名。"""
+
+
+def _section_from_model(model_cls: type) -> dict[str, Any]:
+    """按配置模型的**默认实例**生成一个默认段：键 = 字段名，值 = 默认值。
+
+    只用 ``model_fields``（不用 ``model_dump``）是为了把「哪些键算这一段」焊死在
+    字段表上；嵌套模型递归展开，列表里包着的模型也展开，返回值一律是 JSON 能写的
+    纯数据（``world.json`` 直接落盘，不留 pydantic 对象）。
+    """
+
+    instance = model_cls()
+    section: dict[str, Any] = {}
+    for name in model_cls.model_fields:
+        section[name] = _plain_default(getattr(instance, name))
+    return section
+
+
+def _plain_default(value: Any) -> Any:
+    """把默认值转成纯数据：模型递归成 dict，列表 / 元组逐项转，其余深拷贝。"""
+
+    if hasattr(type(value), "model_fields"):
+        return _section_from_model(type(value))
+    if isinstance(value, dict):
+        return {key: _plain_default(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_default(item) for item in value]
+    return copy.deepcopy(value)
+
+
+def model_section_defaults() -> dict[str, Any]:
+    """``_SECTION_MODELS`` 里那几段的默认值（每次现算，调用方随便改）。
+
+    延迟 import：``core/models.py`` 反过来 import 本模块的提示词常量，模块级
+    import 会绕成循环。
+    """
+
+    from . import models as config_models  # noqa: PLC0415
+
+    sections: dict[str, Any] = {}
+    for name, class_name in _SECTION_MODELS.items():
+        model_cls = getattr(config_models, class_name, None)
+        if model_cls is None:  # 模型改名 / 删了：这一段退回静态 dict，不炸启动
+            continue
+        sections[name] = _section_from_model(model_cls)
+    return sections
+
+
+# }}}
+
 
 DEFAULT_WORLD: dict[str, Any] = {
     "world_id": "default",
@@ -151,6 +228,9 @@ DEFAULT_WORLD: dict[str, Any] = {
         "cooldown_after_unanswered": 120,
         "halve_on_cooldown_end": True,
         "after_reply_cooldown_minutes": 10,
+        "burst_window_seconds": 180,
+        "burst_busy_messages": 12,
+        "burst_quiet_messages": 1,
     },
     "nickname_sync": {
         "enabled": True,
@@ -226,21 +306,56 @@ DEFAULT_WORLD: dict[str, Any] = {
     # 说话的节奏：分段之间的打字停顿，以及"话太密"的判定
     "reply_style": {
         "typing_delay_enabled": True,
-        "typing_delay_per_char": 0.03,
-        "typing_delay_max": 2.5,
+        "typing_delay_per_char": 0.16,
+        "typing_delay_max": 5.0,
         "dense_window_minutes": 10,
         "dense_max_lines": 4,
+    },
+    # 追问（用户 m27236 / m28281）：她说了句在等回话的话，等 3 分钟没人接就再问一句，
+    # 最多一次（用户 2026-10-26：追问太啰嗦，别每句都追、也别几分钟就回来追）；
+    # 要不要等由模型写在回话的 expects_reply 里，不靠字面判断。
+    "follow_up": {
+        "enabled": True,
+        "wait_minutes": 3.0,
+        "max_times": 1,
     },
     # 图片转述：交给多模态模型的那段提示词（留空则用内置默认）
     "vision": {
         "prompt": DEFAULT_CAPTION_PROMPT,
-        "relation_prompt": DEFAULT_CAPTION_RELATION_PROMPT,
-        # 看图（多模态、贵）只做一次并缓存；关系分析是纯文本、每次现算
-        "relation_enabled": True,
+        # 看图（多模态、贵）只做一次并缓存
         # 同一张图只识别一次：表情包/梗图会反复出现，按图片指纹缓存、重启后仍在
         "cache_enabled": True,
         "cache_max": 500,
         "cache_days": 30,
+    },
+    # 媒体资产（阶段B）：图存一份在本地，按内容寻址复用（见 core/media_store.py）
+    "media": {
+        "enabled": True,
+        "max_file_mb": 10.0,
+        "max_total_mb": 512.0,
+        "retention_days": 14.0,
+        "keep_entries": 5000,
+        "download_concurrency": 4,
+        "fetch_timeout_seconds": 30.0,
+        "max_per_round": 4,
+    },
+    # 联网搜索（用户 m10393）：从动作里搬到全局一份，动作本身藏起来由我们维护。
+    # 这些值与 search_web 原来的默认行为一致，所以老存档升级后表现不变。
+    "search": {
+        "enabled": True,
+        "tool_names": [],
+        "reader_tool_names": [],
+        "tool_mode": "sequence",
+        "depth": "standard",
+        "depth_max": "deep",
+        "max_queries": 3,
+        "max_reads": 2,
+        "rounds": 1,
+        "freshness_days": 365,
+        "budget_seconds": 20.0,
+        "topic": "",
+        "query_template": "",
+        "cite": True,
     },
     # 天气：全局共享一份，按需静默刷新，写进提示词也画在编辑器地图页顶部
     "weather": {
@@ -280,6 +395,11 @@ DEFAULT_WORLD: dict[str, Any] = {
         "presence_affinity": 0.05,
         "presence_cooldown_minutes": 10,
         "presence_daily_max": 2.0,
+        "dm_send_enabled": True,
+        "dm_session_template": "",
+        "dm_daily_max": 3,
+        # 主动发言不落 WebUI 测试会话（线上那回 25/35 段进了 webchat 私聊）
+        "allow_webchat_target": False,
         "affinity_decay_per_day": 0.2,
         "digest_chars": 60,
         "digest_limit": 5,
@@ -298,7 +418,8 @@ DEFAULT_WORLD: dict[str, Any] = {
         "miss_push_daily_max": 2,
         "call_name_blacklist": [],
         "bond_conflict_policy": "reject",
-        "default_bond": "陌生人",
+        "default_bond": "群友",
+        "bond_chosen": True,
         # 关系类型 → 亲密度的下限 / 上限（都是 level 的下标）。
         # floor 是"关系本身带来的态度"：绑成男友之后，好感还没养起来也该能抱抱；
         # cap 是"上限"：普通关系聊再久也上不去，只有关系本身升级才会放宽。
@@ -392,6 +513,186 @@ DEFAULT_WORLD: dict[str, Any] = {
                 "prompt": "他是你最特别的人：亲昵动作都可以，会吃醋、会闹脾气、也会主动找他。",
             },
         ],
+    },
+    # 表达变奏（阶段 G）：只改说法，不动 mood / 好感 / 关系数值。
+    # 默认开着、力度上限给到"大"——判定不过时她会自动退回直答，所以放开上限不是风险。
+    "variation": {
+        "enabled": True,
+        "rate": 0.15,
+        "min_gap_turns": 3,
+        "magnitude": "strong",
+    },
+    # 话题层（T12 Step 3 / E2）：闲聊里她可以把话拐到自己身上——但必须给下文或明确放下。
+    # 正经事/求助/急事/有失败动作的回合一律不拐；冷却与每日上限按人落 state。
+    # 想整条关掉就把 enabled 写 false：提示词、解析、tick 钩子一起退回改动前。
+    "topic_steer": {
+        "enabled": True,
+        "cooldown_turns": 5,
+        "daily_cap": 2,
+        "follow_ticks": 2,
+        "drop_ticks": 3,
+    },
+    # 回复格式（用户 2026-10-26）：回话轮的 JSON 被新字段撑复杂了，性格被压平。
+    # legacy=True（默认）＝提示词里只要求 request，其余五个新字段逐字不出现；
+    # 写 false 就换回 2026-10-26 那版完整 schema。解析/落库/变奏一行都不受影响。
+    "reply_schema": {
+        "legacy": True,
+    },
+    # 分层候选（阶段 D）：先硬过滤，再按目的分层展开，最后带 seed 加权抽样。
+    # **默认关**（用户 m26298：退回旧的规则顺序——她只做插话/睡觉/查东西/发呆/出门这几件，
+    # 不再从"当前地点所有启用动作"里随手抽，拍照、自己解决这类不会再冒出来）。
+    # 想开就在「全局设置 → 说话与决策 → 分层候选」勾上。
+    "action_selection": {
+        "enabled": False,
+        "top_k": 4,
+        "near_radius": 2,
+        "expand_limit": 3,
+        # 同类冷却：刚指挥过外部插件（拍照/拍腿/自拍这类），30 分钟内不再抽指挥型动作。
+        # 用户 m25880：一会儿拍腿、一会儿拍自己，连着三次；写 0 = 关掉。
+        "command_quiet_minutes": 30,
+    },
+    # 无聊上网池（T20）：默认开着；池子成员由各动作自己的 ``idle_activity`` 声明。
+    # 这一节要留在默认世界里，老 ``world.json`` 才能在加载时回填出
+    # ``during_cooldown``——它是「冷却期也做独处活动」的回滚开关。
+    "boredom_online": {
+        "enabled": True,
+        "during_cooldown": True,
+        "min_boredom": 0.55,
+        "min_gap_minutes": 20.0,
+    },
+    # 群友的回应（阶段 E3）：分类留痕、有界追问、真正改变做法才算数。
+    # 收话短窗默认 120 秒：群里帮她出主意常常是连着几句，攒一小会儿一起听。
+    "contributions": {
+        "max_rounds": 3,
+        "window_seconds": 120,
+        "keep_rounds": 12,
+    },
+    # 睡眠整理（阶段F）：按登记序号做增量作业，一次作业一个事务。
+    # 旧世界没这两节时按缺省补上（mode 默认就走新路径；legacy 是回退开关）。
+    "consolidation": {
+        "mode": "incremental_jobs",
+        "window": 200,
+        "jobs_per_sleep": 4,
+        "max_attempts": 3,
+        "keep_jobs": 40,
+    },
+    # 梦（阶段F4）：默认开着——梦只是低权重素材，不算事实、不做关系证据。
+    "dream": {
+        "enabled": True,
+        "chance": 0.3,
+        "keep": 30,
+    },
+    # 表情包系统（阶段 M1）：收藏、展示、可用状态与管理页。
+    # 默认开着：默认值刻意保守——一轮最多自己发一张、一轮最多搜一次、
+    # 预热总预算 500 毫秒。M1 只落字段与默认值，行为由 M2 接上。
+    "meme": {
+        "enabled": True,
+        # 收图没有"看到就全收"这一档（用户 2026-10-29）：只有 meme_collect 的
+        # 攒池 -> 拼图评审 -> 通过才收藏。
+        "max_prompt_images": 10,
+        "meme_image_max": 5,
+        "prefetch_enabled": True,
+        "retrieval_mode": "auto",
+        "embedding_provider_id": "",
+        "prefetch_candidate_count": 3,
+        "search_candidate_count": 5,
+        "max_candidate_images_per_prompt": 5,
+        "max_candidate_preview_bytes": 1000000,
+        "max_asset_bytes": 10000000,
+        "exposure_keep_days": 30,
+        "recent_context_messages": 6,
+        "query_max_chars": 1200,
+        "prefetch_total_budget_ms": 500,
+        "max_search_rounds_per_reply": 1,
+        "max_send_per_reply": 1,
+        "send_meme_per_hour": 20,
+        "max_send_per_day": 100,
+        "repeat_cooldown": 0,
+        "recent_use_window": 20,
+        "max_asset_frames": 200,
+        "storage_quota_bytes": 500000000,
+    },
+    # 攒一波"她看到过的图"再评审收进收藏（用户 2026-10-24）：每张图按概率入池，
+    # 攒够 min_batch 张才拼 3×3 拼图、一次调用决定收哪些。开着也只在空闲 tick 里跑，
+    # 不占回复延迟；关掉时连聊天里的 collect_meme 动作行一起消失。
+    "meme_collect": {
+        "enabled": True,
+        "batch_probability": 0.35,
+        "min_batch": 6,
+        "max_batch": 18,
+        "review_interval_hours": 12.0,
+        "max_reviews_per_day": 3,
+        "sheet_size": 9,
+        "candidate_ttl_days": 7.0,
+    },
+    # 谈资（阶段 C）：经历做成可查看/可编辑的素材，并按"这个会话说没说过这一版"去重。
+    # 默认开着——她经历过的事本来就该记得；要不要开口仍由她自己决定。
+    "topics": {
+        # settings_version = 2：多了 retrieval 段（老配置按 1 迁移，写回时带 2）。
+        "settings_version": 2,
+        "retrieval": {
+            "candidate_limit": 12,
+            "context_topic_limit": 2,
+            "query_total_budget_seconds": 6.0,
+            "request_timeout_seconds": 5.0,
+            "index_request_timeout_seconds": 20.0,
+            "index_batch_seconds": 30,
+            "index_batch_size": 16,
+            "prefetch_enabled": True,
+            "prefetch_interval_seconds": 300.0,
+            "prefetch_ttl_seconds": 900.0,
+            "max_steps": 5,
+        },
+        "overrides": {name: {"mode": "auto"} for name in
+                      ("recall_limit", "proactive_limit", "proactive_min_importance",
+                       "share_purpose_weight", "experience_willingness", "expression_length")},
+        "enabled": True,
+        "claim_ttl_seconds": 120.0,
+        "proactive_limit": 1,
+        "recall_limit": 3,
+        "proactive_min_importance": 0.5,
+        # T8-2：一天最多主动外发几条谈资（0 = 不限）。问到才说的不算。
+        "topic_daily_share_limit": 2,
+    },
+    # agent（自主能力）：以前这六个键在 AstrBot 的插件配置里（agent_*），现在跟着
+    # 世界配置一起存、在编辑器里改。B3 落执行器时补上它**自己的**预算：这几项以前
+    # 只有 topics.retrieval 一份，Agent 页显示的和执行器实际用的不是一回事
+    # （接线后先读 agent 自己的、缺了再回退 retrieval）。默认值刻意保守。
+    "agent": {
+        "provider_id": "",
+        "enabled": False,
+        "history_lookup_enabled": False,
+        "artifact_generation_enabled": False,
+        "file_send_enabled": False,
+        "code_execution_enabled": False,
+        "research_enabled": True,
+        # 插件工坊（用户 m31581）：写草稿与自装都默认关——"给她造新能力"这件事
+        # 该由人先点头。开了写草稿只是往 plugin_data/drafts 里放文件，真装进宿主
+        # 还要再开 plugin_forge_auto_install，或者由人在页面上按"装上"。
+        "plugin_forge_enabled": False,
+        "plugin_forge_auto_install": False,
+        # 主人裁决（用户 m31581）：非主人提的"麻烦事"先问主人一句。默认开，
+        # 因为默认放行等于让群里任何人都能让她去装插件、改配置。
+        "owner_approval_enabled": True,
+        "owner_user_id": "",
+        # A6：只读详情入口的独立开关（**平铺 bool**，不是带 enabled 的段——所以
+        # 它不该、也没有进编辑器向导的「功能总开关」那张表）。默认关：关了与
+        # "没有这个能力"完全一样。
+        "inspect_capability_enabled": False,
+        # 一次任务最多做成多少步（用户 2026-10-22：5 步太短、128 步太贵，取 32）。
+        # 计数口径是"做成的步"，失败的步不占额度；上限之外另有一道尝试次数闸。
+        "max_steps": DEFAULT_AGENT_MAX_STEPS,
+        # 时间预算：「一次等她回话」的上限，不是「整件事多久」的上限。
+        # 以前默认 6 秒 / 5 秒——一次带工具清单的规划请求刚发出去就被掐了，
+        # 任务必然落「想下一步的时候超时」，看着像功能坏了，其实是预算不够。
+        # 现在：单次请求 60 秒（够一次真模型回话 + 一次工具调用），整件事 10 分钟
+        # （用户 m25774：180 秒还是太短，写一份东西、跑几步工具根本不够）。
+        "query_total_seconds": 600.0,
+        "request_timeout_seconds": 60.0,
+        "tasks_per_hour": 3,
+        "code_runs_per_task": 0,
+        "artifact_max_bytes": 5000000,
+        "artifact_keep_days": 7,
     },
     "zones": [
         {
@@ -525,7 +826,7 @@ DEFAULT_WORLD: dict[str, Any] = {
             "y": 60,
             "icon": "book",
             "color": "#4C8BF5",
-            "prompt": "堆着书和旧笔记，桌上有一台电脑。适合看书、上网、想事情。",
+            "prompt": "堆着书和旧笔记，窗边有张旧书桌。安静，适合看书、想事情。",
             "nickname_text": "在书房",
             "atmosphere": {
                 "calm": 0.7,
@@ -752,7 +1053,7 @@ DEFAULT_WORLD: dict[str, Any] = {
             "y": 60,
             "icon": "book",
             "color": "#5C9E7E",
-            "prompt": "书架很高，只有翻书声和空调声；角落里有几台公共电脑能查资料。",
+            "prompt": "书架很高，只有翻书声和空调声；靠窗有几张长桌，坐一下午也没人赶。",
             "nickname_text": "在图书馆",
             "atmosphere": {
                 "calm": 0.8,
@@ -1049,6 +1350,56 @@ DEFAULT_WORLD: dict[str, Any] = {
                 '{"type":"remember","params":{"user":"2692047521","text":"爱喝冰美式，不加糖",'
                 '"evidence":"今天又灌了一杯冰美式","kind":"喜好"}}。'
                 "**写完不用再说什么**：想顺口提一句就另外写一个 say。"
+            ),
+        },
+        {
+            # 用户 2026-10-26：「我 agent 功能都开着的，但她只要不调 agent 就查不到吧？
+            # 能不能做成内置动作」——原来「翻聊天记录」只在 agent 档里注册
+            # （core/agent_tools.py 的 vw_history_lookup），既要开「开启Agent功能」+
+            # 「允许她查历史」，还得真去跑一个任务。做成内置动作之后她任何一轮都能
+            # 自己翻一次；查库与成文与那条工具链共用 Engine._history_lookup_text，
+            # 口径（必须有由头 / 窗口 ≤30 天 / 条数 ≤50 / 总字数 ≤2400）完全一样。
+            #
+            # 开关是 world.history.lookup_action_enabled：关掉时这个动作**不注册**
+            # （提示词不列、解析白名单不收，见 Engine._hidden_actions），而不是注册后报错。
+            "id": "lookup_history",
+            "builtin": True,
+            "name": "翻聊天记录",
+            "category": "instant",
+            # 引擎自己执行（长得像工具型，但一个 AstrBot 工具都不调）：工具清单留空，
+            # _start_action 里它在 llm_level == "tool" 那一支之前就 return 了。
+            "llm_level": "tool",
+            "scope": "global",
+            "target_type": "none",
+            "duration": 0,
+            "visible": True,
+            "preconditions": {},
+            "priority": 4,
+            "on_complete": {"trigger": "none"},
+            "params": {
+                "keyword": {
+                    "type": "string",
+                    "required": False,
+                    "description": "要找什么：人名、话题、某句话里的几个字都行（不给她就只能按时间范围翻）",
+                },
+                "days": {
+                    "type": "number",
+                    "required": False,
+                    "description": "往回翻几天（不给按 world.history.default_days，最多 30 天）",
+                },
+                "limit": {
+                    "type": "integer",
+                    "required": False,
+                    "description": "最多几条（不给按 20，最多 world.history.max_rows，硬上限 50）",
+                },
+            },
+            "description": (
+                "翻**这个会话自己的**聊天记录（只读，不会改任何东西）。"
+                "对方说「之前说过 / 上次 / 那天 / 你忘了」而你不确定的时候用它："
+                "给个关键词（params.keyword），或者给个时间范围（params.days）。"
+                "翻到的原文片段会拿回来给你，你再按自己的话说，别整段照念；"
+                "翻不到就照实说没翻到，别编。"
+                "**没有由头的「把聊天记录都给我看看」会被拒**——那就问他按什么找。"
             ),
         },
         {
@@ -1622,7 +1973,7 @@ DEFAULT_WORLD: dict[str, Any] = {
             "llm_level": "template",
             "scope": "global",
             "target_type": "user",
-            "template": "（{bot}把吃得到{user}嘴边）",
+            "template": "（{bot}把吃的递到{user}嘴边）",
             "desc_mode": "brief",
             "visible": True,
             "priority": 4,
@@ -1708,7 +2059,7 @@ DEFAULT_WORLD: dict[str, Any] = {
             "visible": False,
             "priority": 8,
             "description": (
-                "睡一整晚恢复精力（约 8 小时，夜里或凌晨、实在撑不住时用），需要先回到卧室。"
+                "睡一整晚恢复精力（约 8 小时，夜里或凌晨、困得撑不住时用），需要先回到卧室。"
                 "白天只是犯困就小睡一会儿，别在白天睡整觉。"
             ),
         },
@@ -2197,14 +2548,14 @@ DEFAULT_WORLD: dict[str, Any] = {
             "on_complete": {
                 "trigger": "llm_followup",
                 "prompt_hint": (
-                    "说你刚在看什么、看到哪、什么感受——**剧名（可以自己起）、人物或剧情要讲出来**，"
-                    "别人得知道你看的到底是什么；上面「在看什么」里已经有剧名就接着往下说，"
-                    "没有就这会儿定下来。别只来一句「这剧情真离谱」"
+                    "可以自然提剧名和看到第几集，但别报清单、别念进度条"
                 ),
                 "effects_per_minute": {"boredom": "-0.004", "curiosity": "-0.0006"},
             },
             "state_slot": "watching",
             "state_label": "在看的剧",
+            # VW-T19：12 小时没更新就不再注入（一次看剧最多 2 小时，够连看几集）
+            "state_ttl_minutes": 720,
             "visible": False,
             "priority": 4,
             "description": "窝在客厅看会儿剧或节目，看多久由你自己决定；看完常想吐槽两句。",
@@ -2474,7 +2825,9 @@ DEFAULT_WORLD: dict[str, Any] = {
         {
             "id": "search_web",
             "builtin": True,
-            "name": "上网搜索",
+            # 她查东西用的是**手机**，不是书房的电脑——所以这个动作到处都能做，
+            # 不再按地点限制（用户 2026-10-17 的口径：「不是电脑搜索而是用手机搜索就解释得通了」）。
+            "name": "用手机查一下",
             # 瞬时动作：动作一开始就真的去查，拿到结果紧接着用她自己的话讲出来。
             # 做成持续动作的话要等"上网中"结束才调用工具，群里要等好几分钟才看得到结果。
             "category": "instant",
@@ -2487,30 +2840,96 @@ DEFAULT_WORLD: dict[str, Any] = {
             "tool_flow": "search",
             "reader_tool_names": [],
             "search_depth": "standard",
+            # 她自己可以在 params.search_depth 里写 quick / standard / deep：
+            # 这里是她能开到的最高档（想省时间/省钱就设成 standard，深挖就没人能用）
+            "search_depth_max": "deep",
+            "search_freshness_days": 365,
             # 查完一次好奇心回落多少：这个值要能把她从阈值（0.7）以上拉下来，
             # 不然冷却一到又去查同一件事（详细说明见 ActionDef.search_satisfy_curiosity）
             "search_satisfy_curiosity": 0.30,
-            "scope": "node",
-            "allowed_nodes": ["study", "library"],
+            # 全局可用：手机在哪都能掏出来（以前限制在书房/图书馆，等于把人拴在电脑前）
+            "scope": "global",
+            "allowed_nodes": [],
             "target_type": "none",
             "interruptible": True,
             "preconditions": {},
-            "params": {},
+            "params": {
+                # 她可以自己挑查多深（不写就按 intent 自动判）
+                "search_depth": {
+                    "type": "string",
+                    "required": False,
+                    "description": (
+                        "查多深：quick=只要个大概（不读正文、不压缩），"
+                        "standard=一般事实，deep=要核实/对比/多源（会多查一轮、读正文）"
+                    ),
+                    "enum": ["quick", "standard", "deep"],
+                },
+            },
             "on_complete": {
                 "trigger": "llm_followup",
                 "prompt_hint": (
                     "把查到的内容讲给群里听：用你自己的口吻，挑最有用的两三点，别照抄原文、别念网址；"
-                    "查到什么说什么，查不到就直说没查到，别拿印象里的东西凑"
+                    "查到什么说什么，查不到就直说没查到，别拿印象里的东西凑。"
+                    "讲了具体事实（数字、日期、谁说了什么）时，末尾用「（来源：<链接>）」补一条来源"
                 ),
                 "effects": {"boredom": "-0.05"},
+            },
+            # 闲得慌的时候，掏手机查点东西是她的默认消遣（T20 无聊上网池）。
+            # 只有这个内置动作声明：发呆、看书本来就是 explore/light 那一路，不靠池子。
+            "idle_activity": {"weight": 3.0, "cooldown_minutes": 15},
+            "visible": False,
+            "priority": 5,
+            "description": (
+                "掏出手机查一下。"
+                "**不知道、拿不准、或者涉及最新消息的事就用它查，"
+                "不要凭印象猜、也不要编**：谁、什么时候、哪方面，写进 intent 说清楚就行，"
+                "关键词由系统补全。查直播比分、天气、新闻、某个东西现在什么样，都走这个动作。"
+            ),
+        },
+        {
+            "id": "read_web_page",
+            "builtin": True,
+            # 用户 2026-10-20 要求：搜索能拿到摘要，但"想看这一页原文"没有入口。
+            # 她还是用**手机**看，所以不按地点限制。
+            "name": "用手机看网页",
+            "category": "instant",
+            "llm_level": "tool",
+            # 本机装了哪个抓取工具由用户自己挑；没选时这一步会跳过并提示。
+            "tool_names": [],
+            # 跟 search_web 一样不预置工具：本机装了哪个抓取工具（deepseek_web_fetch /
+            # exa_get_contents / …）由用户在动作里自己挑，没挑时这一步会跳过并提示。
+            "tool_fallbacks": [],
+            "tool_flow": "simple",
+            "scope": "global",
+            "allowed_nodes": [],
+            "target_type": "none",
+            "interruptible": True,
+            "preconditions": {},
+            "params": {
+                "url": {
+                    "type": "string",
+                    "required": True,
+                    "description": (
+                        "要读的那一页的完整网址（http:// 或 https:// 开头）。"
+                        "别人只给了标题或域名时，先 search_web 查一下再读。"
+                    ),
+                }
+            },
+            "on_complete": {
+                "trigger": "llm_followup",
+                "prompt_hint": (
+                    "把这一页里跟她问的相关内容讲出来：两三句，用自己的话，"
+                    "别照抄整段、别念网址；页面打不开或者没有那件事就直说"
+                ),
+                "effects": {"boredom": "-0.03"},
             },
             "visible": False,
             "priority": 5,
             "description": (
-                "上网查东西（在书房的电脑、或者图书馆的公共机位）。"
-                "**不知道、拿不准、或者涉及最新消息的事就用它查，"
-                "不要凭印象猜、也不要编**：谁、什么时候、哪方面，写进 intent 说清楚就行，"
-                "关键词由系统补全。查直播比分、天气、新闻、某个东西现在什么样，都走这个动作。"
+                "把某个网址的正文读回来（用手机看网页）。"
+                "**只有拿到具体网址时才用它**：把完整地址写进 params.url。"
+                "想知道「某一页到底怎么写的、原文说了什么」就用它；"
+                "只是想找资料用 search_web。"
             ),
         },
         {
@@ -2551,11 +2970,14 @@ DEFAULT_SCHEDULES: dict[str, Any] = {
         {
             "id": "morning_greet",
             "enabled": True,
+            "name": "早安",
+            "note": "早上起来打个招呼：走到客厅伸个懒腰，说一句早安（说自己昨晚睡得怎么样、今天想做什么都行）。",
             "time": "08:30",
             "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
             "action_chain": [
                 {"type": "walk_to", "target_node": "lobby"},
                 {"type": "stretch"},
+                {"type": "say", "messages": []},
             ],
             "conditions": {"not_state": ["sleeping"], "min_energy": 0.35},
             "priority": 5,
@@ -2564,6 +2986,8 @@ DEFAULT_SCHEDULES: dict[str, Any] = {
         {
             "id": "dinner_cook",
             "enabled": True,
+            "name": "做晚饭",
+            "note": "做晚饭：走到厨房做一顿饭，做完可以顺口说一句做好了、或者叫人来吃。",
             "time": "18:00",
             "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
             "action_chain": [
@@ -2577,6 +3001,8 @@ DEFAULT_SCHEDULES: dict[str, Any] = {
         {
             "id": "night_sleep",
             "enabled": True,
+            "name": "睡觉",
+            "note": "睡前收尾：走回卧室躺下睡觉，别再摸手机。",
             "time": "23:30",
             "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
             "action_chain": [
@@ -2592,9 +3018,18 @@ DEFAULT_SCHEDULES: dict[str, Any] = {
 
 
 def default_world() -> dict[str, Any]:
-    """返回默认世界的深拷贝，避免调用方修改常量。"""
+    """返回默认世界的深拷贝，避免调用方修改常量。
+
+    ``storage`` / ``memory`` / ``temp_session`` / ``meme_send_scale`` /
+    ``meme_collect`` / ``agent`` / ``events`` 这几段不认 ``DEFAULT_WORLD`` 里的
+    手写副本，一律由 ``core/models.py`` 里对应配置模型的默认实例派生（见
+    ``_SECTION_MODELS``）：默认值只有一个真源，模型新加的字段下次启动就能被
+    T1 回填写进 ``world.json``（回归测试：``tests/test_defaults_single_source.py``）。
+    """
 
     world = copy.deepcopy(DEFAULT_WORLD)
+    for section, value in model_section_defaults().items():
+        world[section] = value
     return world
 
 

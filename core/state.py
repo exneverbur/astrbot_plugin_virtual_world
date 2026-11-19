@@ -7,6 +7,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from .agency import AGENCY_HISTORY_MAX
+from . import intention_policy
 from .events import normalize_abilities
 
 # bot_state 取值
@@ -25,6 +27,172 @@ STATE_SEARCHING = "searching"
 STATE_READING = "reading"
 STATE_WALKING = "walking"
 STATE_THINKING = "thinking"
+
+# ---------------- T12 Step 2：意图的一生 ----------------
+#
+# ``WorldState.intention`` 不是"一条当前打算"那么简单了：它得能说出这条打算走到哪一步
+# （``state``）、什么时候立下的（``created_at``）、什么时候该收（``expires_at``）、
+# 有没有被兑现（``fulfilled_at``）、推进过几次（``rounds``）、以及被让位时她换成了什么
+# （``alternative``）。全都还在这一个 dict 里、跟着 ``WorldState`` 存档——**不建新表**，
+# 也就不存在"状态和意图两本账对不上"的问题。缺字段的老存档由
+# :func:`normalize_intention` 补默认值，不炸。
+
+INTENTION_STATES = ("proposed", "kept", "fulfilled", "expired", "abandoned")
+"""``state.intention["state"]`` 的全部取值。
+
+- ``proposed``：刚立下，还没动过（tick 里从 ``own_topics`` 或待办长出来的那种）；
+- ``kept``：推进过至少一次，她还在惦记；
+- ``fulfilled``：被兑现了（待办做完 / 她自己的事划掉）；
+- ``expired``：到点自己过时了；
+- ``abandoned``：连续若干拍没有推进，或者那条待办被丢弃——她自己放下了。
+"""
+
+INTENTION_TERMINAL_STATES = ("fulfilled", "expired", "abandoned")
+"""已经收尾的三个状态：只用来写一条 ``intention_state`` 日志，随后就地清空。"""
+
+AGENCY_CHOICES_MAX = 30
+"""``state.agency_choices`` 留最近几条选择（含"照做"）：编辑器的卡只显示 10 条。"""
+
+AGENCY_INTENTION_LOG_MAX = 10
+"""``state.intention_log`` 留最近几次意图生命周期变化：够对照"最近十次选择"。"""
+
+TOPIC_STEER_MOVES_MAX = 20
+"""``state.topic_steer_moves`` 留最近几次"把话拐走"：够算冷却间隔与 24 小时上限。"""
+
+AGENCY_INTENTION_STRENGTH_WORDS = (
+    (0.75, "很想"),
+    (0.5, "有点想"),
+    (0.25, "偶尔想起"),
+    (0.0, "快忘了"),
+)
+"""强度说成人话：按"这条打算还剩多少劲"分四档（见 :func:`intention_strength`）。"""
+
+AGENCY_MODE_LABELS = {
+    "comply": "照做",
+    "negotiate": "协商",
+    "ask_first": "先问一句",
+    "partial": "只做一半",
+}
+"""Step 1 那四种执行方式在界面上叫什么（编辑器卡片与日志共用一份）。"""
+
+INTENTION_STATE_LABELS = {
+    "proposed": "刚立下",
+    "kept": "还在惦记",
+    "fulfilled": "兑现了",
+    "expired": "过时了",
+    "abandoned": "放弃了",
+}
+"""意图生命周期各状态在界面上叫什么。"""
+
+INTENTION_ORIGIN_LABELS = {
+    "own_topic": "自己想做的",
+    "self": "她自己说的",
+    "promise": "答应过的事",
+    "request": "他让做的事",
+    "unknown": "来路不明",
+}
+"""这条打算是哪来的：她自己说的 / 答应过别人的 / 他让做的。
+
+``own_topic`` 是 T12 Step 2 修之前的自动来源（``own_topics`` 里冒出的半句），现在
+不再自动转成打算，只剩老存档读得出这个标签。
+"""
+
+
+def normalize_intention(raw: Any) -> dict[str, Any]:
+    """把 ``state.intention`` 规整成带生命周期的结构（坏值一律当"没有打算"）。
+
+    老存档里的意图只有 ``{text, kind, target, created_at, expires_at}``：这里补上
+    ``state`` / ``rounds`` / ``idle_ticks`` / ``origin`` / ``alternative``，默认值让
+    Step 1 的行为一点不变（``state`` 缺省 ``proposed`` 就还是"一条还没过期的打算"）。
+    没有 ``text`` 的直接当空（空 dict = 没有打算，主链路一切照常）。
+    """
+
+    source = dict(raw) if isinstance(raw, dict) else {}
+    text = str(source.get("text") or "").strip()
+    if not text:
+        return {}
+    result = dict(source)
+    result["text"] = text
+    result["kind"] = str(result.get("kind") or "plan")
+    result["target"] = str(result.get("target") or "")
+    status = str(result.get("state") or "").strip().lower()
+    result["state"] = status if status in INTENTION_STATES else "proposed"
+    try:
+        result["created_at"] = float(result.get("created_at") or 0.0)
+    except (TypeError, ValueError):
+        result["created_at"] = 0.0
+    try:
+        result["expires_at"] = float(result.get("expires_at") or 0.0)
+    except (TypeError, ValueError):
+        result["expires_at"] = 0.0
+    try:
+        result["fulfilled_at"] = float(result.get("fulfilled_at") or 0.0)
+    except (TypeError, ValueError):
+        result["fulfilled_at"] = 0.0
+    try:
+        result["rounds"] = max(0, int(result.get("rounds") or 0))
+    except (TypeError, ValueError):
+        result["rounds"] = 0
+    try:
+        result["idle_ticks"] = max(0, int(result.get("idle_ticks") or 0))
+    except (TypeError, ValueError):
+        result["idle_ticks"] = 0
+    result["origin"] = str(result.get("origin") or "unknown")
+    result["alternative"] = str(result.get("alternative") or "")
+    result["id"] = str(result.get("id") or "")
+    return result
+
+
+def intention_is_active(raw: Any) -> bool:
+    """这条打算现在还算不算"她手头的事"（过期的、已收尾的都不算）。"""
+
+    intention = normalize_intention(raw)
+    if not intention:
+        return False
+    return intention["state"] not in INTENTION_TERMINAL_STATES
+
+
+def intention_strength(raw: Any, now: float) -> float:
+    """她这会儿还有多想做这件事：0~1，按"这条打算还剩多少寿命"算。
+
+    没有 ``expires_at`` 的老数据给 0.5（说不清就不装懂）；过期的给 0。
+    """
+
+    intention = normalize_intention(raw)
+    if not intention:
+        return 0.0
+    created = float(intention.get("created_at") or 0.0)
+    expires = float(intention.get("expires_at") or 0.0)
+    if expires <= 0:
+        return 0.5
+    span = expires - created
+    if span <= 0:
+        return 1.0 if float(now) < expires else 0.0
+    left = (expires - float(now)) / span
+    return max(0.0, min(1.0, left))
+
+
+def intention_strength_label(strength: float) -> str:
+    """强度说人话：很想 / 有点想 / 偶尔想起 / 快忘了。"""
+
+    try:
+        value = max(0.0, min(1.0, float(strength)))
+    except (TypeError, ValueError):
+        value = 0.0
+    for floor, word in AGENCY_INTENTION_STRENGTH_WORDS:
+        if value >= floor:
+            return word
+    return AGENCY_INTENTION_STRENGTH_WORDS[-1][1]
+
+
+def intention_origin_label(origin: Any) -> str:
+    key = str(origin or "unknown")
+    return INTENTION_ORIGIN_LABELS.get(key) or INTENTION_ORIGIN_LABELS["unknown"]
+
+
+def intention_state_label(status: Any) -> str:
+    key = str(status or "proposed")
+    return INTENTION_STATE_LABELS.get(key) or INTENTION_STATE_LABELS["proposed"]
 
 # 同一个人在这段时间内发的内容差不多，就认为是同一条消息（两个钩子重复记一次）
 _CHAT_DEDUPE_SECONDS = 60.0
@@ -147,6 +315,40 @@ def split_annotation(text: str) -> tuple[str, str]:
 
 ANNOTATION_KEEP_CHARS = 240
 """注释最多留多少字：注释本身也可能很长（@ 了五个人 + 引用 + 三张图）。"""
+
+THOUGHT_KEEP_CHARS = 40
+"""她自己那句台词后面挂的「当时在想什么」最多留多少字。
+
+比 :data:`ANNOTATION_KEEP_CHARS` 短得多：它只是"我当时打算干什么"的一句话
+（草稿里 ``inner`` 本来就要求 30 字以内），不是要复述的正文。
+2026-10-22 收窄到 40：这段注解每轮都会被重读一遍，越短越不占地方。
+"""
+
+THOUGHT_KEEP_PER_ORIGIN = 2
+"""**每个来源**各留多少条带 ``thought`` 的台词，更早的写入时清掉。
+
+「来源」取条目自带的 ``origin``（会话 umo，例如 ``aiocqhttp:FriendMessage:100``）：
+它是 :meth:`note_chat` 记下这条时标的「在哪个会话说的」。老条目没有 ``origin``
+时按建档会话 :attr:`session_id` 算——和 :meth:`_trim_chat` 分桶、
+:meth:`note_chat` 去重是同一把尺子。
+
+以前是**全局**只留最近两条：``recent_chat`` 是整个会话组共用的一份，一个热闹的
+群能把私聊那条心里话挤掉，她在私聊里的心事就断在半截。
+"""
+
+THOUGHT_KEEP_TOTAL = 6
+"""整份 ``recent_chat`` 里带 ``thought`` 的台词总数上限。
+
+每个来源都各留满时，注解会随会话数线性膨胀；所以再加一道总闸：超出时按列表
+顺序（越靠前越旧）先丢最旧的。上限只砍 ``thought``，正文一个字段都不动。
+"""
+
+THOUGHT_KEEP_TURNS = THOUGHT_KEEP_PER_ORIGIN
+"""旧名字，值等同于 :data:`THOUGHT_KEEP_PER_ORIGIN`。
+
+语义已经从"全局最近 2 条"改成"每个来源各 2 条"；留着这个名字只是
+给还在读它的调用方/测试一个不炸的入口。
+"""
 
 
 CHAT_MERGE_GAP_SECONDS = 300.0
@@ -293,6 +495,19 @@ class WorldState:
     或者宿主卡顿了，都不会改变曲线形状。
     """
 
+    persona_id: str = ""
+    """这份状态上一次是**哪个人格**在推进（B5/WP6 收尾⑤）。
+
+    ⚠️ 语义先说清楚：世界状态**仍然按会话只有一份**——一个会话里的她只有一副身体，
+    位置、数值、计划、事件都只有一份，这不是漏洞而是设计（同一个人格在两个群里
+    也该是同一个她）。所以这个字段**只做可观测**，不拿它做过滤：
+    - 状态页与调试输出里看得见"上次是谁在推进"，换了人格一眼能发现，
+      而不是默默接着上一位的数值往下走；
+    - 给将来"要不要按人格拆状态"留个可查的依据。
+
+    老存档里没有这个字段 → 默认空串（等价于"没记过"），读写往返不受影响。
+    """
+
     storm: bool = False
     """「正在气头上」标记：高心潮 + 负效价，带滞回，用于提示词与安全阀。"""
 
@@ -328,6 +543,51 @@ class WorldState:
     """她自己记着的事：`{text, who, who_name, at}`——答应过别人的、自己想做的，还没做。
 
     跟「还没聊完的」正好对称：那份记的是**别人的**事，这份记的是**她自己的**事。
+    """
+
+    agency_history: list[dict[str, Any]] = field(default_factory=list)
+    """她最近几次「没照做」的记录：`{at, mode, kind, reason}`（只留最近 20 条）。
+
+    T12 Step 1 的频率闸吃它：7 天内最多 2 次协商 / 反问 / 只做一半，第 3 次必须照做。
+    只记非 ``comply`` 的那几次——照做是默认，记下来只会把窗口撑爆。
+    """
+
+    intention: dict[str, Any] = field(default_factory=dict)
+    """她**自己手头的一件打算**，默认空；T12 Step 2 起它带生命周期。
+
+    字段：``text`` / ``kind``（``plan`` / ``promise``）/ ``target`` / ``state``（见
+    :data:`INTENTION_STATES`）/ ``origin`` / ``created_at`` / ``expires_at`` /
+    ``fulfilled_at`` / ``rounds``（推进过几次）/ ``idle_ticks``（连续几拍没推进）/
+    ``alternative``（让位时她换成了什么）/ ``id``。
+
+    它只回答一个判据——"她要先做自己的事吗"；默认空 = 没有打算，一切照常。
+    收尾（兑现 / 过期 / 放弃）由 tick 里的 ``VirtualWorldEngine._sweep_intention``
+    结账并清空，同时写一条 ``intention_state`` 日志（见 :meth:`to_payload` 的存档）。
+    """
+
+    agency_choices: list[dict[str, Any]] = field(default_factory=list)
+    """最近几次自主选择的**逐条记录**（含"照做"）：``{at, mode, kind, reason, changed,
+    request, note}``，只留最近 :data:`AGENCY_CHOICES_MAX` 条。
+
+    跟 :attr:`agency_history` 分工不同：那份只记"没照做"的那几次，喂 7 天频率闸；
+    这份是给编辑器「她自己的打算」卡看的流水账，照做也要留——不然卡片永远只有半张。
+    """
+
+    intention_log: list[dict[str, Any]] = field(default_factory=list)
+    """最近几次意图生命周期变化：``{at, id, text, from, to, reason}``。
+
+    只留最近 :data:`AGENCY_INTENTION_LOG_MAX` 条。意图一收尾就从
+    :attr:`intention` 里清掉，靠这份流水账才能回答"她这两天到底放下了几件事"。
+    """
+
+    intention_retired: dict[str, float] = field(default_factory=dict)
+    """放弃过的打算文字 → 解禁时刻（``{text_hash: until}``，最多 50 条）。
+
+    T12 Step 2 修的第三道闸：一条打算因为**连拍没推进**被放弃之后，同一句话 24 小时
+    之内不许再自动立起来。只按"来源 30 分钟冷却"是不够的——``own_topics`` 里那半句
+    常常一直躺着，冷却一过就从同一条复活，于是 live 上每约 30 分钟凭空多出
+    ``proposed → abandoned`` 一对。键是正文哈希（见 ``intention_policy.text_key``），
+    超 :data:`intention_policy.RETIRED_MAX` 条按 ``until`` 裁掉最旧的。
     """
 
     last_say_limit: int = 0
@@ -369,6 +629,21 @@ class WorldState:
     "她真的经历了一件事"还管用，尺子就反了。
     """
 
+    intimacy_valence_day: str = ""
+    intimacy_valence_spent: float = 0.0
+    """**亲密互动**（亲昵口吻 / 肢体接触动作）今天累计推动了多少效价（跨天清零）。
+
+    单独记一本账，不跟日常闲聊抢额度：被抱着亲着聊二十分钟跟"被夸两句"
+    不该用同一个量程（见 ``state_dynamics.intimacy_valence_daily_cap``）。
+    """
+
+    loneliness_company_hour_sum: float = 0.0
+    """这一小时里"被认真搭话"卸掉的孤独感累计了多少
+    （配合 ``loneliness_company_relief_hour_cap``）。"""
+
+    loneliness_company_hour_marker: int = 0
+    """上面那个累计数属于哪个小时（换小时就清零）。"""
+
     soothe_log: list[dict[str, Any]] = field(default_factory=list)
     """安抚通道（低潮时的抱抱、有人听懂她）最近的几次记录。
 
@@ -407,8 +682,21 @@ class WorldState:
     last_event_started_at: float = 0.0
     """上一件事是什么时候开始的（真实时间）：用来保证两件事之间的最小间隔。"""
 
+    last_exclusive_closed_at: float = 0.0
+    """上一件 ``exclusive`` 事件收尾的时刻（真实时间）：用来算独占冷却。
+
+    老存档没有这个键：缺省 0 = 从没结束过独占，冷却不生效。
+    """
+
     node_since: float = 0.0
     """她是什么时候到这个地点的（真实时间）：待够一段时间才算"在这儿生活"。"""
+
+    skills_idle_at: float = 0.0
+    """上一次在自主轮给她摆"我会什么"清单的时刻（真实时间）。
+
+    自主轮 5 秒一拍，清单每拍都注入既贵又吵：同一会话 ``IDLE_INJECT_SECONDS``
+    内只摆一次。老存档没有这个键 → 缺省 0 = 从没摆过，第一次照常注入。
+    """
 
     event_recent_titles: list[str] = field(default_factory=list)
     """最近发生过的事件标题：生成新事件时喂回去做去重。"""
@@ -418,6 +706,19 @@ class WorldState:
 
     event_genre_at: dict[str, float] = field(default_factory=dict)
     """每个题材上一次用是什么时候（真实时间）：题材也有冷却，不然连着几件都是一个味。"""
+
+    event_fail_notes: list[str] = field(default_factory=list)
+    """最近没成的事（一行一条：``标题：结果``，≤5 条）。
+
+    T15：只在提示词里用——她抉择之前会看到自己最近在这类事上栽过，
+    免得模型把"失败"当成没有代价的选项。不进聊天记录，也不进记忆。
+    """
+
+    event_cost_day: str = ""
+    """「今天这件事扣了多少」所属的世界日（``world_day_key``；跨天清零）。"""
+
+    event_cost_today: float = 0.0
+    """今天事件已经扣掉的代价总量（≥0 的幅度，用来卡 ``EVENT_COST_DAY_LIMIT``）。"""
 
     greet_pending: dict[str, dict[str, Any]] = field(default_factory=dict)
     """刚冒头的"好久没来"的人：``uid -> {name, gap_hours, at}``。提示词读过一次就清掉。"""
@@ -463,6 +764,13 @@ class WorldState:
     event_digest: list[str] = field(default_factory=list)
     """这段时间发生的事（一行一条）；动作完成续说时带出来，然后清空。"""
 
+    schedule_digest: list[str] = field(default_factory=list)
+    """这段时间按日程做完的事（一行一条）。
+
+    T15-S1 起跟 ``event_digest`` 分开放：``event_digest`` 只装「她自己身上发生的
+    事」，日程的流水账单独走这里，免得日程把事件挤掉，事件段永远是空的。
+    """
+
     pending_help: dict[str, Any] = field(default_factory=dict)
     """悬而未决的求助。
 
@@ -483,6 +791,13 @@ class WorldState:
     """这一觉睡过没有：睡醒时欲求要按「睡醒系数」松一截，只做一次。"""
     current_action: dict[str, Any] | None = None
     current_plan: dict[str, Any] | None = None
+    paused_action: dict[str, Any] = field(default_factory=dict)
+    """被打断的**持续动作**（用户 m30124）：短动作插进来时，她原本在做的事先按下不表。
+
+    只有"原本在做要花时间的动作、插进来的是即时动作（指令/工具，或只占 1 拍）"
+    这一种组合才会写。新动作做完就回去接着做；被取消、睡觉、或者搁太久
+    （``core/engine.py`` 的 ``PAUSE_MAX_TICKS``）就清掉，并按没做成记账。
+    """
     last_plan: dict[str, Any] = field(default_factory=dict)
     """最近一次生成的计划（做完了也留着，提示词里会带上，免得她每轮重新打算）。"""
     recent_events: list[dict[str, Any]] = field(default_factory=list)
@@ -500,7 +815,9 @@ class WorldState:
     pending_images: list[dict[str, Any]] = field(default_factory=list)
     """自上次回复以来收到的图片（没配转述模型时，会把它们直接交给多模态主模型）。
 
-    只存地址和时间，回复一次就清空；上限由「全局设置 → 上下文 → 图片上限」决定。
+    只存地址、时间和「哪来的」（``origin``：来源会话），回复一次就清空；上限由
+    「全局设置 → 上下文 → 图片上限」决定。``origin`` 是 2026-10-20 补的：同一个她
+    可能同时连着群和私聊（同一个 scope），没有它就会出现"私聊看到她没发过的群图"。
     """
 
     chat_summary: str = ""
@@ -530,6 +847,8 @@ class WorldState:
     chat_overflow_warned_at: float = 0.0
     """上次提醒"留档满了、最早的在被丢掉"的时间（配置成"直接丢弃"时才用）。"""
 
+    processed_event_ids: dict[str, list[str]] = field(default_factory=dict)
+    """Exact successful decisions, separate from actual spoken replies."""
     chat_replied_until: float = 0.0
     """「已回应水位线」：这个时间点之前的群聊不再进"最近在聊"（留档仍然保留）。"""
 
@@ -566,6 +885,35 @@ class WorldState:
     chat_seq: int = 0
     """群聊留档的递增序号（时间戳只有秒，判断"谁是新消息"不够用）。"""
 
+    variation_turns: dict[str, int] = field(default_factory=dict)
+    """表达变奏的冷却记录：``{会话 id: 上次变奏那一轮的 chat_seq}``（用户 m00001 的 B2）。
+
+    以前这张表只在 engine 的内存里，而且写入用 ``ctx.session_id``、读取用
+    ``state.session_id``——分组会话里两个键对不上，``min_gap`` 等于永远不生效，
+    重启后更是直接清零。现在它是 :class:`WorldState` 的正式字段，跟着存档走：
+    重启、重载都还在，键统一用 ``state.session_id``（写和读同一个来源）。
+    """
+
+    topic_steer: dict[str, Any] = field(default_factory=dict)
+    """她刚把话拐到哪儿、还没接着说（T12 Step 3 / E2 话题层）。
+
+    形状：``{own, text, created_tick, due_tick, drop_tick, status, session, move,
+    reminded_tick, followed_tick, follow_reason}``；``status`` 走 ``pending`` →
+    ``followed`` / ``dropped``（判定与迁移都在 ``core/topic_steer.py``）。
+
+    只有模型这一轮写了 ``move=own`` 才写得进来；旧存档没有这个字段 = "没有挂着的事"，
+    不需要迁移（``from_payload`` 缺字段走默认值）。
+    """
+
+    topic_steer_moves: list[dict[str, Any]] = field(default_factory=list)
+    """她最近几次把话拐到自己事上的记录：``{at, turn, own, session}``（留最近 20 条）。
+
+    冷却与每日上限按人吃它：``core/topic_steer.py`` 拿 ``state.chat_seq`` 算轮次间隔、
+    拿 ``at`` 算 24 小时上限。**放 state 而不是内存 dict**——重启后冷却照样生效，
+    上一批表达变奏就是因为内存冷却踩过坑（见 :attr:`variation_turns`）。
+    """
+
+
     chat_replied_seq: int = 0
     """已回应水位线（序号版）：大于它的群聊才是"还没回应过的"。"""
 
@@ -601,6 +949,17 @@ class WorldState:
 
     pending_review: str = ""
     """刚想起的一两件事：写进提示词，等被读过就清掉（同一件事只提一次）。"""
+
+    image_reaction: dict[str, Any] = field(default_factory=dict)
+    """有人发了张（可能）有意思的图，等她这一拍决定要不要接一句。
+
+    ``{event_id, session_id, images, captions, score, sender, at}``；由插件侧看完图后
+    登记（:meth:`VirtualWorldEngine.offer_image_reaction`），下一拍消费或丢弃。
+    """
+
+    image_spoke_at: float = 0.0
+    """上一次"看图开口"的现实时间戳（同群最少间隔按它算）。"""
+
     session_activity: dict[str, dict[str, Any]] = field(default_factory=dict)
     """每个会话最近有没有人跟她说话：``{session_id: {at, user_id, user_name}}``。
 
@@ -615,6 +974,8 @@ class WorldState:
     """
 
     bot_base_nickname: str = ""
+    bot_qq: str = ""
+    """她自己（bot）的 QQ 号：头像与"我是谁"用；私聊里也能拿到。"""
     bot_current_nickname: str = ""
     bot_nickname_locked: bool = False
     nickname_fail_count: int = 0
@@ -697,6 +1058,15 @@ class WorldState:
     """刚被叫醒时给提示词的一句说明（下一次回复用完即弃，见 wake_note_until）。"""
     wake_note_until: int = 0
     """上面那句说明的有效期（世界时间）。"""
+    delivery_miss_note: str = ""
+    """刚才有一句话没送到（没加好友、没共同群…）：下一次回复当旁白告诉她，用完即弃。
+
+    以前投递失败会自动回一句「刚才想跟…单独说两句，话没发出去（…）」——用户说
+    那句模板太系统腔，要她自己看着说（用户 m00001）。所以改成把处境写进这里，
+    下一轮回复时作为提示注入一次，注入完就清空。
+    """
+    delivery_miss_at: float = 0.0
+    """上面那条提示是什么时候记下的（超过 ``DELIVERY_MISS_TTL`` 秒没用就作废）。"""
 
     sleep_started_at: int = 0
     """这一段睡眠是从哪个 tick 开始的（算"睡了多久"，起床气按它结账）。"""
@@ -901,6 +1271,20 @@ class WorldState:
                 for key, value in self.praise_streak_at.items()
             }
         self.chat_day = str(self.chat_day or "")
+        self.intimacy_valence_day = str(self.intimacy_valence_day or "")
+        try:
+            self.intimacy_valence_spent = float(self.intimacy_valence_spent or 0.0)
+        except (TypeError, ValueError):
+            self.intimacy_valence_spent = 0.0
+        try:
+            self.loneliness_company_hour_sum = float(
+                self.loneliness_company_hour_sum or 0.0
+            )
+        except (TypeError, ValueError):
+            self.loneliness_company_hour_sum = 0.0
+        self.loneliness_company_hour_marker = max(
+            0, int(self.loneliness_company_hour_marker or 0)
+        )
         if not isinstance(self.soothe_log, list):
             self.soothe_log = []
         else:
@@ -939,6 +1323,46 @@ class WorldState:
             self.own_topics = [
                 dict(item) for item in self.own_topics if isinstance(item, dict)
             ][:8]
+        # T12 Step 1：老存档里没有这两个字段 → dataclass 默认值已经补上；这里只把
+        # 类型不对的垃圾值清掉（手改存档、旧实验版本留下的东西）。
+        if not isinstance(self.agency_history, list):
+            self.agency_history = []
+        else:
+            self.agency_history = [
+                dict(item) for item in self.agency_history if isinstance(item, dict)
+            ][-AGENCY_HISTORY_MAX:]
+        if not isinstance(self.intention, dict):
+            self.intention = {}
+        else:
+            self.intention = dict(self.intention)
+        # T12 Step 2：这两份也是"老存档里没有"的字段——dataclass 默认值先兜住，
+        # 这里只清掉类型不对的垃圾（手改存档、旧实验版本留下的东西）。
+        if not isinstance(self.agency_choices, list):
+            self.agency_choices = []
+        else:
+            self.agency_choices = [
+                dict(item) for item in self.agency_choices if isinstance(item, dict)
+            ][-AGENCY_CHOICES_MAX:]
+        if not isinstance(self.intention_log, list):
+            self.intention_log = []
+        else:
+            self.intention_log = [
+                dict(item) for item in self.intention_log if isinstance(item, dict)
+            ][-AGENCY_INTENTION_LOG_MAX:]
+        # 退休表：老存档没有这个字段（默认空 dict），手改坏的条目一律当没有。
+        self.intention_retired = intention_policy.prune_retired(self.intention_retired)
+        # T12 Step 3：话题层的两个新字段同样是"老存档里没有"的——默认值先兜住，
+        # 这里只清类型不对的垃圾（手改存档、旧实验版本留下的东西）。
+        if not isinstance(self.topic_steer, dict):
+            self.topic_steer = {}
+        else:
+            self.topic_steer = dict(self.topic_steer)
+        if not isinstance(self.topic_steer_moves, list):
+            self.topic_steer_moves = []
+        else:
+            self.topic_steer_moves = [
+                dict(item) for item in self.topic_steer_moves if isinstance(item, dict)
+            ][-TOPIC_STEER_MOVES_MAX:]
         try:
             self.chat_valence_spent = float(self.chat_valence_spent or 0.0)
         except (TypeError, ValueError):
@@ -984,6 +1408,11 @@ class WorldState:
         self.negative_tone_streak = max(0, int(self.negative_tone_streak or 0))
         self.memory_flush_wanted = bool(self.memory_flush_wanted)
         self.wake_note_until = max(0, int(self.wake_note_until))
+        self.delivery_miss_note = str(self.delivery_miss_note or "").strip()
+        try:
+            self.delivery_miss_at = max(0.0, float(self.delivery_miss_at or 0.0))
+        except (TypeError, ValueError):
+            self.delivery_miss_at = 0.0
         self.sleep_started_at = max(0, int(self.sleep_started_at or 0))
         if not isinstance(self.drowsy_sleep_step, dict):
             self.drowsy_sleep_step = {}
@@ -1118,6 +1547,14 @@ class WorldState:
                 except (TypeError, ValueError):
                     continue
             self.event_genre_at = cleaned
+        if not isinstance(self.event_fail_notes, list):
+            self.event_fail_notes = []
+        else:
+            self.event_fail_notes = [
+                " ".join(str(item).split())
+                for item in self.event_fail_notes
+                if str(item).strip()
+            ][-5:]
         if not isinstance(self.schedule_delays, dict):
             self.schedule_delays = {}
         if not isinstance(self.schedule_last_fired, dict):
@@ -1137,11 +1574,33 @@ class WorldState:
             self.event_digest = [
                 " ".join(str(item).split()) for item in self.event_digest if str(item).strip()
             ][-40:]
+        # 日程流水账：跟事件分开两条列表（T15-S1），旧档没有这个字段就补空表
+        if not isinstance(getattr(self, "schedule_digest", None), list):
+            self.schedule_digest = []
+        else:
+            self.schedule_digest = [
+                " ".join(str(item).split())
+                for item in self.schedule_digest
+                if str(item).strip()
+            ][-40:]
         # 上一轮的口吻：只认白名单，写坏的当没判过
         tone = str(self.last_user_tone or "").strip().lower()
         self.last_user_tone = (
             tone if tone in ("praise", "hug", "attack", "refuse", "normal") else ""
         )
+        # 表达变奏的冷却记录：只留能转成正整数的项（旧档没有这个字段就补空表）
+        if not isinstance(getattr(self, "variation_turns", None), dict):
+            self.variation_turns = {}
+        else:
+            cleaned_turns: dict[str, int] = {}
+            for key, value in self.variation_turns.items():
+                try:
+                    number = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if number > 0:
+                    cleaned_turns[str(key)] = number
+            self.variation_turns = cleaned_turns
         # 打招呼 / 主动问的账本：清了坏的，别的照原样
         if not isinstance(self.greet_pending, dict):
             self.greet_pending = {}
@@ -1284,7 +1743,9 @@ class WorldState:
         keep: int = 12,
         is_self: bool = False,
         internal: bool = False,
+        thought: str = "",
         images: Any = None,
+        media_ids: Any = None,
         buffer_dropped: bool = False,
         origin: str = "",
         at: Any = None,
@@ -1298,6 +1759,9 @@ class WorldState:
         ``images`` 是这条消息带的图片地址：留着是为了「聊天记录里的图直接交给
         多模态主模型」那一步——她能看到"这条带的是哪张图"。
 
+        ``media_ids`` 是同一批图在本地资产库里的 id（阶段B，见 core/media_store.py）：
+        与 ``images`` 一一对应，收不进来的那格是空串。
+
         ``buffer_dropped``：被上限顶掉的那几条先攒到 :attr:`chat_dropped`，
         等下一次压缩并进摘要（只有配置成"压成摘要"时才需要传 True）。
 
@@ -1307,6 +1771,11 @@ class WorldState:
         ``internal``：插件自己写进去的"她身上发生的事"（事件的结果）。
         它不是谁说的话，也不该被当成"还没回的消息"——渲染时会标出来，
         水位线判定也会直接跳过它。
+
+        ``thought``：她说这句话时心里在想什么（那一轮 ``reasoning`` 草稿）。
+        **单独存一个字段、不并进 ``text``**：渲染时它挂在那一行后面，
+        要能穿过 :func:`clip_line` 的字数上限，也不能参与去重指纹
+        （那个指纹按 :func:`chat_core_text` 切掉注释后再算）。
 
         返回**刚记下的那条**（dict，就是 ``recent_chat`` 里那一个对象）；
         判定为重复而没记时返回 ``None``。调用方要补标来源/身份时用返回值，
@@ -1382,6 +1851,12 @@ class WorldState:
         }
         if internal:
             item["internal"] = True
+        # 「她说这句时心里在想什么」：单独一个字段，渲染时挂在那一行后面。
+        # 不并进 text 是有意的——正文会被 clip_line 按字数上限掐，而这段注解要完整留下；
+        # 去重指纹又按 chat_core_text 切掉注释再算，所以它也不会把同一句话算成两条。
+        thought_text = " ".join(str(thought or "").split())
+        if thought_text:
+            item["thought"] = thought_text[:THOUGHT_KEEP_CHARS]
         if str(origin or "").strip():
             item["origin"] = str(origin).strip()
         # 「这句是冲谁说的」：@ 名单与引用对象结构化留一份，渲染聊天记录时画箭头用
@@ -1407,6 +1882,11 @@ class WorldState:
         refs = _chat_image_refs(images)
         if refs:
             item["images"] = refs
+        # 本地资产 id（阶段B）：与 ``images`` 一一对应，平台地址失效了还能翻出字节。
+        # 空串是"这一轮没收进来"，留着占位才数得清第几张。
+        ids = [str(value) for value in (media_ids or [])] if media_ids else []
+        if ids and any(value.strip() for value in ids):
+            item["media_ids"] = ids
         # 事件身份留一份：渲染和「这轮要回的那批」排除历史里的同一条时按它认，
         # 不再靠正文（正文一样的两条是两件事）。
         if key:
@@ -1417,12 +1897,56 @@ class WorldState:
                 item["event_id"] = str(event_id).strip()
         self.recent_chat.append(item)
         self.chat_seq = int(self.chat_seq) + 1
+        if "thought" in item:
+            # 每个来源只让最近几条她的台词带心里话：更早的清掉，历史渲染那边一个字都不用改
+            self._keep_recent_thoughts()
         dropped = self._trim_chat(keep)
         if dropped:
             wanted = bool(getattr(self, "buffer_dropped_chat", buffer_dropped))
             if wanted:
                 self.chat_dropped = [*self.chat_dropped, *dropped][-CHAT_DROPPED_KEEP:]
         return item
+
+    def _keep_recent_thoughts(self) -> None:
+        """每个来源各留最近 :data:`THOUGHT_KEEP_PER_ORIGIN` 条带 ``thought`` 的台词。
+
+        写新心里话的时候顺手清旧的（渲染侧不动）。以前是全局只留最近两条：
+        ``recent_chat`` 是整个会话组共用的一份，一个热闹的群能把私聊那条挤掉，
+        她在私聊里的心事就断在半截。现在按**来源**（条目里的 ``origin``，老条目
+        没有就按建档会话 :attr:`session_id`，和 :meth:`_trim_chat` 同口径）各留各的，
+        群聊刷屏不再影响私聊。
+
+        会话数多时注解会线性膨胀，所以再加一道 :data:`THOUGHT_KEEP_TOTAL` 的总闸：
+        每个来源选完之后，如果总数还超，就按列表顺序先丢最旧的（越靠前越旧）。
+        """
+
+        per_origin = max(1, int(THOUGHT_KEEP_PER_ORIGIN))
+        total = max(1, int(THOUGHT_KEEP_TOTAL))
+        # 倒着扫（最近的在最后）：每个来源数到第 per_origin 条为止，记下要留的条目。
+        used: dict[str, int] = {}
+        keep_ids: set[int] = set()
+        for entry in reversed(self.recent_chat):
+            if not isinstance(entry, dict) or "thought" not in entry:
+                continue
+            key = str(entry.get("origin") or self.session_id or "")
+            seen = used.get(key, 0)
+            used[key] = seen + 1
+            if seen < per_origin:
+                keep_ids.add(id(entry))
+        # 总闸：从最旧的开始丢，直到总数不超过 total。
+        overflow = len(keep_ids) - total
+        if overflow > 0:
+            for entry in self.recent_chat:
+                if overflow <= 0:
+                    break
+                if isinstance(entry, dict) and id(entry) in keep_ids:
+                    keep_ids.discard(id(entry))
+                    overflow -= 1
+        for entry in self.recent_chat:
+            if not isinstance(entry, dict) or "thought" not in entry:
+                continue
+            if id(entry) not in keep_ids:
+                entry.pop("thought", None)
 
     def _trim_chat(self, keep: int) -> list[dict[str, Any]]:
         """留档超上限时裁掉最早的那几条，**按会话各自裁**。
@@ -1557,8 +2081,13 @@ class WorldState:
             return ""
         return strip_mention_note(self.chat_preview or "")
 
-    def note_reply(self, text: str, *, keep: int = 6, session_id: str = "") -> None:
-        """记一句她刚说过的话（提示词里用来提醒她别重复句式），并记下在哪儿说的。"""
+    def note_reply(
+        self, text: str, *, keep: int = 6, session_id: str = "", now: float = 0.0
+    ) -> None:
+        """记一句她刚说过的话（提示词里用来提醒她别重复句式），并记下在哪儿说的、什么时候。
+
+        ``now`` 是给 ⑤（自主流的开头去重窗口）用的：同一开头 30 分钟内不许再说一次。
+        """
 
         clean = " ".join(str(text or "").split())
         if not clean:
@@ -1572,5 +2101,5 @@ class WorldState:
             return
         self.recent_replies = [
             *self.recent_replies,
-            {"text": clean, "session": str(session_id or "")},
+            {"text": clean, "session": str(session_id or ""), "at": float(now or 0.0)},
         ][-max(1, int(keep)) :]

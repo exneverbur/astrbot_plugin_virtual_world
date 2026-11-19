@@ -1,7 +1,7 @@
 {
   "pages": {
     "world_editor": {
-      "title": "虚拟世界编辑器",
+      "title": "SOLIS世界编辑器",
       "description": "配置地图、动作、日程、记忆与会话白名单，并查看她的实时状态。"
     }
   }

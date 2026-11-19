@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .db import Database
+from .memory import normalize_for_memory
 from .models import BondType, IntimacyLevel, ProfileConfig, WorldConfig
 
 AFFINITY_DAILY_KEY = "affinity_daily"
@@ -29,6 +30,53 @@ AFFINITY_DAILY_KEY = "affinity_daily"
 
 AFFINITY_DECAY_KEY = "affinity_decay_day"
 """每个会话组最后一次"回落结算"是哪天，保证一天只淡一次。"""
+
+TRUST_MIN = -1.0
+TRUST_MAX = 1.0
+"""信赖值（T15-S3）的范围：和好感一样允许负值，初始 0。"""
+
+TRUST_SINGLE_CAP = 0.2
+"""单次结算最多 ±0.2（不管模型写了多少）。"""
+
+TRUST_DAILY_CAP = 0.3
+"""同一个人一天之内的净变化最多 ±0.3。"""
+
+TRUST_CHANNEL_A_STEP = 0.05
+"""日常小额通道 A（夜间整理时评估）：单次最多 ±0.05。"""
+
+TRUST_CHANNEL_A_DAILY = 0.05
+"""日常小额通道 A：单日单人净变化最多 ±0.05（2–3 周大约攒到 +0.3）。"""
+
+TRUST_DECAY_IDLE_DAYS = 30.0
+"""多久没互动算"淡了"（只有负信赖会往回走）。"""
+
+TRUST_DECAY_RATE = 0.9
+"""每次夜间整理，负信赖乘这个系数（向 0 靠拢 10%）。"""
+
+TRUST_NOTE_LIMIT = 3
+"""画像里留几条"为什么涨/跌"（编辑器通讯录显示最近 3 条）。"""
+
+TRUST_EVENT_WINDOW_BEFORE = 2 * 3600.0
+"""B 通道（事件内即时结算）的证据窗口：约定时刻前 2 小时。"""
+
+TRUST_EVENT_WINDOW_AFTER = 6 * 3600.0
+"""B 通道的证据窗口：约定时刻后 6 小时。超出窗口就不算证据。"""
+
+TRUST_ADVICE_WINDOW_DAYS = 3.0
+"""建议类（advice）证据的窗口：3 天。"""
+
+
+def _trust_value(value: Any) -> float:
+    """读一个信赖值：坏值、缺项、NaN 一律当 0（老数据没有这一项）。"""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if number != number or number in (float("inf"), float("-inf")):
+        return 0.0
+    return max(TRUST_MIN, min(TRUST_MAX, number))
+
 
 CALL_NAME_CHARS = 12
 """称呼最多几个字：再长基本就是一句话，不是称呼。"""
@@ -131,6 +179,12 @@ class PersonView:
     user_id: str
     name: str = ""
     affinity: float = 0.0
+    trust: float = 0.0
+    """信赖值（T15-S3）：-1~+1，0 是"没判断"，负值代表"不太信得过"。
+
+    它**只用来写提示词**，不参与任何"要不要听他的"判定——采纳与否仍然由她
+    按人设自己决定。见 ``core/prompt.py`` 里的「你更信得过谁」段。
+    """
     level: IntimacyLevel = field(default_factory=IntimacyLevel)
     level_index: int = 0
     """生效档位在 ``levels`` 里的下标（提示词里要拿它说"再熟一点会到哪一档"）。"""
@@ -179,11 +233,26 @@ class ProfileStore:
         world: WorldConfig | None = None,
         *,
         group_of: Any = None,
+        now: Any = None,
     ) -> None:
         self.db = db
         self.world = world
         self._group_of = group_of
         """``session_id -> 组代表会话``：画像按"她"（会话组）存。"""
+        self._now_provider = now
+        """时钟回调：记事实时要把"明天"换算成日期，用她那边的现在（缺省真实时钟）。"""
+
+    def set_now(self, hook: Any) -> None:
+        self._now_provider = hook
+
+    def _now(self) -> float:
+        hook = self._now_provider
+        if callable(hook):
+            try:
+                return float(hook())
+            except Exception:  # noqa: BLE001 - 时钟坏了按真实时间走
+                pass
+        return time.time()
 
     # ---------------- 基础 ----------------
 
@@ -221,6 +290,30 @@ class ProfileStore:
         if not key:
             return []
         return self.db.list_user_profiles(group_id=key, limit=limit)
+
+    def cards_across_groups(self, user_id: str) -> dict[str, str]:
+        """他在**所有群**里的名片：``{会话 id: 名片}``（用户 m14014）。
+
+        画像表是按 (群, 用户) 存的，同一个 QQ 号在不同群的 ``cards`` 各存一份；
+        想让她知道"这几张名片是同一个人"，就得把它们合起来看。
+        """
+
+        uid = str(user_id or "")
+        if not uid:
+            return {}
+        merged: dict[str, str] = {}
+        try:
+            rows = self.db.profile_rows_for_user(user_id=uid)
+        except Exception:
+            return {}
+        for row in rows or ():
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            cards = payload.get("cards") if isinstance(payload.get("cards"), dict) else {}
+            for sid, card in cards.items():
+                text = " ".join(str(card or "").split())
+                if text:
+                    merged[str(sid)] = text
+        return merged
 
     # ---------------- 平台信息（QQ 号 / 昵称 / 名片）----------------
 
@@ -398,6 +491,9 @@ class ProfileStore:
         body = " ".join(str(text or "").split())[:80]
         if not key or not uid or not body:
             return {"ok": False, "action": "skip", "reason": "没有内容"}
+        # 事实也会被原话带偏：「他明天要去体检」挂到库里，明天之后就成了假话。
+        # 统一走记忆那套归一（换成绝对日期 + 句末保留原话），读出来永远是确定的日期。
+        body = normalize_for_memory(body, now=self._now())
         kind = str(kind or "other")
         existing = self.db.list_user_facts(group_id=key, user_id=uid)
         for item in existing:
@@ -418,7 +514,11 @@ class ProfileStore:
                 )
                 return {"ok": True, "id": int(item["id"]), "action": "merge"}
             if _conflicts(str(item.get("text") or ""), body):
-                self.db.update_user_fact(fact_id=int(item["id"]), status="past")
+                # 观点冲突：旧说法**不删、也不写 status="past"**，走统一的 supersede——
+                # ``superseded`` + ``superseded_by`` 指向新说法 + ``memory_superseded`` 事件。
+                # 为什么不是 ``past``：那是"关系结束"的语义（``close_user_bond`` 用的），
+                # 事实这里需要的是"被新说法覆盖、还能翻出来"（她说"以前不是这样吗"时要看得到）。
+                # 顺序必须先 add 再 supersede：``by`` 要指向新事实的 id。
                 new_id = self.db.add_user_fact(
                     group_id=key,
                     user_id=uid,
@@ -431,6 +531,15 @@ class ProfileStore:
                     source_session=source_session,
                     pinned=pinned,
                     mentions=mentions,
+                )
+                self.db.supersede_user_fact(
+                    fact_id=int(item["id"]),
+                    by=int(new_id or 0),
+                    when=self._now(),
+                    why="观点冲突",
+                    via="profile",
+                    group_id=key,
+                    user_id=uid,
                 )
                 return {"ok": True, "id": new_id, "action": "replace"}
         new_id = self.db.add_user_fact(
@@ -480,6 +589,9 @@ class ProfileStore:
             kept: list[dict[str, Any]] = []
             for item in ordered:
                 if any(_same_fact(one.get("text"), item.get("text")) for one in kept):
+                    # 存量清理仍写 ``past``（这也是老数据里 ``past`` 行的来源之一）：
+                    # 读路径只认 ``active``，所以它照样不进提示词。这里刻意不改成
+                    # supersede——它没有"被哪条覆盖"的指向，dedupe 只是把重复说法收起来。
                     self.db.update_user_fact(fact_id=int(item["id"]), status="past")
                     merged += 1
                     continue
@@ -957,6 +1069,327 @@ class ProfileStore:
         raw.kv_set(AFFINITY_DECAY_KEY, marks)
         return changed
 
+    # ---------------- 信赖值（T15-S3）----------------
+    #
+    # 口径（用户拍板，别改）：
+    # 1. 每人一个 trust，范围 -1~+1，初始 0，允许负值；
+    # 2. **只有事件与日常通道会动它**，没有别的手动入口；
+    # 3. 它只进提示词（"谁更值得信赖"），**绝不**变成"采纳概率"，也不因为
+    #    信赖高就强制听谁的；
+    # 4. 负信赖会淡（30 天没互动，每次夜间整理 *0.9），正信赖不淡；
+    # 5. 结算必须有能核对的原话（evidence），核不上就不计分；同一个来源只算一次。
+
+    def trust_of(self, session_id: str, user_id: str) -> float:
+        """这个人现在的信赖值（没建过档 / 没有这一项就是 0）。"""
+
+        row = self.profile(session_id, user_id)
+        if row is None:
+            return 0.0
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        return _trust_value(payload.get("trust"))
+
+    def trust_notes(
+        self, session_id: str, user_id: str, *, limit: int = TRUST_NOTE_LIMIT
+    ) -> list[dict[str, Any]]:
+        """最近几次"为什么涨/跌"（编辑器通讯录里显示最近 3 条）。"""
+
+        row = self.profile(session_id, user_id)
+        if row is None:
+            return []
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        notes = payload.get("trust_notes")
+        if not isinstance(notes, list):
+            return []
+        cleaned: list[dict[str, Any]] = []
+        for item in reversed(notes):  # 存的顺序是旧→新，读出来新的在前
+            if not isinstance(item, dict):
+                continue
+            cleaned.append(
+                {
+                    "at": float(item.get("at") or 0.0),
+                    "delta": round(float(item.get("delta") or 0.0), 3),
+                    "reason": str(item.get("reason") or ""),
+                    "source": str(item.get("source") or ""),
+                }
+            )
+            if len(cleaned) >= max(1, int(limit)):
+                break
+        return cleaned
+
+    def trust_ranking(
+        self,
+        session_id: str,
+        *,
+        limit: int = 3,
+        exclude: str = "",
+        min_abs: float = 0.1,
+    ) -> list[dict[str, Any]]:
+        """"她更信得过谁"：按 |trust| 从大到小取前几名（正负都算，0 附近不算）。
+
+        排序用绝对值：+0.6 和 -0.6 都说明"她对这个人有明确判断"，
+        而 +0.05 这种刚起步的数字不值得写进提示词。返回的每项是
+        ``{"user_id", "name", "trust"}``，下游只拿它写自然语言。
+        """
+
+        key = self.group_key(session_id)
+        if not key or not self.enabled():
+            return []
+        skip = str(exclude or "")
+        rows: list[dict[str, Any]] = []
+        for row in self.list_people(session_id, limit=200):
+            uid = str(row.get("user_id") or "")
+            if not uid or uid == skip:
+                continue
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            value = _trust_value(payload.get("trust"))
+            if abs(value) < abs(float(min_abs)):
+                continue
+            names = [str(item) for item in (payload.get("names") or []) if str(item)]
+            rows.append(
+                {
+                    "user_id": uid,
+                    "name": names[-1] if names else str(payload.get("qq_name") or uid),
+                    "trust": value,
+                }
+            )
+        rows.sort(key=lambda item: (-abs(float(item["trust"])), -float(item["trust"])))
+        return rows[: max(0, int(limit))]
+
+    def adjust_trust(
+        self,
+        session_id: str,
+        user_id: str,
+        delta: float,
+        *,
+        reason: str = "",
+        source: str = "consolidate",
+        channel: str = "event",
+        kind: str = "advice",
+        evidence: str = "",
+        source_kind: str = "",
+        source_id: str = "",
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """改一次信赖值：先削到单次上限，再过"每天每人"与 A 通道的额度。
+
+        * ``channel="event"``：事件 / 承诺类结算（单次 ±0.2，单日 ±0.3）；
+        * ``channel="consolidate"``：日常小额通道 A（单次与单日都 ±0.05）。
+
+        ``source_kind`` + ``source_id`` 是幂等键：同一个来源重复提交时，
+        ``add_trust_observation`` 会拦住第二次，返回值里 ``duplicate=True``，
+        调用方据此知道"这条已经算过了"。没给幂等键就不去重（只给测试/手工用）。
+        """
+
+        key, uid = self.group_key(session_id), str(user_id or "").strip()
+        if not self.enabled() or not key or not uid:
+            return {"ok": False, "applied": False, "value": 0.0, "delta": 0.0}
+        try:
+            amount = float(delta)
+        except (TypeError, ValueError):
+            return {"ok": False, "applied": False, "value": 0.0, "delta": 0.0}
+        if amount != amount or amount in (float("inf"), float("-inf")):
+            return {"ok": False, "applied": False, "value": 0.0, "delta": 0.0}
+        daily_channel = str(channel or "") in ("consolidate", "daily", "A", "a")
+        single_cap = TRUST_CHANNEL_A_STEP if daily_channel else TRUST_SINGLE_CAP
+        daily_cap = TRUST_CHANNEL_A_DAILY if daily_channel else TRUST_DAILY_CAP
+        # 单次夹取：不管上游写了多少，一次最多这么多
+        amount = max(-single_cap, min(single_cap, amount))
+        stamp = float(now if now is not None else time.time())
+        row = self.db.get_user_profile(group_id=key, user_id=uid)
+        if row is None:
+            row = self.touch(session_id, uid, count_message=False, now=stamp)
+        if row is None:
+            return {"ok": False, "applied": False, "value": 0.0, "delta": 0.0}
+        payload: dict[str, Any] = dict(row.get("payload") or {})
+        before = _trust_value(payload.get("trust"))
+        day = self._day_key(stamp)
+        same_day = str(payload.get("trust_day") or "") == day
+        day_delta = float(payload.get("trust_day_delta") or 0.0) if same_day else 0.0
+        a_delta = float(payload.get("trust_a_day_delta") or 0.0) if same_day else 0.0
+        # 每天每人的额度：只限同方向的净变化（今天涨满了不许再涨，但可以跌）
+        amount = self._trust_room(amount, day_delta, daily_cap)
+        if daily_channel:
+            amount = self._trust_room(amount, a_delta, TRUST_CHANNEL_A_DAILY)
+        after = _trust_value(before + amount)
+        amount = after - before
+        gated = bool(str(source_kind or "").strip() and str(source_id or "").strip())
+        if gated:
+            fresh = self.db.add_trust_observation(
+                group_id=key,
+                person_id=uid,
+                delta=amount,
+                kind=kind,
+                value_after=after,
+                evidence=evidence,
+                source_kind=str(source_kind or "").strip(),
+                source_id=str(source_id or "").strip(),
+                reason=reason,
+                applied=abs(amount) > 1e-9,
+                at=stamp,
+            )
+            if not fresh:
+                return {
+                    "ok": True,
+                    "applied": False,
+                    "duplicate": True,
+                    "value": before,
+                    "delta": 0.0,
+                }
+        if abs(amount) < 1e-9:
+            # 额度用完了 / 已经到头了：幂等记录照写（表示"这次看过、不加分"）
+            return {
+                "ok": True,
+                "applied": False,
+                "value": before,
+                "delta": 0.0,
+                "reason": reason,
+            }
+        payload["trust"] = after
+        payload["trust_updated_at"] = stamp
+        payload["trust_day"] = day
+        payload["trust_day_delta"] = round(day_delta + amount, 6)
+        if daily_channel:
+            payload["trust_a_day"] = day
+            payload["trust_a_day_delta"] = round(a_delta + amount, 6)
+        payload["trust_notes"] = self._trust_note_append(
+            payload, amount, reason=reason, source=source, at=stamp
+        )
+        self._save(key, uid, payload)
+        try:
+            self.db.add_event(
+                session_id=key,
+                event_type="trust_change",
+                detail={
+                    "person_id": uid,
+                    "delta": round(amount, 4),
+                    "value_after": round(after, 4),
+                    "reason": reason,
+                    "source": source,
+                    "channel": "A" if daily_channel else "B",
+                    "kind": kind,
+                },
+            )
+        except Exception:
+            # 落账失败不影响信赖值本身（它已经写进画像了）
+            pass
+        return {
+            "ok": True,
+            "applied": True,
+            "value": after,
+            "before": before,
+            "delta": amount,
+            "reason": reason,
+        }
+
+    def decay_trust(
+        self, session_id: str, *, now: float | None = None
+    ) -> list[tuple[str, float]]:
+        """夜间整理时跑一次：**只有负信赖**会朝 0 靠拢 10%（正的不动）。
+
+        触发条件：30 天没互动（``last_seen_at`` 与 ``last_talked_at`` 取晚的
+        那个）。每个会话组一天只结算一次，靠 ``trust_observations`` 的
+        ``(decay, 当天日期, person_id)`` 唯一约束挡重复。
+        """
+
+        stamp = float(now if now is not None else time.time())
+        key = self.group_key(session_id)
+        if not self.enabled() or not key:
+            return []
+        day = self._day_key(stamp)
+        changed: list[tuple[str, float]] = []
+        for row in self.list_people(session_id, limit=500):
+            uid = str(row.get("user_id") or "")
+            if not uid:
+                continue
+            payload = dict(row.get("payload") or {})
+            value = _trust_value(payload.get("trust"))
+            if value >= -1e-9:  # 0 和正值都不淡
+                continue
+            last = max(
+                float(row.get("last_seen_at") or 0.0),
+                float(payload.get("last_talked_at") or 0.0),
+            )
+            if last and stamp - last < TRUST_DECAY_IDLE_DAYS * 86400.0:
+                continue
+            after = _trust_value(value * TRUST_DECAY_RATE)
+            if abs(after - value) < 1e-6:
+                continue
+            try:
+                fresh = self.db.add_trust_observation(
+                    group_id=key,
+                    person_id=uid,
+                    delta=after - value,
+                    kind="decay",
+                    value_after=after,
+                    source_kind="decay",
+                    source_id=day,
+                    reason="好久没互动，慢慢没那么信了",
+                    applied=True,
+                    at=stamp,
+                )
+            except Exception:
+                continue
+            if not fresh:
+                continue
+            payload["trust"] = after
+            payload["trust_updated_at"] = stamp
+            payload["trust_decay_day"] = day
+            payload["trust_notes"] = self._trust_note_append(
+                payload,
+                after - value,
+                reason="好久没互动，慢慢没那么信了",
+                source="decay",
+                at=stamp,
+            )
+            try:
+                self._save(key, uid, payload)
+            except Exception:
+                continue
+            changed.append((uid, round(after, 4)))
+        return changed
+
+    # -- B / C 通道：本轮只留接口，不实现（用户拍板：先把 A 跑通）--
+
+    def settle_event_trust(
+        self,
+        session_id: str,
+        user_id: str,
+        *,
+        outcome: str = "",
+        due_at: float = 0.0,
+        evidence: str = "",
+        source_id: str = "",
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """B 通道（事件内即时结算）：承诺 kept +0.03 / broken −0.03。
+
+        **本轮不实现**：等事件系统把承诺的 ``due_at`` 与本轮对话一起喂进来再做。
+        接口先定死，免得以后改调用方。
+        """
+
+        # TODO(T15-S3-B): 证据窗口 [due-2h, due+6h]，窗口内没有这个人的消息就
+        # 直接 unclear；evidence 必须能在窗口内的原文里核对到；同一人每周正向
+        # 合计上限 +0.06；status 单向 pending -> kept|broken|unclear，unclear 不重试。
+        return {"ok": False, "applied": False, "todo": "B 通道尚未实现"}
+
+    def judge_trust_in_chat(
+        self,
+        session_id: str,
+        user_id: str,
+        *,
+        reply_text: str = "",
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """C 通道（对话中即时判断）：kept +0.05 / broken −0.05。
+
+        **本轮不实现**：不想再为每轮对话多打一次模型（成本），等 A 通道
+        跑稳、观察一段时间再决定。
+        """
+
+        # TODO(T15-S3-C): 复用主模型的回复做判断，不额外发一次请求；证据取本轮
+        # 原话；同样受单次 ±0.05 与单日 ±0.05 约束，靠 source_kind="chat" 去重。
+        return {"ok": False, "applied": False, "todo": "C 通道尚未实现"}
+
     # ---------------- 她主动找人的额度 ----------------
 
     def proactive_quota_left(
@@ -1189,8 +1622,21 @@ class ProfileStore:
 
     # ---------------- 视图 ----------------
 
-    def view(self, session_id: str, user_id: str, *, limit_facts: int = 40) -> PersonView | None:
-        """把库里的行整理成提示词要用的视图（关系、分级、事实都算好）。"""
+    def view(
+        self,
+        session_id: str,
+        user_id: str,
+        *,
+        limit_facts: int = 40,
+        include_superseded: bool = False,
+    ) -> PersonView | None:
+        """把库里的行整理成提示词要用的视图（关系、分级、事实都算好）。
+
+        ``include_superseded``：只有她提到「以前 / 之前」（``memory_supersede.
+        wants_history``）时才把被覆盖的旧事实带上，渲染时加「（旧说法）」。
+        默认只给 ``active``——**老数据里 ``status="past"`` 的行也就自动不进提示词**
+        （那是 supersede 之前的写法，按"已过期"读，不做批量改写）。
+        """
 
         row = self.profile(session_id, user_id)
         if row is None:
@@ -1212,6 +1658,7 @@ class ProfileStore:
             user_id=uid,
             name=names[-1] if names else str(payload.get("qq_name") or uid),
             affinity=affinity,
+            trust=_trust_value(payload.get("trust")),
             level=level,
             level_index=level_index,
             negative=any(
@@ -1223,7 +1670,14 @@ class ProfileStore:
             past=past,
             claims=claims,
             facts=self.db.list_user_facts(
-                group_id=key, user_id=uid, statuses=["active"], limit=limit_facts
+                group_id=key,
+                user_id=uid,
+                statuses=["active"],
+                limit=limit_facts,
+                # 她说「以前 / 之前」时才把被覆盖的旧说法也读出来（渲染加「（旧说法）」）。
+                # 注意老库里的 ``status="past"`` 行：这里按 status 白名单取，天然不进
+                # 提示词（当作已过期），不需要、也不做批量改写。
+                include_superseded=include_superseded,
             ),
             call_me=str(payload.get("call_me") or ""),
             call_him=str(payload.get("call_him") or ""),
@@ -1262,3 +1716,44 @@ class ProfileStore:
             message_count=int(row.get("message_count") or 0) if row else 0,
             digest=str(row.get("digest") or "") if row else "",
         )
+
+    @staticmethod
+    def _trust_room(amount: float, applied: float, cap: float) -> float:
+        """同方向还剩多少额度：涨和跌各自独立计数（今天涨满还能跌）。"""
+
+        if abs(amount) < 1e-9:
+            return 0.0
+        limit = abs(float(cap or 0.0))
+        if limit <= 0:
+            return amount
+        if amount > 0:
+            room = max(0.0, limit - max(0.0, float(applied or 0.0)))
+            return min(amount, room)
+        room = max(0.0, limit - max(0.0, -float(applied or 0.0)))
+        return -min(-amount, room)
+
+    @staticmethod
+    def _trust_note_append(
+        payload: dict[str, Any],
+        delta: float,
+        *,
+        reason: str,
+        source: str,
+        at: float,
+        limit: int = TRUST_NOTE_LIMIT,
+    ) -> list[dict[str, Any]]:
+        """把这次涨/跌的原因记在画像里（只留最近几条，旧的不涨体积）。"""
+
+        notes = payload.get("trust_notes")
+        out = [dict(item) for item in notes if isinstance(item, dict)] if isinstance(
+            notes, list
+        ) else []
+        out.append(
+            {
+                "at": float(at),
+                "delta": round(float(delta), 4),
+                "reason": str(reason or ""),
+                "source": str(source or ""),
+            }
+        )
+        return out[-max(1, int(limit)):]
