@@ -2,7 +2,7 @@ name: astrbot_plugin_virtual_world
 display_name: 虚拟世界SOLIS
 desc: 给 Bot 一个有空间、有作息、有记忆的生活状态机：她有自己的地图与位置、日程与作息、会变化的状态与心情，以及按人归档的记忆。没有人和她说话时她的生活照常继续；她能在允许的地点调用 AstrBot 的工具，也会自己走动、做饭、发呆、主动开口。
 short_desc: 有空间、有作息、有记忆的生活状态机
-version: v3.0
+version: 3.0
 author: exneverbur
 repo: https://github.com/exneverbur/astrbot_plugin_virtual_world
 astrbot_version: ">=4.20.0"
