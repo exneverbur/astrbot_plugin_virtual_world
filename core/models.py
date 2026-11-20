@@ -3313,6 +3313,16 @@ class AgentConfig(Permissive):
     "失败了直接停"。
     """
 
+    plugin_forge_risk_accepted: bool = False
+    """显式确认「插件工坊有风险」（插件市场审核提醒后新增；默认关）。
+
+    审核提醒说得很直白：这一套会让模型生成代码、写进 ``data/plugins/`` 并热加载，
+    属于高敏感的自扩展安装钩子。所以除了 ``plugin_forge_enabled``，还要在这里
+    单独勾一次"我知道它会让模型写代码并安装"——两个都开，草稿工具才出现。
+
+    默认关，也不跟随任何预设自动打开：它是"要人明确点头"的那一类开关。
+    """
+
     plugin_forge_enabled: bool = False
     """允许她**自己写插件**（用户 m31581，L1 草稿层；默认关）。
 

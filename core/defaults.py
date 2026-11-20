@@ -669,6 +669,7 @@ DEFAULT_WORLD: dict[str, Any] = {
         # 插件工坊（用户 m31581）：写草稿与自装都默认关——"给她造新能力"这件事
         # 该由人先点头。开了写草稿只是往 plugin_data/drafts 里放文件，真装进宿主
         # 还要再开 plugin_forge_auto_install，或者由人在页面上按"装上"。
+        "plugin_forge_risk_accepted": False,
         "plugin_forge_enabled": False,
         "plugin_forge_auto_install": False,
         # 主人裁决（用户 m31581）：非主人提的"麻烦事"先问主人一句。默认开，

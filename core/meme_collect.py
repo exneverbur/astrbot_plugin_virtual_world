@@ -21,7 +21,6 @@
 
 from __future__ import annotations
 
-import logging
 import random
 import re
 import time
@@ -42,7 +41,7 @@ from .meme_scale import (
     composed_collect_sheet,
 )
 
-LOGGER = logging.getLogger("astrbot_plugin_virtual_world.meme_collect")
+from .host_log import logger  # noqa: PLC2701
 
 #: 评审那一次内部调用用的动作名（主回复轮里没有它）。
 COLLECT_BATCH_ACTION_ID = "collect_meme_batch"
@@ -378,7 +377,7 @@ class MemeCollectStore:
                     else self._db.find_meme_entry_by_media(media_id) is not None
                 )
             except Exception as exc:  # pragma: no cover - 坏库
-                LOGGER.warning("候选池：查已收藏失败，跳过这张：%s", exc)
+                logger.warning("候选池：查已收藏失败，跳过这张：%s", exc)
                 continue
             if known:
                 continue
@@ -413,7 +412,7 @@ class MemeCollectStore:
                         source=str(item.get("source") or kind_default),
                     )
             except Exception as exc:
-                LOGGER.warning("候选池：入池失败（不影响回复）：%s", exc)
+                logger.warning("候选池：入池失败（不影响回复）：%s", exc)
                 continue
             if inserted:
                 added += 1
@@ -436,7 +435,7 @@ class MemeCollectStore:
                 )
             )
         except Exception as exc:  # pragma: no cover - 坏库
-            LOGGER.warning("候选池：过期清理失败：%s", exc)
+            logger.warning("候选池：过期清理失败：%s", exc)
             return 0
 
     def pending_count(self, session_id: Any = "") -> int:
@@ -479,7 +478,7 @@ class MemeCollectStore:
                     captions=dict(captions), session_id=str(session_id or "")
                 )
             except Exception as exc:  # pragma: no cover - 补描述失败不影响评审
-                LOGGER.warning("候选池：补画面描述失败：%s", exc)
+                logger.warning("候选池：补画面描述失败：%s", exc)
         try:
             last = self._db.last_meme_collect_review(session_id=str(session_id or ""))
         except Exception:  # pragma: no cover - 坏库
@@ -509,7 +508,7 @@ class MemeCollectStore:
                 limit=limit,
             )
         except Exception as exc:  # pragma: no cover - 坏库
-            LOGGER.warning("候选池：读取失败：%s", exc)
+            logger.warning("候选池：读取失败：%s", exc)
             return {"due": False, "reason": "error", "batch": [], "sheets": 0}
         waiting = len(rows or ())
         if waiting < max(1, settings.min_batch):
@@ -529,7 +528,7 @@ class MemeCollectStore:
                     start_index=sheet_no * size + 1,
                 )
             except Exception as exc:  # pragma: no cover - 坏库
-                LOGGER.warning("候选池：分配候选编号失败：%s", exc)
+                logger.warning("候选池：分配候选编号失败：%s", exc)
                 continue
             sheets += 1
             for row in assigned or ():
@@ -549,7 +548,7 @@ class MemeCollectStore:
         try:
             return int(self._db.release_meme_collect_refs(candidate_ids=keys))
         except Exception as exc:  # pragma: no cover - 坏库
-            LOGGER.warning("候选池：退回编号失败：%s", exc)
+            logger.warning("候选池：退回编号失败：%s", exc)
             return 0
 
     # ---- 文本 ------------------------------------------------------------
@@ -561,7 +560,7 @@ class MemeCollectStore:
         try:
             data = self._db.meme_collect_inventory(since=since)
         except Exception as exc:  # pragma: no cover - 坏库
-            LOGGER.warning("库存反馈读取失败：%s", exc)
+            logger.warning("库存反馈读取失败：%s", exc)
             return {"total": 0, "never_sent": 0, "top_name": "", "top_count": 0}
         return dict(data or {})
 
@@ -645,7 +644,7 @@ class MemeCollectStore:
             try:
                 result = collect(str(row.get("media_id") or ""), fields)
             except Exception as exc:
-                LOGGER.warning("批量收藏：单张失败（按不收处理）：%s", exc)
+                logger.warning("批量收藏：单张失败（按不收处理）：%s", exc)
                 result = None
             if isinstance(result, Mapping) and result.get("ok"):
                 collected_ids.append(candidate_id)
@@ -680,7 +679,7 @@ class MemeCollectStore:
             )
             review_id = str((review or {}).get("review_id") or "")
         except Exception as exc:  # pragma: no cover - 坏库
-            LOGGER.warning("批量收藏：评审记账失败：%s", exc)
+            logger.warning("批量收藏：评审记账失败：%s", exc)
         return {
             "collected": collected,
             "passed": len(passed_ids),
@@ -702,7 +701,7 @@ class MemeCollectStore:
                 now=stamp,
             )
         except Exception as exc:  # pragma: no cover - 坏库
-            LOGGER.warning("批量收藏：候选状态写回失败：%s", exc)
+            logger.warning("批量收藏：候选状态写回失败：%s", exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -754,7 +753,7 @@ async def render_sheets(
                 cache_dir=cache_dir,
             )
         except Exception as exc:  # pragma: no cover - composed_collect_sheet 自己不抛
-            LOGGER.warning("候选拼图渲染失败（退回文字清单）：%s", exc)
+            logger.warning("候选拼图渲染失败（退回文字清单）：%s", exc)
             continue
         if result.composed and result.path:
             paths.append(result.path)

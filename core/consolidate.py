@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -42,7 +41,7 @@ def _captions_of(item: dict[str, Any]) -> dict[str, str]:
 
 
 PAYLOAD_SEP = "；"
-logger = logging.getLogger(__name__)
+from .host_log import logger  # noqa: PLC2701
 
 REVIEW_STEPS = (1.0, 3.0, 7.0, 30.0)
 """间隔重复：一条值得记住的事，隔多久回访一次（天）。"""

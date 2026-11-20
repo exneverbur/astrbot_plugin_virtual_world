@@ -5868,7 +5868,7 @@ class EditorAuth:
     PLUGIN_NAME,
     "exneverbur",
     "给 Bot 一个私有空间、动作、日程、场景记忆和工具能力，让 ta 像住在群里一样生活。",
-    "v2.2",
+    "3.0.0",
 )
 class VirtualWorldPlugin(Star):
     @staticmethod

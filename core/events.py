@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -1085,7 +1084,7 @@ _EVENT_JSON_KEYS = frozenset(
 只收协议里真的出现过的键；不在表里的键名被劈开也**不猜**。
 """
 
-_LOGGER = logging.getLogger(__name__)
+from .host_log import logger  # noqa: PLC2701
 
 
 def parse_json_object(text: str) -> dict[str, Any] | None:
@@ -1113,7 +1112,7 @@ def parse_json_object(text: str) -> dict[str, Any] | None:
         if data is None:
             continue
         if repaired:
-            _LOGGER.warning(
+            logger.warning(
                 "事件输出的 JSON 有裸控制字符 / 被劈开的键名，已修复："
                 "repaired=%s raw_len=%d in_string_newlines=%d",
                 repaired,
@@ -1266,7 +1265,7 @@ def parse_event_speech(text: str) -> tuple[str, list[dict[str, Any]]]:
     if stripped.startswith("{") or stripped.startswith("[") or stripped.startswith("```"):
         # 长得像 JSON 却连修复都解析不出来：宁可这一句不说，也绝不把她没写完的
         # JSON 当台词发进聊天里（线上 10-26 10:41 / 10:43 各发过一次原样 JSON）。
-        _LOGGER.warning(
+        logger.warning(
             "事件收尾句是解析不出来的 JSON，已丢弃（不发原样 JSON）：raw_len=%d",
             len(text),
         )

@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -23,7 +22,7 @@ from .time_ref import normalize_relative_dates
 
 from . import memory_supersede
 
-logger = logging.getLogger(__name__)
+from .host_log import logger  # noqa: PLC2701
 
 SCENE = "scene"
 RELATION = "relation"

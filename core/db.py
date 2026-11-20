@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import logging
 import math
 import sqlite3
 import struct
@@ -62,7 +61,7 @@ from .experience import (
 # 流程型 skill 的形状与版本号以 core/skills.py 为唯一真相（本文件只管存得住、读得回）
 from . import skills as skill_policy
 
-logger = logging.getLogger(__name__)
+from .host_log import logger  # noqa: PLC2701
 
 #: ``vw_skills`` 的 v2 形状：每个字段都会进提示词（见 core/skills.py 的渲染），
 #: 所以不再有 ``detail`` 这种"整包塞进去、谁也读不到"的列。

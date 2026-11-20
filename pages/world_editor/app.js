@@ -529,6 +529,8 @@ const LOG_TYPES = {
   tool_call: { icon: "🔧", label: "调用工具" },
   tool_result: { icon: "📥", label: "工具返回" },
   mood_reset: { icon: "🌤️", label: "心情缓过来" },
+  plugin_forge_draft: { icon: "🧪", label: "写了插件草稿" },
+  plugin_forge_install: { icon: "🧩", label: "装了插件" },
   day_mood: { icon: "🌅", label: "今天的调子" },
   desire_push: { icon: "🫂", label: "想被碰一碰" },
   soothed: { icon: "🫂", label: "被安抚 / 被理解" },
@@ -16378,9 +16380,26 @@ function renderSettings() {
     ),
   );
 
-  // 插件工坊（用户 m31581）：给她造新能力的两个开关，也是平铺 bool、不进上面那张表
+  // 插件工坊（用户 m31581）：给她造新能力的开关，也是平铺 bool、不进上面那张表
   // （那张表只装与 AgentConfig 前五个子开关一一对应的键）。自装排在写草稿后面：
-  // 先能写、再决定要不要让她直接装——两步都默认关，装上的东西会真的跑起来。
+  // 先能写、再决定要不要让她直接装——都默认关，装上的东西会真的跑起来。
+  // 插件市场审核提醒（用户 m23946 第 1 条）：先要一道显式的风险确认，才谈得上
+  // 「允许她写插件」——这两个都关着时，草稿工具连影子都不会出现。
+  agentCard._fields.appendChild(
+    checkboxField(
+      "确认插件工坊的风险",
+      !!world.agent.plugin_forge_risk_accepted,
+      (value) => {
+        world.agent.plugin_forge_risk_accepted = !!value;
+        markDirty();
+      },
+      {
+        hint:
+          "打开后她才会按你的要求生成插件代码、写进插件目录（未必装上）。这是高敏感的自扩展开关，确认再用。",
+        confirm: AGENT_FILE_POWER_WARNING,
+      },
+    ),
+  );
   agentCard._fields.appendChild(
     checkboxField(
       "允许她写插件",
@@ -20084,6 +20103,7 @@ const WIZARD_AGENT_SWITCHES = [
   ["code_execution_enabled", "执行代码", "在这台机器上运行她写的代码。不是沙箱，有真实风险，默认关。"],
   ["inspect_capability_enabled", "查看动作说明", "只读查看动作能做什么、需要什么。"],
   ["ask_user_enabled", "缺信息时问一句", "拿不准就问她/他一句；这类追问不占说话的额度。"],
+  ["plugin_forge_risk_accepted", "确认插件工坊的风险", "打开后她会生成代码、写进插件目录；这是高敏感开关，确认再开。"],
   ["plugin_forge_enabled", "允许她写插件", "她能自己写一份插件草稿；装不装由你点。"],
   ["plugin_forge_auto_install", "允许她自己装", "装上会真的跑起来；要先打开上面那条，默认关。"],
 ];
@@ -21708,6 +21728,7 @@ function agentSwitchesCard() {
     ["把文件发出去", "file_send_enabled"],
     ["跑代码", "code_execution_enabled"],
     ["办不成先查资料", "research_enabled"],
+    ["确认插件工坊的风险", "plugin_forge_risk_accepted"],
     ["允许她写插件", "plugin_forge_enabled"],
     ["允许她自己装", "plugin_forge_auto_install"],
     // 这两项设置页一直能改、Agent 页却看不到（用户 m00001 第 8 条）：补在这里，

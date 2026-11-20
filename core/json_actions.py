@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Collection
@@ -16,7 +15,7 @@ from .source_events import normalize_sensitivity
 
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
-_LOGGER = logging.getLogger(__name__)
+from .host_log import logger  # noqa: PLC2701
 """修复成功时打 WARN 用（用户 m00001：「修复成功时记一条 WARN」）。"""
 
 # 模型的思考段：有的模型即使关了思考开关也会吐出来（有时还漏掉开标签）。
@@ -536,7 +535,7 @@ def loads_json_repaired(
         if not renamed:
             return data, REPAIR_NONE, 0
         # debug 级：这是"合法 JSON 的键名带空格"，不是上游折行事故，别 WARN 刷屏。
-        _LOGGER.debug(
+        logger.debug(
             "JSON 合法但顶层键名带空白，已按白名单归一：keys_after_parse raw_len=%d",
             len(str(text or "")),
         )
@@ -557,7 +556,7 @@ def loads_json_repaired(
     data, renamed = normalize_json_keys_after_parse(data, known)
     base = REPAIR_BOTH if len(flags) > 1 else flags[0]
     if renamed:
-        _LOGGER.debug(
+        logger.debug(
             "JSON 修好后顶层键名仍带空白，已按白名单归一：keys_after_parse raw_len=%d",
             len(str(text or "")),
         )
@@ -1041,7 +1040,7 @@ def extract_json_object_with_repair(
         if data is None:
             continue
         if repaired and repair_needs_notice(repaired):
-            _LOGGER.warning(
+            logger.warning(
                 "模型输出的 JSON 有裸控制字符 / 被劈开的键名，已修复："
                 "repaired=%s raw_len=%d in_string_newlines=%d",
                 repaired,

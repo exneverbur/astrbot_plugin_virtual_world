@@ -26859,9 +26859,18 @@ class VirtualWorldEngine:
     # ---------------- 插件工坊：她写插件、装上、再挂成动作（用户 m31581） ----------------
 
     def plugin_forge_enabled(self) -> bool:
-        """允许她写插件草稿没有（L1）。"""
+        """允许她写插件草稿没有（L1）。
 
-        return bool(getattr(getattr(self.world, "agent", None), "plugin_forge_enabled", False))
+        插件市场审核提醒之后又多了一道：光有 ``plugin_forge_enabled`` 不够，
+        还要 ``plugin_forge_risk_accepted`` 显式确认"模型会写代码并安装"这件事
+        （用户 m23946 只批了这一条与审计，没批自动改默认值）。
+        """
+
+        agent = getattr(self.world, "agent", None)
+        return bool(
+            getattr(agent, "plugin_forge_enabled", False)
+            and getattr(agent, "plugin_forge_risk_accepted", False)
+        )
 
     def plugin_forge_auto_install(self) -> bool:
         """允许她**自己**把草稿装进 AstrBot 没有（L2；要 L1 也开着）。"""
@@ -46360,6 +46369,18 @@ class VirtualWorldEngine:
                 started=started,
             )
         action = dict(saved.get("action") or {})
+        # 审计（审核提醒第 5 条）：每一次生成都留一条，谁提的、写了什么、挂哪个动作。
+        await self._log_event(
+            state,
+            "plugin_forge_draft",
+            {
+                "slug": str(saved.get("slug") or slug),
+                "files": list(saved.get("files") or []),
+                "action": str(action.get("id") or ""),
+                "auto_install": self.plugin_forge_auto_install(),
+            },
+            target=str(getattr(state, "session_id", "") or ""),
+        )
         if fingerprint:
             # 记下这一版：同一任务里再交一模一样的，就只回"这步做过了"。
             seen[str(saved.get("slug") or slug)] = fingerprint
@@ -46421,6 +46442,18 @@ class VirtualWorldEngine:
                 ),
                 started=started,
             )
+        # 审计（审核提醒第 5 条）：装进宿主是最重的一步，留一条完整的。
+        await self._log_event(
+            state,
+            "plugin_forge_install",
+            {
+                "slug": slug,
+                "dir": str(result.get("dir") or ""),
+                "action_id": str(result.get("action_id") or ""),
+                "warnings": list(result.get("warnings") or [])[:3],
+            },
+            target=str(getattr(state, "session_id", "") or ""),
+        )
         lines = [
             f"装上了：插件目录 {result.get('dir')}，动作 {result.get('action_id')}"
             f"「{(result.get('action') or {}).get('name') or ''}」",
